@@ -20,15 +20,38 @@ export type HistoryBar = {
   close_dn?: number // denoised close (when denoising applied)
 }
 
+export type RuntimeTimezoneMeta = {
+  utc?: {
+    tz?: string | null
+    now?: string
+  }
+  server?: {
+    source?: string
+    tz?: string | null
+    offset_seconds?: number
+    now?: string
+  }
+  client?: {
+    tz?: string | null
+    now?: string
+  }
+}
+
 export type HistoryResponse = {
-  success: boolean
-  symbol: string
-  timeframe: string
-  candles: number
-  last_candle_open: boolean
   data: HistoryBar[]
+  candles?: number
+  timeframe?: string
+  symbol?: string
+  success?: boolean
+  has_forming_candle?: boolean
+  forming_candle_status?: 'included' | 'skipped' | 'detected' | 'none'
+  forming_candle_included?: boolean
+  forming_candle_skipped?: boolean
+  incomplete_candles_skipped?: number
   meta?: {
-    server_tz_offset: number
+    runtime?: {
+      timezone?: RuntimeTimezoneMeta
+    }
   }
 }
 
@@ -40,9 +63,64 @@ export type SupportResistanceLevel = {
   type: 'support' | 'resistance'
   value: number
   touches: number
+  episodes?: number
   score?: number
+  distance?: number | null
+  distance_pct?: number | null
+  zone_low?: number | null
+  zone_high?: number | null
+  zone_width?: number | null
+  zone_width_atr?: number | null
   first_touch?: string | null
   last_touch?: string | null
+  dominant_source?: 'support' | 'resistance' | 'mixed'
+  status?: string
+  source_tests?: {
+    support: number
+    resistance: number
+  }
+  source_episodes?: {
+    support: number
+    resistance: number
+  }
+  avg_bounce_atr?: number | null
+  avg_pretest_adx?: number | null
+  breakout_analysis?: {
+    decisive_break_count: number
+    avg_breach_atr?: number | null
+    last_break_time?: string | null
+    role_reversal_count: number
+  }
+  score_breakdown?: {
+    base?: number
+    retests?: number
+    bounce?: number
+    adx?: number
+    breakout_penalty?: number
+    role_reversal_bonus?: number
+    mtf_confirmation_bonus?: number
+    total?: number
+  }
+  source_timeframes?: string[]
+  merge_details?: {
+    cross_timeframe_dedupe_count: number
+    deduped_timeframes: string[]
+  }
+  episode_details?: Array<{
+    type: 'support' | 'resistance' | 'mixed'
+    touches: number
+    first_touch?: string | null
+    last_touch?: string | null
+  }>
+  timeframe_contributions?: Array<{
+    timeframe: string
+    weight: number
+    raw_score: number
+    weighted_score: number
+    touches: number
+    episodes?: number
+    merge_mode?: 'full' | 'deduped'
+  }>
 }
 
 export type PivotLevel = {
@@ -61,12 +139,40 @@ export type PivotResponse = {
 export type SupportResistanceResponse = {
   symbol: string
   timeframe: string
+  mode?: string
+  timeframes_analyzed?: string[]
+  timeframe_weights?: Record<string, number>
+  per_timeframe?: Array<{
+    timeframe: string
+    supports: number
+    resistances: number
+    current_price?: number | null
+    window?: { start?: string | null; end?: string | null }
+    effective_tolerance_pct?: number
+    effective_reaction_bars?: number
+    volatility_ratio?: number
+    current_atr_pct?: number | null
+    baseline_atr_pct?: number | null
+  }>
   limit: number
   method: string
   tolerance_pct: number
+  effective_tolerance_pct?: number
   min_touches: number
+  qualification_basis?: 'episodes'
+  max_levels?: number
+  reaction_bars?: number
+  effective_reaction_bars?: number
+  adx_period?: number
+  adaptive_mode?: 'atr_regime'
+  volatility_ratio?: number
+  current_atr_pct?: number | null
+  baseline_atr_pct?: number | null
+  current_price?: number | null
   window?: { start?: string | null; end?: string | null }
   levels: SupportResistanceLevel[]
+  supports?: SupportResistanceLevel[]
+  resistances?: SupportResistanceLevel[]
 }
 
 // ============================================================================
@@ -195,6 +301,7 @@ export type DenoiseSpecUI = {
 export type ForecastPriceBody = {
   symbol: string
   timeframe?: string
+  library?: 'native' | 'statsforecast' | 'sktime' | 'mlforecast' | 'pretrained'
   method?: string
   horizon?: number
   lookback?: number
@@ -202,7 +309,6 @@ export type ForecastPriceBody = {
   params?: Record<string, unknown>
   ci_alpha?: number
   quantity?: 'price' | 'return' | 'volatility'
-  target?: 'price' | 'return'
   denoise?: DenoiseSpecUI
   features?: Record<string, unknown>
   dimred_method?: string
@@ -229,8 +335,7 @@ export type BacktestBody = {
   spacing?: number
   methods?: string[]
   params_per_method?: Record<string, unknown>
-  quantity?: 'price' | 'return'
-  target?: 'price' | 'return'
+  quantity?: 'price' | 'return' | 'volatility'
   denoise?: DenoiseSpecUI
   params?: Record<string, unknown>
   features?: Record<string, unknown>
@@ -238,6 +343,7 @@ export type BacktestBody = {
   dimred_params?: Record<string, unknown>
   slippage_bps?: number
   trade_threshold?: number
+  detail?: 'compact' | 'full'
 }
 
 export type BacktestResult = {
@@ -246,16 +352,14 @@ export type BacktestResult = {
   horizon: number
   steps: number
   spacing: number
-  results: {
-    method: string
-    mae?: number
-    mape?: number
-    rmse?: number
-    direction_accuracy?: number
-    predictions?: number[][]
-    actuals?: number[][]
-    anchor_times?: number[]
-  }[]
+  results: Record<string, {
+    success: boolean
+    avg_mae?: number
+    avg_rmse?: number
+    avg_directional_accuracy?: number
+    successful_tests?: number
+    num_tests?: number
+  }>
 }
 
 // ============================================================================

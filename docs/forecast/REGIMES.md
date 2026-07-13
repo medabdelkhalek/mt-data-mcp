@@ -37,9 +37,18 @@ A strategy that profits in one regime may lose in another. Regime detection help
 2. Each state has characteristic mean return and volatility
 3. Uses observed data to estimate which state is currently active
 
+The implementation is a Gaussian HMM with an estimated transition matrix.
+`params.inference=filtered` is the default and uses observations through each
+bar under parameters fitted on the requested window. Use
+`params.inference=smoothed` only for retrospective segmentation because it uses
+later observations. State changes are confirmed causally by `min_regime_bars`.
+Model parameters are still fitted on the requested analysis window, and canonical
+state IDs are ordered by full-window state means. Historical canonical IDs are
+therefore retrospective labels; use rolling `as_of` calls for point-in-time tests.
+
 **Example:**
 ```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
 ```
 
 **Output:**
@@ -59,10 +68,15 @@ summary:
 - **State 1:** High volatility (σ = 0.0007) — trending/active market
 - Currently in State 0 (low volatility)
 
+State IDs are ordered by ascending mean return, not by volatility. The example's
+State 0 happens to be the low-volatility state; always use
+`state_sigma[last_state]` to read the current state's fitted volatility.
+
 **Parameters:**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `n_states` | 2 | Number of regimes to detect |
+| `inference` | `filtered` | `filtered` for live interpretation or `smoothed` for retrospective segmentation |
 
 **When to use:**
 - Ongoing regime classification
@@ -82,7 +96,7 @@ summary:
 
 **Example:**
 ```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method bocpd --threshold 0.5 --output summary
+mtdata-cli regime_detect EURUSD --timeframe H1 --method bocpd --threshold 0.5
 ```
 
 **Output:**
@@ -101,8 +115,8 @@ summary:
 **Parameters:**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `threshold` | 0.5 | Probability cutoff to flag a change point |
-| `lookback` | 300 | Historical bars to analyze |
+| `threshold` | auto | Probability cutoff to flag a change point. Omit it for automatic asset/timeframe calibration; any supplied number, including `0.5`, is fixed. |
+| `lookback` | timeframe-based | Recent window used for BOCPD summary statistics in compact/summary detail. `limit` controls the detection history. |
 
 **When to use:**
 - Detecting breakouts
@@ -111,18 +125,66 @@ summary:
 
 ---
 
-### 3. Markov-Switching AR (MS-AR)
+### 3. PELT Change-Point Detection
+
+**What it does:** Segments the return series at structural breaks using the Pruned Exact Linear Time algorithm from `ruptures`.
+
+```bash
+mtdata-cli regime_detect EURUSD --timeframe H1 --method pelt \
+  --params "model=rbf penalty=auto min_size=5 jump=1"
+```
+
+Supported cost models are `l1`, `l2`, `rbf`, `normal`, and `ar`. Set a numeric `penalty` for explicit sensitivity or keep `penalty=auto` for a variance-scaled default.
+
+**When to use:**
+- Retrospective structural-break detection
+- Segmenting history before fitting forecasts
+- Confirming breaks suggested by BOCPD
+
+---
+
+### 4. Markov-Switching AR (MS-AR)
 
 **What it does:** Combines HMM with autoregressive modeling. Each regime has its own AR parameters.
 
 **Example:**
 ```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method ms_ar --params "k_regimes=2 order=1"
+mtdata-cli regime_detect EURUSD --timeframe H1 --method ms_ar --params "n_states=2 order=1"
 ```
+
+Use `n_states` to choose the number of regimes.
+Like HMM, MS-AR defaults to filtered probabilities. Set
+`params.inference=smoothed` only for retrospective analysis.
 
 **When to use:**
 - When regime changes affect both mean and autocorrelation structure
 - Academic research contexts
+
+---
+
+### 5. Clustering (`clustering`)
+
+**What it does:** Groups bars into regimes using distance-based clustering (e.g. KMeans on return/volatility features). Does not assume a hidden Markov structure.
+
+The scaler, optional PCA, cluster model, and canonical state ordering are fitted
+on the full requested window. Clustering output is descriptive; reproduce live
+behavior with rolling `as_of` calls. `min_regime_bars` confirmation itself is causal.
+
+**Example:**
+```bash
+mtdata-cli regime_detect EURUSD --timeframe H1 --method clustering --params "n_states=3"
+```
+
+Use `n_states` to choose the number of regimes; legacy aliases are ignored.
+
+### 6. Gaussian mixture (`gmm`)
+
+`gmm` is independent Gaussian soft clustering. It has no transition matrix or
+Markov persistence and must not be interpreted as an HMM state filter.
+
+**When to use:**
+- Exploratory regime discovery without a parametric model
+- When HMM convergence is unstable
 
 ---
 
@@ -134,7 +196,7 @@ Only enter trend-following trades when HMM detects high-volatility state:
 
 ```bash
 # Check current regime
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
 
 # If state_sigma shows current state is high-volatility:
 #   → Enable trend-following entries
@@ -148,7 +210,7 @@ Monitor for regime transitions and reduce exposure when detected:
 
 ```bash
 # Check for recent change points
-python cli.py regime_detect EURUSD --timeframe H1 --method bocpd --threshold 0.6
+mtdata-cli regime_detect EURUSD --timeframe H1 --method bocpd --threshold 0.6
 
 # If last_cp_prob > 0.6:
 #   → Tighten stops
@@ -162,35 +224,107 @@ Run barrier optimization separately for each regime:
 
 ```bash
 # In low-volatility regime: tighter barriers
-python cli.py forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
+mtdata-cli forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
   --tp-min 0.15 --tp-max 0.5 --sl-min 0.1 --sl-max 0.4
 
 # In high-volatility regime: wider barriers
-python cli.py forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
+mtdata-cli forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
   --tp-min 0.5 --tp-max 2.0 --sl-min 0.3 --sl-max 1.5
 ```
 
 ---
 
-## Output Formats
+## Output Contract
 
-### Summary Output (Default)
+### Compact TOON Output (Default)
 ```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --output summary
-```
-Shows aggregate statistics: current state, state distributions, volatility per state.
-
-### Compact Output
-```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --output compact
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm
 ```
 Shows regime segments: start time, end time, duration, state ID.
 
-### Full Output
+### JSON Output
 ```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --output full
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm --json
 ```
-Shows per-bar state assignments and probabilities.
+Returns structured JSON for programmatic use.
+
+Canonical fields for successful compact/full JSON responses:
+
+| Field | Applies to | Notes |
+|-------|------------|-------|
+| `method` | all methods | Actual implementation method. `hmm` and `gmm` are distinct. |
+| `current_regime` | all methods | Uses `regime_id`, `label`, `since`, `bars`, and `regime_confidence` when those concepts apply. BOCPD also includes transition-oriented fields such as `status` and `transition_risk`. |
+| `regimes` | all compact/full methods | Uses `start`, `end`, `bars`, and `regime_confidence` consistently where regime confidence applies. |
+| `regime_info` | state/rule methods | Describes regime labels and statistics. Clustering labels are derived from return/volatility when available instead of opaque `regime_N` names. |
+| `reliability` | all methods | Always includes `confidence`, `reliability_label`, and `source`; method-specific diagnostics may add more fields. |
+| `warnings` | as needed | Explains accepted parameters that do not apply to the selected method. |
+
+`current_regime.regime_confidence` and `regimes[].regime_confidence` are the canonical regime-confidence keys. Reliability diagnostics keep their own `reliability.confidence` field.
+
+**Method-specific meaning of `regime_confidence`:**
+
+| Method | Meaning |
+|--------|---------|
+| `hmm`, `gmm`, `ms_ar`, `clustering`, … | Average posterior probability of the assigned state over the segment (classification confidence). |
+| `bocpd` | Segment **stability**: `1 - mean(change-point probability)` over bars in the segment. High values mean low internal CP mass (stable stretch). Boundary evidence is separate: `transition_prob_at_start` and `avg_transition_prob`. |
+
+Do not treat BOCPD `regime_confidence` as "how sure we are of a bullish/bearish label"; BOCPD segments are change-point intervals, and bias labels (when present) come from post-change return statistics.
+
+Volatility words in state labels (`low_vol`, `high_vol`, `quiet`, and
+`volatile`) rank the fitted states within that run. They are not absolute
+thresholds and should not be compared across symbols or timeframes. Use the
+numeric `volatility` / `volatility_pct` fields for quantitative comparisons.
+
+### Parameter applicability
+
+Use `n_states` as the canonical state-count parameter for HMM/GMM, MS-AR, clustering, GARCH, wavelet, and ensemble.
+
+`threshold` only applies to BOCPD change-point detection. If supplied for non-BOCPD methods, the tool reports a warning rather than silently changing confidence filtering.
+
+For `rule_based`, use `params.window_bars` to choose the analysis window. `lookback`, `min_regime_bars`, and `max_regimes` do not change rule-based output because it emits one current-window regime; non-default uses are reported in `warnings`.
+
+### Heuristic state counts
+
+Some methods use a heuristic to choose `n_states` when it is not explicitly supplied:
+
+| Method | Auto-detection basis |
+|--------|----------------------|
+| `garch` | Realized-volatility percentile spread plus return kurtosis |
+| `ensemble` | Return-distribution kurtosis |
+
+These rules control output granularity; they are not AIC/BIC model selection and
+do not estimate the true number of market regimes. Set `n_states` explicitly and
+compare out-of-sample or backtest results when the state count affects a strategy.
+GARCH and ensemble can choose different counts on the same data because their
+heuristics use different inputs.
+
+The ensemble defaults to `hmm`, `clustering`, and `wavelet`. Ensemble voters
+must emit state IDs canonicalized by return, so supported overrides are
+`hmm`, `gmm`, `ms_ar`, `clustering`, and `wavelet`. BOCPD/PELT change points,
+rule-based labels, and GARCH volatility tiers are different concepts and are
+rejected as ensemble voters instead of being mapped into the same state-ID
+space. Use those methods separately as transition or volatility gates.
+
+#### GARCH volatility tiers
+
+The `garch` method fits a single GARCH model to estimate conditional
+volatility, then bins that path into ordered volatility tiers. By default the
+cut points are percentiles of the full analysis window, so labels such as
+`low_vol` and `high_vol` are relative within that run and can change when the
+window changes. With two states, `params.vol_threshold` selects an explicit
+absolute cut point instead. The output reports `threshold_scope` and
+`volatility_thresholds` in `params_used`.
+
+This method is not a Markov-switching GARCH model and does not estimate latent
+regime dynamics. AIC, BIC, and log likelihood are exposed as `model_fit`
+diagnostics only; they are not converted into a generic regime-confidence
+score.
+
+### Richer Sections
+```bash
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm --extras metadata,diagnostics --json
+```
+Adds supported richer sections such as metadata and diagnostics.
 
 ---
 
@@ -198,10 +332,13 @@ Shows per-bar state assignments and probabilities.
 
 | Task | Command |
 |------|---------|
-| Classify regimes (2 states) | `python cli.py regime_detect EURUSD --method hmm --params "n_states=2"` |
-| Classify regimes (3 states) | `python cli.py regime_detect EURUSD --method hmm --params "n_states=3"` |
-| Detect change points | `python cli.py regime_detect EURUSD --method bocpd --threshold 0.5` |
-| Markov-switching AR | `python cli.py regime_detect EURUSD --method ms_ar --params "k_regimes=2"` |
+| Classify regimes (2 states) | `mtdata-cli regime_detect EURUSD --method hmm --params "n_states=2"` |
+| Classify regimes (3 states) | `mtdata-cli regime_detect EURUSD --method hmm --params "n_states=3"` |
+| Cluster return distributions without Markov persistence | `mtdata-cli regime_detect EURUSD --method gmm --params "n_states=2"` |
+| Detect change points | `mtdata-cli regime_detect EURUSD --method bocpd --threshold 0.5` |
+| Segment structural breaks | `mtdata-cli regime_detect EURUSD --method pelt --params "model=rbf penalty=auto"` |
+| Markov-switching AR | `mtdata-cli regime_detect EURUSD --method ms_ar --params "n_states=2"` |
+| Clustering | `mtdata-cli regime_detect EURUSD --method clustering --params "n_states=3"` |
 
 ---
 

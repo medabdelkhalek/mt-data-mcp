@@ -1,8 +1,18 @@
 # Documentation Index
 
-This folder contains user-facing documentation for mtdata. Start with setup, then follow a guided workflow before exploring individual topics.
+This folder contains user-facing documentation for mtdata. Start with setup, run a read-only workflow, then explore the deeper references as you need them.
 
 Safety note: `trade_*` commands can place/modify/close real orders on the account currently logged into MT5 (demo or live). Use a demo account until you're confident in your setup.
+
+## Choose Your Path
+
+| Goal | Start Here | Then Read |
+|------|------------|-----------|
+| Install and confirm MT5 connectivity | [SETUP.md](SETUP.md) | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) if anything fails |
+| Learn the command line safely | [CLI.md](CLI.md) | [GLOSSARY.md](GLOSSARY.md), [SAMPLE-TRADE.md](SAMPLE-TRADE.md) |
+| Build a research workflow | [EXAMPLE.md](EXAMPLE.md) | [FORECAST.md](FORECAST.md), [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md) |
+| Integrate with an app or agent | [WEB_API.md](WEB_API.md) | [DEPLOYMENT.md](DEPLOYMENT.md), [ENV_VARS.md](ENV_VARS.md), [CLI.md](CLI.md) |
+| Prepare for trade execution | [SAMPLE-TRADE-ADVANCED.md](SAMPLE-TRADE-ADVANCED.md) | [ENV_VARS.md](ENV_VARS.md#trade-guardrails), [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 
 ## Learning Path
 
@@ -11,31 +21,50 @@ Safety note: `trade_*` commands can place/modify/close real orders on the accoun
 3. [CLI.md](CLI.md) — How to run commands and read output
 4. [SAMPLE-TRADE.md](SAMPLE-TRADE.md) — A beginner-friendly workflow with explanations
 5. [SAMPLE-TRADE-ADVANCED.md](SAMPLE-TRADE-ADVANCED.md) — More methods + stricter risk/execution gates
-6. Deep dives: [FORECAST.md](FORECAST.md), [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md), [TECHNICAL_INDICATORS.md](TECHNICAL_INDICATORS.md)
+6. Deep dives: [FORECAST.md](FORECAST.md), [TIME_SERIES_DIAGNOSTICS.md](TIME_SERIES_DIAGNOSTICS.md), [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md), [TECHNICAL_INDICATORS.md](TECHNICAL_INDICATORS.md)
+7. Specialized: [FINVIZ.md](FINVIZ.md), [TEMPORAL.md](TEMPORAL.md), [OPTIONS_QUANTLIB.md](OPTIONS_QUANTLIB.md)
 
 ## Getting Started
 
 | Document | Description |
 |----------|-------------|
 | [SETUP.md](SETUP.md) | Installation, MT5 connection, environment variables |
+| [ENV_VARS.md](ENV_VARS.md) | Complete `.env` reference (MT5, MCP, Web API, GPU, etc.) |
 | [CLI.md](CLI.md) | Command conventions, output formats, help system |
+| [OUTPUT.md](OUTPUT.md) | Response envelope, `detail`/`extras`, pagination, and error codes |
+| [TIMESTAMPS.md](TIMESTAMPS.md) | Timezone policy: broker time, UTC, client-local, and provider time |
 | [GLOSSARY.md](GLOSSARY.md) | **Start here** — Explanations of all technical terms |
+| [LIMITATIONS.md](LIMITATIONS.md) | Practical caveats, provider limits, and documentation gaps |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Run the MCP server or Web API as a persistent local service |
 
 ## Core Topics
 
 | Document | Description |
 |----------|-------------|
-| [FORECAST.md](FORECAST.md) | Price forecasting methods and usage |
+| [FORECAST.md](FORECAST.md) | Price forecasting methods, async training, and model store |
+| [forecast/METHODS.md](forecast/METHODS.md) | Per-method reference: categories, libraries, default parameters, dependencies |
+| [forecast/FORECAST_GENERATE.md](forecast/FORECAST_GENERATE.md) | Detailed `forecast_generate` reference (parameters, quantity modes, pipeline) |
 | [forecast/BACKTESTING.md](forecast/BACKTESTING.md) | Rolling backtests and parameter optimization |
 | [forecast/VOLATILITY.md](forecast/VOLATILITY.md) | Volatility estimation and forecasting |
 | [forecast/REGIMES.md](forecast/REGIMES.md) | Market regime and change-point detection |
+| [TIME_SERIES_DIAGNOSTICS.md](TIME_SERIES_DIAGNOSTICS.md) | Stationarity, automatic seasonality, outlier, and volatility-cone analysis |
 | [forecast/UNCERTAINTY.md](forecast/UNCERTAINTY.md) | Confidence and conformal intervals |
-| [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md) | TP/SL hit probability and optimization |
+| [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md) | TP/SL hit probability, optimization, and statistical robustness checks |
 | [TECHNICAL_INDICATORS.md](TECHNICAL_INDICATORS.md) | Available indicators and how to use them |
-| [DENOISING.md](DENOISING.md) | Smoothing filters and noise reduction |        
+| [LEVELS.md](LEVELS.md) | Pivots, support/resistance, confluence zones, and volume profile |
+| [DENOISING.md](DENOISING.md) | Smoothing filters and noise reduction |
 | [SIMPLIFICATION.md](SIMPLIFICATION.md) | Downsampling and output reduction (`--simplify`) |
 | [CAUSAL_DISCOVERY.md](CAUSAL_DISCOVERY.md) | Granger-style causal signal discovery |
+| [ADVANCED_ANALYTICS.md](ADVANCED_ANALYTICS.md) | Tick microstructure, execution quality, robust strategy validation, portfolio risk decomposition, and relative strength |
+| [TEMPORAL.md](TEMPORAL.md) | Session effects, day-of-week, hourly and monthly patterns |
 | [forecast/PATTERN_SEARCH.md](forecast/PATTERN_SEARCH.md) | Pattern detection and similarity search |
+
+## External Data & Options
+
+| Document | Description |
+|----------|-------------|
+| [FINVIZ.md](FINVIZ.md) | US equity fundamentals, screening, news, insider activity, macro snapshots |
+| [OPTIONS_QUANTLIB.md](OPTIONS_QUANTLIB.md) | Options chains, QuantLib barrier pricing, Heston calibration |
 | [WEB_API.md](WEB_API.md) | FastAPI endpoints powering the Web UI |
 
 ## Tutorials
@@ -46,27 +75,35 @@ Safety note: `trade_*` commands can place/modify/close real orders on the accoun
 | [SAMPLE-TRADE-ADVANCED.md](SAMPLE-TRADE-ADVANCED.md) | Advanced workflow with regimes, HAR-RV, barriers |
 | [EXAMPLE.md](EXAMPLE.md) | Complete end-to-end command-driven research loop |
 
+## Trading
+
+| Document | Description |
+|----------|-------------|
+| [TRADING_RISK.md](TRADING_RISK.md) | Read-only risk analytics: position sizing (fixed-fraction + Kelly), VaR/CVaR, and scenario stress tests |
+| [TRADING_SAFETY.md](TRADING_SAFETY.md) | Safety runbook: dry-run previews, guardrails, validation, and broker behavior for `trade_*` |
+| [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md) | TP/SL hit probability, optimization, and statistical robustness checks |
+
 ## Common Workflows (Recipes)
 
 These are research workflows (not financial advice). For a guided narrative, start with [SAMPLE-TRADE.md](SAMPLE-TRADE.md).
 
 ### 1) Quick market snapshot (no trading)
 ```bash
-python cli.py symbols_describe EURUSD --format json
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 --format json
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --model theta --format json
+mtdata-cli symbols_describe EURUSD --json
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 --json
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta --json
 ```
 
 ### 2) TP/SL odds for a trade idea
 ```bash
-python cli.py forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
-  --method mc --mc-method mc_gbm --direction long --tp-pct 0.4 --sl-pct 0.6 --format json
+mtdata-cli forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
+  --method mc_gbm --direction long --tp-pct 0.4 --sl-pct 0.6 --json
 ```
 
 ### 3) Scan a small watchlist (PowerShell)
 ```powershell
 $symbols = "EURUSD","GBPUSD","USDJPY"
-$symbols | % { python cli.py forecast_volatility_estimate $_ --timeframe H1 --horizon 12 --method ewma --format json }
+$symbols | % { mtdata-cli forecast_volatility_estimate $_ --timeframe H1 --horizon 12 --method ewma --json }
 ```
 
 ## Troubleshooting
@@ -75,21 +112,32 @@ $symbols | % { python cli.py forecast_volatility_estimate $_ --timeframe H1 --ho
 |----------|-------------|
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common issues and solutions |
 
+## Reference Coverage
+
+See [LIMITATIONS.md](LIMITATIONS.md) for user-facing caveats. Recent review passes closed the previously-tracked documentation gaps, which now have dedicated references:
+
+- Per-method forecast defaults, libraries, and dependencies → [forecast/METHODS.md](forecast/METHODS.md) (plus reproducibility notes in [FORECAST.md](FORECAST.md#reproducibility-notes)).
+- Response envelope, `detail`/`extras`, pagination, and error codes → [OUTPUT.md](OUTPUT.md).
+- A single timestamp policy (broker time, UTC, client-local, provider time) → [TIMESTAMPS.md](TIMESTAMPS.md).
+- Trading safety runbook with dry-run examples, guardrails, and broker behavior → [TRADING_SAFETY.md](TRADING_SAFETY.md).
+- Running the MCP server or Web API as a long-lived local service → [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## Quick Reference
 
 **List available commands:**
 ```bash
-python cli.py --help
+mtdata-cli --help
 ```
 
 **Search for a command:**
 ```bash
-python cli.py --help forecast
-python cli.py --help barrier
+mtdata-cli --help forecast
+mtdata-cli --help barrier
 ```
 
 **Get help for a specific command:**
 ```bash
-python cli.py forecast_generate --help
-python cli.py regime_detect --help
+mtdata-cli forecast_generate --help
+mtdata-cli regime_detect --help
 ```
+

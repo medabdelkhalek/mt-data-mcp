@@ -62,7 +62,7 @@ A simple, robust forecasting technique that decomposes a time series into trend 
 
 **Example:**
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --model theta
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta
 ```
 
 ### ARIMA (AutoRegressive Integrated Moving Average)
@@ -87,8 +87,8 @@ Generates thousands of possible future price paths by randomly sampling from his
 
 **Example:**
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model mc_gbm --model-params "n_sims=2000"
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method mc_gbm --params "n_sims=2000"
 ```
 
 **Interpretation:** Instead of one forecast line, you get percentile bands showing where price might land.
@@ -100,8 +100,8 @@ A foundation model for time series (like GPT for text). Pre-trained on millions 
 
 **Example:**
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 24 \
-  --library pretrained --model chronos2
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 24 \
+  --library pretrained --method chronos2
 ```
 
 ---
@@ -125,8 +125,8 @@ A distribution-free method to create prediction intervals. Instead of assuming a
 
 **Example:**
 ```bash
-python cli.py forecast_conformal_intervals EURUSD --timeframe H1 \
-  --method theta --horizon 12 --steps 25 --alpha 0.1
+mtdata-cli forecast_conformal_intervals EURUSD --timeframe H1 \
+  --method theta --horizon 12 --steps 25 --ci-alpha 0.1
 ```
 
 ---
@@ -146,13 +146,17 @@ The current "behavior mode" of the market. Different regimes require different s
 ### Hidden Markov Model (HMM)
 An algorithm that assumes the market switches between hidden "states" (regimes). It estimates which state generated the current data based on observed returns and volatility.
 
+In `regime_detect`, `hmm` is a Gaussian HMM with explicit transition
+probabilities. Filtered inference is the live-oriented default; smoothed
+inference is retrospective. `gmm` is a separate i.i.d. Gaussian mixture.
+
 **Output:** State ID (0, 1, 2...) and confidence probability.
 
 **Important:** The model doesn't know "Bull" or "Bear." You must interpret what each state means by examining its mean return and volatility.
 
 **Example:**
 ```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
 ```
 
 **Interpretation:**
@@ -165,12 +169,12 @@ Bayesian Online Change Point Detection. Answers: "Did the market's underlying be
 **Output:** Probability (0-1) that each bar represents a regime shift.
 
 **When to use:**
-- If probability > 0.5, the previous pattern may be breaking down
+- If probability exceeds the configured cutoff (0.5 in the example), the previous pattern may be breaking down
 - Useful for detecting breakouts or structural changes
 
 **Example:**
 ```bash
-python cli.py regime_detect EURUSD --timeframe H1 --method bocpd --threshold 0.5
+mtdata-cli regime_detect EURUSD --timeframe H1 --method bocpd --threshold 0.5
 ```
 
 ---
@@ -194,7 +198,7 @@ A volatility estimator that gives more weight to recent observations.
 
 **Example:**
 ```bash
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 \
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 \
   --horizon 12 --method ewma --params "lambda=0.94"
 ```
 
@@ -225,6 +229,10 @@ A method to label historical data based on which barrier was hit first:
 - **-1 (Loss):** SL hit first
 - **0 (Neutral):** Neither hit within horizon
 
+For triple-barrier labeling in `high_low` mode, `same_bar_policy` controls a
+bar that touches both TP and SL. It defaults to conservative `sl_first`;
+`tp_first` and `neutral` are explicit alternatives.
+
 **Use case:** Creating labels for machine learning models.
 
 ---
@@ -252,7 +260,7 @@ When optimizing TP/SL levels, you must choose what to maximize. Each objective a
 ### Kelly Criterion
 **What it measures:** The optimal fraction of your capital to bet for maximum long-term growth.
 
-**Formula:** `Kelly = P(win) - P(loss) / (TP/SL)`
+**Formula:** `Kelly = P(win) - (P(loss) / (TP/SL))`
 
 **Example:** Kelly = 0.25 means bet 25% of capital per trade for maximum growth.
 
@@ -516,6 +524,22 @@ Number of best candidates to return from optimization.
 
 ---
 
+## Forecast Parameters
+
+### Quantity
+The target variable for a forecast: `price` (raw closing prices), `return` (log returns), or `volatility` (predicted variance). Most users want `price`; use `return` for stationarity or `volatility` for risk sizing.
+
+### CI Alpha
+Miscoverage rate for confidence intervals. `--ci-alpha 0.1` produces a 90% interval; `--ci-alpha 0.05` produces 95%.
+
+### Library
+Selects which forecasting backend to use: `native` (built-in), `statsforecast`, `sktime`, `mlforecast`, or `pretrained` (foundation models like Chronos).
+
+### As-Of Date
+The `--as-of` parameter lets you generate a retrospective forecast as if running at a past point in time. Useful for comparison and auditing.
+
+---
+
 ## Signal Processing
 
 ### Denoising
@@ -533,7 +557,7 @@ Removing random fluctuations ("noise") to reveal the underlying trend ("signal")
 
 **Example:**
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 500 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 500 \
   --denoise ema --denoise-params "alpha=0.2"
 ```
 
@@ -655,6 +679,79 @@ Peak-to-trough decline in account equity.
 **Example:** Account peaks at $10,000, drops to $8,500 → Drawdown = 15%.
 
 **Maximum drawdown:** Largest historical drawdown. Key risk metric.
+
+### VaR (Value at Risk)
+The loss your positions are not expected to exceed over a holding period at a given confidence level.
+
+**Example:** One-bar 95% VaR = $120 means that, 95% of the time, you should not lose more than $120 over the next bar.
+
+**In mtdata:** Estimated for open positions by `trade_var_cvar_calculate` (historical or Gaussian). See [TRADING_RISK.md](TRADING_RISK.md).
+
+### CVaR (Conditional VaR / Expected Shortfall)
+The average loss in the worst cases beyond the VaR threshold — a measure of tail severity.
+
+**Example:** If the 95% VaR is $120, the 95% CVaR is the average loss across the worst 5% of outcomes, which is ≥ $120.
+
+**In mtdata:** Returned alongside VaR by `trade_var_cvar_calculate`. See [TRADING_RISK.md](TRADING_RISK.md).
+
+---
+
+## External Tools and Techniques
+
+### Finviz
+A financial visualization platform providing fundamental data, stock screening, insider trading activity, analyst ratings, and market news for US equities. Data is delayed 15–20 minutes.
+
+**In mtdata:** The `finviz_*` commands fetch data from Finviz. See [FINVIZ.md](FINVIZ.md).
+
+### QuantLib
+An open-source C++ library (with Python bindings) for quantitative finance, providing pricing engines for exotic options, yield curves, and calibration routines.
+
+**In mtdata:** Used for barrier option pricing (`options_barrier_price`) and Heston model calibration (`options_heston_calibrate`). See [OPTIONS_QUANTLIB.md](OPTIONS_QUANTLIB.md).
+
+### Heston Model
+A stochastic volatility model where the asset price and its variance follow correlated stochastic processes. Characterized by five parameters: v0 (initial variance), kappa (mean reversion speed), theta (long-run variance), sigma (vol of vol), and rho (correlation).
+
+**When to use:** Pricing barrier options and exotic derivatives where constant-volatility (Black-Scholes) assumptions are inadequate.
+
+### Optuna
+A Bayesian hyperparameter optimization framework supporting TPE, CMA-ES, and random sampling with pruning (early stopping of unpromising trials).
+
+**In mtdata:** Used by `forecast_tune_optuna` for automated parameter tuning. See [FORECAST.md](FORECAST.md).
+
+### Barrier Option
+A financial derivative whose payoff depends on whether the underlying asset's price reaches a specified barrier level. Types include knock-in (activated when barrier is hit) and knock-out (extinguished when barrier is hit).
+
+**In mtdata:** Barrier analysis is central to TP/SL optimization. See [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md).
+
+### Support and Resistance
+Price levels where buying pressure (support) or selling pressure (resistance) tends to concentrate, causing price to pause or reverse.
+
+**In mtdata:** Detected via `support_resistance_levels` and the Web API `/api/support-resistance` endpoint. See [WEB_API.md](WEB_API.md) and [LEVELS.md](LEVELS.md).
+
+### Pivot Points
+Formula-derived price levels (a central pivot plus resistances R1–R3 and supports S1–S3) computed from the prior bar's high, low, and close. Common methods include classic, Fibonacci, Camarilla, Woodie, and DeMark.
+
+**In mtdata:** Computed by `pivot_compute_points`. See [LEVELS.md](LEVELS.md).
+
+### Volume Profile (POC, VAH, VAL)
+A distribution of traded volume across price rather than time. The **Point of Control (POC)** is the most-traded price; the **Value Area** (bounded by **VAH** and **VAL**) is the price range that contains a chosen share of volume (70% by default).
+
+**In mtdata:** Computed by `volume_profile_levels` from bounded ticks or an M1-bar approximation. See [LEVELS.md](LEVELS.md).
+
+### Confluence
+A price zone where several independent methods (pivots, support/resistance, Fibonacci, volume profile) agree, raising the odds of a reaction.
+
+**In mtdata:** Ranked by `confluence_levels`; use `min_source_families=2` to require independent agreement. See [LEVELS.md](LEVELS.md).
+
+### Fundamental Analysis
+Evaluating a security by examining its intrinsic value through financial statements, earnings, revenue, P/E ratios, and other economic data — as opposed to technical analysis which focuses on price/volume patterns.
+
+**In mtdata:** The Finviz commands provide fundamental data for US equities. See [FINVIZ.md](FINVIZ.md).
+
+### Temporal Analysis
+Analyzing how a symbol's behavior varies across time dimensions — day of week, hour of day, month of year — to identify recurring seasonal patterns.
+
+**In mtdata:** The `temporal_analyze` command groups returns by time dimension. See [TEMPORAL.md](TEMPORAL.md).
 
 ---
 

@@ -1,0 +1,13 @@
+# Optional native accelerator that still requires a source build on Python 3.14.
+#
+# This package is intentionally kept out of requirements.txt because the
+# validated full stack stays on package-index releases with broad wheel
+# coverage. On Python 3.14, pip must build hnswlib from source.
+#
+# Windows prerequisites:
+# - hnswlib: Visual Studio Build Tools 2022 with the Desktop development with C++ workload
+#
+# This accelerator is opt-in and is not part of the project's supported
+# default Python 3.14 environment.
+
+hnswlib==0.8.0

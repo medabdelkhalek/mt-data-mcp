@@ -2,24 +2,20 @@
 Forecast validation utilities and error handling.
 """
 
-from typing import Any, Dict, Optional, List, Literal, Union
+import difflib
+from typing import Any, Dict, List, Literal, Optional, Union
+
 import pandas as pd
-import sys
-import os
 
-# Add the src directory to path for relative imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-
-from mtdata.core.constants import TIMEFRAME_MAP
-from mtdata.forecast.forecast_methods import FORECAST_METHODS, validate_method_params, get_method_requirements
-
-# Local fallbacks for typing aliases (avoid import cycle)
-try:
-    from mtdata.core.server import ForecastMethodLiteral, TimeframeLiteral, DenoiseSpec  # type: ignore
-except Exception:  # runtime fallback
-    ForecastMethodLiteral = str
-    TimeframeLiteral = str
-    DenoiseSpec = Dict[str, Any]
+from ..shared.constants import TIMEFRAME_MAP
+from ..shared.schema import DenoiseSpec, ForecastMethodLiteral, TimeframeLiteral
+from ..shared.validators import invalid_timeframe_error
+from .forecast_methods import (
+    get_forecast_method_names,
+    get_forecast_methods_snapshot,
+    get_method_requirements,
+    validate_method_params,
+)
 
 
 class ForecastValidationError(Exception):
@@ -27,11 +23,109 @@ class ForecastValidationError(Exception):
     pass
 
 
+def _normalize_method_text(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _method_family(value: Any) -> Optional[str]:
+    normalized = _normalize_method_text(value)
+    if not normalized:
+        return None
+    for prefix in ("chronos", "timesfm", "sf_", "skt_", "mlf_"):
+        if normalized.startswith(prefix):
+            return prefix.rstrip("_")
+    return None
+
+
+def _method_description_map() -> Dict[str, str]:
+    snapshot = get_forecast_methods_snapshot()
+    methods = snapshot.get("methods", [])
+    if not isinstance(methods, list):
+        return {}
+    out: Dict[str, str] = {}
+    for item in methods:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("method") or "").strip()
+        if not name:
+            continue
+        description = str(item.get("description") or item.get("display_name") or "").strip()
+        if description:
+            out[name] = description.splitlines()[0].strip()
+    return out
+
+
+def suggest_forecast_methods(method: Any, valid_methods: List[str], limit: int = 5) -> List[str]:
+    normalized_needle = _normalize_method_text(method)
+    if not normalized_needle:
+        return []
+    family = _method_family(method)
+    candidates = [
+        str(candidate).strip()
+        for candidate in valid_methods
+        if str(candidate).strip()
+    ]
+    if family:
+        same_family = [
+            candidate
+            for candidate in candidates
+            if _method_family(candidate) == family
+        ]
+        if same_family:
+            candidates = same_family
+    ranked: List[str] = []
+    normalized_to_name: Dict[str, str] = {}
+    for name in candidates:
+        lowered = _normalize_method_text(name)
+        normalized_to_name[lowered] = name
+        concepts = {
+            lowered,
+            lowered.removeprefix("sf_"),
+            lowered.removeprefix("skt_"),
+            lowered.removeprefix("mlf_"),
+        }
+        if any(
+            normalized_needle == concept or normalized_needle in concept
+            for concept in concepts
+            if concept
+        ):
+            if name not in ranked:
+                ranked.append(name)
+    fuzzy = difflib.get_close_matches(
+        normalized_needle,
+        list(normalized_to_name),
+        n=limit,
+        cutoff=0.6,
+    )
+    for normalized in fuzzy:
+        name = normalized_to_name.get(normalized, normalized)
+        if name not in ranked:
+            ranked.append(name)
+    return ranked[:limit]
+
+
+def format_invalid_method_error(method: Any, valid_methods: List[str]) -> str:
+    suggestions = suggest_forecast_methods(method, valid_methods)
+    message = f"Invalid method: {method!s}."
+    if suggestions:
+        descriptions = _method_description_map()
+        suggestion_text = []
+        for name in suggestions:
+            description = descriptions.get(name)
+            if description:
+                suggestion_text.append(f"{name} ({description})")
+            else:
+                suggestion_text.append(name)
+        message += f" Did you mean: {'; '.join(suggestion_text)}?"
+    message += " Run forecast_list_methods for the full catalog."
+    return message
+
+
 def validate_timeframe(timeframe: TimeframeLiteral) -> List[str]:
     """Validate timeframe parameter."""
     errors = []
     if timeframe not in TIMEFRAME_MAP:
-        errors.append(f"Invalid timeframe: {timeframe}. Valid options: {list(TIMEFRAME_MAP.keys())}")
+        errors.append(invalid_timeframe_error(timeframe, TIMEFRAME_MAP))
     return errors
 
 
@@ -39,8 +133,9 @@ def validate_method(method: ForecastMethodLiteral) -> List[str]:
     """Validate forecast method parameter."""
     errors = []
     method_l = str(method).lower().strip()
-    if method_l not in FORECAST_METHODS:
-        errors.append(f"Invalid method: {method}. Valid options: {list(FORECAST_METHODS)}")
+    valid_methods = list(get_forecast_method_names())
+    if method_l not in valid_methods:
+        errors.append(format_invalid_method_error(method, valid_methods))
     return errors
 
 
@@ -76,11 +171,10 @@ def validate_ci_alpha(ci_alpha: Optional[float]) -> List[str]:
     return errors
 
 
-def validate_quantity_target_combination(quantity: str, target: str, method: str) -> List[str]:
-    """Validate quantity and target parameter combination."""
+def validate_quantity_method_combination(quantity: str, method: str) -> List[str]:
+    """Validate quantity and method compatibility."""
     errors = []
     quantity_l = str(quantity).lower().strip()
-    target_l = str(target).lower().strip()
     method_l = str(method).lower().strip()
 
     # Check volatility method usage
@@ -90,10 +184,6 @@ def validate_quantity_target_combination(quantity: str, target: str, method: str
     # Validate quantity values
     if quantity_l not in ['price', 'return', 'volatility']:
         errors.append(f"Invalid quantity: {quantity}. Must be 'price', 'return', or 'volatility'")
-
-    # Validate target values
-    if target_l not in ['price', 'return']:
-        errors.append(f"Invalid target: {target}. Must be 'price' or 'return'")
 
     return errors
 
@@ -108,11 +198,27 @@ def validate_denoise_spec(denoise: Optional[DenoiseSpec]) -> List[str]:
         errors.append("denoise must be a dictionary")
         return errors
 
+    method = ""
+    method_supports: Dict[str, Any] = {}
+    try:
+        from ..utils.denoise import get_denoise_methods_data as _get_denoise_methods_data
+
+        methods_data = _get_denoise_methods_data()
+        methods = methods_data.get("methods") if isinstance(methods_data, dict) else None
+        if isinstance(methods, list):
+            method_supports = {
+                str(entry.get("method")).lower(): dict(entry)
+                for entry in methods
+                if isinstance(entry, dict) and entry.get("method")
+            }
+    except Exception:
+        method_supports = {}
+
     # Validate required fields
     if 'method' not in denoise:
         errors.append("denoise must specify a 'method'")
     else:
-        valid_methods = ['none', 'ema', 'sma', 'median', 'lowpass_fft', 'wavelet', 'emd', 'eemd', 'ceemdan']
+        valid_methods = sorted(method_supports) or ['none', 'ema', 'sma', 'median', 'lowpass_fft', 'wavelet', 'emd', 'eemd', 'ceemdan']
         method = str(denoise['method']).lower()
         if method not in valid_methods:
             errors.append(f"Invalid denoise method: {method}. Valid options: {valid_methods}")
@@ -122,6 +228,13 @@ def validate_denoise_spec(denoise: Optional[DenoiseSpec]) -> List[str]:
         causality = str(denoise['causality']).lower()
         if causality not in ['causal', 'zero_phase']:
             errors.append(f"Invalid denoise causality: {causality}. Must be 'causal' or 'zero_phase'")
+        elif method and method in method_supports:
+            supported = method_supports[method].get("supports", {}).get("causality") or []
+            if causality not in supported:
+                errors.append(
+                    f"Invalid denoise causality for {method}: {causality}. "
+                    f"Supported values: {supported}"
+                )
 
     # Validate when parameter
     if 'when' in denoise:
@@ -262,14 +375,37 @@ def validate_seasonality_for_method(method: str, seasonality: Optional[int]) -> 
 
 def check_method_dependencies(method: str) -> List[str]:
     """Check if required dependencies are installed for a method."""
-    errors = []
+    import importlib.util
+
+    errors: List[str] = []
     requirements = get_method_requirements(method)
+    module_name_overrides = {
+        "scikit-learn": "sklearn",
+        "chronos-forecasting": "chronos",
+        "chronos-forecasting>=2.0.0": "chronos",
+        "python-dotenv": "dotenv",
+    }
 
     for package in requirements:
-        try:
-            __import__(package)
-        except ImportError:
-            errors.append(f"Missing required package: {package}")
+        # Registry availability notes may join packages with commas.
+        for raw in str(package).split(","):
+            pkg = raw.strip()
+            if not pkg:
+                continue
+            if pkg.lower().startswith("python "):
+                continue
+            name = pkg
+            for sep in (">=", "==", "<=", "~=", ">", "<"):
+                if sep in name:
+                    name = name.split(sep, 1)[0].strip()
+                    break
+            name = module_name_overrides.get(name, name)
+            try:
+                missing = importlib.util.find_spec(name) is None
+            except Exception:
+                missing = True
+            if missing:
+                errors.append(f"Missing required package: {pkg}")
 
     return errors
 
@@ -283,7 +419,6 @@ def validate_forecast_request(
     params: Optional[Dict[str, Any]] = None,
     ci_alpha: Optional[float] = 0.05,
     quantity: Literal['price', 'return', 'volatility'] = 'price',
-    target: Literal['price', 'return'] = 'price',
     denoise: Optional[DenoiseSpec] = None,
     features: Optional[Dict[str, Any]] = None,
     dimred_method: Optional[str] = None,
@@ -299,7 +434,7 @@ def validate_forecast_request(
     errors.extend(validate_horizon(horizon))
     errors.extend(validate_lookback(lookback))
     errors.extend(validate_ci_alpha(ci_alpha))
-    errors.extend(validate_quantity_target_combination(quantity, target, method))
+    errors.extend(validate_quantity_method_combination(quantity, method))
 
     # Advanced parameter validation
     errors.extend(validate_denoise_spec(denoise))
@@ -337,7 +472,7 @@ def create_error_response(errors: List[str]) -> Dict[str, Any]:
     }
 
 
-def safe_cast_numeric(value: Any, param_name: str) -> Union[int, float, str]:
+def safe_cast_numeric(value: Any, param_name: str) -> Optional[Union[int, float, str]]:
     """Safely cast a value to numeric type or return original."""
     if value is None:
         return None

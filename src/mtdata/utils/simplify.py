@@ -5,25 +5,28 @@ Contains target-point selection utilities and core selection algorithms.
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import ruptures as rpt
-from rdp import rdp as _rdp
-from tsdownsample import MinMaxLTTBDownsampler
 
-# Import defaults from core.constants to avoid duplication.
+try:
+    from tsdownsample import MinMaxLTTBDownsampler
+except Exception:
+    MinMaxLTTBDownsampler = None
+
+# Import defaults from shared.constants to avoid duplication.
 # Use a lazy import to prevent circular imports during initialization.
 def _get_simplify_defaults() -> Tuple[float, int, int]:
-    """Lazy-load simplify defaults from core.constants to avoid circular imports."""
+    """Lazy-load simplify defaults from shared.constants to avoid circular imports."""
     try:
-        from ..core.constants import (
-            SIMPLIFY_DEFAULT_RATIO,
-            SIMPLIFY_DEFAULT_MIN_POINTS,
+        from ..shared.constants import (
             SIMPLIFY_DEFAULT_MAX_POINTS,
+            SIMPLIFY_DEFAULT_MIN_POINTS,
+            SIMPLIFY_DEFAULT_RATIO,
         )
         return (SIMPLIFY_DEFAULT_RATIO, SIMPLIFY_DEFAULT_MIN_POINTS, SIMPLIFY_DEFAULT_MAX_POINTS)
     except ImportError:
-        # Fallback if core.constants is not available (e.g., during isolated testing)
+        # Fallback if shared.constants is not available (e.g., during isolated testing)
         return (0.25, 100, 500)
 
 
@@ -76,7 +79,56 @@ def _choose_simplify_points(total: int, spec: Dict[str, Any]) -> int:
         return total
 
 
-_LTTB_DOWNSAMPLER = MinMaxLTTBDownsampler()
+_LTTB_DOWNSAMPLER = MinMaxLTTBDownsampler() if MinMaxLTTBDownsampler is not None else None
+
+
+def _fallback_lttb_indices(y: np.ndarray, n_out: int) -> List[int]:
+    """Pure-Python min/max bucket fallback when tsdownsample is unavailable."""
+    m = int(len(y))
+    if n_out >= m:
+        return list(range(m))
+    if n_out <= 2 or m <= 2:
+        return [0, max(0, m - 1)]
+
+    interior_target = max(0, int(n_out) - 2)
+    if interior_target <= 0:
+        return [0, m - 1]
+
+    bucket_count = max(1, int(np.ceil(interior_target / 2.0)))
+    edges = np.linspace(1, m - 1, num=bucket_count + 1, dtype=int)
+    selected: List[int] = []
+
+    for i in range(bucket_count):
+        start = int(edges[i])
+        stop = int(edges[i + 1])
+        if stop <= start:
+            stop = min(start + 1, m - 1)
+        if start >= m - 1:
+            break
+
+        bucket = y[start:stop]
+        if bucket.size == 0:
+            continue
+
+        base = np.arange(start, stop, dtype=int)
+        lo = int(base[int(np.argmin(bucket))])
+        hi = int(base[int(np.argmax(bucket))])
+        if lo == hi:
+            selected.append(lo)
+        elif lo < hi:
+            selected.extend([lo, hi])
+        else:
+            selected.extend([hi, lo])
+
+    selected = sorted(set(i for i in selected if 0 < i < (m - 1)))
+    if len(selected) < interior_target:
+        fill = np.linspace(1, m - 2, num=interior_target, dtype=int).tolist()
+        selected = sorted(set(selected + fill))
+    if len(selected) > interior_target:
+        keep = np.linspace(0, len(selected) - 1, num=interior_target, dtype=int)
+        selected = [selected[int(i)] for i in keep]
+
+    return _finalize_indices(m, [0, *selected, m - 1])
 
 
 def _finalize_indices(n: int, idxs: List[int]) -> List[int]:
@@ -120,14 +172,16 @@ def _n_bkps_from_segments_points(n: int, segments: Optional[int], points: Option
 
 
 def _lttb_select_indices(x: List[float], y: List[float], n_out: int) -> List[int]:
-    """Library-backed LTTB downsampling using tsdownsample."""
+    """Downsampling using tsdownsample when available, else a Python fallback."""
     m = len(x)
     if n_out >= m:
         return list(range(m))
     if n_out <= 2 or m <= 2:
         return [0, max(0, m - 1)]
-    xx = np.asarray(x, dtype=float)
     yy = np.asarray(y, dtype=float)
+    if _LTTB_DOWNSAMPLER is None:
+        return _fallback_lttb_indices(yy, int(n_out))
+    xx = np.asarray(x, dtype=float)
     idxs = _LTTB_DOWNSAMPLER.downsample(xx, yy, n_out=int(n_out))
     return _finalize_indices(m, np.asarray(idxs, dtype=int).tolist())
 
@@ -136,19 +190,52 @@ def _point_line_distance(px: float, py: float, x1: float, y1: float, x2: float, 
     """Vertical distance from P to line y(x) through (x1,y1)-(x2,y2)."""
     dx = x2 - x1
     if dx == 0.0:
-        return abs(py - (y1 + y2) / 2.0)
+        return abs(px - x1)
     m = (y2 - y1) / dx
     y_on_line = y1 + m * (px - x1)
     return abs(py - y_on_line)
 
 
+def _rdp_keep_mask(x: List[float], y: List[float], epsilon: float) -> np.ndarray:
+    """Iterative Douglas-Peucker mask to avoid an external rdp dependency."""
+    n = len(x)
+    keep = np.zeros(n, dtype=bool)
+    if n == 0:
+        return keep
+    keep[0] = True
+    keep[-1] = True
+
+    stack: List[Tuple[int, int]] = [(0, n - 1)]
+    while stack:
+        i0, i1 = stack.pop()
+        if i1 <= i0 + 1:
+            continue
+
+        x0, y0 = x[i0], y[i0]
+        x1, y1 = x[i1], y[i1]
+        split_idx = -1
+        split_dist = -1.0
+
+        for i in range(i0 + 1, i1):
+            dist = _point_line_distance(x[i], y[i], x0, y0, x1, y1)
+            if dist > split_dist:
+                split_idx = i
+                split_dist = dist
+
+        if split_idx >= 0 and split_dist > float(epsilon):
+            keep[split_idx] = True
+            stack.append((i0, split_idx))
+            stack.append((split_idx, i1))
+
+    return keep
+
+
 def _rdp_select_indices(x: List[float], y: List[float], epsilon: float) -> List[int]:
-    """Douglas-Peucker simplification returning kept indices via rdp package."""
+    """Douglas-Peucker simplification returning kept indices."""
     n = len(x)
     if n <= 2 or epsilon <= 0:
         return list(range(n))
-    pts = np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])
-    mask = _rdp(pts, epsilon=float(epsilon), algo="iter", return_mask=True)
+    mask = _rdp_keep_mask(list(map(float, x)), list(map(float, y)), float(epsilon))
     idxs = np.flatnonzero(np.asarray(mask, dtype=bool)).astype(int).tolist()
     return _finalize_indices(n, idxs)
 
@@ -263,7 +350,7 @@ def _apca_autotune_max_error(y: List[float], target_points: int, max_iter: int =
     return idxs, 0.0
 
 
-def _select_indices_for_timeseries(x: List[float], y: List[float], spec: Optional[Dict[str, Any]]) -> Tuple[List[int], str, Dict[str, Any]]:
+def _select_indices_for_timeseries(x: List[float], y: List[float], spec: Optional[Dict[str, Any]]) -> Tuple[List[int], str, Dict[str, Any]]:  # noqa: C901
     """Select representative indices according to simplify spec.
 
     Returns (indices, method_used, params_meta).
@@ -276,6 +363,8 @@ def _select_indices_for_timeseries(x: List[float], y: List[float], spec: Optiona
         n_out = _choose_simplify_points(len(x), spec)
         idxs = _lttb_select_indices(x, y, n_out)
         meta.update({"points": n_out})
+        if _LTTB_DOWNSAMPLER is None:
+            meta["implementation"] = "python-fallback"
         return idxs, "lttb", meta
     if method == "rdp":
         eps = spec.get("epsilon", None) or spec.get("tolerance", None) or spec.get("eps", None)
@@ -308,6 +397,8 @@ def _select_indices_for_timeseries(x: List[float], y: List[float], spec: Optiona
         n_out = _choose_simplify_points(len(x), spec)
         idxs = _lttb_select_indices(x, y, n_out)
         meta.update({"points": n_out, "fallback": "rdp->lttb"})
+        if _LTTB_DOWNSAMPLER is None:
+            meta["implementation"] = "python-fallback"
         return idxs, "lttb", meta
     if method == "pla":
         max_error = spec.get("max_error", None)
@@ -338,6 +429,8 @@ def _select_indices_for_timeseries(x: List[float], y: List[float], spec: Optiona
         n_out = _choose_simplify_points(len(x), spec)
         idxs = _lttb_select_indices(x, y, n_out)
         meta.update({"points": n_out, "fallback": "pla->lttb"})
+        if _LTTB_DOWNSAMPLER is None:
+            meta["implementation"] = "python-fallback"
         return idxs, "lttb", meta
     if method == "apca":
         max_error = spec.get("max_error", None)
@@ -368,10 +461,14 @@ def _select_indices_for_timeseries(x: List[float], y: List[float], spec: Optiona
         n_out = _choose_simplify_points(len(x), spec)
         idxs = _lttb_select_indices(x, y, n_out)
         meta.update({"points": n_out, "fallback": "apca->lttb"})
+        if _LTTB_DOWNSAMPLER is None:
+            meta["implementation"] = "python-fallback"
         return idxs, "lttb", meta
     n_out = _choose_simplify_points(len(x), spec)
     idxs = _lttb_select_indices(x, y, n_out)
     meta.update({"points": n_out, "fallback": f"{method}->lttb"})
+    if _LTTB_DOWNSAMPLER is None:
+        meta["implementation"] = "python-fallback"
     return idxs, "lttb", meta
 
 
@@ -413,36 +510,129 @@ def _handle_select_mode(df: pd.DataFrame, headers: List[str], spec: Dict[str, An
     return simplified_df, meta
 
 
-def _handle_resample_mode(df: pd.DataFrame, headers: List[str], spec: Dict[str, Any]) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
-    rule = spec.get('rule') or spec.get('interval')
-    if not rule:
-        return df, {'error': 'Missing rule for resample'}
+def _first_non_null_value(series: pd.Series) -> Any:
+    for value in series.tolist():
+        if pd.notna(value):
+            return value
+    return series.iloc[0] if len(series) else None
+
+
+def _last_non_null_value(series: pd.Series) -> Any:
+    values = series.tolist()
+    for value in reversed(values):
+        if pd.notna(value):
+            return value
+    return series.iloc[-1] if len(series) else None
+
+
+def _resolve_resample_bucket_seconds(df: pd.DataFrame, spec: Dict[str, Any]) -> Optional[int]:
+    bucket_seconds = spec.get("bucket_seconds")
+    if bucket_seconds is not None:
+        try:
+            return max(1, int(bucket_seconds))
+        except Exception:
+            return None
+
+    # Only infer a relative bucket size when the caller supplied a target shape.
+    if "__epoch" not in df.columns:
+        return None
+    if not any(spec.get(key) is not None for key in ("points", "target_points", "max_points", "ratio")):
+        return None
+
     try:
-        if 'time' in df.columns:
-            if '__epoch' in df.columns:
-                df = df.set_index(pd.to_datetime(df['__epoch'], unit='s'))
-            else:
-                df = df.set_index(pd.to_datetime(df['time']))
+        n_out = _choose_simplify_points(len(df), spec)
+        t0 = float(df["__epoch"].iloc[0])
+        t1 = float(df["__epoch"].iloc[-1])
+        span = max(1.0, t1 - t0)
+        return max(1, int(round(span / max(1, n_out))))
+    except Exception:
+        return None
 
-        agg_map: Dict[str, str] = {}
-        for h in headers:
-            if h in ['open']:
-                agg_map[h] = 'first'
-            elif h in ['high']:
-                agg_map[h] = 'max'
-            elif h in ['low']:
-                agg_map[h] = 'min'
-            elif h in ['close']:
-                agg_map[h] = 'last'
-            elif h in ['tick_volume', 'real_volume', 'volume']:
-                agg_map[h] = 'sum'
-            else:
-                agg_map[h] = 'last'
 
-        resampled = df.resample(rule).agg(agg_map).dropna()
-        return resampled, {'mode': 'resample', 'rule': rule, 'rows': int(len(resampled))}
+def _aggregate_resample_segment(seg: pd.DataFrame, columns: List[str]) -> Dict[str, Any]:
+    row: Dict[str, Any] = {}
+    for col in columns:
+        if col not in seg.columns:
+            continue
+        series = seg[col]
+        if col == "time":
+            row[col] = _first_non_null_value(series)
+            continue
+        if col == "__epoch":
+            numeric = pd.to_numeric(series, errors="coerce").dropna()
+            row[col] = float(numeric.iloc[0]) if not numeric.empty else _first_non_null_value(series)
+            continue
+        if col == "open":
+            row[col] = _first_non_null_value(series)
+            continue
+        if col in {"high", "low", "tick_volume", "real_volume", "volume"}:
+            numeric = pd.to_numeric(series, errors="coerce").dropna()
+            if numeric.empty:
+                row[col] = _last_non_null_value(series)
+            elif col == "high":
+                row[col] = float(numeric.max())
+            elif col == "low":
+                row[col] = float(numeric.min())
+            else:
+                row[col] = float(numeric.sum())
+            continue
+        row[col] = _last_non_null_value(series)
+    return row
+
+
+def _handle_resample_mode(df: pd.DataFrame, headers: List[str], spec: Dict[str, Any]) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
+    rule = spec.get("rule") or spec.get("interval")
+    bucket_seconds = _resolve_resample_bucket_seconds(df, spec)
+    if not rule and bucket_seconds is None:
+        return df, {"error": "Missing rule for resample"}
+    try:
+        if "__epoch" in df.columns:
+            time_index = pd.to_datetime(pd.to_numeric(df["__epoch"], errors="coerce"), unit="s", utc=True)
+        elif "time" in df.columns:
+            time_index = pd.to_datetime(df["time"], errors="coerce")
+        else:
+            return df, {"error": "Resample requires a time or __epoch column"}
+
+        working = df.copy()
+        working["__time_index"] = time_index
+        working = working[working["__time_index"].notna()].copy()
+        if working.empty:
+            return df, {"error": "Resample requires at least one valid timestamp"}
+
+        source_columns = [col for col in df.columns if col != "__time_index"]
+        rows: List[Dict[str, Any]] = []
+
+        if rule:
+            grouped = working.groupby(pd.Grouper(key="__time_index", freq=str(rule)), sort=True)
+        else:
+            if "__epoch" in working.columns:
+                base_seconds = pd.to_numeric(working["__epoch"], errors="coerce")
+            else:
+                base_seconds = working["__time_index"].astype("int64") / 1_000_000_000.0
+            base_seconds = pd.to_numeric(base_seconds, errors="coerce")
+            working = working[base_seconds.notna()].copy()
+            if working.empty:
+                return df, {"error": "Resample requires at least one valid timestamp"}
+            base_seconds = pd.to_numeric(base_seconds[base_seconds.notna()], errors="coerce")
+            origin = float(base_seconds.iloc[0])
+            bucket_keys = ((base_seconds - origin) // int(bucket_seconds)).astype(int)
+            grouped = working.groupby(bucket_keys, sort=True)
+
+        for bucket, seg in grouped:
+            if seg.empty or pd.isna(bucket):
+                continue
+            rows.append(_aggregate_resample_segment(seg, source_columns))
+
+        out_df = pd.DataFrame(rows)
+        if rule:
+            return out_df.reset_index(drop=True), {"mode": "resample", "rule": str(rule), "rows": int(len(out_df))}
+        return out_df.reset_index(drop=True), {
+            "mode": "resample",
+            "bucket_seconds": int(bucket_seconds),
+            "rows": int(len(out_df)),
+        }
     except Exception as exc:
-        return df, {'error': f'Resample failed: {exc}'}
+        return df, {"error": f"Resample failed: {exc}"}
 
 
 def _handle_encode_mode(df: pd.DataFrame, headers: List[str], spec: Dict[str, Any]) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
@@ -631,7 +821,7 @@ def _simplify_dataframe_rows_ext(
     if df.empty:
         return df, None
 
-    from ..core.constants import SIMPLIFY_DEFAULT_MODE
+    from ..shared.constants import SIMPLIFY_DEFAULT_MODE
 
     spec = dict(simplify) if simplify else {}
     mode = str(spec.get('mode', SIMPLIFY_DEFAULT_MODE)).lower().strip() or SIMPLIFY_DEFAULT_MODE
@@ -647,17 +837,17 @@ def _simplify_dataframe_rows_ext(
     return _handle_select_mode(df, headers, spec)
 
 
-def _simplify_dataframe_rows(df: pd.DataFrame, headers: List[str], simplify: Optional[Dict[str, Any]]) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
+def _simplify_dataframe_rows(df: pd.DataFrame, headers: List[str], simplify: Optional[Dict[str, Any]]) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:  # noqa: C901
     """Reduce or transform rows across numeric columns.
 
     Modes (simplify['mode']):
     - 'select' (default): pick representative existing rows using the chosen method.
     - 'approximate': partition by selected breakpoints and aggregate numeric columns per segment.
-    - 'resample': time-based bucketing by '__epoch' with 'bucket_seconds'; aggregates numeric columns.
+    - 'resample': time-based bucketing via 'rule'/'interval' or '__epoch' with 'bucket_seconds'.
     - 'encode': transform per-row representation to a compact schema (e.g., envelope or delta) and
                 optionally pre-select rows before encoding.
 
-    Aggregation: mean for numeric columns; first value for non-numeric columns like 'time'.
+    Aggregation depends on mode; resample preserves OHLC semantics and sums volume-like columns.
     """
     if not simplify:
         return df, None
@@ -667,7 +857,7 @@ def _simplify_dataframe_rows(df: pd.DataFrame, headers: List[str], simplify: Opt
             return df, None
         
         # Import constants to avoid circular imports
-        from ..core.constants import SIMPLIFY_DEFAULT_METHOD, SIMPLIFY_DEFAULT_MODE
+        from ..shared.constants import SIMPLIFY_DEFAULT_METHOD, SIMPLIFY_DEFAULT_MODE
         
         method = str(simplify.get("method", SIMPLIFY_DEFAULT_METHOD)).lower().strip()
         mode = str(simplify.get("mode", SIMPLIFY_DEFAULT_MODE)).lower().strip() or SIMPLIFY_DEFAULT_MODE
@@ -679,82 +869,16 @@ def _simplify_dataframe_rows(df: pd.DataFrame, headers: List[str], simplify: Opt
                 mode = method
         spec_eff = dict(simplify)
         spec_eff["mode"] = mode
-
-        # Helper: numeric columns in requested headers order, then any others
-        def _numeric_columns_from_headers() -> List[str]:
-            cols: List[str] = []
-            for h in headers:
-                if h in ('time',) or str(h).startswith('_'):
-                    continue
-                try:
-                    if h in df.columns and pd.api.types.is_numeric_dtype(df[h]):
-                        cols.append(h)
-                except Exception:
-                    continue
-            if not cols:
-                for c in df.columns:
-                    if c in ('time',) or str(c).startswith('_'):
-                        continue
-                    try:
-                        if pd.api.types.is_numeric_dtype(df[c]):
-                            cols.append(c)
-                    except Exception:
-                        continue
-            return cols
-
-        # Aggregation helper for approximate/resample modes
-        def _aggregate_segment(i0: int, i1: int) -> Dict[str, Any]:
-            seg = df.iloc[i0:i1]
-            row: Dict[str, Any] = {}
-            if "time" in df.columns and "time" in headers:
-                row["time"] = seg.iloc[0]["time"]
-            for col in headers:
-                if col == "time":
-                    continue
-                if col in seg.columns and pd.api.types.is_numeric_dtype(seg[col]):
-                    row[col] = float(seg[col].mean())
-                elif col in seg.columns:
-                    try:
-                        row[col] = next((v for v in seg[col].tolist() if pd.notna(v)), seg.iloc[0][col])
-                    except Exception:
-                        row[col] = seg.iloc[0][col]
-            return row
-
-        # Determine target number of points early (used for select and to infer resample/encode)
-        n_out = _choose_simplify_points(total, spec_eff)
-        
-        if mode == "resample" and "__epoch" in df.columns:
-            bs = spec_eff.get("bucket_seconds")
-            if bs is None or (isinstance(bs, (int, float)) and bs <= 0):
-                try:
-                    # Infer bucket by total time span / target buckets
-                    t0 = float(df["__epoch"].iloc[0])
-                    t1 = float(df["__epoch"].iloc[-1])
-                    span = max(1.0, t1 - t0)
-                    bs = max(1, int(round(span / max(1, n_out))))
-                except Exception:
-                    # Fallback to rough bucket from count
-                    bs = max(1, int(round(total / float(max(1, n_out)))))
-            try:
-                bs = max(1, int(bs))
-            except Exception:
-                bs = max(1, int(round(total / float(max(1, n_out)))))
-            grp = ((df["__epoch"].astype(float) - float(df["__epoch"].iloc[0])) // bs).astype(int)
-            out_rows: List[Dict[str, Any]] = []
-            for _, seg in df.groupby(grp):
-                i0 = seg.index[0]
-                i1 = seg.index[-1] + 1
-                out_rows.append(_aggregate_segment(i0, i1))
-            out_df = pd.DataFrame(out_rows)
-            meta = {
-                "mode": "resample",
-                "method": method or SIMPLIFY_DEFAULT_METHOD,
-                "bucket_seconds": int(bs),
-                "original_rows": total,
-                "returned_rows": len(out_df),
-                "points": len(out_df),
-            }
-            return out_df.reset_index(drop=True), meta
+        if mode == "resample":
+            if (
+                "__epoch" in df.columns
+                and spec_eff.get("rule") is None
+                and spec_eff.get("interval") is None
+                and spec_eff.get("bucket_seconds") is None
+                and not any(spec_eff.get(key) is not None for key in ("points", "target_points", "max_points", "ratio"))
+            ):
+                spec_eff["points"] = _choose_simplify_points(total, spec_eff)
+            return _handle_resample_mode(df, headers, spec_eff)
 
         return _simplify_dataframe_rows_ext(df, headers, spec_eff)
         

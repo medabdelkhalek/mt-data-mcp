@@ -1,0 +1,546 @@
+from __future__ import annotations
+
+"""QuantLib-based pricing and calibration helpers."""
+
+import datetime as _dt
+import math
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from ..services.options_service import get_options_chain
+
+_DEFAULT_QUANTLIB_CALENDAR = "UnitedStates.NYSE"
+_DEFAULT_MATURITY_BASIS = "calendar_days"
+
+
+def _quantlib_pricing_assumptions(
+    model: str,
+    *,
+    calendar: str,
+    maturity_basis: str,
+) -> Dict[str, str]:
+    return {
+        "source": "QuantLib",
+        "model": model,
+        "day_count": "Actual365Fixed",
+        "calendar": calendar,
+        "rate_compounding": "continuous_flat",
+        "maturity_basis": maturity_basis,
+    }
+
+
+def _normalize_quantlib_calendar_name(calendar: Any) -> str:
+    name = str(calendar or _DEFAULT_QUANTLIB_CALENDAR).strip()
+    return name or _DEFAULT_QUANTLIB_CALENDAR
+
+
+def _normalize_maturity_basis(maturity_basis: Any) -> str:
+    value = str(maturity_basis or _DEFAULT_MATURITY_BASIS).strip().lower()
+    if value not in {"calendar_days", "business_days"}:
+        raise ValueError(
+            f"Invalid maturity_basis: {maturity_basis}. "
+            "Use calendar_days|business_days."
+        )
+    return value
+
+
+def _resolve_quantlib_calendar(ql: Any, calendar_name: Any) -> tuple[Any, str]:
+    normalized_name = _normalize_quantlib_calendar_name(calendar_name)
+    if "." in normalized_name:
+        class_name, market_name = normalized_name.split(".", 1)
+        calendar_factory = getattr(ql, class_name, None)
+        market = getattr(calendar_factory, market_name, None) if calendar_factory is not None else None
+        if calendar_factory is None or market is None:
+            raise ValueError(
+                f"Invalid calendar: {normalized_name}. "
+                "Use QuantLib calendar names such as UnitedStates.NYSE or NullCalendar."
+            )
+        return calendar_factory(market), normalized_name
+    calendar_factory = getattr(ql, normalized_name, None)
+    if calendar_factory is None:
+        raise ValueError(
+            f"Invalid calendar: {normalized_name}. "
+            "Use QuantLib calendar names such as UnitedStates.NYSE or NullCalendar."
+        )
+    try:
+        return calendar_factory(), normalized_name
+    except TypeError as exc:
+        raise ValueError(
+            f"Invalid calendar: {normalized_name}. "
+            "Use QuantLib calendar names such as UnitedStates.NYSE or NullCalendar."
+        ) from exc
+
+
+def _quantlib_date(ql: Any, day: _dt.date) -> Any:
+    return ql.Date(int(day.day), int(day.month), int(day.year))
+
+
+def _advance_maturity_date(
+    *,
+    ql: Any,
+    ql_today: Any,
+    calendar: Any,
+    maturity_days: int,
+    maturity_basis: str,
+) -> Any:
+    if maturity_basis == "business_days":
+        return calendar.advance(ql_today, int(maturity_days), ql.Days)
+    return ql_today + int(maturity_days)
+
+
+def _days_to_expiry(
+    *,
+    ql: Any,
+    calendar: Any,
+    valuation_day: _dt.date,
+    expiry_date: _dt.date,
+    maturity_basis: str,
+) -> int:
+    if maturity_basis == "business_days":
+        return max(
+            1,
+            int(
+                calendar.businessDaysBetween(
+                    _quantlib_date(ql, valuation_day),
+                    _quantlib_date(ql, expiry_date),
+                )
+            ),
+        )
+    return max(1, int((expiry_date - valuation_day).days))
+
+
+def price_barrier_option_quantlib(
+    *,
+    spot: float,
+    strike: float,
+    barrier: float,
+    maturity_days: int,
+    option_type: str = "call",
+    barrier_type: str = "up_out",
+    risk_free_rate: float = 0.02,
+    dividend_yield: float = 0.0,
+    volatility: float = 0.2,
+    rebate: float = 0.0,
+    calendar: str = _DEFAULT_QUANTLIB_CALENDAR,
+    maturity_basis: str = _DEFAULT_MATURITY_BASIS,
+) -> Dict[str, Any]:
+    """Price a European barrier option with QuantLib."""
+    try:
+        spot_val = float(spot)
+        strike_val = float(strike)
+        barrier_val = float(barrier)
+        maturity_val = int(maturity_days)
+        rf = float(risk_free_rate)
+        div = float(dividend_yield)
+        vol = float(volatility)
+        rebate_val = float(rebate)
+    except Exception:
+        return {"error": "Invalid numeric input for barrier pricing"}
+
+    if not (spot_val > 0 and strike_val > 0 and barrier_val > 0 and maturity_val > 0 and vol > 0):
+        return {"error": "spot/strike/barrier/maturity_days/volatility must be positive"}
+
+    option_type_norm = str(option_type).strip().lower()
+    barrier_type_norm = str(barrier_type).strip().lower()
+    opt_choices = {"call", "put"}
+    barrier_choices = {"up_in", "up_out", "down_in", "down_out"}
+    if option_type_norm not in opt_choices:
+        return {"error": f"Invalid option_type: {option_type}. Use call|put."}
+    if barrier_type_norm not in barrier_choices:
+        return {"error": f"Invalid barrier_type: {barrier_type}. Use up_in|up_out|down_in|down_out."}
+    try:
+        maturity_basis_norm = _normalize_maturity_basis(maturity_basis)
+    except ValueError as ex:
+        return {"error": str(ex)}
+    calendar_name = _normalize_quantlib_calendar_name(calendar)
+
+    geometry_error = _barrier_option_geometry_error(
+        barrier_type=barrier_type_norm,
+        spot=spot_val,
+        barrier=barrier_val,
+    )
+    if geometry_error is not None:
+        return {
+            "error": geometry_error,
+            "error_code": "invalid_barrier_geometry",
+            "params_used": _barrier_option_params(
+                spot=spot_val,
+                strike=strike_val,
+                barrier=barrier_val,
+                maturity_days=maturity_val,
+                option_type=option_type_norm,
+                barrier_type=barrier_type_norm,
+                risk_free_rate=rf,
+                dividend_yield=div,
+                volatility=vol,
+                rebate=rebate_val,
+                calendar=calendar_name,
+                maturity_basis=maturity_basis_norm,
+            ),
+        }
+
+    try:
+        import QuantLib as ql
+    except Exception as ex:
+        return {"error": f"QuantLib is required: {ex}"}
+
+    try:
+        calendar_obj, calendar_name = _resolve_quantlib_calendar(ql, calendar_name)
+    except ValueError as ex:
+        return {"error": str(ex)}
+
+    opt_map = {"call": ql.Option.Call, "put": ql.Option.Put}
+    barrier_map = {
+        "up_in": ql.Barrier.UpIn,
+        "up_out": ql.Barrier.UpOut,
+        "down_in": ql.Barrier.DownIn,
+        "down_out": ql.Barrier.DownOut,
+    }
+
+    ql_today = ql.Date.todaysDate()
+    ql.Settings.instance().evaluationDate = ql_today
+    day_count = ql.Actual365Fixed()
+    maturity = _advance_maturity_date(
+        ql=ql,
+        ql_today=ql_today,
+        calendar=calendar_obj,
+        maturity_days=maturity_val,
+        maturity_basis=maturity_basis_norm,
+    )
+
+    payoff = ql.PlainVanillaPayoff(opt_map[option_type_norm], float(strike_val))
+    exercise = ql.EuropeanExercise(maturity)
+    barrier_opt = ql.BarrierOption(
+        barrier_map[barrier_type_norm],
+        float(barrier_val),
+        float(rebate_val),
+        payoff,
+        exercise,
+    )
+
+    def _price_with(spot_local: float, vol_local: float) -> float:
+        spot_h = ql.QuoteHandle(ql.SimpleQuote(float(spot_local)))
+        rf_ts = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, float(rf), day_count))
+        div_ts = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, float(div), day_count))
+        vol_ts = ql.BlackVolTermStructureHandle(
+            ql.BlackConstantVol(
+                ql_today,
+                calendar_obj,
+                float(vol_local),
+                day_count,
+            )
+        )
+        process = ql.BlackScholesMertonProcess(spot_h, div_ts, rf_ts, vol_ts)
+        barrier_opt.setPricingEngine(ql.AnalyticBarrierEngine(process))
+        return float(barrier_opt.NPV())
+
+    try:
+        npv = _price_with(spot_val, vol)
+    except Exception as ex:
+        return {"error": f"QuantLib pricing failed: {ex}"}
+
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    vega: Optional[float] = None
+    greeks_method: Optional[str] = None
+    greeks_warnings: List[str] = []
+
+    barrier_distance = abs(barrier_val - spot_val)
+    eps_s = min(
+        max(1e-6, abs(spot_val) * 1e-4),
+        barrier_distance * 0.25,
+        spot_val * 0.25,
+    )
+    try:
+        p_up = _price_with(spot_val + eps_s, vol)
+        p_dn = _price_with(spot_val - eps_s, vol)
+        delta = (p_up - p_dn) / (2.0 * eps_s)
+        gamma = (p_up - 2.0 * npv + p_dn) / (eps_s * eps_s)
+        greeks_method = "central_difference"
+    except Exception as central_exc:
+        try:
+            direction = -1.0 if barrier_type_norm.startswith("up_") else 1.0
+            p_1 = _price_with(spot_val + direction * eps_s, vol)
+            p_2 = _price_with(spot_val + direction * 2.0 * eps_s, vol)
+            p_3 = _price_with(spot_val + direction * 3.0 * eps_s, vol)
+            delta = direction * (-3.0 * npv + 4.0 * p_1 - p_2) / (2.0 * eps_s)
+            gamma = (2.0 * npv - 5.0 * p_1 + 4.0 * p_2 - p_3) / (
+                eps_s * eps_s
+            )
+            greeks_method = "one_sided_away_from_barrier"
+            greeks_warnings.append(
+                f"Central spot differences failed ({central_exc}); used a one-sided "
+                "difference away from the barrier."
+            )
+        except Exception as one_sided_exc:
+            greeks_warnings.append(
+                "Spot Greeks unavailable: central and one-sided differences failed "
+                f"({one_sided_exc})."
+            )
+
+    try:
+        eps_v = max(1e-4, abs(vol) * 5e-2)
+        pv_up = _price_with(spot_val, vol + eps_v)
+        pv_dn = _price_with(spot_val, max(1e-6, vol - eps_v))
+        vega = (pv_up - pv_dn) / (2.0 * eps_v)
+    except Exception as ex:
+        greeks_warnings.append(f"Vega unavailable: volatility differences failed ({ex}).")
+
+    finite_greeks = sum(
+        value is not None and math.isfinite(value)
+        for value in (delta, gamma, vega)
+    )
+    greeks_status = "complete" if finite_greeks == 3 else "partial" if finite_greeks else "unavailable"
+
+    return {
+        "success": True,
+        "price": float(npv),
+        "delta": float(delta) if delta is not None and math.isfinite(delta) else None,
+        "gamma": float(gamma) if gamma is not None and math.isfinite(gamma) else None,
+        "vega": float(vega) if vega is not None and math.isfinite(vega) else None,
+        "greeks_status": greeks_status,
+        "greeks_method": greeks_method,
+        "greeks_spot_step": float(eps_s),
+        **({"greeks_warnings": greeks_warnings} if greeks_warnings else {}),
+        "pricing_assumptions": _quantlib_pricing_assumptions(
+            "BlackScholesMerton analytic barrier",
+            calendar=calendar_name,
+            maturity_basis=maturity_basis_norm,
+        ),
+        "params_used": _barrier_option_params(
+            spot=spot_val,
+            strike=strike_val,
+            barrier=barrier_val,
+            maturity_days=maturity_val,
+            option_type=option_type_norm,
+            barrier_type=barrier_type_norm,
+            risk_free_rate=rf,
+            dividend_yield=div,
+            volatility=vol,
+            rebate=rebate_val,
+            calendar=calendar_name,
+            maturity_basis=maturity_basis_norm,
+        ),
+    }
+
+
+def _barrier_option_geometry_error(
+    *,
+    barrier_type: str,
+    spot: float,
+    barrier: float,
+) -> Optional[str]:
+    if str(barrier_type).startswith("up_") and barrier <= spot:
+        return "For an up barrier option, barrier must be above spot."
+    if str(barrier_type).startswith("down_") and barrier >= spot:
+        return "For a down barrier option, barrier must be below spot."
+    return None
+
+
+def _barrier_option_params(
+    *,
+    spot: float,
+    strike: float,
+    barrier: float,
+    maturity_days: int,
+    option_type: str,
+    barrier_type: str,
+    risk_free_rate: float,
+    dividend_yield: float,
+    volatility: float,
+    rebate: float,
+    calendar: str,
+    maturity_basis: str,
+) -> Dict[str, Any]:
+    return {
+        "spot": float(spot),
+        "strike": float(strike),
+        "barrier": float(barrier),
+        "maturity_days": int(maturity_days),
+        "option_type": str(option_type),
+        "barrier_type": str(barrier_type),
+        "risk_free_rate": float(risk_free_rate),
+        "dividend_yield": float(dividend_yield),
+        "volatility": float(volatility),
+        "rebate": float(rebate),
+        "calendar": str(calendar),
+        "maturity_basis": str(maturity_basis),
+    }
+
+
+def calibrate_heston_quantlib_from_options(
+    *,
+    symbol: str,
+    expiration: Optional[str] = None,
+    option_type: str = "call",
+    risk_free_rate: float = 0.02,
+    dividend_yield: float = 0.0,
+    min_open_interest: int = 0,
+    min_volume: int = 0,
+    max_contracts: int = 25,
+    valuation_date: Optional[str] = None,
+    calendar: str = _DEFAULT_QUANTLIB_CALENDAR,
+    maturity_basis: str = _DEFAULT_MATURITY_BASIS,
+) -> Dict[str, Any]:
+    """Calibrate a Heston model from option-chain implied vols using QuantLib."""
+    try:
+        import QuantLib as ql
+    except Exception as ex:
+        return {"error": f"QuantLib is required: {ex}"}
+
+    try:
+        maturity_basis_norm = _normalize_maturity_basis(maturity_basis)
+    except ValueError as ex:
+        return {"error": str(ex)}
+    calendar_name = _normalize_quantlib_calendar_name(calendar)
+    try:
+        calendar_obj, calendar_name = _resolve_quantlib_calendar(ql, calendar_name)
+    except ValueError as ex:
+        return {"error": str(ex)}
+
+    side = str(option_type or "call").strip().lower()
+    if side not in {"call", "put", "both"}:
+        return {"error": f"Invalid option_type: {option_type}. Use call|put|both."}
+
+    chain = get_options_chain(
+        symbol=symbol,
+        expiration=expiration,
+        option_type=side,
+        min_open_interest=int(min_open_interest),
+        min_volume=int(min_volume),
+        limit=max(50, int(max_contracts) * 6),
+    )
+    if isinstance(chain, dict) and chain.get("error"):
+        return chain
+
+    contracts = chain.get("options", []) if isinstance(chain, dict) else []
+    if not isinstance(contracts, list):
+        contracts = []
+
+    spot_val = float(chain.get("underlying_price", float("nan")))
+    if not (spot_val == spot_val and spot_val > 0):
+        return {"error": "Underlying spot price unavailable from options provider."}
+
+    rows: List[Dict[str, Any]] = []
+    for row in contracts:
+        if not isinstance(row, dict):
+            continue
+        strike = float(row.get("strike", float("nan")))
+        iv = float(row.get("implied_volatility", float("nan")))
+        if not (np.isfinite(strike) and strike > 0 and np.isfinite(iv) and 0.01 <= iv <= 5.0):
+            continue
+        rows.append({"strike": strike, "iv": iv, "side": row.get("side")})
+
+    if len(rows) < 5:
+        return {"error": "Need at least 5 contracts with valid implied volatility for Heston calibration."}
+
+    rows.sort(key=lambda x: abs(float(x["strike"]) - spot_val))
+    rows = rows[: max(5, int(max_contracts))]
+    expiry_text = str(chain.get("expiration") or "")
+    if not expiry_text:
+        return {"error": "Options expiration date missing from chain output."}
+    try:
+        expiry_date = _dt.datetime.strptime(expiry_text, "%Y-%m-%d").date()
+    except Exception:
+        return {"error": f"Invalid expiration format: {expiry_text}"}
+    if valuation_date is None:
+        valuation_day = _dt.datetime.now(_dt.timezone.utc).date()
+    else:
+        try:
+            valuation_day = _dt.datetime.strptime(
+                str(valuation_date).strip(),
+                "%Y-%m-%d",
+            ).date()
+        except (TypeError, ValueError):
+            return {
+                "error": (
+                    f"Invalid valuation_date: {valuation_date}. "
+                    "Use YYYY-MM-DD."
+                )
+            }
+    days_to_expiry = _days_to_expiry(
+        ql=ql,
+        calendar=calendar_obj,
+        valuation_day=valuation_day,
+        expiry_date=expiry_date,
+        maturity_basis=maturity_basis_norm,
+    )
+
+    ql_today = _quantlib_date(ql, valuation_day)
+    ql.Settings.instance().evaluationDate = ql_today
+    day_count = ql.Actual365Fixed()
+    rf_ts = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, float(risk_free_rate), day_count))
+    div_ts = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, float(dividend_yield), day_count))
+    spot_handle = ql.QuoteHandle(ql.SimpleQuote(float(spot_val)))
+
+    ivs = np.asarray([float(r["iv"]) for r in rows], dtype=float)
+    theta0 = float(max(1e-6, np.median(ivs) ** 2))
+    v0_0 = float(theta0)
+    kappa0 = 1.0
+    sigma0 = float(max(0.05, np.std(ivs) * 2.0))
+    rho0 = -0.5
+
+    process = ql.HestonProcess(rf_ts, div_ts, spot_handle, v0_0, kappa0, theta0, sigma0, rho0)
+    model = ql.HestonModel(process)
+    engine = ql.AnalyticHestonEngine(model)
+    helpers: List[Any] = []
+    # HestonModelHelper Period(Days) is calendar-based. Anchor it to the
+    # contract's actual expiry date even when diagnostics use business days.
+    maturity_calendar_days = max(1, int((expiry_date - valuation_day).days))
+    maturity = ql.Period(maturity_calendar_days, ql.Days)
+    for row in rows:
+        helper_option_type = (
+            ql.Option.Put
+            if str(row.get("side") or "").strip().lower() == "put"
+            else ql.Option.Call
+        )
+        helper = ql.HestonModelHelper(
+            maturity,
+            calendar_obj,
+            float(spot_val),
+            float(row["strike"]),
+            ql.QuoteHandle(ql.SimpleQuote(float(row["iv"]))),
+            rf_ts,
+            div_ts,
+            ql.BlackCalibrationHelper.ImpliedVolError,
+            helper_option_type,
+        )
+        helper.setPricingEngine(engine)
+        helpers.append(helper)
+
+    try:
+        method = ql.LevenbergMarquardt()
+        end_criteria = ql.EndCriteria(500, 100, 1e-8, 1e-8, 1e-8)
+        model.calibrate(helpers, method, end_criteria)
+    except Exception as ex:
+        return {"error": f"QuantLib Heston calibration failed: {ex}"}
+
+    errors = [float(h.calibrationError()) for h in helpers]
+    rmse = float(np.sqrt(np.mean(np.square(errors)))) if errors else float("nan")
+
+    return {
+        "success": True,
+        "symbol": str(symbol).upper().strip(),
+        "expiration": expiry_text,
+        "valuation_date": valuation_day.isoformat(),
+        "days_to_expiry": int(days_to_expiry),
+        "contracts_used": int(len(rows)),
+        "spot": float(spot_val),
+        "calibration_error_rmse": float(rmse) if np.isfinite(rmse) else None,
+        "params": {
+            "kappa": float(model.kappa()),
+            "theta": float(model.theta()),
+            "sigma": float(model.sigma()),
+            "rho": float(model.rho()),
+            "v0": float(model.v0()),
+        },
+        "pricing_assumptions": _quantlib_pricing_assumptions(
+            "Heston analytic calibration",
+            calendar=calendar_name,
+            maturity_basis=maturity_basis_norm,
+        ),
+        "risk_free_rate": float(risk_free_rate),
+        "dividend_yield": float(dividend_yield),
+        "sample_contracts": rows[:10],
+    }

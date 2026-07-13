@@ -38,6 +38,8 @@ The language is kept simple so anyone with a basic interest in trading can follo
 | **`pivot_compute_points`** | `symbol=EURUSD`, `timeframe=D1` | <ul><li>Each run returns classic, Fibonacci, Camarilla, Woodie, and DeMark tables so you can compare support/resistance ladders.</li><li>Every method lists **support (S1, S2, …)** and **resistance (R1, R2, …)** tiers that traders monitor.</li></ul> |
 | **Result** | JSON with: <br>‑ Pivot (PP) = 1.17505 <br>‑ R1 = 1.17848 <br>‑ S1 = 1.17264 <br>‑ R2, S2, R3, S3 also provided. | **Interpretation** <br>‑ Current price (≈ 1.1776) sits **just below R1** and **above the pivot** – a classic “test‑and‑break” situation. <br>‑ If price falls, S1 (1.17264) is the first support; if it breaks above R1, the next target is R2 (≈ 1.1809). |
 
+Use **`confluence_levels`** when you want the pivot ladder ranked against data-driven support/resistance and Fibonacci swing levels. It highlights zones where independent methods cluster, such as a daily pivot resistance sitting within a few pips of an H1 resistance retest and a 61.8% Fibonacci retracement.
+
 ---
 
 ### 4. Estimate near‑future volatility
@@ -53,7 +55,7 @@ The language is kept simple so anyone with a basic interest in trading can follo
 
 | Tool | Call | Why we used it |
 |------|------|----------------|
-| **`forecast_generate`** | `symbol=EURUSD`, `timeframe=H1`, `library=native`, `model=theta`, `horizon=12`, `quantity=price` | <ul><li>The **Theta** method is a fast, reliable forecasting model that works well on short‑term series.</li><li>We ask for a **price forecast** (not returns) for the next 12 hourly bars.</li></ul> |
+| **`forecast_generate`** | `symbol=EURUSD`, `timeframe=H1`, `library=native`, `method=theta`, `horizon=12`, `quantity=price` | <ul><li>The **Theta** method is a fast, reliable forecasting model that works well on short‑term series.</li><li>We ask for a **price forecast** (not returns) for the next 12 hourly bars.</li></ul> |
 | **Result** | JSON with: <br>‑ Forecasted price for each of the next 12 hours (≈ 1.17528 → 1.17543). <br>‑ 95 % confidence interval (lower ≈ 1.1717, upper ≈ 1.1789). <br>‑ Trend flag = **up**. | **Interpretation** <br>‑ The model expects a **small pull‑back** toward the pivot (1.1750) before the up‑trend resumes. <br>‑ The confidence band comfortably contains the pivot and the first resistance, confirming the “test‑and‑bounce” picture. |
 
 ---
@@ -90,3 +92,12 @@ The language is kept simple so anyone with a basic interest in trading can follo
 
 By following these steps you move from raw price numbers to **data‑driven trade ideas** that are backed by both technical analysis and statistical probability. This is the same logical chain that underlies the expert report you received.
 
+---
+
+## See Also
+
+- [SAMPLE-TRADE-ADVANCED.md](SAMPLE-TRADE-ADVANCED.md) — Advanced playbook with regimes, conformal intervals, Monte Carlo
+- [FORECAST.md](FORECAST.md) — Forecasting methods guide
+- [BARRIER_FUNCTIONS.md](BARRIER_FUNCTIONS.md) — Barrier optimization deep dive
+- [GLOSSARY.md](GLOSSARY.md) — Term definitions
+- [FINVIZ.md](FINVIZ.md) — Fundamental data (for equity analysis)

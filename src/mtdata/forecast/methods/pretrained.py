@@ -1,19 +1,23 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import gc
 import importlib.util as _importlib_util
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 
+from ..forecast_registry import ForecastRegistry
 from ..interface import ForecastMethod, ForecastResult
-from ..registry import ForecastRegistry
+from ..model_cache import model_cache
 from .pretrained_helpers import (
-    extract_context_window,
     adjust_forecast_length,
-    process_quantile_levels,
     build_params_used,
+    extract_context_window,
+    process_quantile_levels,
     safe_import_modules,
 )
+
 
 class PretrainedMethod(ForecastMethod):
     """Base class for pretrained foundation models."""
@@ -28,7 +32,23 @@ class PretrainedMethod(ForecastMethod):
 
 
 _HAS_TIMESFM = _importlib_util.find_spec('timesfm') is not None
-_HAS_LAG_LLAMA = _importlib_util.find_spec('lag_llama') is not None
+
+
+def _stringify_exception_chain(error: BaseException) -> str:
+    parts: List[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip()
+        parts.append(text or current.__class__.__name__)
+        next_error = current.__cause__
+        if next_error is None and not current.__suppress_context__:
+            next_error = current.__context__
+        current = next_error
+    if not parts:
+        return error.__class__.__name__
+    return " | caused by: ".join(parts)
 
 
 def _resolve_chronos_device_map(requested: Any, torch_module: Any) -> str:
@@ -59,16 +79,517 @@ def _resolve_chronos_device_map(requested: Any, torch_module: Any) -> str:
             count_fn = getattr(cuda, "device_count", None)
             if callable(count_fn):
                 n = int(count_fn())
-                if n > 1:
+                if n >= 1:
                     return "cuda:0"
     except Exception:
         pass
-    return "auto"
+    return "cpu"
+
+
+def _resolve_chronos_model_defaults(method_name: str, params: Dict[str, Any]) -> Tuple[str, Tuple[str, ...]]:
+    requested = str((params or {}).get("model_name") or "").strip()
+    if requested:
+        model_name = requested
+    elif str(method_name).strip().lower() == "chronos2":
+        model_name = "amazon/chronos-2"
+    else:
+        model_name = "amazon/chronos-bolt-base"
+
+    model_name_l = model_name.lower()
+    if "chronos-bolt" in model_name_l:
+        pipeline_order = ("ChronosBoltPipeline",)
+    elif "chronos-2" in model_name_l:
+        pipeline_order = ("Chronos2Pipeline",)
+    else:
+        pipeline_order = ("ChronosPipeline",)
+
+    return model_name, pipeline_order
+
+
+def _load_chronos_pipeline(
+    pipeline_candidates: List[Tuple[str, Any]],
+    model_name: str,
+    effective_device_map: str,
+) -> Tuple[Any, str]:
+    cache_key = (
+        f"chronos::{model_name}::{effective_device_map}::"
+        f"{','.join(name for name, _ in pipeline_candidates)}"
+    )
+
+    def _loader() -> Tuple[Any, str]:
+        init_err: Optional[Exception] = None
+        for candidate_name, pipeline_cls in pipeline_candidates:
+            try:
+                try:
+                    pipe = pipeline_cls.from_pretrained(model_name, device_map=effective_device_map)
+                except TypeError:
+                    pipe = pipeline_cls.from_pretrained(model_name)
+                return pipe, candidate_name
+            except AttributeError as ex:
+                # Some chronos builds expose Chronos2Pipeline but fail due missing internal classes.
+                init_err = ex
+                continue
+            except Exception as ex:
+                init_err = ex
+                break
+
+        if init_err is not None:
+            raise RuntimeError(
+                "chronos2 error: failed to initialize any compatible Chronos pipeline. "
+                f"Last error: {init_err!r}"
+            ) from init_err
+        raise RuntimeError("chronos2 error: failed to initialize a supported Chronos pipeline.")
+
+    cached, _meta = model_cache.get_or_load(cache_key, _loader)
+    pipe, pipe_name = cached
+    return pipe, pipe_name
+
+
+def _is_chronos2_pipeline(pipe_name: Optional[str], model_name: str) -> bool:
+    return str(pipe_name or "").strip() == "Chronos2Pipeline" or "chronos-2" in str(model_name).lower()
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _falsey(value: Any) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"0", "false", "no", "off"}
+
+
+def _coerce_feature_tokens(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [tok.strip() for tok in value.replace(",", " ").split() if tok.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(tok).strip() for tok in value if str(tok).strip()]
+    return []
+
+
+def _resolve_chronos2_multivariate_columns(
+    history_df: Optional[pd.DataFrame],
+    base_col: str,
+    features_cfg: Optional[Dict[str, Any]],
+    feature_info: Optional[Dict[str, Any]],
+) -> List[str]:
+    if history_df is None or history_df.empty:
+        return [str(base_col or "close")]
+
+    selected: List[str] = []
+    base_name = str(base_col or "close").strip() or "close"
+    selected.append(base_name)
+
+    fcfg = dict(features_cfg or {}) if isinstance(features_cfg, dict) else {}
+    finfo = dict(feature_info or {}) if isinstance(feature_info, dict) else {}
+    explicit_targets = _coerce_feature_tokens(
+        fcfg.get("chronos2_targets")
+        or fcfg.get("multivariate_targets")
+        or fcfg.get("target_columns")
+    )
+    enabled = bool(explicit_targets) or _truthy(fcfg.get("chronos2_multivariate")) or str(fcfg.get("chronos2_mode") or "").strip().lower() in {"multivariate", "multivar", "joint_targets"}
+    if not enabled:
+        return [col for col in selected if col in history_df.columns]
+
+    if explicit_targets:
+        for col in explicit_targets:
+            if col not in selected:
+                selected.append(col)
+    else:
+        for col in list(finfo.get("include_columns") or []):
+            if col not in selected:
+                selected.append(str(col))
+        for col in list(finfo.get("indicator_columns") or []):
+            if col not in selected:
+                selected.append(str(col))
+
+    valid: List[str] = []
+    for col in selected:
+        if col not in history_df.columns:
+            continue
+        try:
+            series = pd.to_numeric(history_df[col], errors="coerce")
+        except Exception:
+            continue
+        if series.notna().sum() < 3:
+            continue
+        valid.append(str(col))
+    return valid or [base_name]
+
+
+def _build_chronos2_covariate_frames(
+    exog_hist: Any,
+    exog_fut: Any,
+    context_len: int,
+    *,
+    feature_info: Optional[Dict[str, Any]] = None,
+    exclude_columns: Optional[List[str]] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    if exog_hist is None:
+        return None, None
+    try:
+        hist_arr = np.asarray(exog_hist, dtype=float)
+    except Exception:
+        return None, None
+    fut_arr = None
+    if exog_fut is not None:
+        try:
+            fut_arr = np.asarray(exog_fut, dtype=float)
+        except Exception:
+            fut_arr = None
+
+    if hist_arr.ndim == 1:
+        hist_arr = hist_arr.reshape(-1, 1)
+    if fut_arr is not None and fut_arr.ndim == 1:
+        fut_arr = fut_arr.reshape(-1, 1)
+    if hist_arr.ndim != 2:
+        return None, None
+    if hist_arr.shape[0] < int(context_len):
+        return None, None
+
+    hist_slice = hist_arr[-int(context_len):, :]
+    feature_names = []
+    if isinstance(feature_info, dict):
+        feature_names = [str(col) for col in list(feature_info.get("selected_columns") or [])]
+    if len(feature_names) != int(hist_slice.shape[1]):
+        feature_names = [f"covariate_{idx}" for idx in range(int(hist_slice.shape[1]))]
+
+    excluded = {str(col) for col in list(exclude_columns or [])}
+    keep_idx = [idx for idx, col in enumerate(feature_names) if str(col) not in excluded]
+    if not keep_idx:
+        return None, None
+
+    kept_cols = [feature_names[idx] for idx in keep_idx]
+    hist_df = pd.DataFrame(hist_slice[:, keep_idx], columns=kept_cols)
+    fut_df: Optional[pd.DataFrame] = None
+    if fut_arr is not None and fut_arr.ndim == 2 and fut_arr.shape[1] == hist_slice.shape[1]:
+        fut_df = pd.DataFrame(fut_arr[:, keep_idx], columns=kept_cols)
+    return hist_df, fut_df
+
+
+def _timeframe_seconds_hint(timeframe: Optional[str]) -> int:
+    token = str(timeframe or "").strip().upper()
+    if token.startswith("MN"):
+        try:
+            return int(token[2:] or 1) * 30 * 24 * 3600
+        except Exception:
+            return 30 * 24 * 3600
+    if token.startswith("W"):
+        try:
+            return int(token[1:] or 1) * 7 * 24 * 3600
+        except Exception:
+            return 7 * 24 * 3600
+    if token.startswith("D"):
+        try:
+            return int(token[1:] or 1) * 24 * 3600
+        except Exception:
+            return 24 * 3600
+    if token.startswith("H"):
+        try:
+            return int(token[1:] or 1) * 3600
+        except Exception:
+            return 3600
+    if token.startswith("M"):
+        try:
+            return int(token[1:] or 1) * 60
+        except Exception:
+            return 60
+    return 3600
+
+
+def _ensure_chronos2_history_df(
+    history_df: Optional[pd.DataFrame],
+    *,
+    series: pd.Series,
+    base_col: str,
+    timeframe: Optional[str],
+) -> pd.DataFrame:
+    base_name = str(base_col or series.name or "target").strip() or "target"
+    if isinstance(history_df, pd.DataFrame) and not history_df.empty and "time" in history_df.columns:
+        frame = history_df.copy()
+        if base_name not in frame.columns:
+            frame[base_name] = np.nan
+            try:
+                frame.loc[series.index, base_name] = pd.to_numeric(series, errors="coerce").astype(float).to_numpy()
+            except Exception:
+                vals = pd.to_numeric(series, errors="coerce").astype(float).to_numpy()
+                frame.iloc[-len(vals):, frame.columns.get_loc(base_name)] = vals
+        return frame
+
+    values = pd.to_numeric(series, errors="coerce").astype(float).to_numpy()
+    step_seconds = _timeframe_seconds_hint(timeframe)
+    epochs = np.arange(len(values), dtype=float) * float(step_seconds)
+    return pd.DataFrame({
+        "time": epochs,
+        base_name: values,
+    })
+
+
+def _regularize_chronos2_timestamps(timestamps: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Return evenly spaced timestamps so Chronos-2 can infer dataframe frequency."""
+    if len(timestamps) < 3:
+        return timestamps
+    try:
+        if pd.infer_freq(timestamps) is not None:
+            return timestamps
+    except Exception:
+        pass
+    try:
+        deltas = pd.Series(timestamps).diff().dropna()
+        positive = deltas[deltas > pd.Timedelta(0)]
+        if positive.empty:
+            return timestamps
+        step = positive.median()
+        if not isinstance(step, pd.Timedelta) or step <= pd.Timedelta(0):
+            return timestamps
+        return pd.date_range(end=timestamps[-1], periods=len(timestamps), freq=step)
+    except Exception:
+        return timestamps
+
+
+def _build_chronos2_df_inputs(
+    *,
+    history_df: pd.DataFrame,
+    base_col: str,
+    multivariate_cols: List[str],
+    covariate_history: Optional[pd.DataFrame],
+    covariate_future: Optional[pd.DataFrame],
+    horizon: int,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], List[str]]:
+    if history_df.empty or "time" not in history_df.columns:
+        raise RuntimeError("chronos2 error: history_df with time column is required for Chronos-2 inputs")
+
+    frame = history_df.copy().reset_index(drop=True)
+    target_columns: List[str] = []
+    start_idx = 0
+    for col in multivariate_cols:
+        if col not in frame.columns:
+            continue
+        numeric = pd.to_numeric(frame[col], errors="coerce").astype(float)
+        if numeric.notna().sum() < 3:
+            continue
+        first_valid = numeric.first_valid_index()
+        if first_valid is not None:
+            start_idx = max(start_idx, int(first_valid))
+        target_columns.append(str(col))
+
+    if base_col not in target_columns and base_col in frame.columns:
+        target_columns.insert(0, str(base_col))
+    if not target_columns:
+        raise RuntimeError("chronos2 error: no valid multivariate target columns available")
+
+    frame = frame.iloc[start_idx:].copy().reset_index(drop=True)
+    for col in target_columns:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce").astype(float).ffill().bfill()
+
+    if covariate_history is not None and not covariate_history.empty:
+        covariate_history = covariate_history.iloc[start_idx:].copy().reset_index(drop=True)
+        for col in covariate_history.columns:
+            covariate_history[col] = pd.to_numeric(covariate_history[col], errors="coerce").astype(float).ffill().bfill()
+
+    timestamps = pd.to_datetime(frame["time"].astype(float).to_numpy(), unit="s", utc=True)
+    timestamps = _regularize_chronos2_timestamps(timestamps)
+    context_df = pd.DataFrame({
+        "item_id": np.repeat("series_0", len(frame)),
+        "timestamp": timestamps,
+    })
+    for col in multivariate_cols:
+        if col not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[col], errors="coerce").astype(float)
+        context_df[str(col)] = values.to_numpy()
+
+    if base_col in frame.columns:
+        context_df[str(base_col)] = pd.to_numeric(frame[base_col], errors="coerce").astype(float).to_numpy()
+
+    future_df: Optional[pd.DataFrame] = None
+    if covariate_history is not None and covariate_future is not None and not covariate_history.empty:
+        for col in covariate_history.columns:
+            context_df[str(col)] = pd.to_numeric(covariate_history[col], errors="coerce").astype(float).to_numpy()
+
+        if len(timestamps) >= 2:
+            delta = timestamps[-1] - timestamps[-2]
+        else:
+            delta = pd.Timedelta(hours=1)
+        future_times = [timestamps[-1] + delta * (idx + 1) for idx in range(int(horizon))]
+        future_df = pd.DataFrame({
+            "item_id": np.repeat("series_0", int(horizon)),
+            "timestamp": future_times,
+        })
+        for col in covariate_future.columns:
+            future_df[str(col)] = pd.to_numeric(covariate_future[col], errors="coerce").astype(float).to_numpy()
+
+    return context_df, future_df, target_columns
+
+
+def _format_chronos2_runtime_error(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message.startswith("chronos2 error:"):
+        return message
+    detail = message or repr(exc)
+    lowered = detail.lower()
+    if "could not infer frequency" in lowered or "infer frequency" in lowered:
+        return (
+            "chronos2 error: Chronos-2 could not infer a regular dataframe frequency. "
+            "mtdata regularizes MT5 bar timestamps before calling Chronos-2; if this "
+            "still fails, retry with a fixed liquid timeframe/symbol or use "
+            "chronos_bolt/theta. Details: "
+            f"{detail}"
+        )
+    return f"chronos2 error ({type(exc).__name__}): {detail}"
+
+
+def _extract_chronos2_predict_df_output(
+    pred_df: pd.DataFrame,
+    *,
+    primary_target: str,
+    quantile_levels: List[float],
+) -> Tuple[np.ndarray, Dict[str, List[float]], Dict[str, Any]]:
+    if pred_df.empty or "target_name" not in pred_df.columns or "predictions" not in pred_df.columns:
+        raise RuntimeError("chronos2 error: predict_df returned an unexpected dataframe")
+
+    frame = pred_df.copy()
+    frame["target_name"] = frame["target_name"].astype(str)
+    try:
+        frame = frame.sort_values(["target_name", "timestamp"])  # type: ignore[arg-type]
+    except Exception:
+        frame = frame.sort_values(["target_name"])
+
+    target_names = list(dict.fromkeys(frame["target_name"].tolist()))
+    primary = str(primary_target) if str(primary_target) in target_names else str(target_names[0])
+    metadata: Dict[str, Any] = {}
+    if len(target_names) > 1:
+        metadata["multivariate_forecasts"] = {}
+
+    def _extract_rows(target_name: str) -> Tuple[np.ndarray, Dict[str, List[float]]]:
+        rows = frame[frame["target_name"] == str(target_name)]
+        fc = pd.to_numeric(rows["predictions"], errors="coerce").astype(float).to_numpy()
+        qd: Dict[str, List[float]] = {}
+        for q in quantile_levels:
+            key = f"{float(q):g}"
+            col_name = str(q)
+            if col_name not in rows.columns:
+                alt = f"{float(q):g}"
+                col_name = alt if alt in rows.columns else col_name
+            if col_name in rows.columns:
+                qd[key] = pd.to_numeric(rows[col_name], errors="coerce").astype(float).tolist()
+        return fc, qd
+
+    f_vals, fq = _extract_rows(primary)
+    for target_name in target_names:
+        if target_name == primary:
+            continue
+        fc_other, qd_other = _extract_rows(target_name)
+        metadata.setdefault("multivariate_forecasts", {})[target_name] = {
+            "forecast": [float(v) for v in fc_other.tolist()],
+            "quantiles": qd_other,
+        }
+    return f_vals, fq, metadata
+
+
+def _build_chronos_inputs(
+    context: np.ndarray,
+    known_covariates: Optional[Any],
+    pipe_name: Optional[str],
+    model_name: str,
+    torch_module: Any,
+    future_covariates: Optional[pd.DataFrame] = None,
+) -> Any:
+    if _is_chronos2_pipeline(pipe_name, model_name):
+        target = torch_module.tensor(context, dtype=torch_module.float32)
+        if known_covariates is None:
+            return [target]
+
+        covariates_dict: Dict[str, Any] = {}
+        try:
+            if isinstance(known_covariates, pd.DataFrame):
+                cov_arr = known_covariates.to_numpy(dtype=float)
+                cov_cols = [str(col) for col in known_covariates.columns]
+            else:
+                cov_arr = np.asarray(known_covariates, dtype=float)
+                cov_cols = [f"covariate_{idx}" for idx in range(int(cov_arr.shape[1]))] if cov_arr.ndim == 2 else []
+            if cov_arr.ndim == 3 and cov_arr.shape[0] == 1:
+                cov_arr = cov_arr[0]
+            if cov_arr.ndim == 2:
+                for idx, col in enumerate(cov_cols):
+                    covariates_dict[str(col)] = torch_module.tensor(cov_arr[:, idx], dtype=torch_module.float32)
+        except Exception:
+            covariates_dict = {}
+
+        item: Dict[str, Any] = {"target": target}
+        if covariates_dict:
+            item["past_covariates"] = covariates_dict
+            if isinstance(future_covariates, pd.DataFrame) and not future_covariates.empty:
+                future_dict: Dict[str, Any] = {}
+                for col in list(future_covariates.columns):
+                    if str(col) in covariates_dict:
+                        future_dict[str(col)] = torch_module.tensor(
+                            pd.to_numeric(future_covariates[col], errors="coerce").astype(float).to_numpy(),
+                            dtype=torch_module.float32,
+                        )
+                if future_dict:
+                    item["future_covariates"] = future_dict
+        return [item]
+
+    # Keep legacy Chronos/T5 inputs on CPU; Chronos handles device placement internally.
+    return torch_module.tensor(context, dtype=torch_module.float32).unsqueeze(0)
+
+
+def _unwrap_chronos_quantiles(quantiles_tensor: Any, mean_tensor: Any, *, model_name: str, pipe_name: Optional[str]) -> Tuple[np.ndarray, np.ndarray]:
+    if _is_chronos2_pipeline(pipe_name, model_name):
+        if isinstance(quantiles_tensor, list):
+            quantiles_tensor = quantiles_tensor[0] if quantiles_tensor else None
+        if isinstance(mean_tensor, list):
+            mean_tensor = mean_tensor[0] if mean_tensor else None
+        if quantiles_tensor is None or mean_tensor is None:
+            raise RuntimeError("chronos2 error: no quantile forecast produced")
+
+        qf_np = np.asarray(quantiles_tensor.detach().cpu().numpy(), dtype=float)
+        mean_np = np.asarray(mean_tensor.detach().cpu().numpy(), dtype=float)
+        if qf_np.ndim == 3 and qf_np.shape[0] == 1:
+            qf_np = qf_np[0]
+        if mean_np.ndim == 2 and mean_np.shape[0] == 1:
+            mean_np = mean_np[0]
+        return qf_np, mean_np
+
+    qf_np = np.asarray(quantiles_tensor.detach().cpu().numpy(), dtype=float)
+    mean_np = np.asarray(mean_tensor.detach().cpu().numpy(), dtype=float)
+    return qf_np, mean_np
+
+
+def _unwrap_chronos_predict(mean_tensor: Any, *, model_name: str, pipe_name: Optional[str]) -> np.ndarray:
+    if _is_chronos2_pipeline(pipe_name, model_name):
+        if isinstance(mean_tensor, list):
+            mean_tensor = mean_tensor[0] if mean_tensor else None
+        if mean_tensor is None:
+            raise RuntimeError("chronos2 error: no point forecast produced")
+        f_np = np.asarray(mean_tensor.detach().cpu().numpy(), dtype=float)
+        if f_np.ndim == 2 and f_np.shape[0] == 1:
+            f_np = f_np[0]
+        if f_np.ndim == 3 and f_np.shape[0] == 1:
+            # Chronos-2 predict() returns quantile forecasts; use median if present.
+            f_np = f_np[0]
+        return f_np
+
+    return np.asarray(mean_tensor.detach().cpu().numpy(), dtype=float)
 
 
 @ForecastRegistry.register("chronos_bolt")
-@ForecastRegistry.register("chronos2")
 class ChronosBoltMethod(PretrainedMethod):
+    CAPABILITY_REQUIRES = {
+        "chronos2": ("chronos-forecasting>=2.0.0", "torch"),
+        "chronos_bolt": ("chronos-forecasting>=2.0.0", "torch"),
+    }
+    CAPABILITY_NOTES = {
+        "chronos2": "Hugging Face model id via params.model_name (default: amazon/chronos-2); uses regularized bar timestamps for Chronos-2 frequency inference.",
+        "chronos_bolt": "Uses Bolt-family checkpoints (default: amazon/chronos-bolt-base); set device_map explicitly for stable CPU/CUDA routing.",
+    }
     PARAMS: List[Dict[str, Any]] = [
         {"name": "model_name", "type": "str", "description": "Hugging Face model id."},
         {"name": "context_length", "type": "int|null", "description": "Context window length."},
@@ -84,7 +605,26 @@ class ChronosBoltMethod(PretrainedMethod):
     def required_packages(self) -> List[str]:
         return ["chronos", "torch"]
 
-    def forecast(
+    def prepare_forecast_call(
+        self,
+        params: Dict[str, Any],
+        call_kwargs: Dict[str, Any],
+        context: Any,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        out_params = dict(params or {})
+        if "method_name" not in out_params:
+            out_params["method_name"] = str(getattr(context, "method", "") or self.name)
+        if isinstance(getattr(context, "history_df", None), pd.DataFrame):
+            call_kwargs.setdefault("history_df", context.history_df.copy())
+        if getattr(context, "base_col", None) is not None:
+            call_kwargs.setdefault("history_base_col", str(context.base_col))
+        if getattr(context, "features", None) is not None:
+            call_kwargs.setdefault("features", dict(context.features))
+        if getattr(context, "feature_info", None) is not None:
+            call_kwargs.setdefault("feature_info", dict(context.feature_info))
+        return out_params, call_kwargs
+
+    def forecast(  # noqa: C901
         self, 
         series: pd.Series, 
         horizon: int, 
@@ -94,10 +634,8 @@ class ChronosBoltMethod(PretrainedMethod):
         **kwargs
     ) -> ForecastResult:
         p = params or {}
-        # NOTE: The upstream HF model `amazon/chronos-2` may require a newer `chronos`
-        # package API than some environments have; default to a widely compatible
-        # Bolt checkpoint unless the caller explicitly overrides it.
-        model_name = str(p.get('model_name') or 'amazon/chronos-bolt-base')
+        method_name = str(kwargs.get("method_name") or p.get("method_name") or self.name).strip().lower() or self.name
+        model_name, pipeline_order = _resolve_chronos_model_defaults(method_name, p)
         ctx_len = int(p.get('context_length', 0) or 0)
         device_map = p.get('device_map', None)
         quantiles = process_quantile_levels(p.get('quantiles'))
@@ -116,17 +654,23 @@ class ChronosBoltMethod(PretrainedMethod):
         _torch = modules['torch']
         _chronos = modules['chronos']
         effective_device_map = _resolve_chronos_device_map(device_map, _torch)
-        _Pipeline = None
-        for attr in ("Chronos2Pipeline", "ChronosBoltPipeline", "ChronosPipeline"):
+        pipeline_candidates: List[Tuple[str, Any]] = []
+        for attr in pipeline_order:
             if hasattr(_chronos, attr):
-                _Pipeline = getattr(_chronos, attr)
-                break
-        if _Pipeline is None:
+                pipeline_candidates.append((attr, getattr(_chronos, attr)))
+        if not pipeline_candidates:
             raise RuntimeError(
                 "chronos installed but no supported pipeline found "
-                "(expected one of Chronos2Pipeline/ChronosBoltPipeline/ChronosPipeline)."
+                f"(expected one of {', '.join(pipeline_order)})."
             )
-        
+
+        pipe = None
+        pipe_name = None
+        known_covariates = None
+        future_covariates = None
+        ctx_tensor = None
+        quantiles_tensor = None
+        mean_tensor = None
         try:
             q_levels = quantiles or [0.5]
             # Prepare covariates if available
@@ -139,121 +683,171 @@ class ChronosBoltMethod(PretrainedMethod):
                 exog_fut = exog_future
             if exog_fut is None:
                 exog_fut = p.get('exog_future')
-            
-            known_covariates = None
-            
+
+            history_df = kwargs.get('history_df')
+            history_base_col = str(kwargs.get('history_base_col') or p.get('base_col') or series.name or 'close').strip() or 'close'
+            features_cfg = kwargs.get('features') if isinstance(kwargs.get('features'), dict) else None
+            feature_info = kwargs.get('feature_info') if isinstance(kwargs.get('feature_info'), dict) else None
+
+            history_frame = _ensure_chronos2_history_df(
+                history_df if isinstance(history_df, pd.DataFrame) else None,
+                series=series,
+                base_col=history_base_col,
+                timeframe=kwargs.get('timeframe') or p.get('timeframe'),
+            )
+
+            multivariate_cols = _resolve_chronos2_multivariate_columns(
+                history_frame,
+                history_base_col,
+                features_cfg,
+                feature_info,
+            )
+            covariate_history = None
+            covariate_future = None
+
             if exog_hist is not None and exog_fut is not None:
                 try:
-                    # Ensure arrays
-                    hist_arr = np.asarray(exog_hist, dtype=float)
-                    fut_arr = np.asarray(exog_fut, dtype=float)
-                    
-                    # Match context length (take last len(context) rows of history)
-                    if len(hist_arr) >= len(context):
-                        hist_slice = hist_arr[-len(context):]
-                        
-                        # Concatenate history + future
-                        if hist_slice.shape[1] == fut_arr.shape[1]:
-                            full_exog = np.vstack([hist_slice, fut_arr])
-                            
-                            # Convert to tensor (1, time, n_feat)
-                            known_covariates = _torch.tensor(full_exog, dtype=_torch.float32).unsqueeze(0)
-                            
-                            # Handle device placement if explicit
-                            if effective_device_map and effective_device_map not in ('auto', 'cpu'):
-                                try:
-                                    known_covariates = known_covariates.to(effective_device_map)
-                                except Exception:
-                                    pass
+                    covariate_history, covariate_future = _build_chronos2_covariate_frames(
+                        exog_hist,
+                        exog_fut,
+                        len(context),
+                        feature_info=feature_info,
+                        exclude_columns=multivariate_cols,
+                    )
+                    if covariate_history is not None and covariate_future is not None:
+                        full_exog = np.vstack([covariate_history.to_numpy(dtype=float), covariate_future.to_numpy(dtype=float)])
+                        known_covariates = _torch.tensor(full_exog, dtype=_torch.float32).unsqueeze(0)
+                        future_covariates = covariate_future
                 except Exception:
                     # Fallback: ignore covariates on error
                     pass
 
-            try:
-                pipe = _Pipeline.from_pretrained(model_name, device_map=effective_device_map)
-            except TypeError:
-                pipe = _Pipeline.from_pretrained(model_name)
+            pipe, pipe_name = _load_chronos_pipeline(
+                pipeline_candidates,
+                model_name,
+                effective_device_map,
+            )
             
-            # Convert context to tensor. Chronos pipelines expect (batch, time) -> (1, L).
-            ctx_tensor = _torch.tensor(context, dtype=_torch.float32).unsqueeze(0)
-            if effective_device_map and effective_device_map not in ('auto', 'cpu'):
-                try:
-                    ctx_tensor = ctx_tensor.to(effective_device_map)
-                except Exception:
-                    pass
-
-            fq: Dict[str, List[float]] = {}
-            f_vals: Optional[np.ndarray] = None
-
-            predict_kwargs: Dict[str, Any] = {}
-            if known_covariates is not None:
-                predict_kwargs["known_covariates"] = known_covariates
-
-            quantiles_tensor = None
-            mean_tensor = None
-            if hasattr(pipe, "predict_quantiles"):
-                try:
-                    quantiles_tensor, mean_tensor = pipe.predict_quantiles(
-                        ctx_tensor,
-                        prediction_length=int(horizon),
-                        quantile_levels=[float(q) for q in q_levels],
-                        **predict_kwargs,
-                    )
-                except TypeError:
-                    quantiles_tensor, mean_tensor = pipe.predict_quantiles(
-                        ctx_tensor,
-                        prediction_length=int(horizon),
-                        quantile_levels=[float(q) for q in q_levels],
-                    )
-
-            if quantiles_tensor is None or mean_tensor is None:
-                # Fallback to point prediction only
-                try:
-                    mean_tensor = pipe.predict(ctx_tensor, prediction_length=int(horizon))
-                except Exception as e:
-                    raise RuntimeError(f"Chronos predict failed: {e}")
-
-            if quantiles_tensor is not None:
-                q_np = np.asarray([float(q) for q in q_levels], dtype=float).reshape(-1)
-                qf_np = np.asarray(quantiles_tensor.detach().cpu().numpy(), dtype=float)
-
-                if qf_np.ndim == 3:
-                    qf_np = qf_np[0]
-                elif qf_np.ndim == 2 and qf_np.shape[0] == 1:
-                    qf_np = qf_np[0]
-
-                q_axis = None
-                if qf_np.ndim == 2:
-                    if qf_np.shape[0] == q_np.size:
-                        q_axis = 0
-                    elif qf_np.shape[1] == q_np.size:
-                        q_axis = 1
-                if q_axis is None:
-                    raise RuntimeError(f"chronos2 error: unexpected quantile forecast shape {tuple(qf_np.shape)}")
-
-                for idx, q in enumerate(q_np.tolist()):
-                    if q_axis == 0:
-                        fq[f"{float(q):g}"] = [float(v) for v in qf_np[idx, :].tolist()]
-                    else:
-                        fq[f"{float(q):g}"] = [float(v) for v in qf_np[:, idx].tolist()]
-
-                # Point forecast: prefer explicit mean/median output if provided
-                mean_np = np.asarray(mean_tensor.detach().cpu().numpy(), dtype=float)
-                if mean_np.ndim == 2:
-                    mean_np = mean_np[0]
-                f_vals = mean_np
+            if _is_chronos2_pipeline(pipe_name, model_name):
+                context_df, future_df, target_columns = _build_chronos2_df_inputs(
+                    history_df=history_frame,
+                    base_col=history_base_col,
+                    multivariate_cols=multivariate_cols,
+                    covariate_history=covariate_history,
+                    covariate_future=covariate_future,
+                    horizon=int(horizon),
+                )
+                pred_df = pipe.predict_df(
+                    context_df,
+                    future_df=future_df,
+                    prediction_length=int(horizon),
+                    quantile_levels=[float(q) for q in q_levels],
+                    id_column="item_id",
+                    timestamp_column="timestamp",
+                    target=target_columns if len(target_columns) > 1 else target_columns[0],
+                    validate_inputs=False,
+                )
+                f_vals, fq, extra_meta = _extract_chronos2_predict_df_output(
+                    pred_df,
+                    primary_target=history_base_col,
+                    quantile_levels=[float(q) for q in q_levels],
+                )
+                metadata = {"quantiles": fq}
+                metadata.update(extra_meta)
             else:
-                # mean_tensor from predict(); accept either (H,) or (B, H)
-                f_np = np.asarray(mean_tensor.detach().cpu().numpy(), dtype=float)
-                if f_np.ndim == 2:
-                    f_np = f_np[0]
-                f_vals = f_np
+                future_df = None
+                target_columns = [history_base_col]
+                ctx_tensor = _build_chronos_inputs(
+                    context,
+                    known_covariates,
+                    pipe_name,
+                    model_name,
+                    _torch,
+                    future_covariates=future_covariates,
+                )
+                metadata = {"quantiles": {}}
+
+            fq: Dict[str, List[float]] = dict(metadata.get("quantiles") or {})
+            f_vals: Optional[np.ndarray] = np.asarray(f_vals, dtype=float) if _is_chronos2_pipeline(pipe_name, model_name) and f_vals is not None else None
+
+            if not _is_chronos2_pipeline(pipe_name, model_name):
+                predict_kwargs: Dict[str, Any] = {}
+                if known_covariates is not None:
+                    predict_kwargs["known_covariates"] = known_covariates
+
+                if hasattr(pipe, "predict_quantiles"):
+                    try:
+                        quantiles_tensor, mean_tensor = pipe.predict_quantiles(
+                            ctx_tensor,
+                            prediction_length=int(horizon),
+                            quantile_levels=[float(q) for q in q_levels],
+                            **predict_kwargs,
+                        )
+                    except TypeError:
+                        quantiles_tensor, mean_tensor = pipe.predict_quantiles(
+                            ctx_tensor,
+                            prediction_length=int(horizon),
+                            quantile_levels=[float(q) for q in q_levels],
+                        )
+
+                if quantiles_tensor is None or mean_tensor is None:
+                    # Fallback to point prediction only
+                    try:
+                        mean_tensor = pipe.predict(ctx_tensor, prediction_length=int(horizon))
+                    except Exception as e:
+                        raise RuntimeError(f"Chronos predict failed: {e}")
+
+                if quantiles_tensor is not None:
+                    q_np = np.asarray([float(q) for q in q_levels], dtype=float).reshape(-1)
+                    qf_np, mean_np = _unwrap_chronos_quantiles(
+                        quantiles_tensor,
+                        mean_tensor,
+                        model_name=model_name,
+                        pipe_name=pipe_name,
+                    )
+
+                    if qf_np.ndim == 3:
+                        qf_np = qf_np[0]
+                    elif qf_np.ndim == 2 and qf_np.shape[0] == 1:
+                        qf_np = qf_np[0]
+
+                    q_axis = None
+                    if qf_np.ndim == 2:
+                        if qf_np.shape[0] == q_np.size:
+                            q_axis = 0
+                        elif qf_np.shape[1] == q_np.size:
+                            q_axis = 1
+                    if q_axis is None:
+                        raise RuntimeError(f"chronos2 error: unexpected quantile forecast shape {tuple(qf_np.shape)}")
+
+                    for idx, q in enumerate(q_np.tolist()):
+                        if q_axis == 0:
+                            fq[f"{float(q):g}"] = [float(v) for v in qf_np[idx, :].tolist()]
+                        else:
+                            fq[f"{float(q):g}"] = [float(v) for v in qf_np[:, idx].tolist()]
+
+                    # Point forecast: prefer explicit mean/median output if provided
+                    if mean_np.ndim == 2:
+                        mean_np = mean_np[0]
+                    f_vals = adjust_forecast_length(mean_np, int(horizon), "chronos2")
+                else:
+                    # mean_tensor from predict(); accept either (H,) or (B, H)
+                    f_np = _unwrap_chronos_predict(
+                        mean_tensor,
+                        model_name=model_name,
+                        pipe_name=pipe_name,
+                    )
+                    if f_np.ndim == 2:
+                        f_np = f_np[0]
+                    f_vals = adjust_forecast_length(f_np, int(horizon), "chronos2")
 
             params_used = build_params_used(
-                {'model_name': model_name, 'device_map': effective_device_map},
+                {'model_name': model_name, 'device_map': effective_device_map, 'pipeline': pipe_name},
                 quantiles_dict=fq,
                 context_length=ctx_len if ctx_len else n
             )
+            if _is_chronos2_pipeline(pipe_name, model_name):
+                params_used['multivariate_targets'] = list(target_columns)
             
             if known_covariates is not None:
                 params_used['covariates_used'] = True
@@ -262,18 +856,176 @@ class ChronosBoltMethod(PretrainedMethod):
             if f_vals is None:
                 raise RuntimeError("chronos2 error: no point forecast produced")
                 
-            return ForecastResult(forecast=f_vals, params_used=params_used, metadata={"quantiles": fq})
+            return ForecastResult(forecast=f_vals, params_used=params_used, metadata=metadata)
             
         except Exception as ex:
-            raise RuntimeError(f"chronos2 error ({type(ex).__name__}): {ex!r}") from ex
+            raise RuntimeError(_format_chronos2_runtime_error(ex)) from ex
+        finally:
+            # Cached pipelines may be shared across requests; only drop local refs here.
+            pipe = None
+            known_covariates = None
+            ctx_tensor = None
+            quantiles_tensor = None
+            mean_tensor = None
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            try:
+                cuda = getattr(_torch, "cuda", None)
+                if cuda is not None and callable(getattr(cuda, "is_available", None)) and bool(cuda.is_available()):
+                    empty_cache = getattr(cuda, "empty_cache", None)
+                    if callable(empty_cache):
+                        empty_cache()
+            except Exception:
+                pass
+
+
+@ForecastRegistry.register("chronos2")
+class Chronos2Method(ChronosBoltMethod):
+    """Chronos-2 alias of :class:`ChronosBoltMethod`.
+
+    Shares the Chronos implementation but reports its own method identity so
+    diagnostics, fingerprints, and cached artifacts do not collide with the
+    ``chronos_bolt`` alias. Model-family defaults are resolved from the method
+    name at forecast time (see ``_resolve_chronos_model_defaults``).
+    """
+
+    @property
+    def name(self) -> str:
+        return "chronos2"
+
+
+def _resolve_timesfm_device(requested: Any, torch_module: Any) -> str:
+    req = str(requested).strip().lower() if requested is not None else ""
+    cuda = getattr(torch_module, "cuda", None)
+    cuda_available = False
+    try:
+        cuda_available = bool(cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available())
+    except Exception:
+        cuda_available = False
+
+    if not req or req == "auto":
+        return "cuda:0" if cuda_available else "cpu"
+    if req == "gpu":
+        req = "cuda:0"
+    if req == "cuda":
+        req = "cuda:0"
+    if req.startswith("cuda") and not cuda_available:
+        raise RuntimeError("CUDA was requested for timesfm but torch.cuda is not available")
+    return req
+
+
+def _set_timesfm_torch_device(wrapper: Any, torch_module: Any, device_name: str) -> Optional[Any]:
+    model = getattr(wrapper, "model", None)
+    if model is None:
+        return None
+    device = torch_module.device(device_name)
+    try:
+        model.device = device
+    except Exception:
+        pass
+    try:
+        model.device_count = 1
+    except Exception:
+        pass
+    move = getattr(model, "to", None)
+    if callable(move):
+        try:
+            move(device)
+        except Exception:
+            pass
+    return model
+
+
+def _timesfm_checkpoint_path(params: Dict[str, Any]) -> Optional[str]:
+    for key in ("checkpoint_path", "ckpt_path", "checkpoint", "model_path"):
+        value = params.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
+def _download_timesfm_checkpoint(params: Dict[str, Any]) -> str:
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore
+    except Exception as ex:
+        raise RuntimeError(
+            "timesfm checkpoint auto-download requires huggingface_hub; "
+            "set params.checkpoint_path to a local model.safetensors file."
+        ) from ex
+
+    repo_id = str(
+        params.get("model_name")
+        or params.get("model_id")
+        or "google/timesfm-2.5-200m-pytorch"
+    )
+    filename = str(params.get("filename") or params.get("hf_filename") or "model.safetensors")
+    kwargs: Dict[str, Any] = {
+        "repo_id": repo_id,
+        "filename": filename,
+        "force_download": _truthy(params.get("force_download")),
+        "local_files_only": _truthy(params.get("local_files_only")),
+    }
+    for key in ("revision", "cache_dir", "token"):
+        value = params.get(key)
+        if value is not None and str(value).strip():
+            kwargs[key] = value
+    try:
+        return str(hf_hub_download(**kwargs))
+    except Exception as ex:
+        raise RuntimeError(
+            f"timesfm checkpoint auto-download failed for {repo_id}/{filename}; "
+            "set params.checkpoint_path to a local model.safetensors file or "
+            "check network/cache access."
+        ) from ex
+
+
+def _load_timesfm_checkpoint(wrapper: Any, params: Dict[str, Any]) -> Optional[str]:
+    model = getattr(wrapper, "model", None)
+    nested_load = getattr(model, "load_checkpoint", None)
+    if callable(nested_load):
+        path = _timesfm_checkpoint_path(params) or _download_timesfm_checkpoint(params)
+        torch_compile = False
+        if "torch_compile" in params:
+            torch_compile = _truthy(params.get("torch_compile")) and not _falsey(params.get("torch_compile"))
+        try:
+            nested_load(path, torch_compile=torch_compile)
+        except TypeError:
+            nested_load(path)
+        return path
+
+    wrapper_load = getattr(wrapper, "load_checkpoint", None)
+    if not callable(wrapper_load):
+        return None
+    path = _timesfm_checkpoint_path(params)
+    try:
+        if path:
+            wrapper_load(path)
+        else:
+            wrapper_load()
+    except TypeError:
+        if path:
+            wrapper_load(path)
+        else:
+            raise
+    return path
+
 
 @ForecastRegistry.register("timesfm")
 class TimesFMMethod(PretrainedMethod):
+    CAPABILITY_REQUIRES = ("timesfm", "torch")
+    CAPABILITY_NOTES = "Uses timesfm 2.x (GitHub) API with the TimesFM 2.5 PyTorch checkpoint."
     PARAMS: List[Dict[str, Any]] = [
         {"name": "device", "type": "str|null", "description": "Compute device (cpu/cuda)."},
         {"name": "model_class", "type": "str|null", "description": "TimesFM torch class name override."},
+        {"name": "model_name", "type": "str|null", "description": "Hugging Face repo id (default: google/timesfm-2.5-200m-pytorch)."},
+        {"name": "checkpoint_path", "type": "str|null", "description": "Local model.safetensors checkpoint path."},
         {"name": "context_length", "type": "int|null", "description": "Context window length."},
         {"name": "quantiles", "type": "list|null", "description": "Quantile levels to return."},
+        {"name": "local_files_only", "type": "bool", "description": "Use only cached Hugging Face files when auto-loading the checkpoint."},
+        {"name": "force_download", "type": "bool", "description": "Force Hugging Face checkpoint re-download."},
+        {"name": "torch_compile", "type": "bool", "description": "Enable torch.compile during checkpoint load (default: false)."},
     ]
 
     @property
@@ -284,7 +1036,7 @@ class TimesFMMethod(PretrainedMethod):
     def required_packages(self) -> List[str]:
         return ["timesfm", "torch"]
 
-    def forecast(
+    def forecast(  # noqa: C901
         self, 
         series: pd.Series, 
         horizon: int, 
@@ -301,7 +1053,9 @@ class TimesFMMethod(PretrainedMethod):
             except Exception:
                 pass
             try:
-                from timesfm.timesfm_2p5 import timesfm_2p5_torch as _timesfm_2p5_torch  # type: ignore
+                from timesfm.timesfm_2p5 import (
+                    timesfm_2p5_torch as _timesfm_2p5_torch,  # type: ignore
+                )
                 mods.append(_timesfm_2p5_torch)
             except Exception:
                 pass
@@ -312,7 +1066,9 @@ class TimesFMMethod(PretrainedMethod):
             if cfg is not None:
                 return cfg
             try:
-                from timesfm.configs import ForecastConfig as _ForecastConfig  # type: ignore
+                from timesfm.configs import (
+                    ForecastConfig as _ForecastConfig,  # type: ignore
+                )
                 return _ForecastConfig
             except Exception:
                 return None
@@ -389,7 +1145,7 @@ class TimesFMMethod(PretrainedMethod):
         modules, import_error = safe_import_modules(['timesfm', 'torch'], 'timesfm')
         if import_error:
             raise RuntimeError(import_error)
-        
+        _torch = modules['torch']
         _timesfm_root = modules['timesfm']
         _ForecastConfig = _resolve_forecast_config(_timesfm_root)
         if _ForecastConfig is None:
@@ -409,13 +1165,22 @@ class TimesFMMethod(PretrainedMethod):
                 "timesfm installed but no torch pipeline class was found. "
                 "Install the GitHub version (timesfm==2.x) and ensure torch is installed."
             )
-        
+
+        _mdl = None
+        _cfg = None
+        _device_name = _resolve_timesfm_device(p.get("device"), _torch)
+        _checkpoint_path: Optional[str] = None
         try:
             try:
                 _mdl = _Cls()
             except TypeError:
                 # Some versions accept device/config in constructor.
-                _mdl = _Cls(device=p.get("device"))  # type: ignore[arg-type]
+                _mdl = _Cls(device=_device_name)  # type: ignore[arg-type]
+            _set_timesfm_torch_device(_mdl, _torch, _device_name)
+            try:
+                _checkpoint_path = _load_timesfm_checkpoint(_mdl, p)
+            finally:
+                _set_timesfm_torch_device(_mdl, _torch, _device_name)
             _max_ctx = int(ctx_len) if ctx_len and int(ctx_len) > 0 else None
             _cfg_kwargs: Dict[str, Any] = {
                 'max_context': _max_ctx or min(int(n), 1024),
@@ -428,15 +1193,11 @@ class TimesFMMethod(PretrainedMethod):
             }
             _cfg = _ForecastConfig(**_cfg_kwargs)
             try:
-                if hasattr(_mdl, "load_checkpoint"):
-                    _mdl.load_checkpoint()
-            except Exception:
-                pass
-            try:
                 if hasattr(_mdl, "compile"):
                     _mdl.compile(_cfg)
             except Exception:
-                pass
+                if getattr(_mdl, "compiled_decode", None) is None:
+                    raise
 
             pf, qf = _call_forecast(_mdl, np.asarray(context, dtype=float), int(horizon))
             if pf is not None:
@@ -478,8 +1239,14 @@ class TimesFMMethod(PretrainedMethod):
                                 continue
                             col = qarr[0, :horizon, idx]
                             fq[key] = [float(v) for v in np.asarray(col, dtype=float).tolist()]
+            _params_base = {
+                'timesfm_model': str(_cls_name or getattr(_Cls, "__name__", "timesfm")),
+                'device': str(_device_name),
+            }
+            if _checkpoint_path:
+                _params_base['checkpoint_path'] = str(_checkpoint_path)
             params_used = build_params_used(
-                {'timesfm_model': str(_cls_name or getattr(_Cls, "__name__", "timesfm"))},
+                _params_base,
                 quantiles_dict=fq,
                 context_length=int(_max_ctx or n)
             )
@@ -489,261 +1256,22 @@ class TimesFMMethod(PretrainedMethod):
                  
             return ForecastResult(forecast=f_vals, params_used=params_used, metadata={"quantiles": fq})
         except Exception as ex:
-            raise RuntimeError(f"timesfm error: {ex}")
-
-@ForecastRegistry.register("lag_llama")
-class LagLlamaMethod(PretrainedMethod):
-    PARAMS: List[Dict[str, Any]] = [
-        {"name": "ckpt_path", "type": "str|null", "description": "Checkpoint path."},
-        {"name": "hf_repo", "type": "str|null", "description": "HF repo id (if auto-download)."},
-        {"name": "hf_filename", "type": "str|null", "description": "HF checkpoint filename."},
-        {"name": "context_length", "type": "int", "description": "Context window length."},
-        {"name": "num_samples", "type": "int", "description": "Number of samples (default: 100)."},
-        {"name": "use_rope_scaling", "type": "bool", "description": "Enable rope scaling (default: False)."},
-        {"name": "device", "type": "str|null", "description": "Compute device (cpu/cuda)."},
-        {"name": "freq", "type": "str", "description": "Pandas frequency string (default: H)."},
-        {"name": "quantiles", "type": "list|null", "description": "Quantile levels to return."},
-    ]
-
-    @property
-    def name(self) -> str:
-        return "lag_llama"
-        
-    @property
-    def required_packages(self) -> List[str]:
-        return ["lag-llama", "gluonts", "torch"]
-
-    def forecast(
-        self, 
-        series: pd.Series, 
-        horizon: int, 
-        seasonality: int, 
-        params: Dict[str, Any], 
-        exog_future: Optional[pd.DataFrame] = None,
-        **kwargs
-    ) -> ForecastResult:
-        p = params or {}
-        ckpt_path = p.get('ckpt_path') or p.get('checkpoint') or p.get('model_path')
-        if not ckpt_path:
-            # Try to fetch a default checkpoint from Hugging Face Hub
+            raise RuntimeError(f"timesfm error: {ex}") from ex
+        finally:
+            _mdl = None
+            _cfg = None
             try:
-                from huggingface_hub import hf_hub_download  # type: ignore
-                repo_id = str(p.get('hf_repo', 'time-series-foundation-models/Lag-Llama'))
-                filename = str(p.get('hf_filename', 'lag-llama.ckpt'))
-                revision = p.get('revision')
-                token = p.get('hf_token')
-                ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, token=token)
-                # Stash back into params for traceability
-                p['ckpt_path'] = ckpt_path
-                p['hf_repo'] = repo_id
-                p['hf_filename'] = filename
-            except Exception as ex:
-                raise RuntimeError(f"lag_llama requires params.ckpt_path or the ability to auto-download via huggingface_hub. Tried default repo but failed: {ex}")
-
-        ctx_len = int(p.get('context_length', 32) or 32)
-        num_samples = int(p.get('num_samples', 100) or 100)
-        use_rope = bool(p.get('use_rope_scaling', False))
-        freq = str(p.get('freq', 'H'))
-        quantiles = p.get('quantiles') if isinstance(p.get('quantiles'), (list, tuple)) else None
-
-        vals = series.values
-        
-        # Select context window
-        if ctx_len and ctx_len > 0:
-            k = int(min(len(vals), ctx_len))
-            context = np.asarray(vals[-k:], dtype=float)
-        else:
-            context = np.asarray(vals, dtype=float)
-
-        try:
-            import torch  # type: ignore
-            from lag_llama.gluon.estimator import LagLlamaEstimator  # type: ignore
-            from gluonts.evaluation import make_evaluation_predictions  # type: ignore
-            from gluonts.dataset.common import ListDataset  # type: ignore
-            import pandas as pd  # type: ignore
-        except Exception as ex:
-            raise RuntimeError(f"lag_llama dependencies missing: {ex}")
-
-        # PyTorch 2.6+ defaults torch.load(..., weights_only=True) which blocks unpickling
-        # of custom classes used by GluonTS (e.g., StudentTOutput).
-        try:
-            _add_safe = getattr(torch.serialization, "add_safe_globals", None)
-            if callable(_add_safe):
-                _to_allow = []
-                for mod, name in (
-                    ("gluonts.torch.distributions.studentT", "StudentTOutput"),
-                    ("gluonts.torch.distributions.student_t", "StudentTOutput"),
-                    ("gluonts.torch.distributions.normal", "NormalOutput"),
-                    ("gluonts.torch.distributions.laplace", "LaplaceOutput"),
-                    ("gluonts.torch.modules.loss", "NegativeLogLikelihood"),
-                ):
-                    try:
-                        _m = __import__(mod, fromlist=[name])  # type: ignore
-                        _cls = getattr(_m, name, None)
-                        if _cls is not None:
-                            _to_allow.append(_cls)
-                    except Exception:
-                        continue
-                if _to_allow:
-                    try:
-                        _add_safe(_to_allow)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # Resolve device
-        device_str = str(p.get('device')) if p.get('device') is not None else None
-        if device_str:
-            device = torch.device(device_str)
-        else:
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-        # Load checkpoint to get model hyperparameters
-        try:
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            est_args = ckpt.get('hyper_parameters', {}).get('model_kwargs', {})
-        except Exception as ex:
-            raise RuntimeError(f"failed to load Lag-Llama checkpoint: {ex}")
-
-        # Optional rope scaling when context exceeds training
-        rope_scaling = None
-        try:
-            base_ctx = int(est_args.get('context_length', 32))
-            if use_rope:
-                factor = max(1.0, float((ctx_len + int(horizon)) / max(1, base_ctx)))
-                rope_scaling = {"type": "linear", "factor": float(factor)}
-        except Exception:
-            rope_scaling = None
-
-        try:
-            estimator = LagLlamaEstimator(
-                ckpt_path=str(ckpt_path),
-                prediction_length=int(horizon),
-                context_length=int(ctx_len),
-                input_size=est_args.get('input_size', 1),
-                n_layer=est_args.get('n_layer', 8),
-                n_embd_per_head=est_args.get('n_embd_per_head', 64),
-                n_head=est_args.get('n_head', 8),
-                scaling=est_args.get('scaling', 'none'),
-                time_feat=est_args.get('time_feat', 'none'),
-                rope_scaling=rope_scaling,
-                batch_size=1,
-                num_parallel_samples=max(1, int(num_samples)),
-                device=device,
-            )
-
-            lightning_module = estimator.create_lightning_module()
-            transformation = estimator.create_transformation()
-            predictor = estimator.create_predictor(transformation, lightning_module)
-
-            # Build single-series GluonTS ListDataset with synthetic timestamps
-            idx = pd.date_range(start=pd.Timestamp('2000-01-01'), periods=len(context), freq=freq)
-            ds = ListDataset([
-                {
-                    'target': np.asarray(context, dtype=np.float32),
-                    'start': idx[0],
-                }
-            ], freq=freq)
-
-            forecast_it, ts_it = make_evaluation_predictions(dataset=ds, predictor=predictor, num_samples=max(1, int(num_samples)))
-            forecasts = list(forecast_it)
-            if not forecasts:
-                raise RuntimeError("lag_llama produced no forecasts")
-            f = forecasts[0]
-
-            # Point forecast: use mean if available, else median quantile, else samples average
-            vals = None
-            try:
-                vals = np.asarray(f.mean, dtype=float)
+                gc.collect()
             except Exception:
                 pass
-            if vals is None or vals.size == 0:
-                try:
-                    vals = np.asarray(f.quantile(0.5), dtype=float)
-                except Exception:
-                    pass
-            if (vals is None or vals.size == 0) and hasattr(f, 'samples'):
-                try:
-                    vals = np.asarray(np.mean(f.samples, axis=0), dtype=float)
-                except Exception:
-                    pass
-            if vals is None:
-                raise RuntimeError("lag_llama could not extract forecast values")
-            f_vals = adjust_forecast_length(vals, int(horizon), "lag_llama")
+            try:
+                cuda = getattr(_torch, "cuda", None)
+                if cuda is not None and callable(getattr(cuda, "is_available", None)) and bool(cuda.is_available()):
+                    empty_cache = getattr(cuda, "empty_cache", None)
+                    if callable(empty_cache):
+                        empty_cache()
+            except Exception:
+                pass
 
-            fq: Dict[str, List[float]] = {}
-            if quantiles:
-                for q in quantiles:
-                    try:
-                        qf = float(q)
-                    except Exception:
-                        continue
-                    try:
-                        q_arr = np.asarray(f.quantile(qf), dtype=float)
-                    except Exception:
-                        continue
-                    fq[str(qf)] = [float(v) for v in q_arr[:horizon].tolist()]
-
-        except Exception as ex:
-            raise RuntimeError(f"lag_llama inference error: {ex}")
-
-        params_used = {
-            'ckpt_path': str(ckpt_path),
-            'context_length': int(ctx_len),
-            'device': str(device),
-            'num_samples': int(num_samples),
-            'use_rope_scaling': bool(use_rope),
-            'freq': freq,
-        }
-        if quantiles:
-            params_used['quantiles'] = sorted({str(float(q)) for q in quantiles}, key=lambda x: float(x))
-
-        return ForecastResult(forecast=f_vals, params_used=params_used, metadata={"quantiles": fq})
 ## Note: Moirai is available via `sktime`'s `MOIRAIForecaster` when its optional
 ## dependencies are installed. mtdata no longer ships a separate `moirai` method.
-
-# Backward compatibility wrappers
-def forecast_chronos_bolt(
-    *,
-    series: np.ndarray,
-    fh: int,
-    params: Dict[str, Any],
-    n: int,
-) -> Tuple[Optional[np.ndarray], Optional[Dict[str, List[float]]], Dict[str, Any], Optional[str]]:
-    try:
-        res = ForecastRegistry.get("chronos_bolt").forecast(pd.Series(series), fh, 0, params)
-        return res.forecast, res.metadata.get("quantiles"), res.params_used, None
-    except Exception as e:
-        return None, None, {}, str(e)
-
-def forecast_timesfm(
-    *,
-    series: np.ndarray,
-    fh: int,
-    params: Dict[str, Any],
-    n: int,
-) -> Tuple[Optional[np.ndarray], Optional[Dict[str, List[float]]], Dict[str, Any], Optional[str]]:
-    try:
-        if not _HAS_TIMESFM:
-            return None, None, {}, "timesfm is not installed; install it to enable the timesfm forecast method."
-        res = ForecastRegistry.get("timesfm").forecast(pd.Series(series), fh, 0, params)
-        return res.forecast, res.metadata.get("quantiles"), res.params_used, None
-    except Exception as e:
-        return None, None, {}, str(e)
-
-def forecast_lag_llama(
-    *,
-    series: np.ndarray,
-    fh: int,
-    params: Dict[str, Any],
-    n: int,
-) -> Tuple[Optional[np.ndarray], Optional[Dict[str, List[float]]], Dict[str, Any], Optional[str]]:
-    try:
-        if not _HAS_LAG_LLAMA:
-            return None, None, {}, "lag_llama is not installed; install it (and its dependencies) to enable the lag_llama forecast method."
-        res = ForecastRegistry.get("lag_llama").forecast(pd.Series(series), fh, 0, params)
-        return res.forecast, res.metadata.get("quantiles"), res.params_used, None
-    except Exception as e:
-        return None, None, {}, str(e)
-

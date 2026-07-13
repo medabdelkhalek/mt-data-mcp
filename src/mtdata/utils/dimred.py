@@ -29,16 +29,18 @@ except Exception:
     _SKPCA = None
 
 try:  # scikit-learn TruncatedSVD, KernelPCA, SparsePCA
-    from sklearn.decomposition import TruncatedSVD as _SKSVD  # type: ignore
-    from sklearn.decomposition import SparsePCA as _SKSparsePCA  # type: ignore
     from sklearn.decomposition import KernelPCA as _SKKPCA  # type: ignore
+    from sklearn.decomposition import SparsePCA as _SKSparsePCA  # type: ignore
+    from sklearn.decomposition import TruncatedSVD as _SKSVD  # type: ignore
 except Exception:
     _SKSVD = None
     _SKSparsePCA = None
     _SKKPCA = None
 
 try:  # scikit-learn Linear Discriminant Analysis (supervised)
-    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as _SKLDA  # type: ignore
+    from sklearn.discriminant_analysis import (
+        LinearDiscriminantAnalysis as _SKLDA,  # type: ignore
+    )
 except Exception:
     _SKLDA = None
 
@@ -287,7 +289,10 @@ class TSNEReducer(DimReducer):
         self.perplexity = float(perplexity)
         self.learning_rate = float(learning_rate)
         self.n_iter = int(max(250, n_iter))
-        self._model = _SKTSNE(n_components=self.n_components, perplexity=self.perplexity, learning_rate=self.learning_rate, n_iter=self.n_iter, init="pca")
+        import inspect
+        _tsne_params = inspect.signature(_SKTSNE).parameters
+        iter_kwarg = "max_iter" if "max_iter" in _tsne_params else "n_iter"
+        self._model = _SKTSNE(n_components=self.n_components, perplexity=self.perplexity, learning_rate=self.learning_rate, init="pca", **{iter_kwarg: self.n_iter})
 
     def supports_transform(self) -> bool:
         # sklearn TSNE does not support transforming new samples
@@ -364,7 +369,9 @@ class DreamsCNEReducer(DimReducer):
         if self.regularizer and reg_emb is None:
             try:
                 # Use PCA with n_components matching embedding size
-                from sklearn.decomposition import PCA as _SKPCA_local  # local import to avoid hard dep if unused
+                from sklearn.decomposition import (
+                    PCA as _SKPCA_local,  # local import to avoid hard dep if unused
+                )
                 pca = _SKPCA_local(n_components=self.n_components)
                 reg_emb = pca.fit_transform(X)
                 if reg_emb.shape[1] >= 1:

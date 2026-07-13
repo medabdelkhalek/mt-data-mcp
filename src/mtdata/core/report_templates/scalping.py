@@ -1,8 +1,9 @@
 from typing import Any, Dict, Optional
-from ..schema import DenoiseSpec
-from .common import build_report_with_market
-from ..report_utils import merge_params, market_snapshot
+
 from ...utils.barriers import get_pip_size as _get_pip_size
+from ..report.utils import market_snapshot, merge_params
+from ...shared.schema import DenoiseSpec
+from .common import build_report_with_market
 
 
 def template_scalping(
@@ -13,17 +14,20 @@ def template_scalping(
 ) -> Dict[str, Any]:
     user_keys = set(params.keys()) if isinstance(params, dict) else set()
     p = merge_params(params, {
-        'context_limit': 400,
-        'context_tail': 60,
-        'backtest_steps': 20,
-        'backtest_spacing': 10,
+        'context_limit': 250,
+        'context_tail': 40,
+        'backtest_steps': 6,
+        'backtest_spacing': 6,
         'backtest_rmse_tolerance': 0.10,
-        'patterns_limit': 200,
-        'mode': 'pips',
+        'patterns_limit': 120,
+        'mode': 'ticks',
         'grid_style': 'fixed',
-        'tp_min': 2.0, 'tp_max': 15.0, 'tp_steps': 6,
-        'sl_min': 4.0, 'sl_max': 30.0, 'sl_steps': 7,
-        'top_k': 5,
+        'tp_min': 2.0, 'tp_max': 15.0, 'tp_steps': 3,
+        'sl_min': 4.0, 'sl_max': 30.0, 'sl_steps': 3,
+        'top_k': 3,
+        'barrier_method': 'mc_gbm',
+        'search_profile': 'fast',
+        'fast_defaults': True,
         # Barrier optimization defaults
         'objective': 'ev',
         'params': {'spread_bps': 1.0, 'slippage_bps': 0.5, 'rr_min': 0.7, 'rr_max': 1.6},
@@ -32,7 +36,7 @@ def template_scalping(
     if 'timeframe' not in p:
         p['timeframe'] = 'M5'
     snap = market_snapshot(symbol)
-    if str(p.get('mode', '')).lower() == 'pips':
+    if str(p.get('mode', '')).lower() == 'ticks':
         last_price = None
         spread_ticks = None
         if isinstance(snap, dict) and not snap.get('error'):
@@ -74,4 +78,4 @@ def template_scalping(
             _set_default('sl_min', sl_min_ticks)
             _set_default('sl_max', sl_max_ticks)
 
-    return build_report_with_market(symbol, horizon, denoise, p, default_extra=['M1','M5','M15','D1'], default_pivots=['D1'], snapshot=snap)
+    return build_report_with_market(symbol, horizon, denoise, p, default_extra=['M1','M5','M15'], default_pivots=['D1'], snapshot=snap)

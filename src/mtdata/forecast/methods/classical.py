@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, List
 import math
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 
 from ..interface import ForecastMethod, ForecastResult
-from ..registry import ForecastRegistry
+from ..forecast_registry import ForecastRegistry
+
 
 class ClassicalMethod(ForecastMethod):
     """Base class for classical methods."""
@@ -36,12 +38,15 @@ class NaiveMethod(ClassicalMethod):
         exog_future: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> ForecastResult:
+        if len(series) == 0:
+            raise ValueError("Naive forecast requires at least 1 data point")
         last_val = float(series.iloc[-1])
         f_vals = np.full(int(horizon), last_val, dtype=float)
         return ForecastResult(forecast=f_vals, params_used={})
 
 @ForecastRegistry.register("drift")
 class DriftMethod(ClassicalMethod):
+    MIN_POINTS = 2
     PARAMS: List[Dict[str, Any]] = []
 
     @property
@@ -57,9 +62,15 @@ class DriftMethod(ClassicalMethod):
         exog_future: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> ForecastResult:
-        vals = series.values
+        vals = np.asarray(series.values, dtype=float)
         n = int(vals.size)
-        slope = (float(vals[-1]) - float(vals[0])) / float(max(1, n - 1))
+        if n < self.MIN_POINTS:
+            raise ValueError(
+                f"DriftMethod requires at least {self.MIN_POINTS} data points, got {n}"
+            )
+        if not np.all(np.isfinite(vals)):
+            raise ValueError("DriftMethod requires all series values to be finite")
+        slope = (float(vals[-1]) - float(vals[0])) / float(n - 1)
         f_vals = float(vals[-1]) + slope * np.arange(1, int(horizon) + 1, dtype=float)
         return ForecastResult(forecast=f_vals, params_used={"slope": slope})
 
@@ -86,7 +97,9 @@ class SeasonalNaiveMethod(ClassicalMethod):
         if m <= 0 or len(series) < m:
             raise ValueError("Insufficient data for seasonal_naive")
         
-        last_season = series.values[-m:]
+        last_season = np.asarray(series.values[-m:], dtype=float)
+        if not np.all(np.isfinite(last_season)):
+            raise ValueError("SeasonalNaive forecast requires last m values to be finite")
         reps = int(math.ceil(int(horizon) / float(m)))
         f_vals = np.tile(last_season, reps)[: int(horizon)]
         return ForecastResult(forecast=f_vals, params_used={"m": m})
@@ -110,13 +123,19 @@ class ThetaMethod(ClassicalMethod):
         exog_future: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> ForecastResult:
-        vals = series.values
+        vals = np.asarray(series.values, dtype=float)
         n = int(vals.size)
+        if n == 0:
+            raise ValueError("Theta forecast requires at least 1 data point")
+        if not np.all(np.isfinite(vals)):
+            raise ValueError("Theta forecast requires all series values to be finite")
         alpha = float(params.get('alpha', 0.2))
         
         tt = np.arange(1, n + 1, dtype=float)
         A = np.vstack([np.ones(n), tt]).T
         coef, _, _, _ = np.linalg.lstsq(A, vals, rcond=None)
+        if coef.size < 2 or not np.all(np.isfinite(coef)):
+            raise ValueError("Theta trend fit produced non-finite coefficients")
         a, b = float(coef[0]), float(coef[1])
         trend_future = a + b * (tt[-1] + np.arange(1, int(horizon) + 1, dtype=float))
         
@@ -149,7 +168,9 @@ class FourierOLSMethod(ClassicalMethod):
         exog_future: Optional[pd.DataFrame] = None,
         **kwargs
     ) -> ForecastResult:
-        vals = series.values
+        vals = np.asarray(series.values, dtype=float)
+        if not np.all(np.isfinite(vals)):
+            raise ValueError("FourierOLS forecast requires all series values to be finite")
         n = int(vals.size)
         m_eff = int(seasonality) if seasonality > 0 else 0
         K = params.get('terms')
@@ -159,7 +180,9 @@ class FourierOLSMethod(ClassicalMethod):
             K_eff = min(3, max(1, (m_eff // 2) if m_eff else 2))
         else:
             K_eff = int(K)
-            
+        if m_eff == 1 and K_eff > 0:
+            K_eff = 0
+             
         tt = np.arange(1, n + 1, dtype=float)
         X_list = [np.ones(n)]
         if trend:
@@ -188,29 +211,3 @@ class FourierOLSMethod(ClassicalMethod):
             params_used={"m": m_eff, "K": K_eff, "trend": bool(trend)}
         )
 
-# Backward compatibility wrappers
-def forecast_naive(series: np.ndarray, fh: int) -> Tuple[np.ndarray, Dict[str, Any]]:
-    res = ForecastRegistry.get("naive").forecast(pd.Series(series), fh, 0, {})
-    return res.forecast, res.params_used
-
-def forecast_drift(series: np.ndarray, fh: int, n: Optional[int] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
-    # Note: original drift had 'n' param for slope calculation window, but implementation used full series if n is None.
-    # The new implementation uses full series. If 'n' was used to slice input, we should slice before calling.
-    # The original implementation: slope = (last - first) / (n-1). If n was passed, it implied using only last n points?
-    # Actually original implementation: if n is None: n = series.size. slope = (series[-1] - series[0]) / (n-1).
-    # It seems it always used first and last point of the PASSED series. 
-    # So 'n' argument in original function was redundant if it just meant series size.
-    res = ForecastRegistry.get("drift").forecast(pd.Series(series), fh, 0, {})
-    return res.forecast, res.params_used
-
-def forecast_seasonal_naive(series: np.ndarray, fh: int, m: int) -> Tuple[np.ndarray, Dict[str, Any]]:
-    res = ForecastRegistry.get("seasonal_naive").forecast(pd.Series(series), fh, m, {})
-    return res.forecast, res.params_used
-
-def forecast_theta(series: np.ndarray, fh: int, alpha: float = 0.2) -> Tuple[np.ndarray, Dict[str, Any]]:
-    res = ForecastRegistry.get("theta").forecast(pd.Series(series), fh, 0, {"alpha": alpha})
-    return res.forecast, res.params_used
-
-def forecast_fourier_ols(series: np.ndarray, fh: int, m: Optional[int], K: Optional[int], trend: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
-    res = ForecastRegistry.get("fourier_ols").forecast(pd.Series(series), fh, m or 0, {"terms": K, "trend": trend})
-    return res.forecast, res.params_used

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.signal import correlate
-from scipy.spatial.ckdtree import cKDTree
 import stumpy as _stumpy
-from tslearn.metrics import dtw as _ts_dtw
-from tslearn.metrics import soft_dtw as _ts_soft_dtw
+from scipy.signal import correlate
+from scipy.spatial import cKDTree
 
 try:
     import hnswlib as _HNSW  # type: ignore
@@ -17,13 +16,36 @@ except Exception:
     _HNSW = None  # optional ANN backend
 
 # Dimensionality reduction abstraction
-from .dimred import create_reducer as _create_reducer, DimReducer as _DimReducer
-
 # Reuse existing MT5 helpers and denoise utilities
-from ..core.constants import TIMEFRAME_MAP
+from ..shared.constants import TIMEFRAME_MAP
+from .dtw import dtw_distance_fallback
+from .denoise import (
+    _denoise_series as _apply_denoise_series,
+)
+from .denoise import (
+    get_denoise_methods_data as _get_denoise_methods_data,
+)
+from .denoise import (
+    normalize_denoise_spec as _normalize_denoise_spec,
+)
+from .dimred import DimReducer as _DimReducer
+from .dimred import create_reducer as _create_reducer
 from .mt5 import _mt5_copy_rates_from, _rates_to_df
-from .denoise import _apply_denoise as _apply_denoise_util
 from .utils import align_finite
+
+
+@lru_cache(maxsize=1)
+def _get_ts_dtw():
+    from tslearn.metrics import dtw as _ts_dtw  # type: ignore
+
+    return _ts_dtw
+
+
+@lru_cache(maxsize=1)
+def _get_ts_soft_dtw():
+    from tslearn.metrics import soft_dtw as _ts_soft_dtw  # type: ignore
+
+    return _ts_soft_dtw
 
 
 def _minmax_scale_row(x: np.ndarray) -> np.ndarray:
@@ -68,6 +90,19 @@ class _SeriesStore:
     close: np.ndarray       # float64, ascending
 
 
+@dataclass
+class _SeriesPrepareInfo:
+    source: str
+    base_col: str
+    bars_raw: int
+    bars_used: int
+    denoise_requested: bool = False
+    denoise_applied: bool = False
+    denoise_method: Optional[str] = None
+    denoise_error: Optional[str] = None
+    provided_history: bool = False
+
+
 class PatternIndex:
     """In-memory sliding-window index for pattern similarity search.
 
@@ -90,13 +125,12 @@ class PatternIndex:
         series: List[_SeriesStore],
         scale: str = "minmax",
         metric: str = "euclidean",
-        pca_components: Optional[int] = None,
-        pca_model: Optional[object] = None,
         dimred_method: Optional[str] = None,
         dimred_params: Optional[Dict[str, Any]] = None,
         reducer: Optional[_DimReducer] = None,
         engine: str = "ckdtree",
         max_bars_per_symbol: int = 5000,
+        build_metadata: Optional[Dict[str, Any]] = None,
     ):
         self.timeframe = timeframe
         self.window_size = int(window_size)
@@ -109,14 +143,12 @@ class PatternIndex:
         self._series = series               # list aligned with label indices
         self.scale = (scale or "minmax").lower()
         self.metric = (metric or "euclidean").lower()
-        # Back-compat: keep PCA fields, while new reducer API is used going forward
-        self.pca_components = int(pca_components) if pca_components else None
-        self._pca = pca_model
-        self.dimred_method = (dimred_method or ("pca" if self.pca_components else "none")).lower()
-        self.dimred_params = dict(dimred_params or ({} if not self.pca_components else {"n_components": int(self.pca_components)}))
+        self.dimred_method = (dimred_method or "none").lower()
+        self.dimred_params = dict(dimred_params or {})
         self._reducer = reducer  # type: ignore
         self.engine = (engine or "ckdtree").lower()
         self.max_bars_per_symbol = int(max_bars_per_symbol)
+        self.build_metadata = dict(build_metadata or {})
 
     def search(self, anchor_values: np.ndarray, top_k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
         """Query by a raw (unscaled) anchor window. Returns (indices, distances)."""
@@ -128,13 +160,11 @@ class PatternIndex:
         q = v.astype(float)
         # Scale
         q = _apply_scale_vector(q, self.scale)
-        # Dimensionality reduction (new API), falling back to PCA model if present
+        # Dimensionality reduction
         if self._reducer is not None:
             if not self._reducer.supports_transform():
                 raise RuntimeError(f"Reducer '{self.dimred_method}' does not support transforming new samples")
             q = np.asarray(self._reducer.transform(q.reshape(1, -1)), dtype=np.float32).ravel()
-        elif self._pca is not None:
-            q = np.asarray(self._pca.transform(q.reshape(1, -1))[0], dtype=np.float32)
         # Metric post-process
         q = _apply_metric_vector(q, self.metric)
         k = min(int(top_k), len(self.X))
@@ -335,18 +365,28 @@ class PatternIndex:
                     band = max(1, int(round(float(dtw_band_frac) * n)))
                 if sm == 'dtw':
                     try:
+                        ts_dtw = _get_ts_dtw()
                         if band:
-                            score = float(_ts_dtw(a, w, global_constraint="sakoe_chiba", sakoe_chiba_radius=int(band)))
+                            score = float(ts_dtw(a, w, global_constraint="sakoe_chiba", sakoe_chiba_radius=int(band)))
                         else:
-                            score = float(_ts_dtw(a, w))
+                            score = float(ts_dtw(a, w))
                     except Exception:
-                        score = float("inf")
+                        score = dtw_distance_fallback(
+                            a,
+                            w,
+                            sakoe_chiba_radius=int(band) if band else None,
+                        )
                 else:  # softdtw
                     try:
+                        ts_soft_dtw = _get_ts_soft_dtw()
                         gamma = float(soft_dtw_gamma) if (soft_dtw_gamma is not None and soft_dtw_gamma > 0) else 1.0
-                        score = float(_ts_soft_dtw(a.reshape(1, -1), w.reshape(1, -1), gamma=gamma))
+                        score = float(ts_soft_dtw(a.reshape(1, -1), w.reshape(1, -1), gamma=gamma))
                     except Exception:
-                        score = float("inf")
+                        score = dtw_distance_fallback(
+                            a,
+                            w,
+                            sakoe_chiba_radius=int(band) if band else None,
+                        )
             else:
                 # Fallback to euclidean on scaled windows
                 diff = a - w
@@ -433,41 +473,106 @@ def _fetch_symbol_df(
     return df
 
 
+def _coerce_time_epoch(values: Any) -> np.ndarray:
+    ser = pd.Series(values)
+    numeric = pd.to_numeric(ser, errors='coerce')
+    if numeric.notna().all():
+        return numeric.to_numpy(dtype=float)
+    dt = pd.to_datetime(ser, utc=True, errors='coerce')
+    if dt.isna().any():
+        raise ValueError("history DataFrame must provide numeric or datetime-convertible 'time' values")
+    return (dt.astype('int64') / 1_000_000_000.0).to_numpy(dtype=float)
+
+
+def _denoise_method_available(method: str) -> Tuple[bool, str]:
+    method_l = str(method or "none").strip().lower()
+    if method_l in {"", "none"}:
+        return True, ""
+    try:
+        methods = _get_denoise_methods_data().get("methods", [])
+    except Exception:
+        return True, ""
+    for entry in methods:
+        if str(entry.get("method") or "").strip().lower() == method_l:
+            return bool(entry.get("available", True)), str(entry.get("requires") or "")
+    return True, ""
+
+
 def _prepare_series(
     symbol: str,
     timeframe: str,
     max_bars: int,
-    denoise: Optional[Dict[str, Any]] = None,
+    denoise: Optional[Any] = None,
     *,
     as_of: Optional[Any] = None,
     drop_last_live: bool = True,
-) -> Optional[_SeriesStore]:
-    """Fetch and optionally denoise a symbol series; return _SeriesStore with ascending times."""
-    df = _fetch_symbol_df(symbol, timeframe, max_bars, as_of=as_of, drop_last_live=drop_last_live)
-    # Ensure 'volume' exists for denoise convenience
-    if 'volume' not in df.columns and 'tick_volume' in df.columns:
-        df['volume'] = df['tick_volume']
-    # Apply optional denoise to 'close' in-place
-    if denoise and isinstance(denoise, dict):
-        try:
-            dn = dict(denoise)
-            # Default pre-window denoise, apply to 'close' only unless caller overrode
-            dn.setdefault('when', 'pre_ti')
-            dn.setdefault('columns', ['close'])
-            dn.setdefault('keep_original', False)
-            _apply_denoise_util(df, dn, default_when='pre_ti')
-        except Exception:
-            # Fallback to raw if denoise fails
-            pass
-    # Extract arrays (ascending time assumed)
+    source_df: Optional[pd.DataFrame] = None,
+    source_base_col: str = "close",
+) -> Tuple[Optional[_SeriesStore], _SeriesPrepareInfo]:
+    """Prepare a symbol series from provided history or MT5 fetch."""
+    using_provided_history = source_df is not None
+    data = source_df.copy() if source_df is not None else _fetch_symbol_df(
+        symbol,
+        timeframe,
+        max_bars,
+        as_of=as_of,
+        drop_last_live=drop_last_live,
+    )
+    info = _SeriesPrepareInfo(
+        source="provided_history" if using_provided_history else "mt5_fetch",
+        base_col=str(source_base_col or "close"),
+        bars_raw=int(len(data)),
+        bars_used=0,
+        denoise_requested=bool(denoise),
+        provided_history=using_provided_history,
+    )
+    if 'volume' not in data.columns and 'tick_volume' in data.columns:
+        data['volume'] = data['tick_volume']
+
+    series_col = str(source_base_col or "close").strip() or "close"
+    if using_provided_history:
+        if series_col not in data.columns:
+            info.denoise_error = f"provided history did not include requested base column '{series_col}'"
+            return None, info
+        info.denoise_applied = bool(denoise) or series_col.endswith("_dn")
+        info.denoise_method = str((denoise or {}).get("method")) if isinstance(denoise, dict) else (str(denoise) if denoise else None)
+    else:
+        series_col = "close"
+        normalized_denoise = _normalize_denoise_spec(denoise, default_when='pre_ti')
+        if normalized_denoise:
+            method_name = str(normalized_denoise.get("method") or "").strip().lower()
+            info.denoise_method = method_name or None
+            available, requires = _denoise_method_available(method_name)
+            if not available:
+                info.denoise_error = f"denoise method '{method_name}' is unavailable; requires {requires}"
+                raise RuntimeError(info.denoise_error)
+            params = dict(normalized_denoise.get("params") or {})
+            causality = str(
+                normalized_denoise.get("causality")
+                or ("causal" if str(normalized_denoise.get("when") or "pre_ti") == "pre_ti" else "zero_phase")
+            )
+            try:
+                data[series_col] = _apply_denoise_series(
+                    data[series_col],
+                    method=method_name,
+                    params=params,
+                    causality=causality,
+                )
+                info.denoise_applied = True
+            except Exception as exc:
+                info.denoise_error = f"failed to denoise '{series_col}' using '{method_name}': {exc}"
+                raise RuntimeError(info.denoise_error) from exc
+
     try:
-        # Convert and align by finite mask across both arrays
-        t, c = align_finite(df['time'], df['close'])
-        if t.size < 10:
-            return None
-        return _SeriesStore(symbol=symbol, time_epoch=t, close=c)
+        t = _coerce_time_epoch(data['time'])
+        c = data[series_col].to_numpy(dtype=float)
+        t, c = align_finite(t, c)
     except Exception:
-        return None
+        return None, info
+    info.bars_used = int(t.size)
+    if t.size < 10:
+        return None, info
+    return _SeriesStore(symbol=symbol, time_epoch=t, close=c), info
 
 
 def build_index(
@@ -476,17 +581,17 @@ def build_index(
     window_size: int,
     future_size: int,
     max_bars_per_symbol: int = 5000,
-    denoise: Optional[Dict[str, Any]] = None,
+    denoise: Optional[Any] = None,
     scale: str = "minmax",
     metric: str = "euclidean",
-    pca_components: Optional[int] = None,
-    # New flexible dimension reduction interface
     dimred_method: Optional[str] = None,
     dimred_params: Optional[Dict[str, Any]] = None,
     engine: str = "ckdtree",
     *,
     as_of: Optional[Any] = None,
     drop_last_live: bool = True,
+    history_by_symbol: Optional[Dict[str, pd.DataFrame]] = None,
+    history_base_cols: Optional[Dict[str, str]] = None,
 ) -> PatternIndex:
     """Build a PatternIndex from MT5 data for the provided symbols.
 
@@ -495,18 +600,35 @@ def build_index(
       close[i : i+window_size]. Matches can expose window+future values.
     - Per-window min-max normalization is applied for the index vectors.
     """
-    assert window_size >= 5, "window_size too small"
+    if window_size < 5:
+        raise ValueError("window_size must be at least 5")
     symbols_ok: List[str] = []
     series: List[_SeriesStore] = []
+    prepare_info_by_symbol: Dict[str, Dict[str, Any]] = {}
+    history_by_symbol = dict(history_by_symbol or {})
+    history_base_cols = dict(history_base_cols or {})
     for sym in symbols:
-        ser = _prepare_series(
+        ser, prep_info = _prepare_series(
             sym,
             timeframe,
             max_bars=max_bars_per_symbol,
             denoise=denoise,
             as_of=as_of,
             drop_last_live=drop_last_live,
+            source_df=history_by_symbol.get(sym),
+            source_base_col=str(history_base_cols.get(sym) or "close"),
         )
+        prepare_info_by_symbol[str(sym)] = {
+            "source": prep_info.source,
+            "base_col": prep_info.base_col,
+            "bars_raw": prep_info.bars_raw,
+            "bars_used": prep_info.bars_used,
+            "denoise_requested": bool(prep_info.denoise_requested),
+            "denoise_applied": bool(prep_info.denoise_applied),
+            "denoise_method": prep_info.denoise_method,
+            "denoise_error": prep_info.denoise_error,
+            "provided_history": bool(prep_info.provided_history),
+        }
         if ser is None:
             continue
         # Require enough bars for at least one window
@@ -554,21 +676,15 @@ def build_index(
         raise RuntimeError("Failed to create any windows for the provided symbols")
     X = np.vstack(X_list)
     # Optional dimensionality reduction
-    pca_model = None
     reducer: Optional[_DimReducer] = None
-    # Back-compat: if pca_components provided, prefer PCA
-    effective_dimred_method = (dimred_method or ("pca" if (pca_components and int(pca_components) > 0) else "none"))
+    effective_dimred_method = dimred_method or "none"
     effective_dimred_params: Dict[str, Any] = dict(dimred_params or {})
-    if (pca_components and int(pca_components) > 0) and (not dimred_method or str(dimred_method).lower() in ("", "none", "pca")):
-        # Ensure components bound to window size
-        effective_dimred_params.setdefault("n_components", max(1, min(int(pca_components), int(X.shape[1]))))
-        effective_dimred_method = "pca"
     if effective_dimred_method and str(effective_dimred_method).lower() not in ("none", "false"):
         reducer, info = _create_reducer(effective_dimred_method, effective_dimred_params)
         # If reducer requires n_components, ensure it does not exceed window length
         try:
             if hasattr(reducer, "n_components"):
-                nc = int(getattr(reducer, "n_components"))
+                nc = int(reducer.n_components)
                 if nc > int(X.shape[1]):
                     # Recreate reducer with clipped components
                     effective_dimred_params["n_components"] = int(X.shape[1])
@@ -586,9 +702,8 @@ def build_index(
         norms[norms <= 1e-12] = 1.0
         X = (X / norms).astype(np.float32)
     elif met == "correlation":
-        # If not PCA-centered already, re-center rows; then L2 normalize
-        if pca_model is None:
-            X = X - np.nanmean(X, axis=1, keepdims=True)
+        # Re-center rows; then L2 normalize
+        X = X - np.nanmean(X, axis=1, keepdims=True)
         norms = np.linalg.norm(X, axis=1, keepdims=True)
         norms[norms <= 1e-12] = 1.0
         X = (X / norms).astype(np.float32)
@@ -625,13 +740,19 @@ def build_index(
         series=series,
         scale=(scale or "minmax").lower(),
         metric=(metric or "euclidean").lower(),
-        pca_components=int(pca_components) if pca_components else None,
-        pca_model=pca_model,
         dimred_method=str(effective_dimred_method or 'none'),
         dimred_params=effective_dimred_params,
         reducer=reducer,
         engine=eng,
         max_bars_per_symbol=int(max_bars_per_symbol),
+        build_metadata={
+            "series_prepare_info": prepare_info_by_symbol,
+            "bars_per_symbol": {ser.symbol: int(len(ser.close)) for ser in series},
+            "windows_per_symbol": {
+                ser.symbol: max(0, int(len(ser.close)) - (int(window_size) + int(future_size)) + 1)
+                for ser in series
+            },
+        },
     )
 
 

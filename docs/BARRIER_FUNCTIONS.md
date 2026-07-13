@@ -6,6 +6,7 @@
 - [GLOSSARY.md](GLOSSARY.md) — TP/SL, pips, and spread
 - [SAMPLE-TRADE.md](SAMPLE-TRADE.md) — Practical workflow example
 - [CLI.md](CLI.md) — CLI usage and output formats
+- [forecast/UNCERTAINTY.md](forecast/UNCERTAINTY.md) — Confidence and interval concepts
 
 Barrier functions are essential tools for risk management in trading. They help answer the critical question: *"What's the probability that my take-profit will be hit before my stop-loss within a given time horizon?"*
 
@@ -19,17 +20,19 @@ This document provides a deep dive into the barrier analytics available in mtdat
 
 Percent barriers are expressed in percent (e.g., `--tp-pct 0.40` means **0.40%**, not 40%):
 ```bash
-python cli.py forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
-  --method mc --mc-method mc_gbm --direction long --tp-pct 0.40 --sl-pct 0.60 --format json
+mtdata-cli forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
+  --method mc_gbm --direction long --tp-pct 0.40 --sl-pct 0.60 --json
 ```
 
 Look for `prob_tp_first`, `prob_sl_first`, `prob_no_hit`, and `edge` in the output.
 
+**Defaults**: `--method hmm_mc`, `--horizon 12`, `--direction long`.
+
 ### 2) Search for “good” TP/SL levels
 
 ```bash
-python cli.py forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
-  --method hmm_mc --mode pct --grid-style volatility --objective edge --format json
+mtdata-cli forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
+  --method hmm_mc --mode pct --grid-style volatility --objective edge --json
 ```
 
 ---
@@ -76,7 +79,7 @@ where:
 
 **How it works**:
 1. Calibrate μ and σ from historical log-returns
-2. Generate N random paths using the formula above
+2. Generate N random paths using the formula above (with antithetic variance reduction by default for more stable estimates)
 3. Count paths that hit TP first vs SL first
 
 **Strengths**:
@@ -102,8 +105,8 @@ where:
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob EURUSD --timeframe M5 --horizon 12 \
->   --method mc --mc-method mc_gbm --tp-pct 0.2 --sl-pct 0.15
+> mtdata-cli forecast_barrier_prob EURUSD --timeframe M5 --horizon 12 \
+>   --method mc_gbm --tp-pct 0.2 --sl-pct 0.15
 > ```
 
 ---
@@ -147,8 +150,8 @@ P(hit | S_t, S_T) = exp(-2 * (B - S_t)(B - S_T) / (σ²Δt))
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob BTCUSD --timeframe M1 --horizon 6 \
->   --method mc --mc-method mc_gbm_bb --tp-pct 0.1 --sl-pct 0.08
+> mtdata-cli forecast_barrier_prob BTCUSD --timeframe M1 --horizon 6 \
+>   --method mc_gbm_bb --tp-pct 0.1 --sl-pct 0.08
 > ```
 
 ---
@@ -165,8 +168,8 @@ Transition: P(s_t = j | s_{t-1} = i) = A_{ij}
 ```
 
 **How it works**:
-1. Fit Gaussian mixture to log-returns (EM algorithm)
-2. Estimate transition matrix from soft assignments
+1. Fit a Gaussian HMM to log-returns (Baum-Welch)
+2. Use its transition matrix and filtered final state distribution
 3. Simulate state paths via Markov chain
 4. Sample returns conditional on current state
 5. Build price paths
@@ -195,8 +198,8 @@ Transition: P(s_t = j | s_{t-1} = i) = A_{ij}
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob GBPUSD --timeframe H4 --horizon 48 \
->   --method mc --mc-method hmm_mc --tp-pct 1.5 --sl-pct 1.0 \
+> mtdata-cli forecast_barrier_prob GBPUSD --timeframe H4 --horizon 48 \
+>   --method hmm_mc --tp-pct 1.5 --sl-pct 1.0 \
 >   --params "n_states=2 n_sims=5000"
 > ```
 
@@ -244,8 +247,8 @@ r_t = μ + ε_t
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob SPY --timeframe D1 --horizon 20 \
->   --method mc --mc-method garch --tp-pct 3.0 --sl-pct 2.0 \
+> mtdata-cli forecast_barrier_prob SPY --timeframe D1 --horizon 20 \
+>   --method garch --tp-pct 3.0 --sl-pct 2.0 \
 >   --params "p=1 q=1"
 > ```
 
@@ -285,8 +288,8 @@ r_t = μ + ε_t
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob USDTRY --timeframe H1 --horizon 24 \
->   --method mc --mc-method bootstrap --tp-pct 2.0 --sl-pct 1.5 \
+> mtdata-cli forecast_barrier_prob USDTRY --timeframe H1 --horizon 24 \
+>   --method bootstrap --tp-pct 2.0 --sl-pct 1.5 \
 >   --params "block_size=5"
 > ```
 
@@ -335,8 +338,8 @@ dW_t^1 dW_t^2 = ρ dt
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob AAPL --timeframe D1 --horizon 60 \
->   --method mc --mc-method heston --tp-pct 10.0 --sl-pct 5.0 \
+> mtdata-cli forecast_barrier_prob AAPL --timeframe D1 --horizon 60 \
+>   --method heston --tp-pct 10.0 --sl-pct 5.0 \
 >   --params "kappa=2.0 theta=0.04 xi=0.3 rho=-0.5"
 > ```
 
@@ -383,8 +386,8 @@ J_t: compound Poisson process with log-normal jumps
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob EURUSD --timeframe M15 --horizon 16 \
->   --method mc --mc-method jump_diffusion --tp-pct 0.5 --sl-pct 0.3 \
+> mtdata-cli forecast_barrier_prob EURUSD --timeframe M15 --horizon 16 \
+>   --method jump_diffusion --tp-pct 0.5 --sl-pct 0.3 \
 >   --params "jump_lambda=0.5 jump_mu=0.001 jump_sigma=0.002"
 > ```
 
@@ -449,7 +452,7 @@ Note: `garch` requires the `arch` package; auto falls back to `heston` if it is 
 >
 > **Command**:
 > ```bash
-> python cli.py forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
+> mtdata-cli forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
 >   --method auto --tp-pct 0.5 --sl-pct 0.3
 >
 > # Returns: method_used: "hmm_mc", auto_reason: "auto: regime shift (volatility change)"
@@ -462,6 +465,22 @@ Note: `garch` requires the `arch` package; auto falls back to `heston` if it is 
 ### Grid Search (`forecast_barrier_optimize`)
 
 Searches combinations of TP/SL to maximize an objective function.
+
+With `method=ensemble`, every member simulator evaluates the same TP/SL grid.
+The optimizer aggregates each candidate's metrics by `ensemble_agg` and optional
+`ensemble_weights`, then selects the best aggregate candidate. Member metrics
+for that exact TP/SL pair are returned under `best.member_metrics`; the ensemble
+does not combine statistics from different member-specific optima.
+
+**Search Profiles**: Control the compute budget with `--search-profile`:
+
+| Profile | n_sims | n_trials | Grid density | Refine |
+|---------|--------|----------|-------------|--------|
+| `fast` | 1,200 | 24 | 4 × 4 | off |
+| `medium` (default) | 4,000 | 63 | 7 × 9 | off |
+| `long` | 10,000 | 600 | 41 × 51 | on |
+
+Use `--fast-defaults true` as a shortcut for the `fast` profile. Explicit `--n-sims`, `--tp-steps`, etc. override the profile values.
 
 **Grid Styles**:
 
@@ -476,11 +495,11 @@ Total combinations: tp_steps × sl_steps
 
 **Example**:
 ```bash
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct \
-  --tp_min 0.25 --tp_max 1.5 --tp_steps 7 \
-  --sl_min 0.25 --sl_max 2.5 --sl_steps 9
+  --tp-min 0.25 --tp-max 1.5 --tp-steps 7 \
+  --sl-min 0.25 --sl-max 2.5 --sl-steps 9
 ```
 
 ---
@@ -495,16 +514,18 @@ vol_horizon = vol_per_bar * sqrt(horizon)
 vol_pct = vol_horizon * 100
 
 tp_start = max(vol_floor_pct, vol_pct * vol_min_mult)
-tp_end = vol_pct * vol_max_mult
+tp_end = max(tp_start * 1.1, vol_pct * vol_max_mult)
 sl_start = max(vol_floor_pct, vol_pct * vol_min_mult * 0.8)
 sl_end = sl_start * vol_sl_multiplier
 ```
 
 **Use case**: Adapts to current market volatility
 
+Use `vol_sl_multiplier` to control the volatility-grid stop-loss multiplier.
+
 **Example**:
 ```bash
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct --grid-style volatility \
   --params "vol_window=250 vol_min_mult=0.5 vol_max_mult=4.0 vol_sl_multiplier=1.8"
@@ -526,11 +547,11 @@ For each SL in [sl_min, sl_max]:
 
 **Example**:
 ```bash
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct --grid-style ratio \
   --ratio_min 1.5 --ratio_max 3.0 --ratio_steps 5 \
-  --sl_min 0.3 --sl_max 1.0 --sl_steps 5
+  --sl-min 0.3 --sl-max 1.0 --sl-steps 5
 ```
 
 ---
@@ -546,9 +567,14 @@ Pre-configured ranges for trading styles
 
 **Use case**: Quick setup for standard trading styles
 
+Note:
+- Presets are stored in percentage terms.
+- In `mode=ticks`, the optimizer converts those preset percentages to tick-size distances using the current reference price.
+- That means named presets in tick mode are not portable across different price levels.
+
 **Example**:
 ```bash
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct --grid-style preset \
   --preset swing
@@ -567,14 +593,14 @@ Choose what to optimize. Each objective answers a different trading question:
 | `edge` | `P(win) - P(loss)` | General purpose, consistent win rate |
 | `prob_tp_first` | `P(win)` | Maximize win rate only |
 | `prob_resolve` | `1 - P(no hit)` | Ensure trades complete |
-| `kelly` | `P(win) - P(loss)/RR` | Position sizing |
+| `kelly` | `P(tp_first) - P(sl_first)/net_RR` | Unconditional Kelly edge proxy |
 | `kelly_cond` | Kelly on resolved trades only | Position sizing (ignoring timeouts) |
-| `ev` | `P(win)*TP - P(loss)*SL` | Maximize profit per trade |
+| `ev` | `P(tp_first)*net_TP - P(sl_first)*net_SL + P(no_hit)*timeout_MTM` | Maximize full-path profit per trade |
 | `ev_cond` | EV on resolved trades only | Profit per trade (ignoring timeouts) |
-| `ev_per_bar` | `EV / mean_resolve_time` | Fast trades, capital turnover |
-| `profit_factor` | `(P(win)*TP) / (P(loss)*SL)` | Risk/reward ratio focus |
+| `ev_per_bar` | `EV / mean_time_in_trade_all_paths` | Fast trades, capital turnover |
+| `profit_factor` | `(P(tp_first)*net_TP) / (P(sl_first)*net_SL)` | Risk/reward ratio focus |
 | `min_loss_prob` | Minimize `P(loss)` | Capital preservation |
-| `utility` | `P(win)*log(1+TP) + P(loss)*log(1-SL)` | Risk-averse trading |
+| `utility` | `P(tp_first)*log(1+TP) + P(sl_first)*log(1-SL)` | Risk-averse trading |
 
 #### Detailed Descriptions
 
@@ -586,21 +612,30 @@ Choose what to optimize. Each objective answers a different trading question:
 
 **`ev` (Expected Value)** — *"What's my average profit per trade?"*
 - Accounts for both probability AND payoff size
+- Includes the horizon mark-to-market payoff for paths that hit neither barrier
+- Same-bar ties contribute zero gross payoff when `same_bar_policy=neutral`; configured round-trip costs still apply
+- When spread, slippage, or commission inputs are supplied, EV is net of those costs
 - EV = 0.15% means you expect to gain 0.15% per trade on average
 - **Use when:** Payoff asymmetry matters (e.g., small wins, big losses)
-- **Limitation:** Doesn't account for trade duration
+- **Limitation:** Favorable timeout drift can dominate the barrier-hit edge; inspect
+  `ev_unresolved`, `prob_no_hit`, and `phantom_profit_risk`
 
 **`ev_per_bar`** — *"What's my profit per unit of time?"*
 - Normalizes EV by how long trades take
+- Uses unconditional time-in-trade, so unresolved paths count at full horizon
 - Favors fast trades over slow ones with same total EV
 - **Use when:** Capital turnover matters (reinvesting profits)
 - **Limitation:** May favor trades with higher transaction costs
 
-**`kelly`** — *"How much should I bet?"*
-- Optimal fraction of capital for maximum long-term growth
-- Kelly = 0.25 means bet 25% of capital (but use fractional Kelly in practice)
-- **Use when:** Position sizing decisions
-- **Limitation:** Full Kelly leads to large drawdowns; use 0.25× Kelly
+**`kelly`** — *"How strong is the barrier edge for sizing?"*
+- An unconditional two-barrier Kelly edge proxy; timeout probability shrinks the value
+- Uses net reward/risk when trading costs are supplied
+- Do not use the raw value directly as a lot or capital fraction
+- `kelly_cond` is the standard two-outcome Kelly fraction after conditioning on
+  TP/SL resolution; use fractional Kelly and an independent risk cap for sizing
+- **Use when:** Comparing barrier candidates with the same timeout semantics
+- **Limitation:** Neither variant models horizon mark-to-market outcomes; default
+  `ev` does, so Kelly and EV use different timeout payoff assumptions
 
 **`prob_resolve`** — *"Will my trade actually close?"*
 - Probability that TP or SL is hit within the horizon
@@ -610,6 +645,7 @@ Choose what to optimize. Each objective answers a different trading question:
 
 **`profit_factor`** — *"What's my gains-to-losses ratio?"*
 - Profit factor > 1 means profitable; > 2 is very good
+- Uses net wins/net losses when trading costs are supplied
 - Common metric in backtesting reports
 - **Use when:** Comparing strategies by risk/reward
 - **Limitation:** Doesn't account for trade frequency
@@ -626,8 +662,18 @@ Choose what to optimize. Each objective answers a different trading question:
 - **Limitation:** More theoretical than practical
 
 Notes:
-- `_cond` variants (e.g., `ev_cond`, `kelly_cond`) calculate metrics only on trades that resolved (hit TP or SL), ignoring timeouts.
-- `ev_per_bar` uses mean resolution time (`t_hit_resolve_mean`) when available.
+- `_cond` variants (e.g., `ev_cond`, `kelly_cond`) calculate metrics only on trades that resolved (hit TP or SL), ignoring timeouts, and remain cost-adjusted when trading costs are supplied.
+- `ev_per_bar` uses unconditional time-in-trade (`t_hit_resolve_mean_all`), counting unresolved paths at horizon expiry.
+- `t_hit_tp_median` and `t_hit_sl_median` are conditional medians for paths that hit that barrier; `t_hit_tp_median_cond` and `t_hit_sl_median_cond` are aliases.
+- `edge_vs_breakeven` compares the win rate conditional on TP/SL resolution with the matching two-outcome break-even rate. Full-path EV is kept separate because it includes timeout mark-to-market.
+
+#### Execution-aware stop gaps
+
+Set `gap_aware_stops=true` in `params` to value an SL at the first simulated
+crossing price when that crossing is worse than the requested stop. TP remains
+valued at the target, matching a resting limit-order premise. The result adds
+`realized_loss_mean` and `gap_aware_stops`. This is particularly useful with
+`jump_diffusion`, bootstrap, and other models capable of discrete gap moves.
 
 ---
 
@@ -647,11 +693,11 @@ Notes:
 
 **Example**:
 ```bash
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct \
-  --tp_min 0.25 --tp_max 1.5 --tp_steps 5 \
-  --sl_min 0.25 --sl_max 2.5 --sl_steps 5 \
+  --tp-min 0.25 --tp-max 1.5 --tp-steps 5 \
+  --sl-min 0.25 --sl-max 2.5 --sl-steps 5 \
   --refine true --refine_radius 0.35 --refine_steps 7
 ```
 
@@ -663,19 +709,174 @@ Filter candidates before ranking:
 
 | Constraint | Description | Example |
 |------------|-------------|---------|
-| `min_prob_win` | Minimum win probability | `0.5` (50%) |
+| `min_prob_win` | Minimum tie-adjusted TP-first probability | `0.5` (50%) |
 | `max_prob_no_hit` | Maximum no-hit probability | `0.2` (20%) |
 | `max_median_time` | Maximum resolution time (bars) | `10` |
 
 **Example**:
 ```bash
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct \
-  --tp_min 0.5 --tp_max 2.0 --tp_steps 5 \
-  --sl_min 0.5 --sl_max 2.0 --sl_steps 5 \
+  --tp-min 0.5 --tp-max 2.0 --tp-steps 5 \
+  --sl-min 0.5 --sl-max 2.0 --sl-steps 5 \
   --min_prob_win 0.55 --max_prob_no_hit 0.15 --max_median_time 8
 ```
+
+---
+
+### Statistical Robustness
+
+`forecast_barrier_optimize` can attach extra diagnostics for Monte Carlo quality. This is useful when you want to check whether the selected TP/SL pair is stable enough to trust for research or discretionary trading review.
+
+Enable it with `statistical_robustness=true` in `params` or with the Python keyword arguments.
+
+**What it currently adds:**
+- Minimum simulation guidance based on the requested CI width
+- Convergence diagnostics for the Monte Carlo success estimate
+- Cross-seed stability checks for the selected barrier pair
+- Optional bootstrap uncertainty for `prob_win`, `prob_loss`, `ev`, `edge`, `kelly`, and related metrics
+- Optional power analysis
+- Optional local sensitivity analysis around the selected `tp` and `sl`
+- Drift-stress scenarios (enabled with statistical robustness by default)
+- Independent-seed post-selection evaluation and full-search selection stability
+- Optional held-out walk-forward validation with `enable_oos_validation=true`
+
+**Important:** These checks do not make a trade valid by themselves. They are quality controls on the simulation and on the optimizer output.
+
+#### Python Example
+
+```python
+from mtdata.forecast.barriers_optimization import forecast_barrier_optimize
+
+result = forecast_barrier_optimize(
+    symbol="EURUSD",
+    timeframe="H1",
+    horizon=12,
+    method="hmm_mc",
+    mode="pct",
+    grid_style="volatility",
+    objective="ev",
+    statistical_robustness=True,
+    target_ci_width=0.05,
+    n_seeds_stability=3,
+    enable_bootstrap=True,
+    n_bootstrap=500,
+    enable_power_analysis=True,
+    enable_sensitivity_analysis=True,
+    sensitivity_params=["tp", "sl"],
+    params={"n_sims": 5000, "seed": 42},
+)
+```
+
+#### CLI Example
+
+```bash
+mtdata-cli forecast_barrier_optimize EURUSD \
+  --timeframe H1 \
+  --horizon 12 \
+  --method hmm_mc \
+  --mode pct \
+  --grid-style volatility \
+  --objective ev \
+  --params "statistical_robustness=true,target_ci_width=0.05,n_seeds_stability=3,enable_bootstrap=true,n_bootstrap=500,enable_power_analysis=true,n_sims=5000,seed=42" \
+  --json
+```
+
+Use Python when you want to pass `sensitivity_params` explicitly.
+
+#### Parameters
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `statistical_robustness` | `False` | Enables the extra diagnostics block |
+| `target_ci_width` | `0.05` | Requested width used for minimum-simulation guidance |
+| `n_seeds_stability` | `3` | Number of seed re-runs requested for the selected barrier pair |
+| `enable_convergence_check` | `True` | Adds a non-overlapping batch-means precision diagnostic |
+| `enable_bootstrap` | `False` | Adds `bootstrap_uncertainty` |
+| `n_bootstrap` | `200` | Number of bootstrap resamples |
+| `enable_power_analysis` | `False` | Adds `power_analysis` |
+| `power_effect_size` | `0.05` | Effect size assumed in the power calculation |
+| `enable_sensitivity_analysis` | `False` | Adds local `tp`/`sl` sensitivity checks |
+| `sensitivity_params` | `["tp", "sl"]` | Parameters varied in the sensitivity pass |
+| `enable_drift_stress` | `True` with robustness | Stress the selected pair over scaled historical drift |
+| `drift_stress_multipliers` | `[0, 0.5, 1, 1.5]` | Drift scenarios to evaluate |
+| `enable_oos_validation` | `False` | Enable held-out walk-forward selection and realized validation |
+| `oos_folds` | `5` | Number of walk-forward folds |
+| `oos_n_sims` | `1000` | Maximum simulation paths per fold |
+| `oos_holdout_bars` | `250` | Trailing history reserved for folds |
+
+#### Output Shape
+
+When enabled, the result can include:
+
+```json
+{
+  "min_sims_recommended": 1537,
+  "statistical_robustness": {
+    "minimum_simulations": {
+      "recommended": 1537,
+      "used": 5000,
+      "target_ci_width": 0.05,
+      "confidence": 0.95
+    },
+    "convergence_diagnostic": {
+      "converged": true,
+      "current_estimate": 0.55,
+      "window_mean": 0.548,
+      "window_std": 0.008,
+      "max_change": 0.006
+    },
+    "cross_seed_stability": {
+      "stable": true,
+      "n_seeds": 3,
+      "seeds_attempted": 3,
+      "seeds_succeeded": 3,
+      "metrics": {
+        "prob_win": {
+          "mean": 0.55,
+          "std": 0.02,
+          "cv": 0.036
+        }
+      }
+    },
+    "bootstrap_uncertainty": {
+      "prob_win": {
+        "mean": 0.55,
+        "std": 0.018,
+        "ci_low": 0.51,
+        "ci_high": 0.59
+      }
+    },
+    "power_analysis": {
+      "power": 0.92,
+      "min_n_for_80_power": 3200
+    },
+    "sensitivity_analysis": {
+      "tp": {
+        "success": true,
+        "values_tested": 5
+      }
+    }
+  }
+}
+```
+
+Only the sections you enable are returned. `cross_seed_stability` may also report an error if fewer than two seed re-runs succeed.
+
+#### Practical Use
+
+- For a quick research pass, start with `target_ci_width=0.10`, `n_seeds_stability=2`, and leave bootstrap off.
+- For a fuller review, use `target_ci_width=0.05`, `n_seeds_stability=3`, and turn on bootstrap.
+- Treat a wide batch-means CI, unstable cross-seed candidate selection, or poor held-out EV as a reason to increase `n_sims`, simplify the setup, or reject it.
+- Sensitivity analysis is most useful after you already have a candidate worth inspecting; it is not a replacement for the main grid search.
+
+Walk-forward validation supports fixed, ratio, and preset grids. Volatility
+grids are rejected in this mode so holdout volatility cannot leak into candidate
+generation. Each fold calibrates only on bars available before that fold,
+selects from the original request grid, and scores the following realized close
+path. This remains a close-only research validation; it is not an execution
+backtest with bid/ask or intrabar OHLC ordering.
 
 ---
 
@@ -693,7 +894,7 @@ python cli.py forecast_barrier_optimize \
 **Method Selection**:
 ```bash
 # Use auto or mc_gbm_bb for precision
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe M5 --horizon 6 \
   --method mc_gbm_bb --mode pct --grid-style preset \
   --preset scalp \
@@ -720,7 +921,7 @@ python cli.py forecast_barrier_optimize \
 **Method Selection**:
 ```bash
 # HMM captures regimes, volatility grid adapts to current vol
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   XAUUSD --timeframe H4 --horizon 60 \
   --method hmm_mc --mode pct --grid-style volatility \
   --params "vol_window=300 vol_min_mult=0.8 vol_max_mult=3.0" \
@@ -746,18 +947,18 @@ python cli.py forecast_barrier_optimize \
 **Method Selection**:
 ```bash
 # Jump diffusion captures earnings moves
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   AAPL --timeframe D1 --horizon 5 \
   --method jump_diffusion --mode pct \
-  --tp_min 3.0 --tp_max 10.0 --tp_steps 5 \
-  --sl_min 2.0 --sl_max 6.0 --sl_steps 5 \
+  --tp-min 3.0 --tp-max 10.0 --tp-steps 5 \
+  --sl-min 2.0 --sl-max 6.0 --sl-steps 5 \
   --params "jump_lambda=0.3" \
   --objective ev
 ```
 
 **Interpretation**:
 - Focus on `ev` (expected value)
-- Check `prob_tie` (should be low)
+- Check `prob_same_bar` (should be low)
 - Verify jump parameters via `model_summary`
 
 ---
@@ -774,11 +975,11 @@ python cli.py forecast_barrier_optimize \
 **Method Selection**:
 ```bash
 # Bootstrap preserves range characteristics
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method bootstrap --mode pct \
-  --tp_min 0.2 --tp_max 0.6 --tp_steps 5 \
-  --sl_min 0.2 --sl_max 0.6 --sl_steps 5 \
+  --tp-min 0.2 --tp-max 0.6 --tp-steps 5 \
+  --sl-min 0.2 --sl-max 0.6 --sl-steps 5 \
   --objective prob_resolve \
   --max_prob_no_hit 0.3
 ```
@@ -803,10 +1004,10 @@ python cli.py forecast_barrier_optimize \
 ```bash
 # Auto method adapts to each pair
 for pair in EURUSD GBPUSD USDJPY AUDUSD NZDUSD USDCAD USDCHF; do
-  python cli.py forecast_barrier_optimize \
+  mtdata-cli forecast_barrier_optimize \
     $pair --timeframe H1 --horizon 12 \
     --method auto --mode pct --grid-style volatility \
-    --objective edge --output summary --top_k 1
+    --objective edge --top_k 1
 done
 ```
 
@@ -876,7 +1077,7 @@ done
 - **Edge**: 26% raw (TP prob − SL prob)
 - **Resolve prob**: 90% of paths hit TP/SL within the horizon
 - **Kelly**: 34% (raw), 47% conditional on resolution
-- **EV**: 0.22% per trade; **EV per bar**: 0.03% based on mean resolve time
+- **EV**: 0.22% per trade; **EV per bar**: 0.03% based on unconditional time in trade
 - **Profit factor**: 2.45 (wins/losses ratio)
 - **Utility**: 0.18 (risk‑averse log utility)
 - **Resolve time**: mean 6.8 bars, median 6 bars
@@ -895,11 +1096,11 @@ done
 **Solution**:
 ```bash
 # Check history length first
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 500
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 500
 
 # If insufficient, use mc_gbm (or mc_gbm_bb for short horizons)
-python cli.py forecast_barrier_prob EURUSD --timeframe H1 --horizon 10 \
-  --method mc --mc-method mc_gbm --tp-pct 0.2 --sl-pct 0.15
+mtdata-cli forecast_barrier_prob EURUSD --timeframe H1 --horizon 10 \
+  --method mc_gbm --tp-pct 0.2 --sl-pct 0.15
 ```
 
 ---
@@ -946,7 +1147,7 @@ python cli.py forecast_barrier_prob EURUSD --timeframe H1 --horizon 10 \
 --method auto
 
 # Or manually check for regimes
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=3"
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=3"
 ```
 
 ---
@@ -958,13 +1159,13 @@ python cli.py regime_detect EURUSD --timeframe H1 --method hmm --params "n_state
 **Solution**:
 - Reduce TP by spread/2
 - Increase SL by spread/2
-- Or use `tp_pips`/`sl_pips` which accounts for pip size
+- Or use `tp_ticks`/`sl_ticks` which account for tick size
 
 ```bash
-# Example: 2 pip spread on EURUSD
-python cli.py forecast_barrier_prob \
+# Example: 20/15 tick-size barriers on EURUSD
+mtdata-cli forecast_barrier_prob \
   EURUSD --timeframe M5 --horizon 12 \
-  --method mc --mc-method hmm_mc --tp_pips 20 --sl_pips 15  # RR = 1.33 after spread
+  --method hmm_mc --tp-ticks 20 --sl-ticks 15  # RR = 1.33 after spread
 ```
 
 ---
@@ -978,10 +1179,10 @@ Run multiple horizons to understand time dynamics:
 ```bash
 for H in 6 12 24 48; do
   echo "Horizon $H bars:"
-  python cli.py forecast_barrier_prob \
+  mtdata-cli forecast_barrier_prob \
     EURUSD --timeframe H1 --horizon $H \
-    --method mc --mc-method hmm_mc --tp-pct 0.5 --sl-pct 0.3 \
-    --format json | jq '{horizon: .horizon, edge: .edge, prob_resolve: (.prob_tp_first + .prob_sl_first)}'
+    --method hmm_mc --tp-pct 0.5 --sl-pct 0.3 \
+    --json | jq '{horizon: .horizon, edge: .edge, prob_resolve: (.prob_tp_first + .prob_sl_first)}'
 done
 ```
 
@@ -993,7 +1194,7 @@ Detect regimes first, then optimize per regime:
 
 ```bash
 # Detect current regime
-python cli.py regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
+mtdata-cli regime_detect EURUSD --timeframe H1 --method hmm --params "n_states=2"
 
 # If high-vol regime, use wider barriers
 # If low-vol regime, use tighter barriers
@@ -1005,7 +1206,7 @@ python cli.py regime_detect EURUSD --timeframe H1 --method hmm --params "n_state
 
 ```bash
 # Apply denoising before simulation
-python cli.py forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
+mtdata-cli forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct --grid-style preset --preset swing \
   --denoise lowpass_fft --denoise-params "cutoff_ratio=0.1"
 ```
@@ -1019,9 +1220,9 @@ Test stability of results:
 ```bash
 # Vary n_sims
 for N in 1000 2000 5000 10000; do
-  python cli.py forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
-    --method mc --mc-method hmm_mc --tp-pct 0.5 --sl-pct 0.3 --params "n_sims=$N" \
-    --format json | jq '.prob_tp_first'
+  mtdata-cli forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
+    --method hmm_mc --tp-pct 0.5 --sl-pct 0.3 --params "n_sims=$N" \
+    --json | jq '.prob_tp_first'
 done
 ```
 
@@ -1034,9 +1235,9 @@ Compare methods on same data:
 ```bash
 for METHOD in mc_gbm hmm_mc bootstrap; do
   echo "Method: $METHOD"
-  python cli.py forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
-    --method mc --mc-method $METHOD --tp-pct 0.5 --sl-pct 0.3 \
-    --format json | jq '{method: .method, edge: .edge, prob_resolve: (.prob_tp_first + .prob_sl_first)}'
+  mtdata-cli forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
+    --method $METHOD --tp-pct 0.5 --sl-pct 0.3 \
+    --json | jq '{method: .method, edge: .edge, prob_resolve: (.prob_tp_first + .prob_sl_first)}'
 done
 ```
 
@@ -1065,7 +1266,7 @@ done
 
 **Tips for speed**:
 1. Start with `mc_gbm` for screening
-2. Use `output=summary` to limit grid output
+2. Use `detail="compact"` to limit grid output
 3. Set `top_k` to limit evaluations
 4. Reduce `n_sims` for initial runs (1000), increase for final (5000+)
 
@@ -1108,14 +1309,14 @@ Validate:
 
 **Quick check**:
 ```bash
-python cli.py forecast_barrier_prob \
+mtdata-cli forecast_barrier_prob \
   EURUSD --timeframe H1 --horizon 12 \
   --method auto --tp-pct 0.5 --sl-pct 0.3
 ```
 
 **Find optimal**:
 ```bash
-python cli.py forecast_barrier_optimize \
+mtdata-cli forecast_barrier_optimize \
   EURUSD --timeframe H1 --horizon 12 \
   --method hmm_mc --mode pct --grid-style volatility \
   --refine true --objective edge
@@ -1123,7 +1324,7 @@ python cli.py forecast_barrier_optimize \
 
 **Closed-form check**:
 ```bash
-python cli.py forecast_barrier_prob \
+mtdata-cli forecast_barrier_prob \
   EURUSD --timeframe H1 --horizon 12 \
   --method closed_form --direction long --barrier 1.1000
 ```

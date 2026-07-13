@@ -1,0 +1,842 @@
+from __future__ import annotations
+
+import importlib
+from collections import namedtuple
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+import mtdata.core.market_depth as market_depth_mod
+from mtdata.core._mcp_tools import get_tool_functions, registered_tool_catalog
+from mtdata.core.market_depth import market_depth_fetch, market_ticker
+from mtdata.utils.mt5 import MT5ConnectionError
+
+
+def _raw_market_depth_fetch(symbol: str, spread: bool = False, require_dom: bool = False):
+    raw = getattr(market_depth_fetch, "__wrapped__", market_depth_fetch)
+    return raw(symbol, spread=spread, require_dom=require_dom)
+
+
+def _raw_market_ticker(symbol: str, *, detail: str = "full", price_field=None):
+    return market_ticker.__wrapped__(symbol, detail=detail, price_field=price_field)
+
+
+def _tool_catalog_row(name: str) -> dict:
+    catalog = registered_tool_catalog()
+    rows = catalog.get("tools")
+    assert isinstance(rows, list)
+    row = next(
+        (
+            item
+            for item in rows
+            if isinstance(item, dict) and item.get("name") == name
+        ),
+        None,
+    )
+    assert row is not None
+    return row
+
+
+@pytest.fixture(autouse=True)
+def _enable_market_depth(monkeypatch) -> None:
+    monkeypatch.setenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH", "1")
+
+
+def test_market_depth_tick_fallback_includes_price_display() -> None:
+    tick = SimpleNamespace(
+        bid=65601.0,
+        ask=65601.5,
+        last=65601.0,
+        volume=12,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2, currency_profit="USD")
+        mt5.market_book_get.return_value = []
+        mt5.symbol_info_tick.return_value = tick
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    assert out["type"] == "quote_fallback"
+    assert out["depth_status"] == "unavailable"
+    assert out["recommended_alternative"] == "market_ticker"
+    assert out["capabilities"]["dom_available"] is False
+    assert out["capabilities"]["depth_status"] == "unavailable"
+    assert out["capabilities"]["depth_source"] == "symbol_info_tick"
+    assert out["price_precision"] == 2
+    assert out["price_currency"] == "USD"
+    assert out["data"]["bid"] == 65601.0
+    assert out["data"]["ask"] == 65601.5
+    assert out["data"]["last"] == 65601.0
+    assert out["data"]["time"] == "2023-11-14T22:13Z"
+    assert out["data"]["time_epoch"] == 1700000000
+    assert out["units"] == {"volume": "mt5_tick_volume"}
+    assert isinstance(out.get("query_latency_ms"), float)
+
+
+def test_market_depth_tick_fallback_hides_zero_last_display() -> None:
+    tick = SimpleNamespace(
+        bid=65601.0,
+        ask=65601.5,
+        last=0.0,
+        volume=12,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_get.return_value = []
+        mt5.symbol_info_tick.return_value = tick
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    assert out["data"]["last"] is None
+    assert "last_display" not in out["data"]
+
+
+def test_market_depth_full_depth_includes_price_display() -> None:
+    depth = [
+        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": 65602.5, "volume": 2.0, "volume_real": 2.0, "type": 1},
+    ]
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_get.return_value = depth
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    assert out["type"] == "full_depth"
+    assert out["capabilities"]["dom_available"] is True
+    assert out["data"]["depth_levels"]["total"] == 2
+    assert out["price_precision"] == 2
+    assert out["data"]["buy_orders"][0]["price_display"] == "65601.00"
+    assert out["data"]["sell_orders"][0]["price_display"] == "65602.50"
+    assert out["units"]["volume"] == "book_volume"
+
+
+def test_market_depth_full_depth_accepts_mt5_bookinfo_volume_dbl() -> None:
+    BookInfo = namedtuple("BookInfo", ["type", "price", "volume", "volume_dbl"])
+    depth = [
+        BookInfo(type=0, price=65601.0, volume=1, volume_dbl=1.25),
+        BookInfo(type=1, price=65602.5, volume=2, volume_dbl=2.5),
+    ]
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_get.return_value = depth
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    assert out["data"]["depth_levels"]["total"] == 2
+    assert out["data"]["buy_orders"][0]["volume"] == 1.0
+    assert out["data"]["buy_orders"][0]["volume_real"] == 1.25
+    assert out["data"]["sell_orders"][0]["volume_real"] == 2.5
+
+
+def test_market_depth_subscribes_and_releases_book_snapshot() -> None:
+    depth = [
+        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": 65602.5, "volume": 2.0, "volume_real": 2.0, "type": 1},
+    ]
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_add.return_value = True
+        mt5.market_book_get.return_value = depth
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    mt5.market_book_add.assert_called_once_with("BTCUSD")
+    mt5.market_book_get.assert_called_once_with("BTCUSD")
+    mt5.market_book_release.assert_called_once_with("BTCUSD")
+
+
+def test_market_depth_releases_book_after_empty_snapshot() -> None:
+    tick = SimpleNamespace(
+        bid=65601.0,
+        ask=65601.5,
+        last=65601.0,
+        volume=12,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ), patch("mtdata.core.market_depth.time.sleep"):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_add.return_value = True
+        mt5.market_book_get.return_value = []
+        mt5.symbol_info_tick.return_value = tick
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    assert out["type"] == "quote_fallback"
+    mt5.market_book_add.assert_called_once_with("BTCUSD")
+    mt5.market_book_release.assert_called_once_with("BTCUSD")
+
+
+def test_market_depth_waits_for_initial_subscribed_snapshot() -> None:
+    depth = [
+        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+    ]
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.sleep"
+    ) as sleep:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_add.return_value = True
+        mt5.market_book_get.side_effect = [[], depth]
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    assert out["type"] == "full_depth"
+    assert mt5.market_book_get.call_count == 2
+    sleep.assert_called_once_with(0.01)
+    mt5.market_book_release.assert_called_once_with("BTCUSD")
+
+
+def test_market_depth_tick_fallback_includes_spread_metrics_when_requested() -> None:
+    tick = SimpleNamespace(
+        bid=100.0,
+        ask=101.0,
+        last=100.5,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+        )
+        mt5.market_book_get.return_value = []
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_depth_fetch("BTCUSD", spread=True)
+
+    assert out["success"] is True
+    assert out["data"]["spread"] == 1.0
+    assert out["data"]["spread_points"] == 100.0
+    assert abs(out["data"]["spread_pct"] - (100.0 / 100.5)) < 1e-12
+    assert out["data"]["spread_cost_per_lot"] == 100.0
+    assert out["capabilities"]["spread_overlay_applied"] is True
+
+
+def test_market_depth_compact_mode_fails_fast_without_dom() -> None:
+    tick = SimpleNamespace(
+        bid=100.0,
+        ask=101.0,
+        last=100.5,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2, point=0.01)
+        mt5.market_book_get.return_value = []
+        mt5.symbol_info_tick.return_value = tick
+
+        out = _raw_market_depth_fetch("BTCUSD", require_dom=True)
+
+    assert out["error"] == "DOM not available for BTCUSD. Use market_ticker for bid/ask snapshot instead."
+    assert out["recommended_alternative"] == "market_ticker"
+
+
+def test_market_depth_full_depth_includes_spread_metrics_when_requested() -> None:
+    depth = [
+        {"price": 100.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": 101.0, "volume": 2.0, "volume_real": 2.0, "type": 1},
+    ]
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+        )
+        mt5.market_book_get.return_value = depth
+        out = _raw_market_depth_fetch("BTCUSD", spread=True)
+
+    assert out["success"] is True
+    assert out["data"]["best_bid"] == 100.0
+    assert out["data"]["best_ask"] == 101.0
+    assert out["data"]["spread"] == 1.0
+    assert out["capabilities"]["spread_overlay_applied"] is True
+
+
+def test_market_depth_spread_overlay_skips_all_none_book_prices() -> None:
+    depth = [
+        {"price": None, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": None, "volume": 2.0, "volume_real": 2.0, "type": 1},
+    ]
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+        )
+        mt5.market_book_get.return_value = depth
+        out = _raw_market_depth_fetch("BTCUSD", spread=True)
+
+    assert out["success"] is True
+    assert "best_bid" not in out["data"]
+    assert "best_ask" not in out["data"]
+    assert "spread_overlay_applied" not in out["capabilities"]
+
+
+def test_market_ticker_returns_lightweight_spread_snapshot() -> None:
+    tick = SimpleNamespace(
+        bid=200.0,
+        ask=201.0,
+        last=200.5,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+            trade_contract_size=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("BTCUSD", detail="compact")
+
+    assert out["success"] is True
+    assert out["type"] == "quote"
+    assert out["price_currency"] == "USD"
+    assert out["bid"] == 200.0
+    assert out["ask"] == 201.0
+    assert out["spread_pct"] == 0.498753
+    assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
+    assert out["market_state"] == "unknown"
+    assert out["contract_size"] == 1.0
+    assert out["units"]["contract_size"] == "contract_units_per_lot"
+    assert out["units"]["lot"] == "broker_lot"
+    assert out["lot_definition"] == "1 broker lot equals contract_size contract units."
+    assert out["pricing_basis"] == "per_1_lot_estimate"
+    assert out["pricing_basis_units"] == "broker_lot"
+    assert out["freshness"].startswith("stale, tick ")
+    assert out["time"] == "2023-11-14T22:13Z"
+    assert "spread" not in out
+    assert "spread" not in out["units"]
+    assert "spread_points" not in out
+    assert "spread_pips" not in out
+    assert "spread_pips" not in out["units"]
+    assert "spread_pct_display" not in out
+    assert "data_stale" not in out
+    assert "data_age_seconds" not in out
+    assert "data_age_hours" not in out
+    assert "warning" not in out
+    assert "last" not in out
+    assert "tick_volume" not in out
+    assert "spread_cost_per_lot" not in out
+    assert "spread_cost_currency" not in out
+    assert "spread_display" not in out
+    assert out["meta"]["tool"] == "market_ticker"
+    assert "diagnostics" not in out["meta"]
+
+
+def test_market_ticker_uses_canonical_broker_symbol_case() -> None:
+    tick = SimpleNamespace(bid=100.0, ask=100.1, last=100.05, volume=1, time=1700000000)
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.resolve_broker_symbol_name", return_value="QQQ"
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+            trade_contract_size=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+
+        out = _raw_market_ticker("qqq", detail="compact")
+
+    assert out["symbol"] == "QQQ"
+    mt5.symbol_select.assert_called_once_with("QQQ", True)
+    mt5.symbol_info_tick.assert_called_once_with("QQQ")
+
+
+def test_market_ticker_compact_detail_omits_verbose_fields() -> None:
+    tick = SimpleNamespace(
+        bid=200.0,
+        ask=201.0,
+        last=200.5,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+            trade_contract_size=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("BTCUSD", detail="compact")
+
+    assert out["success"] is True
+    assert out["type"] == "quote"
+    assert out["price_currency"] == "USD"
+    assert out["bid"] == 200.0
+    assert out["ask"] == 201.0
+    assert out["spread_pct"] == 0.498753
+    assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
+    assert out["market_state"] == "unknown"
+    assert out["contract_size"] == 1.0
+    assert out["freshness"].startswith("stale, tick ")
+    assert "spread_display" not in out
+    assert "spread" not in out
+    assert "spread_points" not in out
+    assert "spread_pips" not in out
+    assert "spread_pct_display" not in out
+    assert "last" not in out
+    assert "tick_volume" not in out
+    assert out["time"] == "2023-11-14T22:13Z"
+    assert "time_display" not in out
+    assert "data_stale" not in out
+    assert out["stale_after_seconds"] == 300
+    assert "freshness_basis" not in out
+    assert "data_age" not in out
+    assert "warning" not in out
+    assert "spread_cost_per_lot" not in out
+    assert "spread_cost_currency" not in out
+    assert "diagnostics" not in out
+    assert out["meta"]["tool"] == "market_ticker"
+
+
+def test_market_ticker_none_detail_uses_compact_output() -> None:
+    tick = SimpleNamespace(
+        bid=200.0,
+        ask=201.0,
+        last=200.5,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+            trade_contract_size=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("BTCUSD", detail=None)
+
+    assert out["success"] is True
+    assert out["spread_pct"] == 0.498753
+    assert out["market_state"] == "unknown"
+    assert out["contract_size"] == 1.0
+    assert "spread" not in out
+    assert "diagnostics" not in out
+    assert "spread_cost_per_lot" not in out
+
+
+def test_market_ticker_price_field_returns_simple_price() -> None:
+    tick = SimpleNamespace(
+        bid=1.17221,
+        ask=1.17237,
+        last=1.17230,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("EURUSD", price_field="mid")
+
+    assert out["success"] is True
+    assert out["type"] == "price"
+    assert out["field"] == "mid"
+    assert out["price"] == pytest.approx(1.17229)
+    assert out["price_precision"] == 5
+    assert out["price_currency"] == "USD"
+    assert out["time_display"] == "2023-11-14T22:13Z"
+    assert out["data_age_seconds"] >= 0
+    assert out["stale_after_seconds"] == 300
+    assert out["data_stale"] is True
+    assert out["freshness_basis"] == "absolute_300s"
+    assert "bid" not in out
+    assert "spread_pips" not in out
+    assert out["meta"]["tool"] == "market_ticker"
+
+
+def test_market_ticker_reports_weekend_relaxed_freshness_basis() -> None:
+    tick = SimpleNamespace(bid=1.1, ask=1.2, last=1.15, volume=5, time=100.0)
+    freshness = {
+        "data_age_seconds": 1000,
+        "data_stale": False,
+        "stale_after_seconds": 300,
+        "freshness_policy_relaxed": True,
+        "freshness_basis": "weekend_relaxed_max_3d",
+    }
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.build_tick_freshness_context",
+        return_value=freshness,
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("EURUSD", price_field="mid")
+
+    assert out["freshness_basis"] == "weekend_relaxed_max_3d"
+
+
+def test_market_ticker_price_field_reports_unavailable_last() -> None:
+    tick = SimpleNamespace(
+        bid=1.1,
+        ask=1.2,
+        last=0.0,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("EURUSD", price_field="last")
+
+    assert out["error"] == "last price is unavailable for EURUSD."
+    assert out["success"] is False
+    assert out["error_code"] == "market_ticker_price_unavailable"
+    assert out["operation"] == "market_ticker"
+    assert out["request_id"]
+    assert "Use bid, ask, mid, or spread" in out["remediation"]
+    assert out["meta"]["tool"] == "market_ticker"
+
+
+def test_market_ticker_full_detail_preserves_verbose_fields() -> None:
+    tick = SimpleNamespace(
+        bid=200.0,
+        ask=201.0,
+        last=200.5,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+            trade_contract_size=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("BTCUSD", detail="full")
+
+    assert out["last"] == 200.5
+    assert out["tick_volume"] == 5
+    assert out["spread_cost_per_lot"] == 100.0
+    assert out["spread_cost_currency"] == "USD"
+    assert out["pricing_basis"] == "per_1_lot_estimate"
+    assert out["contract_size"] == 1.0
+    assert out["pricing_basis_units"] == "broker_lot"
+    assert out["units"]["contract_size"] == "contract_units_per_lot"
+    assert out["meta"]["diagnostics"]["source"] == "mt5.symbol_info_tick"
+
+
+def test_market_ticker_full_detail_rounds_age_fields() -> None:
+    tick = SimpleNamespace(
+        bid=1.17221,
+        ask=1.17237,
+        last=1.17230,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ), patch("mtdata.core.market_depth.time.time", return_value=1700000034.670966):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("EURUSD", detail="full")
+
+    assert out["data_age_seconds"] == 34.7
+    assert out["stale_after_seconds"] == 300
+    assert "data_age_hours" not in out
+    assert out["meta"]["diagnostics"]["data_freshness_seconds"] == 34.7
+
+
+def test_market_ticker_treats_weekend_gap_as_closed_market() -> None:
+    tick = SimpleNamespace(
+        bid=1.17221,
+        ask=1.17237,
+        last=1.17230,
+        volume=5,
+        time=1779483360,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ), patch("mtdata.core.market_depth.time.time", return_value=1779656340.0):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("EURUSD", detail="full")
+
+    assert out["data_stale"] is True
+    assert out["usable_for_live_trading"] is False
+    assert out["market_status"] == "closed"
+    assert out["market_status_reason"] == "weekend"
+    assert "latest completed session tick" in out["note"]
+    assert "warning" in out
+
+
+def test_market_ticker_includes_shared_meta_without_dropping_timezone_alias() -> None:
+    tick = SimpleNamespace(
+        bid=200.0,
+        ask=201.0,
+        last=200.5,
+        volume=5,
+        time=1700000000,
+    )
+    timezone_meta = {"used": {"tz": "UTC"}}
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ), patch(
+        "mtdata.core.output_contract.build_runtime_timezone_meta",
+        return_value=timezone_meta,
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("BTCUSD")
+
+    assert out["timezone"] == "UTC"
+    assert out["meta"]["tool"] == "market_ticker"
+    assert out["meta"]["runtime"]["timezone"] == timezone_meta
+
+
+def test_market_ticker_rounds_tick_precision_noise() -> None:
+    tick = SimpleNamespace(
+        bid=1.17581,
+        ask=1.1758999999999235,
+        last=1.175856,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("EURUSD", detail="compact")
+
+    assert out["bid"] == 1.17581
+    assert out["ask"] == 1.1759
+    assert out["spread_pips"] == 0.9
+    assert out["units"]["spread_pips"] == "pips"
+    assert "spread" not in out
+    assert "spread_points" not in out
+    assert "last" not in out
+    assert "spread_display" not in out
+    assert "spread_pct" not in out
+
+
+def test_market_depth_returns_connection_error_payload() -> None:
+    with patch(
+        "mtdata.core.market_depth.ensure_mt5_connection_or_raise",
+        side_effect=MT5ConnectionError("Failed to connect to MetaTrader5. Ensure MT5 terminal is running."),
+    ):
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out == {"error": "Failed to connect to MetaTrader5. Ensure MT5 terminal is running."}
+
+
+def test_market_depth_returns_env_gate_error_when_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH", raising=False)
+
+    out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["error"] == (
+        "market_depth_fetch is disabled. "
+        "Set MTDATA_ENABLE_MARKET_DEPTH_FETCH=1 to enable it."
+    )
+    assert out["recommended_alternative"] == "market_ticker"
+
+
+def test_market_depth_help_discloses_enablement_env() -> None:
+    assert "MTDATA_ENABLE_MARKET_DEPTH_FETCH=1" in market_depth_fetch.__doc__
+
+
+def test_tools_catalog_marks_market_depth_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH", raising=False)
+
+    row = _tool_catalog_row("market_depth_fetch")
+
+    assert row["category"] == "market"
+    assert row["enabled"] is False
+    assert row["status"] == "disabled"
+    assert row["enable_env"] == "MTDATA_ENABLE_MARKET_DEPTH_FETCH"
+    assert row["recommended_alternative"] == "market_ticker"
+
+
+def test_tools_catalog_marks_market_depth_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH", "1")
+
+    row = _tool_catalog_row("market_depth_fetch")
+
+    assert row["enabled"] is True
+    assert row["enable_env"] == "MTDATA_ENABLE_MARKET_DEPTH_FETCH"
+    assert "status" not in row
+
+
+def test_market_depth_tool_not_registered_when_env_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH", raising=False)
+    reloaded = importlib.reload(market_depth_mod)
+    try:
+        assert "market_depth_fetch" not in get_tool_functions()
+    finally:
+        monkeypatch.setenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH", "1")
+        importlib.reload(reloaded)
+
+
+def test_market_ticker_logs_finish_event(caplog) -> None:
+    tick = SimpleNamespace(
+        bid=200.0,
+        ask=201.0,
+        last=200.5,
+        volume=5,
+        time=1700000000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth._use_client_tz", return_value=False
+    ), caplog.at_level("DEBUG", logger="mtdata.core.market_depth"):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        out = _raw_market_ticker("BTCUSD")
+
+    assert out["success"] is True
+    assert any(
+        "event=finish operation=market_ticker success=True" in record.message
+        for record in caplog.records
+    )
+
+
+def test_market_ticker_rewrites_invalid_symbol_selection_error() -> None:
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = False
+        mt5.last_error.return_value = (-1, "Terminal: Call failed")
+
+        out = _raw_market_ticker("FAKESYMBOL")
+
+    assert out["error"] == "Symbol 'FAKESYMBOL' was not found or is not available in MT5."
+    assert out["success"] is False
+    assert out["error_code"] == "market_ticker_symbol_unavailable"
+    assert out["operation"] == "market_ticker"
+    assert out["request_id"]
+    assert "symbols_list(search_term='FAKESYMBOL')" in out["remediation"]
+    assert "symbols_search" not in out["remediation"]
+
+
+def test_market_ticker_rejects_empty_quote_snapshot() -> None:
+    tick = SimpleNamespace(bid=0.0, ask=0.0, last=0.0, volume=0, time=0)
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+        )
+        mt5.symbol_info_tick.return_value = tick
+
+        out = _raw_market_ticker("AAPL")
+
+    assert out["success"] is False
+    assert out["error_code"] == "market_ticker_quote_unavailable"
+    assert "No usable quote data for AAPL" in out["error"]
+    assert "symbols_list(search_term='AAPL')" in out["error"]
+    assert out["operation"] == "market_ticker"

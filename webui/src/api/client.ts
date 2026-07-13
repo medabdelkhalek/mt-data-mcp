@@ -1,6 +1,7 @@
 import axios, { AxiosError } from 'axios'
 import type {
   HistoryBar,
+  HistoryResponse,
   Instrument,
   Tick,
   MethodsMeta,
@@ -23,8 +24,13 @@ import type {
 // Use environment variable or default to empty (same origin)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const baseURL = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE) || ''
+const API_PREFIX = '/api/v1'
 
 export const api = axios.create({ baseURL })
+
+function apiPath(path: string): string {
+  return `${API_PREFIX}${path}`
+}
 
 /**
  * Standardized error extraction from axios errors.
@@ -44,13 +50,14 @@ export function getErrorMessage(error: unknown): string {
 // ============================================================================
 
 export async function getTimeframes(): Promise<string[]> {
-  const { data } = await api.get<{ timeframes: string[] }>('/api/timeframes')
+  const { data } = await api.get<{ timeframes: string[] }>(apiPath('/timeframes'))
   return data.timeframes ?? []
 }
 
-export async function searchInstruments(search?: string, limit?: number): Promise<Instrument[]> {
-  const { data } = await api.get<{ items: Instrument[] }>('/api/instruments', {
+export async function searchInstruments(search?: string, limit?: number, signal?: AbortSignal): Promise<Instrument[]> {
+  const { data } = await api.get<{ items: Instrument[] }>(apiPath('/instruments'), {
     params: { search, limit },
+    signal,
   })
   return data.items ?? []
 }
@@ -69,15 +76,7 @@ export type HistoryParams = {
   include_incomplete?: boolean
 }
 
-export type HistoryResponse = {
-  success: boolean
-  bars: HistoryBar[]
-  meta?: {
-    server_tz_offset: number
-  }
-}
-
-export async function getHistory(params: HistoryParams): Promise<HistoryResponse> {
+export async function getHistory(params: HistoryParams, signal?: AbortSignal): Promise<HistoryResponse> {
   const query: Record<string, unknown> = {
     symbol: params.symbol,
     timeframe: params.timeframe,
@@ -85,6 +84,7 @@ export async function getHistory(params: HistoryParams): Promise<HistoryResponse
     start: params.start,
     end: params.end,
     include_incomplete: params.include_incomplete,
+    timestamp_format: 'epoch',
   }
 
   const dn = params.denoise
@@ -101,16 +101,15 @@ export async function getHistory(params: HistoryParams): Promise<HistoryResponse
     }
   }
 
-  const { data } = await api.get<{ bars: HistoryBar[], meta?: { server_tz_offset: number } }>('/api/history', { params: query })
+  const { data } = await api.get<HistoryResponse>(apiPath('/history'), { params: query, signal })
   return {
-    success: true,
-    bars: data.bars ?? [],
-    meta: data.meta
+    ...data,
+    data: data.data ?? [],
   }
 }
 
-export async function getTick(symbol: string): Promise<Tick> {
-  const { data } = await api.get<Tick>('/api/tick', { params: { symbol } })
+export async function getTick(symbol: string, signal?: AbortSignal): Promise<Tick> {
+  const { data } = await api.get<Tick>(apiPath('/tick'), { params: { symbol }, signal })
   return data
 }
 
@@ -119,32 +118,32 @@ export async function getTick(symbol: string): Promise<Tick> {
 // ============================================================================
 
 export async function getMethods(): Promise<MethodsMeta> {
-  const { data } = await api.get<MethodsMeta>('/api/methods')
+  const { data } = await api.get<MethodsMeta>(apiPath('/methods'))
   return data
 }
 
 export async function getVolatilityMethods(): Promise<VolatilityMethodsMeta> {
-  const { data } = await api.get<VolatilityMethodsMeta>('/api/volatility/methods')
+  const { data } = await api.get<VolatilityMethodsMeta>(apiPath('/volatility/methods'))
   return data
 }
 
 export async function getDenoiseMethods(): Promise<DenoiseMethodsMeta> {
-  const { data } = await api.get<DenoiseMethodsMeta>('/api/denoise/methods')
+  const { data } = await api.get<DenoiseMethodsMeta>(apiPath('/denoise/methods'))
   return data
 }
 
 export async function getDimredMethods(): Promise<DimredMethodsMeta> {
-  const { data } = await api.get<DimredMethodsMeta>('/api/dimred/methods')
+  const { data } = await api.get<DimredMethodsMeta>(apiPath('/dimred/methods'))
   return data
 }
 
 export async function getWavelets(): Promise<WaveletsResponse> {
-  const { data } = await api.get<WaveletsResponse>('/api/denoise/wavelets')
+  const { data } = await api.get<WaveletsResponse>(apiPath('/denoise/wavelets'))
   return data
 }
 
 export async function getSktimeEstimators(): Promise<SktimeEstimatorsResponse> {
-  const { data } = await api.get<SktimeEstimatorsResponse>('/api/sktime/estimators')
+  const { data } = await api.get<SktimeEstimatorsResponse>(apiPath('/sktime/estimators'))
   return data
 }
 
@@ -153,17 +152,17 @@ export async function getSktimeEstimators(): Promise<SktimeEstimatorsResponse> {
 // ============================================================================
 
 export async function forecastPrice(body: ForecastPriceBody): Promise<ForecastPayload> {
-  const { data } = await api.post<ForecastPayload>('/api/forecast/price', body)
+  const { data } = await api.post<ForecastPayload>(apiPath('/forecast/price'), body)
   return data
 }
 
 export async function forecastVolatility(body: ForecastVolBody): Promise<VolatilityPayload> {
-  const { data } = await api.post<VolatilityPayload>('/api/forecast/volatility', body)
+  const { data } = await api.post<VolatilityPayload>(apiPath('/forecast/volatility'), body)
   return data
 }
 
 export async function runBacktest(body: BacktestBody): Promise<BacktestResult> {
-  const { data } = await api.post<BacktestResult>('/api/backtest', body)
+  const { data } = await api.post<BacktestResult>(apiPath('/backtest'), body)
   return data
 }
 
@@ -178,23 +177,29 @@ export type PivotParams = {
 }
 
 export async function getPivots(params: PivotParams): Promise<PivotResponse> {
-  const { data } = await api.get<PivotResponse>('/api/pivots', { params })
+  const { data } = await api.get<PivotResponse>(apiPath('/pivots'), { params })
   return data
 }
 
 export type SupportResistanceParams = {
   symbol: string
-  timeframe: string
+  timeframe?: string
+  lookback?: number
   limit?: number
   tolerance_pct?: number
   min_touches?: number
   max_levels?: number
+  max_distance_pct?: number
+  volume_weighting?: 'off' | 'auto'
+  reaction_bars?: number
+  adx_period?: number
+  decay_half_life_bars?: number
 }
 
 export async function getSupportResistance(
   params: SupportResistanceParams
 ): Promise<SupportResistanceResponse> {
-  const { data } = await api.get<SupportResistanceResponse>('/api/support-resistance', { params })
+  const { data } = await api.get<SupportResistanceResponse>(apiPath('/support-resistance'), { params })
   return data
 }
 
@@ -203,6 +208,6 @@ export async function getSupportResistance(
 // ============================================================================
 
 export async function healthCheck(): Promise<{ service: string; status: string }> {
-  const { data } = await api.get<{ service: string; status: string }>('/')
+  const { data } = await api.get<{ service: string; status: string }>(apiPath('/health'))
   return data
 }

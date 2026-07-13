@@ -1,0 +1,229 @@
+"""Tests for src/mtdata/utils/utils.py — pure utility functions."""
+import math
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from mtdata.utils.time import (
+    _format_datetime_second_explicit,
+    _format_time_explicit,
+    _format_time_minimal,
+)
+from mtdata.utils.utils import (
+    coerce_scalar,
+    _normalize_limit,
+    _normalize_ohlcv_arg,
+    _safe_float,
+    _table_from_rows,
+    _utc_epoch_seconds,
+    align_finite,
+    to_float_np,
+)
+
+
+class TestSafeFloat:
+    def test_returns_finite_float(self):
+        assert _safe_float("2.5") == 2.5
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "   ", float("nan"), float("inf"), float("-inf"), "nan", "inf"],
+    )
+    def test_rejects_missing_blank_and_non_finite_values(self, value):
+        assert _safe_float(value) is None
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("2.5", 2.5), (" 2.5 ", 2.5), (3, 3.0), (True, 1.0)],
+    )
+    def test_coerces_numeric_values(self, value, expected):
+        assert _safe_float(value) == expected
+
+    def test_rejects_non_finite_values(self):
+        assert _safe_float(float("nan")) is None
+        assert _safe_float(float("inf")) is None
+
+    def test_uses_default_when_conversion_fails(self):
+        assert _safe_float("abc", default=1.25) == 1.25
+
+    @pytest.mark.parametrize("value", [None, "", "   ", "nan", float("inf"), "abc"])
+    def test_uses_default_for_all_uncoercible_values(self, value):
+        assert _safe_float(value, default=1.25) == 1.25
+
+
+class TestCoerceScalar:
+    def test_none(self):
+        assert coerce_scalar(None) is None
+
+    def test_empty_string(self):
+        assert coerce_scalar("") == ""
+
+    def test_int_string(self):
+        assert coerce_scalar("42") == 42
+
+    def test_negative_int_string(self):
+        assert coerce_scalar("-7") == -7
+
+    def test_float_string(self):
+        result = coerce_scalar("3.14")
+        assert isinstance(result, float)
+        assert abs(result - 3.14) < 1e-9
+
+    def test_non_numeric(self):
+        assert coerce_scalar("hello") == "hello"
+
+    def test_whitespace_padded(self):
+        assert coerce_scalar("  5  ") == 5
+
+    def test_zero(self):
+        assert coerce_scalar("0") == 0
+
+
+class TestNormalizeOhlcvArg:
+    def test_none_returns_none(self):
+        assert _normalize_ohlcv_arg(None) is None
+
+    def test_empty_returns_none(self):
+        assert _normalize_ohlcv_arg("") is None
+
+    def test_all(self):
+        assert _normalize_ohlcv_arg("all") == {"O", "H", "L", "C", "V"}
+
+    def test_ohlcv(self):
+        assert _normalize_ohlcv_arg("ohlcv") == {"O", "H", "L", "C", "V"}
+
+    def test_ohlc(self):
+        assert _normalize_ohlcv_arg("ohlc") == {"O", "H", "L", "C"}
+
+    def test_price(self):
+        assert _normalize_ohlcv_arg("price") == {"C"}
+
+    def test_close(self):
+        assert _normalize_ohlcv_arg("close") == {"C"}
+
+    def test_compact_letters(self):
+        assert _normalize_ohlcv_arg("cl") == {"C", "L"}
+
+    def test_comma_separated_names(self):
+        result = _normalize_ohlcv_arg("open,high,close")
+        assert result == {"O", "H", "C"}
+
+    def test_semicolon_separated(self):
+        result = _normalize_ohlcv_arg("open;volume")
+        assert result == {"O", "V"}
+
+    def test_unknown_names_return_none(self):
+        assert _normalize_ohlcv_arg("foo,bar") is None
+
+
+class TestNormalizeLimit:
+    def test_none_returns_none(self):
+        assert _normalize_limit(None) is None
+
+    def test_positive_int(self):
+        assert _normalize_limit(10) == 10
+
+    def test_zero_returns_none(self):
+        assert _normalize_limit(0) is None
+
+    def test_negative_returns_none(self):
+        assert _normalize_limit(-5) is None
+
+    def test_float_truncated(self):
+        assert _normalize_limit(3.9) == 3
+
+    def test_string_number(self):
+        assert _normalize_limit("7") == 7
+
+    def test_empty_string(self):
+        assert _normalize_limit("") is None
+
+    def test_invalid_string(self):
+        assert _normalize_limit("abc") is None
+
+
+class TestTableFromRows:
+    def test_basic_table(self):
+        result = _table_from_rows(["a", "b"], [[1, 2], [3, 4]])
+        assert result["success"] is True
+        assert result["count"] == 2
+        assert result["data"][0] == {"a": 1, "b": 2}
+
+    def test_empty_rows(self):
+        result = _table_from_rows(["x"], [])
+        assert result["count"] == 0
+        assert result["data"] == []
+
+    def test_short_row_padded_with_none(self):
+        result = _table_from_rows(["a", "b", "c"], [[1]])
+        assert result["data"][0] == {"a": 1, "b": None, "c": None}
+
+
+class TestFormatTimeMinimal:
+    def test_epoch_zero(self):
+        result = _format_time_minimal(0)
+        assert result == "1970-01-01T00:00Z"
+
+    def test_known_timestamp(self):
+        result = _format_time_minimal(1704067200)  # 2024-01-01 00:00 UTC
+        assert "2024-01-01" in result
+
+    def test_explicit_utc_timestamp_has_timezone_marker(self):
+        result = _format_time_explicit(1704067200)
+        assert result == "2024-01-01T00:00Z"
+
+    def test_explicit_second_timestamp_assumes_utc_for_naive_datetime(self):
+        result = _format_datetime_second_explicit(datetime(2024, 1, 1, 12, 30, 45))
+        assert result == "2024-01-01T12:30:45Z"
+
+class TestToFloatNp:
+    def test_list_of_ints(self):
+        result = to_float_np([1, 2, 3])
+        np.testing.assert_array_equal(result, [1.0, 2.0, 3.0])
+
+    def test_series(self):
+        s = pd.Series([1.5, 2.5])
+        result = to_float_np(s)
+        np.testing.assert_array_almost_equal(result, [1.5, 2.5])
+
+    def test_drop_na(self):
+        result = to_float_np([1.0, float('nan'), 3.0], drop_na=True)
+        np.testing.assert_array_equal(result, [1.0, 3.0])
+
+    def test_finite_only(self):
+        result = to_float_np([1.0, float('inf'), 3.0], finite_only=True)
+        np.testing.assert_array_equal(result, [1.0, 3.0])
+
+    def test_return_mask(self):
+        arr, mask = to_float_np([1.0, 2.0], return_mask=True)
+        assert len(arr) == 2
+        assert all(mask)
+
+    def test_coerce_strings(self):
+        result = to_float_np(["1", "abc", "3"], coerce=True, drop_na=True)
+        np.testing.assert_array_equal(result, [1.0, 3.0])
+
+
+class TestAlignFinite:
+    def test_basic_alignment(self):
+        a, b = align_finite([1, float('nan'), 3], [4, 5, 6])
+        np.testing.assert_array_equal(a, [1.0, 3.0])
+        np.testing.assert_array_equal(b, [4.0, 6.0])
+
+    def test_empty_input(self):
+        result = align_finite()
+        assert result == ()
+
+
+class TestUtcEpochSeconds:
+    def test_naive_datetime(self):
+        dt = datetime(2024, 1, 1, 0, 0, 0)
+        result = _utc_epoch_seconds(dt)
+        assert abs(result - 1704067200.0) < 1.0
+
+    def test_aware_datetime(self):
+        dt = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        result = _utc_epoch_seconds(dt)
+        assert abs(result - 1704067200.0) < 1.0

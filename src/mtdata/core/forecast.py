@@ -1,566 +1,1159 @@
-from typing import Any, Dict, Optional, List, Literal, Tuple
-
-from .schema import TimeframeLiteral, DenoiseSpec, ForecastLibraryLiteral, ForecastMethodLiteral
-from .server import mcp, _auto_connect_wrapper
-from ..forecast.forecast import forecast as _forecast_impl
-from ..forecast.backtest import forecast_backtest as _forecast_backtest_impl
-from ..forecast.volatility import forecast_volatility as _forecast_volatility_impl
-from ..forecast.forecast import get_forecast_methods_data as _get_forecast_methods_data
-from ..forecast.tune import genetic_search_forecast_params as _genetic_search_impl
-from ..utils.utils import parse_kv_or_json as _parse_kv_or_json
-from ..utils.barriers import build_barrier_kwargs_from as _build_barrier_kwargs_from
-
+import io
+import logging
+import multiprocessing as mp
+import os
+import time
+import traceback
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from functools import lru_cache
-import difflib
+from importlib import import_module
+from typing import Any, Dict, List, Literal, Optional
+
+from ..forecast.barriers_shared import (
+    BARRIER_MONTE_CARLO_METHODS,
+)
+from ..forecast.exceptions import ForecastError
+from ..forecast.requests import (
+    ForecastBacktestRequest,
+    ForecastBarrierOptimizeRequest,
+    ForecastBarrierProbRequest,
+    ForecastConformalIntervalsRequest,
+    ForecastGenerateRequest,
+    ForecastOptimizeHintsRequest,
+    ForecastTuneGeneticRequest,
+    ForecastTuneOptunaRequest,
+    ForecastVolatilityEstimateRequest,
+    StrategyBacktestRequest,
+)
+from ..shared.schema import DetailLiteral
+from ..utils.barriers import (
+    build_barrier_kwargs_from as _build_barrier_kwargs_from,
+)
+from ..utils.barriers import (
+    normalize_trade_direction,
+)
+from ..utils.coercion import is_explicit_false as _is_explicit_false
+from ..utils.mt5 import ensure_mt5_connection_or_raise
+from ..utils.utils import parse_kv_or_json as _parse_kv_or_json
+from ._mcp_instance import mcp
+from .error_envelope import build_error_payload
+from .execution_logging import run_logged_operation
+from .mt5_gateway import create_mt5_gateway, mt5_connection_error
+from .output_contract import build_pagination_meta
+
+logger = logging.getLogger(__name__)
+
+_FORECAST_PROCESS_ISOLATION_ENV = "MTDATA_FORECAST_PROCESS_ISOLATION"
+_FORECAST_PROCESS_TIMEOUT_ENV = "MTDATA_FORECAST_PROCESS_TIMEOUT_SECONDS"
+_FORECAST_PROCESS_CHILD_ENV = "MTDATA_FORECAST_PROCESS_CHILD"
+_FORECAST_PROCESS_ISOLATION_DEFAULT = "gpu"
+_FORECAST_LIBRARY_MODELS_COMPACT_LIMIT = 20
+_FORECAST_ISOLATABLE_OPERATIONS = frozenset(
+    {
+        "forecast_generate",
+        "forecast_list_library_models",
+        "forecast_backtest_run",
+        "strategy_backtest",
+        "forecast_volatility_estimate",
+        "forecast_list_methods",
+        "forecast_conformal_intervals",
+        "forecast_tune_genetic",
+        "forecast_tune_optuna",
+        "forecast_optimize_hints",
+        "forecast_barrier_prob",
+        "forecast_barrier_optimize",
+    }
+)
+_FORECAST_CONNECTION_REQUIRED_OPERATIONS = frozenset(
+    {
+        "forecast_generate",
+        "forecast_backtest_run",
+        "strategy_backtest",
+        "forecast_volatility_estimate",
+        "forecast_conformal_intervals",
+        "forecast_tune_genetic",
+        "forecast_tune_optuna",
+        "forecast_optimize_hints",
+        "forecast_barrier_prob",
+        "forecast_barrier_optimize",
+    }
+)
+_FORECAST_QUICKSTART_METHODS = frozenset(
+    {
+        "analog",
+        "drift",
+        "fourier_ols",
+        "mc_gbm",
+        "naive",
+        "seasonal_naive",
+        "theta",
+    }
+)
+_FORECAST_METHOD_PROFILES = {
+    "all": None,
+    "quickstart": _FORECAST_QUICKSTART_METHODS,
+    "core": _FORECAST_QUICKSTART_METHODS,
+}
+
+_FORECAST_TIMESTAMP_OPERATIONS = frozenset(
+    {
+        "forecast_generate",
+        "forecast_backtest_run",
+        "forecast_conformal_intervals",
+        "forecast_volatility_estimate",
+    }
+)
+_FORECAST_HEAVY_OPERATIONS = frozenset(
+    {
+        "forecast_tune_genetic",
+        "forecast_tune_optuna",
+        "forecast_optimize_hints",
+    }
+)
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _value_count(value: Any, default: int = 1) -> int:
+    if isinstance(value, (list, tuple, set)):
+        return max(1, len(value))
+    if value in (None, "", {}):
+        return default
+    return 1
+
+
+def _forecast_compute_cost(operation: str, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if operation not in _FORECAST_HEAVY_OPERATIONS:
+        return None
+    data = dict(payload or {})
+    steps = _positive_int(data.get("steps"), 5)
+    method_count = _value_count(data.get("methods") or data.get("method"), 1)
+    if operation == "forecast_tune_optuna":
+        trials = _positive_int(data.get("n_trials"), 40)
+        return {
+            "unit": "rolling_backtests",
+            "estimated": trials * steps * method_count,
+            "drivers": "n_trials*steps*methods",
+        }
+    population = _positive_int(data.get("population"), 8 if operation == "forecast_optimize_hints" else 12)
+    generations = _positive_int(data.get("generations"), 5 if operation == "forecast_optimize_hints" else 10)
+    timeframes = _value_count(data.get("timeframes") or data.get("timeframe"), 4 if operation == "forecast_optimize_hints" else 1)
+    return {
+        "unit": "rolling_backtests",
+        "estimated": population * generations * steps * method_count * timeframes,
+        "drivers": "population*generations*steps*methods*timeframes",
+    }
+
+
+def _attach_forecast_compute_hint(
+    result: Dict[str, Any],
+    *,
+    operation: str,
+    payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    cost = _forecast_compute_cost(operation, payload)
+    if cost is None or not isinstance(result, dict) or result.get("error"):
+        return result
+    out = dict(result)
+    out.setdefault("compute_intensity", "high")
+    out.setdefault("compute_cost", cost)
+    return out
+
+
+def _attach_timezone(result: Dict[str, Any], *, operation: str) -> Dict[str, Any]:
+    if (
+        operation in _FORECAST_TIMESTAMP_OPERATIONS
+        and isinstance(result, dict)
+        and "error" not in result
+    ):
+        result.setdefault("timezone", "UTC")
+        result.pop("timestamp_timezone", None)
+    return result
+
+
+def _forecast_process_isolation_mode() -> str:
+    """Return process-isolation mode: off | gpu | all.
+
+    Isolation uses ``multiprocessing`` spawn (required on Windows). Spawned
+    children re-initialize independently and cannot share the parent's MT5
+    terminal connection. Operations that need live MT5 data in the child will
+    re-call ``ensure_mt5_connection_or_raise()``; concurrent parent+child MT5
+    use can fail on Windows. Prefer ``MTDATA_FORECAST_PROCESS_ISOLATION=off``
+    when only MT5-backed classical methods run, or keep the default ``gpu`` so
+    only GPU/heavy paths isolate (still re-connects MT5 in the child if needed).
+    """
+    raw = os.environ.get(
+        _FORECAST_PROCESS_ISOLATION_ENV,
+        _FORECAST_PROCESS_ISOLATION_DEFAULT,
+    )
+    mode = str(raw or "").strip().lower()
+    if mode in {"", "auto"}:
+        return _FORECAST_PROCESS_ISOLATION_DEFAULT
+    if mode in {"0", "false", "no", "off", "none", "disabled"}:
+        return "off"
+    if mode in {"1", "true", "yes", "on", "all", "always"}:
+        return "all"
+    if mode == "gpu":
+        return "gpu"
+    logger.warning(
+        "Invalid %s=%r; using %s",
+        _FORECAST_PROCESS_ISOLATION_ENV,
+        raw,
+        _FORECAST_PROCESS_ISOLATION_DEFAULT,
+    )
+    return _FORECAST_PROCESS_ISOLATION_DEFAULT
+
+
+def _forecast_process_timeout_seconds() -> Optional[float]:
+    raw = os.environ.get(_FORECAST_PROCESS_TIMEOUT_ENV)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; forecast child processes will not be time-limited", _FORECAST_PROCESS_TIMEOUT_ENV, raw)
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _in_forecast_process_child() -> bool:
+    return os.environ.get(_FORECAST_PROCESS_CHILD_ENV) == "1"
+
+
+def _model_payload(request: Any) -> Dict[str, Any]:
+    dump = getattr(request, "model_dump", None)
+    if callable(dump):
+        return dict(dump(mode="json"))
+    return dict(request or {})
+
+
+def _is_pretrained_gpu_request(payload: Dict[str, Any]) -> bool:
+    library = str(payload.get("library") or "native").strip().lower()
+    method = str(payload.get("method") or "").strip().lower()
+    if library == "pretrained":
+        return True
+    if method.startswith("pretrained:"):
+        return True
+    return False
+
+
+def _forecast_payload_may_use_gpu(operation: str, payload: Dict[str, Any]) -> bool:
+    try:
+        from ..forecast.gpu_runtime import (
+            forecast_method_may_use_gpu,
+            forecast_methods_may_use_gpu,
+        )
+
+        if operation == "forecast_generate":
+            method = payload.get("method")
+            if _is_pretrained_gpu_request(payload):
+                method = method or "chronos2"
+            return forecast_method_may_use_gpu(method, payload.get("params"))
+
+        if operation == "forecast_backtest_run":
+            return forecast_methods_may_use_gpu(
+                payload.get("methods"),
+                params_per_method=payload.get("params_per_method"),
+                params=payload.get("params"),
+            )
+
+        if operation == "forecast_conformal_intervals":
+            return forecast_method_may_use_gpu(payload.get("method"), payload.get("params"))
+
+        if operation in {"forecast_tune_genetic", "forecast_tune_optuna"}:
+            methods = payload.get("methods") or payload.get("method")
+            return forecast_methods_may_use_gpu(methods, params=payload.get("params"))
+
+        if operation == "forecast_optimize_hints":
+            methods = payload.get("methods")
+            if not methods:
+                return True
+            return forecast_methods_may_use_gpu(methods)
+    except Exception as exc:
+        logger.debug("Forecast process-isolation GPU detection failed for %s: %s", operation, exc)
+    return False
+
+
+def _should_isolate_forecast_operation(operation: str, payload: Optional[Dict[str, Any]]) -> bool:
+    # Note: spawn isolation does not inherit the parent MT5 session. On Windows
+    # (spawn is the only start method) the child must open its own MT5 handle;
+    # running MT5-heavy work in parent and child concurrently is unsupported.
+    if _in_forecast_process_child():
+        return False
+    if operation not in _FORECAST_ISOLATABLE_OPERATIONS:
+        return False
+    mode = _forecast_process_isolation_mode()
+    if mode == "off":
+        return False
+    if mode == "all":
+        return True
+    return _forecast_payload_may_use_gpu(operation, dict(payload or {}))
+
+
+def _send_forecast_process_message(channel: Any, message: Dict[str, Any]) -> None:
+    send = getattr(channel, "send", None)
+    if callable(send):
+        send(message)
+        return
+    put = getattr(channel, "put", None)
+    if callable(put):
+        put(message)
+        return
+    raise RuntimeError("Invalid forecast child result channel")
+
+
+@contextmanager
+def _suppress_forecast_child_side_output():
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    previous_disable = logging.root.manager.disable
+    env_updates = {
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "TRANSFORMERS_VERBOSITY": "error",
+        "TQDM_DISABLE": "1",
+    }
+    previous_env: Dict[str, Optional[str]] = {}
+    missing_env: set[str] = set()
+    for key, value in env_updates.items():
+        if key in os.environ:
+            previous_env[key] = os.environ.get(key)
+        else:
+            missing_env.add(key)
+        os.environ[key] = value
+    try:
+        logging.disable(logging.CRITICAL)
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            yield
+    finally:
+        logging.disable(previous_disable)
+        for key in env_updates:
+            if key in missing_env:
+                os.environ.pop(key, None)
+                continue
+            restored = previous_env.get(key)
+            if restored is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = restored
+
+
+def _forecast_process_entry(operation: str, payload: Dict[str, Any], result_channel: Any) -> None:
+    os.environ[_FORECAST_PROCESS_CHILD_ENV] = "1"
+    with _suppress_forecast_child_side_output():
+        try:
+            result = _run_forecast_payload_direct(operation, payload)
+        except ForecastError as exc:
+            _send_forecast_process_message(
+                result_channel,
+                {
+                    "status": "forecast_error",
+                    "message": str(exc),
+                },
+            )
+        except BaseException as exc:
+            _send_forecast_process_message(
+                result_channel,
+                {
+                    "status": "exception",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+        else:
+            _send_forecast_process_message(result_channel, {"status": "ok", "result": result})
+        finally:
+            try:
+                from ..forecast.gpu_runtime import cleanup_forecast_gpu_runtime
+
+                cleanup_forecast_gpu_runtime(clear_model_cache=True)
+            except Exception:
+                pass
+            try:
+                close = getattr(result_channel, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+
+
+def _run_forecast_payload_direct(operation: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if operation in _FORECAST_CONNECTION_REQUIRED_OPERATIONS:
+        ensure_mt5_connection_or_raise()
+
+    if operation == "forecast_generate":
+        request = ForecastGenerateRequest(**payload)
+        return run_forecast_generate(
+            request,
+            forecast_impl=_forecast_impl,
+            resolve_sktime_forecaster=_resolve_sktime_forecaster,
+            log_events=False,
+        )
+
+    if operation == "forecast_list_library_models":
+        return _forecast_list_library_models_impl(
+            payload.get("library", "all"),
+            show_unavailable=bool(payload.get("show_unavailable", False)),
+            detail=payload.get("detail", "compact"),
+            limit=payload.get("limit"),
+            offset=int(payload.get("offset", 0) or 0),
+        )
+
+    if operation == "forecast_backtest_run":
+        request = ForecastBacktestRequest(**payload)
+        return run_forecast_backtest(
+            request,
+            backtest_impl=_forecast_backtest_impl,
+        )
+
+    if operation == "strategy_backtest":
+        request = StrategyBacktestRequest(**payload)
+        return run_strategy_backtest(
+            request,
+            strategy_backtest_impl=_strategy_backtest_impl,
+        )
+
+    if operation == "forecast_volatility_estimate":
+        request = ForecastVolatilityEstimateRequest(**payload)
+        return run_forecast_volatility_estimate(
+            request,
+            forecast_volatility_impl=_forecast_volatility_impl,
+        )
+
+    if operation == "forecast_list_methods":
+        return _forecast_list_methods_impl(
+            detail=payload.get("detail", "compact"),
+            limit=payload.get("limit"),
+            offset=payload.get("offset", 0),
+            search=payload.get("search_term"),
+            category=payload.get("category"),
+            library=payload.get("library"),
+            supports_ci=payload.get("supports_ci"),
+            supports_training=payload.get("supports_training"),
+            profile=payload.get("profile", "quickstart"),
+            show_unavailable=bool(payload.get("show_unavailable", False)),
+        )
+
+    if operation == "forecast_conformal_intervals":
+        request = ForecastConformalIntervalsRequest(**payload)
+        return run_forecast_conformal_intervals(
+            request,
+            backtest_impl=_forecast_backtest_impl,
+            forecast_impl=_forecast_impl,
+        )
+
+    if operation == "forecast_tune_genetic":
+        request = ForecastTuneGeneticRequest(**payload)
+        return run_forecast_tune_genetic(
+            request,
+            genetic_search_impl=_genetic_search_impl,
+        )
+
+    if operation == "forecast_tune_optuna":
+        request = ForecastTuneOptunaRequest(**payload)
+        return run_forecast_tune_optuna(
+            request,
+            optuna_search_impl=_optuna_search_impl,
+        )
+
+    if operation == "forecast_optimize_hints":
+        request = ForecastOptimizeHintsRequest(**payload)
+        return run_forecast_optimize_hints(
+            request,
+            optimize_hints_impl=_optimize_hints_impl,
+        )
+
+    if operation == "forecast_barrier_prob":
+        from ..forecast.barriers_probabilities import (
+            forecast_barrier_closed_form as _barrier_closed_form_impl,
+        )
+        from ..forecast.barriers_probabilities import (
+            forecast_barrier_hit_probabilities as _barrier_hit_probabilities_impl,
+        )
+
+        request = ForecastBarrierProbRequest(**payload)
+        return run_forecast_barrier_prob(
+            request,
+            build_barrier_kwargs=_build_barrier_kwargs_from,
+            normalize_trade_direction=normalize_trade_direction,
+            barrier_hit_probabilities_impl=_barrier_hit_probabilities_impl,
+            barrier_closed_form_impl=_barrier_closed_form_impl,
+        )
+
+    if operation == "forecast_barrier_optimize":
+        from ..forecast.barriers_optimization import (
+            forecast_barrier_optimize as _barrier_optimize_impl,
+        )
+
+        request = ForecastBarrierOptimizeRequest(**payload)
+        return run_forecast_barrier_optimize(
+            request,
+            parse_kv_or_json=_parse_kv_or_json,
+            barrier_optimize_impl=_barrier_optimize_impl,
+        )
+
+    raise ValueError(f"Unsupported isolated forecast operation: {operation}")
+
+
+def _run_forecast_payload_in_process(operation: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Always spawn (not fork): portable and required on Windows. The child does
+    # not share the parent's MetaTrader5 connection; connection-required
+    # operations re-initialize MT5 inside the child (see _run_forecast_payload_direct).
+    # GPU isolation is the main benefit; treat concurrent parent MT5 use as unsafe.
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    process = ctx.Process(
+        target=_forecast_process_entry,
+        args=(operation, dict(payload), child_conn),
+        daemon=False,
+    )
+    process.start()
+    try:
+        child_conn.close()
+    except Exception:
+        pass
+    timeout_seconds = _forecast_process_timeout_seconds()
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    message: Optional[Dict[str, Any]] = None
+    try:
+        while message is None:
+            if parent_conn.poll(0.1):
+                raw_message = parent_conn.recv()
+                if isinstance(raw_message, dict):
+                    message = raw_message
+                else:
+                    message = {"status": "ok", "result": raw_message}
+                break
+            if not process.is_alive():
+                process.join(timeout=0.1)
+                if parent_conn.poll(0.1):
+                    raw_message = parent_conn.recv()
+                    if isinstance(raw_message, dict):
+                        message = raw_message
+                    else:
+                        message = {"status": "ok", "result": raw_message}
+                    break
+                exit_code = process.exitcode
+                raise RuntimeError(
+                    f"{operation} child process exited without returning a result"
+                    + (f" (exitcode={exit_code})" if exit_code is not None else "")
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                process.terminate()
+                process.join(timeout=5.0)
+                raise TimeoutError(
+                    f"{operation} child process timed out after {timeout_seconds} seconds"
+                )
+    finally:
+        try:
+            parent_conn.close()
+        except Exception:
+            pass
+        if process.is_alive():
+            if message is not None:
+                process.join(timeout=5.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5.0)
+            else:
+                process.join(timeout=0.1)
+
+    status = str(message.get("status") or "")
+    if status == "ok":
+        result = message.get("result")
+        if isinstance(result, dict):
+            return result
+        return {"success": True, "result": result}
+    if status == "forecast_error":
+        raise ForecastError(str(message.get("message") or "Forecast child process failed"))
+    if status == "exception":
+        tb = str(message.get("traceback") or "")
+        if tb:
+            logger.debug("Forecast child traceback for %s:\n%s", operation, tb)
+        exc_type = str(message.get("type") or "RuntimeError")
+        exc_message = str(message.get("message") or "Forecast child process failed")
+        raise RuntimeError(f"{operation} child process failed with {exc_type}: {exc_message}")
+    raise RuntimeError(f"{operation} child process returned an invalid status: {status or '<missing>'}")
+
+
+def _lazy_module(module_name: str):
+    return lambda: import_module(module_name)
+
+
+_forecast_module = _lazy_module("mtdata.forecast.forecast")
+_forecast_backtest_module = _lazy_module("mtdata.forecast.backtest")
+_forecast_use_cases_module = _lazy_module("mtdata.forecast.use_cases")
+_forecast_methods_module = _lazy_module("mtdata.forecast.forecast_methods")
+_forecast_volatility_module = _lazy_module("mtdata.forecast.volatility")
+_forecast_tune_module = _lazy_module("mtdata.forecast.tune")
+_forecast_capabilities_module = _lazy_module("mtdata.forecast.capabilities")
+
+
+def _forecast_impl(**kwargs):
+    module = _forecast_module()
+    func = getattr(module, "execute_forecast", module.forecast)
+    return func(**kwargs)
+
+
+def _forecast_backtest_impl(**kwargs):
+    module = _forecast_backtest_module()
+    func = getattr(module, "execute_forecast_backtest", module.forecast_backtest)
+    return func(**kwargs)
+
+
+def _strategy_backtest_impl(**kwargs):
+    module = _forecast_backtest_module()
+    func = getattr(module, "execute_strategy_backtest", module.strategy_backtest)
+    return func(**kwargs)
+
+
+def _forecast_volatility_impl(**kwargs):
+    return _forecast_volatility_module().forecast_volatility(**kwargs)
+
+
+def _get_forecast_methods_data():
+    return _forecast_module().get_forecast_methods_data()
+
+
+def _get_volatility_methods_data():
+    return _forecast_volatility_module().get_volatility_methods_data()
+
+
+def _get_forecast_methods_snapshot():
+    return _forecast_methods_module().get_forecast_methods_snapshot(
+        method_data=_get_forecast_methods_data(),
+        capabilities=_get_registered_forecast_capabilities(),
+    )
 
 
 @lru_cache(maxsize=1)
-def _discover_sktime_forecasters() -> Dict[str, Tuple[str, str]]:
-    """Return mapping of forecaster class name (lower) -> (class_name, dotted path).
+def _get_registered_forecast_capabilities():
+    return _forecast_capabilities_module().get_registered_capabilities()
 
-    Best-effort: skips modules that fail to import (optional dependencies).
-    Filters out test modules and private/internal classes.
-    """
-    try:
-        import pkgutil
-        import importlib
-        import sktime.forecasting as _sf  # type: ignore
-        from sktime.forecasting.base import BaseForecaster  # type: ignore
-    except Exception:
-        return {}
 
-    mapping: Dict[str, Tuple[str, str]] = {}
+def _get_library_forecast_capabilities(*args, **kwargs):
+    return _forecast_capabilities_module().get_library_capabilities(*args, **kwargs)
 
-    def _skip_module(mod_name: str) -> bool:
-        parts = mod_name.split(".")
-        if "tests" in parts:
-            return True
-        if any(p.startswith("test") for p in parts):
-            return True
-        return False
 
-    for mod in pkgutil.walk_packages(getattr(_sf, "__path__", []), _sf.__name__ + "."):
-        mod_name = getattr(mod, "name", None)
-        if not isinstance(mod_name, str) or _skip_module(mod_name):
-            continue
+def _genetic_search_impl(**kwargs):
+    return _forecast_tune_module().genetic_search_forecast_params(**kwargs)
+
+
+def _optuna_search_impl(**kwargs):
+    return _forecast_tune_module().optuna_search_forecast_params(**kwargs)
+
+
+def _optimize_hints_impl(**kwargs):
+    return _forecast_tune_module().genetic_search_optimize_hints(**kwargs)
+
+
+def _discover_sktime_forecasters():
+    return _forecast_use_cases_module()._discover_sktime_forecasters()
+
+
+def _clear_discover_sktime_forecasters_cache() -> None:
+    func = getattr(_forecast_use_cases_module(), "_discover_sktime_forecasters", None)
+    cache_clear = getattr(func, "cache_clear", None)
+    if callable(cache_clear):
+        cache_clear()
+
+def _resolve_sktime_forecaster(*args, **kwargs):
+    return _forecast_use_cases_module()._resolve_sktime_forecaster(*args, **kwargs)
+
+
+def run_forecast_generate(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_generate(*args, **kwargs)
+
+
+def run_forecast_backtest(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_backtest(*args, **kwargs)
+
+
+def run_strategy_backtest(*args, **kwargs):
+    return _forecast_use_cases_module().run_strategy_backtest(*args, **kwargs)
+
+
+def run_forecast_conformal_intervals(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_conformal_intervals(*args, **kwargs)
+
+
+def run_forecast_tune_genetic(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_tune_genetic(*args, **kwargs)
+
+
+def run_forecast_tune_optuna(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_tune_optuna(*args, **kwargs)
+
+
+def run_forecast_optimize_hints(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_optimize_hints(*args, **kwargs)
+
+
+def run_forecast_barrier_prob(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_barrier_prob(*args, **kwargs)
+
+
+def run_forecast_barrier_optimize(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_barrier_optimize(*args, **kwargs)
+
+
+def run_forecast_volatility_estimate(*args, **kwargs):
+    return _forecast_use_cases_module().run_forecast_volatility_estimate(*args, **kwargs)
+
+
+def _forecast_connection_error() -> Optional[Dict[str, Any]]:
+    return mt5_connection_error(
+        create_mt5_gateway(ensure_connection_impl=ensure_mt5_connection_or_raise),
+    )
+
+
+def _forecast_error_payload(message: Any, *, operation: str) -> Dict[str, Any]:
+    return build_error_payload(
+        message,
+        code=f"{operation}_error",
+        operation=operation,
+    )
+
+
+def _run_forecast_operation(
+    operation: str,
+    *,
+    func,
+    process_payload: Optional[Dict[str, Any]] = None,
+    require_connection: bool = False,
+    generic_error_prefix: Optional[str] = None,
+    catch_forecast_error: bool = False,
+    **fields: Any,
+) -> Dict[str, Any]:
+    def _wrapped() -> Dict[str, Any]:
+        if require_connection:
+            connection_error = _forecast_connection_error()
+            if connection_error is not None:
+                return connection_error
         try:
-            m = importlib.import_module(mod_name)
-        except Exception:
-            continue
-        for _, obj in vars(m).items():
-            if not isinstance(obj, type):
-                continue
-            if obj is BaseForecaster:
-                continue
-            name = getattr(obj, "__name__", None)
-            if not isinstance(name, str) or not name or name.startswith("_"):
-                continue
-            try:
-                if not issubclass(obj, BaseForecaster):
-                    continue
-            except Exception:
-                continue
-            key = name.lower()
-            if key not in mapping:
-                mapping[key] = (name, f"{obj.__module__}.{name}")
-    return mapping
+            if _should_isolate_forecast_operation(operation, process_payload):
+                result = _run_forecast_payload_in_process(operation, dict(process_payload or {}))
+            else:
+                result = func()
+            result = _attach_timezone(result, operation=operation)
+            return _attach_forecast_compute_hint(
+                result,
+                operation=operation,
+                payload=process_payload,
+            )
+        except ForecastError as exc:
+            if catch_forecast_error:
+                return _forecast_error_payload(exc, operation=operation)
+            raise
+        except Exception as exc:
+            if generic_error_prefix is not None:
+                return _forecast_error_payload(
+                    f"{generic_error_prefix}{exc}",
+                    operation=operation,
+                )
+            raise
 
-
-def _normalize_forecaster_name(name: str) -> str:
-    return "".join(ch for ch in str(name).lower() if ch.isalnum())
-
-
-def _resolve_sktime_forecaster(model: str) -> Optional[Tuple[str, str]]:
-    """Resolve a user-provided model name to (class_name, dotted_path) using fuzzy matching."""
-    model_s = str(model or "").strip()
-    if not model_s:
-        return None
-
-    mapping = _discover_sktime_forecasters()
-    if not mapping:
-        return None
-
-    # Exact match on class name (case-insensitive)
-    exact = mapping.get(model_s.lower())
-    if exact:
-        return exact
-
-    # Normalized match (e.g. "theta", "theta_forecaster", "ThetaForecaster")
-    norm_map: Dict[str, Tuple[str, str]] = {}
-    for _, (cls_name, dotted) in mapping.items():
-        norm_map.setdefault(_normalize_forecaster_name(cls_name), (cls_name, dotted))
-
-    qn = _normalize_forecaster_name(model_s)
-    if qn in norm_map:
-        return norm_map[qn]
-
-    # Prefer startswith/contains in normalized space (more intuitive than difflib alone).
-    starts = [v for k, v in norm_map.items() if k.startswith(qn)]
-    if starts:
-        return sorted(starts, key=lambda t: len(t[0]))[0]
-    contains = [v for k, v in norm_map.items() if qn and qn in k]
-    if contains:
-        return sorted(contains, key=lambda t: len(t[0]))[0]
-
-    # Fallback to difflib against normalized names.
-    candidates = difflib.get_close_matches(qn, list(norm_map.keys()), n=1, cutoff=0.6)
-    if candidates:
-        return norm_map[candidates[0]]
-    return None
+    return run_logged_operation(
+        logger,
+        operation=operation,
+        func=_wrapped,
+        **fields,
+    )
 
 @mcp.tool()
-@_auto_connect_wrapper
-def forecast_generate(
-    symbol: str,
-    timeframe: TimeframeLiteral = "H1",
-    library: ForecastLibraryLiteral = "native",
-    model: str = "theta",
-    horizon: int = 12,
-    lookback: Optional[int] = None,
-    as_of: Optional[str] = None,
-    model_params: Optional[Dict[str, Any]] = None,
-    ci_alpha: Optional[float] = 0.05,
-    quantity: Literal['price','return','volatility'] = 'price',  # type: ignore
-    denoise: Optional[DenoiseSpec] = None,
-    features: Optional[Dict[str, Any]] = None,
-    dimred_method: Optional[str] = None,
-    dimred_params: Optional[Dict[str, Any]] = None,
-    target_spec: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Generate forecasts for the next `horizon` bars using a selected model.
+def forecast_generate(request: ForecastGenerateRequest) -> Dict[str, Any]:
+    """Generate forecasts for the next `horizon` bars using a selected method.
 
-    Supports native or library-backed models with optional preprocessing.
-    Delegates to `mtdata.forecast.forecast`.
+    `horizon` counts future bars at the requested timeframe, not elapsed clock
+    units. `quantity` selects the modeled target: price levels, returns, or
+    volatility. When `ci_alpha` is not None, intervals use confidence
+    `1 - ci_alpha` (for example, 0.05 requests 95% intervals).
+
+    Supports native or library-backed methods with optional preprocessing.
     """
-    try:
-        if int(horizon) <= 0:
-            return {"error": "horizon must be a positive integer"}
-    except Exception:
-        return {"error": "horizon must be a positive integer"}
-    lib = str(library or "native").strip().lower()
-    mdl = str(model or "").strip()
-    p = _parse_kv_or_json(model_params)
+    def _execute() -> Dict[str, Any]:
+        return run_forecast_generate(
+            request,
+            forecast_impl=_forecast_impl,
+            resolve_sktime_forecaster=_resolve_sktime_forecaster,
+            log_events=False,
+        )
 
-    if lib in ("", "native"):
-        resolved_method = mdl or "theta"
-    elif lib == "statsforecast":
-        if not mdl:
-            return {"error": "model is required for library=statsforecast"}
-        resolved_method = "statsforecast"
-        p.setdefault("model_name", mdl)
-    elif lib == "sktime":
-        query = mdl.strip() if mdl else "ThetaForecaster"
-        if "." in query:
-            resolved_method = "sktime"
-            p.setdefault("estimator", query)
-        else:
-            found = _resolve_sktime_forecaster(query)
-            if not found:
-                return {"error": f"Unknown sktime forecaster '{query}'"}
-            _, dotted = found
-            resolved_method = "sktime"
-            p.setdefault("estimator", dotted)
-    elif lib == "pretrained":
-        resolved_method = mdl or "chronos2"
-    elif lib == "mlforecast":
-        if not mdl:
-            return {"error": "model is required for library=mlforecast"}
-        resolved_method = "mlforecast"
-        p.setdefault("model", mdl)
-    else:
-        return {"error": f"Unsupported library: {library}"}
-
-    features = features or {}
-
-    return _forecast_impl(
-        symbol=symbol,
-        timeframe=timeframe,  # type: ignore[arg-type]
-        method=str(resolved_method),  # type: ignore[arg-type]
-        horizon=horizon,
-        lookback=lookback,
-        as_of=as_of,
-        params=p,
-        ci_alpha=ci_alpha,
-        quantity=quantity,    # type: ignore[arg-type]
-        target="price",       # deprecated in core; keep fixed here
-        denoise=denoise,
-        features=features,
-        dimred_method=dimred_method,
-        dimred_params=dimred_params,
-        target_spec=target_spec,
+    return _run_forecast_operation(
+        "forecast_generate",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        library=request.library,
+        method=request.method,
+        require_connection=True,
+        catch_forecast_error=True,
+        process_payload=_model_payload(request),
+        func=_execute,
     )
 
 
 @mcp.tool()
 def forecast_list_library_models(
-    library: Literal["native", "statsforecast", "sktime", "pretrained", "mlforecast"],
+    library: Literal["native", "statsforecast", "sktime", "pretrained", "mlforecast", "all"] = "all",
+    show_unavailable: bool = False,
+    detail: DetailLiteral = "compact",  # type: ignore
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """List available model names within a forecast library.
 
     - statsforecast: lists `statsforecast.models.*` class names.
     - sktime: lists supported aliases plus notes for using dotted estimator paths.
     """
-    lib = str(library).strip().lower()
-    if lib == "native":
-        # "Native" methods are mtdata-provided top-level algorithms (as opposed to
-        # external-library model spaces like sktime/statsforecast).
-        try:
-            from mtdata.forecast.forecast_methods import FORECAST_METHODS as _METHODS
-        except Exception:
-            _METHODS = ()
-
-        excluded = {"statsforecast", "sktime", "mlforecast", "chronos2", "chronos_bolt", "timesfm", "lag_llama"}
-        models = [m for m in _METHODS if m not in excluded]
-        return {
-            "library": lib,
-            "models": sorted(models),
-            "usage": [
-                "python cli.py forecast_generate SYMBOL --library native --model analog",
-                "python cli.py forecast_generate SYMBOL --library native --model theta",
-            ],
-        }
-
-    if lib == "statsforecast":
-        try:
-            from statsforecast import models as _models  # type: ignore
-        except Exception as ex:
-            return {"library": lib, "error": f"statsforecast import failed: {ex}"}
-        names: List[str] = []
-        for attr in dir(_models):
-            if attr.startswith("_"):
-                continue
-            obj = getattr(_models, attr, None)
-            if not isinstance(obj, type):
-                continue
-            if getattr(obj, "__module__", None) != getattr(_models, "__name__", None):
-                continue
-            if not any(callable(getattr(obj, a, None)) for a in ("fit", "forecast", "predict")):
-                continue
-            names.append(attr)
-        names = sorted(set(names))
-        return {
-            "library": lib,
-            "models": names,
-            "usage": "python cli.py forecast_generate SYMBOL --library statsforecast --model AutoARIMA",
-        }
-
-    if lib == "sktime":
-        mapping = _discover_sktime_forecasters()
-        forecasters = sorted({v[0] for v in mapping.values()})
-        return {
-            "library": lib,
-            "models": forecasters,
-            "usage": [
-                "python cli.py forecast_generate SYMBOL --library sktime --model theta",
-                "python cli.py forecast_generate SYMBOL --library sktime --model ThetaForecaster",
-                "python cli.py forecast_generate SYMBOL --library sktime --model sktime.forecasting.theta.ThetaForecaster --model-params \"sp=24\"",
-            ],
-            "note": "The --model value is matched to the closest available forecaster name; you can also pass a dotted class path. Constructor kwargs go in --model-params (or use --set model.<k>=<v>).",
-        }
-
-    if lib == "pretrained":
-        # These are the pretrained adapters shipped with mtdata.
-        pretrained = [
-            {
-                "model": "chronos2",
-                "requires": ["chronos-forecasting>=2.0.0", "torch"],
-                "notes": "Hugging Face model id via params.model_name (default: amazon/chronos-bolt-base for compatibility).",
-            },
-            {
-                "model": "chronos_bolt",
-                "requires": ["chronos-forecasting>=2.0.0", "torch"],
-                "notes": "Same adapter as chronos2; different default naming.",
-            },
-            {
-                "model": "timesfm",
-                "requires": ["timesfm", "torch"],
-                "notes": "Uses timesfm 2.x (GitHub) API; runs without downloading external weights.",
-            },
-            {
-                "model": "lag_llama",
-                "requires": ["lag-llama", "gluonts", "torch"],
-                "notes": "May not be installable on Python 3.13 due to upstream pins; included for completeness.",
-            },
-        ]
-        return {
-            "library": lib,
-            "models": pretrained,
-            "usage": [
-                "python cli.py forecast_generate SYMBOL --library pretrained --model chronos2",
-                "python cli.py forecast_generate SYMBOL --library pretrained --model timesfm",
-            ],
-        }
-
-    if lib == "mlforecast":
-        return {
-            "library": lib,
-            "note": "Use `--model <dotted sklearn/lightgbm regressor class>` plus optional constructor kwargs in --model-params (or use --set model.<k>=<v>).",
-            "usage": [
-                "python cli.py forecast_generate SYMBOL --library mlforecast --model sklearn.ensemble.RandomForestRegressor --model-params \"n_estimators=200\"",
-                "python cli.py forecast_generate SYMBOL --library native --model mlf_rf",
-            ],
-        }
-
-    return {"library": lib, "error": "Unsupported library (supported: native, statsforecast, sktime, pretrained, mlforecast)"}
-
-
-@mcp.tool()
-@_auto_connect_wrapper
-def forecast_backtest_run(
-    symbol: str,
-    timeframe: TimeframeLiteral = "H1",
-    horizon: int = 12,
-    steps: int = 5,
-    spacing: int = 20,
-    methods: Optional[List[str]] = None,
-    params_per_method: Optional[Dict[str, Any]] = None,
-    quantity: Literal['price','return','volatility'] = 'price',  # type: ignore
-    target: Literal['price','return'] = 'price',  # type: ignore
-    denoise: Optional[DenoiseSpec] = None,
-    params: Optional[Dict[str, Any]] = None,
-    features: Optional[Dict[str, Any]] = None,
-    dimred_method: Optional[str] = None,
-    dimred_params: Optional[Dict[str, Any]] = None,
-    slippage_bps: float = 0.0,
-    trade_threshold: float = 0.0,
-) -> Dict[str, Any]:
-    """Rolling-origin backtest over historical anchors using the forecast tool."""
-    return _forecast_backtest_impl(
-        symbol=symbol,
-        timeframe=timeframe,  # type: ignore[arg-type]
-        horizon=horizon,
-        steps=steps,
-        spacing=spacing,
-        methods=methods,
-        params_per_method=params_per_method,
-        quantity=quantity,    # type: ignore[arg-type]
-        target=target,        # type: ignore[arg-type]
-        denoise=denoise,
-        params=params,
-        features=features,
-        dimred_method=dimred_method,
-        dimred_params=dimred_params,
-        slippage_bps=slippage_bps,
-        trade_threshold=trade_threshold,
+    return _run_forecast_operation(
+        "forecast_list_library_models",
+        library=library,
+        show_unavailable=show_unavailable,
+        process_payload={
+            "library": library,
+            "show_unavailable": bool(show_unavailable),
+            "detail": detail,
+            "limit": limit,
+            "offset": offset,
+        },
+        func=lambda: _forecast_list_library_models_impl(
+            library,
+            show_unavailable=show_unavailable,
+            detail=detail,
+            limit=limit,
+            offset=offset,
+        ),
     )
 
 
 @mcp.tool()
-@_auto_connect_wrapper
+def forecast_backtest_run(request: ForecastBacktestRequest) -> Dict[str, Any]:
+    """Rolling-origin backtest over historical anchors using the forecast tool."""
+    def _execute() -> Dict[str, Any]:
+        return run_forecast_backtest(
+            request,
+            backtest_impl=_forecast_backtest_impl,
+        )
+
+    return _run_forecast_operation(
+        "forecast_backtest_run",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        horizon=request.horizon,
+        detail=request.detail,
+        require_connection=True,
+        process_payload=_model_payload(request),
+        func=_execute,
+    )
+
+
+@mcp.tool()
+def strategy_backtest(request: StrategyBacktestRequest) -> Dict[str, Any]:
+    """Backtest simple indicator-driven trading strategies on MT5 candle history."""
+    def _execute() -> Dict[str, Any]:
+        return run_strategy_backtest(
+            request,
+            strategy_backtest_impl=_strategy_backtest_impl,
+        )
+
+    return _run_forecast_operation(
+        "strategy_backtest",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        strategy=request.strategy,
+        require_connection=True,
+        process_payload=_model_payload(request),
+        func=_execute,
+    )
+
+
+@mcp.tool()
 def forecast_volatility_estimate(
-    symbol: str,
-    timeframe: TimeframeLiteral = "H1",
-    horizon: int = 1,
-    method: Literal['ewma','parkinson','gk','rs','yang_zhang','rolling_std','realized_kernel','har_rv','garch','egarch','gjr_garch','garch_t','egarch_t','gjr_garch_t','figarch','arima','sarima','ets','theta'] = 'ewma',  # type: ignore
-    proxy: Optional[Literal['squared_return','abs_return','log_r2']] = None,  # type: ignore
-    params: Optional[Dict[str, Any]] = None,
-    as_of: Optional[str] = None,
-    denoise: Optional[DenoiseSpec] = None,
+    request: ForecastVolatilityEstimateRequest,
 ) -> Dict[str, Any]:
     """Forecast volatility over `horizon` bars using direct estimators or proxies."""
-    return _forecast_volatility_impl(
-        symbol=symbol,
-        timeframe=timeframe,  # type: ignore[arg-type]
-        horizon=horizon,
-        method=method,        # type: ignore[arg-type]
-        proxy=proxy,          # type: ignore[arg-type]
-        params=params,
-        as_of=as_of,
-        denoise=denoise,
+    def _execute() -> Dict[str, Any]:
+        return run_forecast_volatility_estimate(
+            request,
+            forecast_volatility_impl=_forecast_volatility_impl,
+        )
+
+    return _run_forecast_operation(
+        "forecast_volatility_estimate",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        horizon=request.horizon,
+        method=request.method,
+        require_connection=True,
+        process_payload=_model_payload(request),
+        func=_execute,
     )
 
 
 @mcp.tool()
-@_auto_connect_wrapper
-def forecast_list_methods() -> Dict[str, Any]:
-    """List forecast methods, availability, and parameter docs."""
-    try:
-        return _get_forecast_methods_data()
-    except Exception as e:
-        return {"error": f"Error listing forecast methods: {e}"}
-
-
-@mcp.tool()
-@_auto_connect_wrapper
-def forecast_conformal_intervals(
-    symbol: str,
-    timeframe: TimeframeLiteral = "H1",
-    method: ForecastMethodLiteral = "theta",
-    horizon: int = 12,
-    steps: int = 25,
-    spacing: int = 10,
-    alpha: float = 0.1,
-    denoise: Optional[DenoiseSpec] = None,
-    params: Optional[Dict[str, Any]] = None,
+def forecast_list_methods(
+    detail: DetailLiteral = "compact",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    search_term: Optional[str] = None,
+    category: Optional[str] = None,
+    library: Optional[
+        Literal["native", "statsforecast", "sktime", "pretrained", "mlforecast"]
+    ] = None,
+    supports_ci: Optional[bool] = None,
+    supports_training: Optional[bool] = None,
+    profile: Literal["quickstart", "core", "all"] = "quickstart",
+    show_unavailable: bool = False,
 ) -> Dict[str, Any]:
-    """Conformalized forecast intervals via rolling-origin calibration.
+    """List forecast methods and availability.
 
-    - Calibrates per-step absolute residual quantiles using `steps` historical anchors (spaced by `spacing`).
-    - Returns point forecast (from `method`) and conformal bands per step.
+    Compact output is the default. Standard adds descriptions, capability
+    details, and related volatility methods; full adds parameter documentation.
+    The default quickstart profile returns a small native baseline set; use
+    profile='all' for the full catalog.
     """
-    try:
-        # 1) Rolling backtest to collect residuals
-        bt = _forecast_backtest_impl(
-            symbol=symbol,
-            timeframe=timeframe,
-            horizon=int(horizon),
-            steps=int(steps),
-            spacing=int(spacing),
-            methods=[str(method)],
-            denoise=denoise,
-            params={str(method): dict(params or {})},
-        )
-        if 'error' in bt:
-            return bt
-        res = bt.get('results', {}).get(str(method))
-        if not res or not res.get('details'):
-            return {"error": "Conformal calibration failed: no backtest details"}
-        # Build per-step residuals |y_hat_i - y_i|
-        fh = int(horizon)
-        errs = [[] for _ in range(fh)]
-        for d in res['details']:
-            fc = d.get('forecast'); act = d.get('actual')
-            if not fc or not act:
-                continue
-            m = min(len(fc), len(act), fh)
-            for i in range(m):
-                try:
-                    errs[i].append(abs(float(fc[i]) - float(act[i])))
-                except Exception:
-                    continue
-        # Per-step quantiles
-        import numpy as _np
-        q = 1.0 - float(alpha)
-        qerrs = [float(_np.quantile(_np.array(e, dtype=float), q)) if e else float('nan') for e in errs]
-
-        # 2) Forecast now (latest)
-        fc_now = _forecast_impl(
-            symbol=symbol,
-            timeframe=timeframe,
-            method=method,  # type: ignore
-            horizon=int(horizon),
-            params=params,
-            denoise=denoise,
-        )
-        if 'error' in fc_now:
-            return fc_now
-        yhat = fc_now.get('forecast_price') or []
-        if not yhat:
-            return {"error": "Empty point forecast for conformal intervals"}
-        yhat_arr = _np.array(yhat, dtype=float)
-        fh_eff = min(fh, yhat_arr.size)
-        lo = _np.empty(fh_eff, dtype=float); hi = _np.empty(fh_eff, dtype=float)
-        for i in range(fh_eff):
-            e = qerrs[i] if i < len(qerrs) and _np.isfinite(qerrs[i]) else 0.0
-            lo[i] = yhat_arr[i] - e
-            hi[i] = yhat_arr[i] + e
-        out = dict(fc_now)
-        out['conformal'] = {
-            'alpha': float(alpha),
-            'calibration_steps': int(steps),
-            'calibration_spacing': int(spacing),
-            'per_step_q': [float(v) for v in qerrs],
-        }
-        out['lower_price'] = [float(v) for v in lo.tolist()]
-        out['upper_price'] = [float(v) for v in hi.tolist()]
-        out['ci_alpha'] = float(alpha)
-        return out
-    except Exception as e:
-        return {"error": f"Error computing conformal forecast: {str(e)}"}
+    search_term_value = str(search_term or "").strip() or None
+    return _run_forecast_operation(
+        "forecast_list_methods",
+        detail=detail,
+        limit=limit,
+        offset=offset,
+        search_term=search_term_value,
+        category=category,
+        library=library,
+        supports_ci=supports_ci,
+        show_unavailable=show_unavailable,
+        process_payload={
+            "detail": detail,
+            "limit": limit,
+            "offset": offset,
+            "search_term": search_term_value,
+            "category": category,
+            "library": library,
+            "supports_ci": supports_ci,
+            "supports_training": supports_training,
+            "profile": profile,
+            "show_unavailable": bool(show_unavailable),
+        },
+        func=lambda: _forecast_list_methods_impl(
+            detail=detail,
+            limit=limit,
+            offset=offset,
+            search=search_term_value,
+            category=category,
+            library=library,
+            supports_ci=supports_ci,
+            supports_training=supports_training,
+            profile=profile,
+            show_unavailable=show_unavailable,
+        ),
+    )
 
 
 @mcp.tool()
-@_auto_connect_wrapper
-def forecast_tune_genetic(
-    symbol: str,
-    timeframe: TimeframeLiteral = "H1",
-    method: Optional[str] = "theta",
-    methods: Optional[List[str]] = None,
-    horizon: int = 12,
-    steps: int = 5,
-    spacing: int = 20,
-    search_space: Optional[Dict[str, Any]] = None,
-    metric: str = "avg_rmse",
-    mode: str = "min",
-    population: int = 12,
-    generations: int = 10,
-    crossover_rate: float = 0.6,
-    mutation_rate: float = 0.3,
-    seed: int = 42,
-    trade_threshold: float = 0.0,
-    denoise: Optional[DenoiseSpec] = None,
-    features: Optional[Dict[str, Any]] = None,
-    dimred_method: Optional[str] = None,
-    dimred_params: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def forecast_conformal_intervals(request: ForecastConformalIntervalsRequest) -> Dict[str, Any]:
+    """Empirical residual-quantile forecast bands via rolling-origin backtest.
+
+    These are **not** finite-sample conformal prediction guarantees. The tool:
+
+    - Fits the chosen `method` at `steps` historical anchors (spaced by `spacing`)
+    - Collects absolute residuals ``|forecast - actual|`` per horizon step
+    - Builds symmetric bands from residual quantiles at level ``1 - ci_alpha``
+
+    Coverage is **empirical / historical** and may not hold under regime change,
+    non-stationarity, or asymmetric errors. Output metadata sets
+    ``interval_method: "rolling_residual_quantiles"``.
+    """
+    def _execute() -> Dict[str, Any]:
+        return run_forecast_conformal_intervals(
+            request,
+            backtest_impl=_forecast_backtest_impl,
+            forecast_impl=_forecast_impl,
+        )
+
+    return _run_forecast_operation(
+        "forecast_conformal_intervals",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        method=request.method,
+        horizon=request.horizon,
+        require_connection=True,
+        catch_forecast_error=True,
+        generic_error_prefix="Error computing residual-quantile forecast intervals: ",
+        process_payload=_model_payload(request),
+        func=_execute,
+    )
+
+
+@mcp.tool()
+def forecast_tune_genetic(request: ForecastTuneGeneticRequest) -> Dict[str, Any]:
     """Genetic search over method params to optimize a backtest metric.
 
     - search_space: dict or JSON like {param: {type, min, max, choices?, log?}}
     - metric: e.g., 'avg_rmse', 'avg_mae', 'avg_directional_accuracy'
     - mode: 'min' or 'max'
     """
-    try:
-        ss = _parse_kv_or_json(search_space)
-        method_for_search: Optional[str] = method
-        from ..forecast.tune import default_search_space as _default_ss
-        if not isinstance(ss, dict) or not ss:
-            # No space provided: keep a pinned single-method search when requested.
-            if isinstance(methods, (list, tuple)) and len(methods) > 0:
-                ss = _default_ss(method=None, methods=methods)
-                method_for_search = None
-            else:
-                ss = _default_ss(method=method_for_search, methods=None)
-        elif isinstance(methods, (list, tuple)) and len(methods) > 0:
-            # Explicit methods list present: treat as multi-method search
-            method_for_search = None
-        return _genetic_search_impl(
-            symbol=symbol,
-            timeframe=timeframe,  # type: ignore[arg-type]
-            method=str(method_for_search) if method_for_search is not None else None,
-            methods=methods,
-            horizon=int(horizon),
-            steps=int(steps),
-            spacing=int(spacing),
-            search_space=ss,
-            metric=str(metric),
-            mode=str(mode),
-            population=int(population),
-            generations=int(generations),
-            crossover_rate=float(crossover_rate),
-            mutation_rate=float(mutation_rate),
-            seed=int(seed),
-            trade_threshold=float(trade_threshold),
-            denoise=denoise,
-            features=features,
-            dimred_method=dimred_method,
-            dimred_params=dimred_params,
+    def _execute() -> Dict[str, Any]:
+        return run_forecast_tune_genetic(
+            request,
+            genetic_search_impl=_genetic_search_impl,
         )
-    except Exception as e:
-        return {"error": f"Error in genetic tuning: {e}"}
+
+    return _run_forecast_operation(
+        "forecast_tune_genetic",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        method=request.method,
+        metric=request.metric,
+        require_connection=True,
+        generic_error_prefix="Error in genetic tuning: ",
+        process_payload=_model_payload(request),
+        func=_execute,
+    )
 
 
 @mcp.tool()
-@_auto_connect_wrapper
+def forecast_tune_optuna(request: ForecastTuneOptunaRequest) -> Dict[str, Any]:
+    """Optuna search over method params to optimize a backtest metric."""
+    def _execute() -> Dict[str, Any]:
+        return run_forecast_tune_optuna(
+            request,
+            optuna_search_impl=_optuna_search_impl,
+        )
+
+    return _run_forecast_operation(
+        "forecast_tune_optuna",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        method=request.method,
+        metric=request.metric,
+        require_connection=True,
+        generic_error_prefix="Error in optuna tuning: ",
+        process_payload=_model_payload(request),
+        func=_execute,
+    )
+
+
+@mcp.tool()
+def forecast_optimize_hints(request: ForecastOptimizeHintsRequest) -> Dict[str, Any]:
+    """Genetic search for optimal forecast settings across timeframes, methods, and parameters.
+
+    Searches over timeframes, algorithms, and algorithm-specific parameters to find
+    top-N configurations ranked by composite trading fitness. When trading metrics
+    are unavailable, composite mode falls back to forecast error and directional
+    accuracy instead of assigning every candidate the same synthetic score.
+
+    Parameters:
+    -----------
+    symbol : str
+        Trading symbol (e.g., 'EURUSD')
+    
+    timeframes : list[str], optional
+        Timeframes to search (e.g., ['H1', 'H4', 'D1']).
+        If not provided, defaults to ['H1', 'H4', 'D1', 'W1'].
+    
+    methods : list[str], optional
+        Forecast methods to search over.
+        If not provided, defaults to fast + pretrained methods
+        (theta, ARIMA, chronos, timesfm, etc.).
+    
+    horizon : int, optional (default=12)
+        Forecast horizon in bars.
+    
+    steps : int, optional (default=5)
+        Number of backtest anchors.
+    
+    spacing : int, optional (default=20)
+        Spacing between anchors in bars.
+    
+    population : int, optional (default=8)
+        Genetic algorithm population size (1-100).
+    
+    generations : int, optional (default=5)
+        Number of generations to evolve (1-100).
+    
+    crossover_rate : float, optional (default=0.6)
+        Crossover probability (0-1).
+    
+    mutation_rate : float, optional (default=0.3)
+        Mutation probability (0-1).
+    
+    fitness_metric : str, optional (default='composite')
+        Fitness metric: 'composite' (default) or specific metric
+        ('avg_rmse', 'sharpe_ratio', 'win_rate', 'calmar_ratio', etc.).
+    
+    fitness_weights : dict, optional
+        Custom weights for composite fitness (metric -> weight).
+        Default: {'sharpe_ratio': 0.4, 'win_rate': 0.3, 'inverse_max_drawdown': 0.2, 'avg_return': 0.1}
+    
+    seed : int, optional (default=42)
+        Random seed for reproducibility.
+    
+    max_search_time_seconds : float, optional
+        Maximum time allowed for search (seconds). No limit if None.
+    
+    top_n : int, optional (default=5)
+        Number of top configurations to return (1-20).
+    
+    include_feature_genes : bool, optional (default=False)
+        If True, include technical indicator parameters (RSI, MACD, etc.) in search.
+    
+    denoise : DenoiseSpec, optional
+        Denoising configuration for preprocessing.
+    
+    features : dict, optional
+        Additional feature configurations.
+    
+    dimred_method : str, optional
+        Dimensionality reduction method for multivariate forecasts.
+    
+    dimred_params : dict, optional
+        Parameters for dimensionality reduction.
+
+    Returns:
+    --------
+    dict
+        Success response with:
+        - hints: list of top-N configurations ranked by fitness
+          Each hint contains: rank, timeframe, method, method_params, fitness_score, backtest_metrics
+        - search_summary: summary of search parameters and results
+        - history_tail: last 10 generations' statistics
+    """
+    from ..forecast.requests import ForecastOptimizeHintsRequest as ReqModel
+
+    # Validate request type if needed
+    if not isinstance(request, ReqModel):
+        request = ReqModel(**dict(request))
+
+    def _execute() -> Dict[str, Any]:
+        return run_forecast_optimize_hints(
+            request,
+            optimize_hints_impl=_optimize_hints_impl,
+        )
+
+    return _run_forecast_operation(
+        "forecast_optimize_hints",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        require_connection=True,
+        generic_error_prefix="Error in optimize hints search: ",
+        process_payload=_model_payload(request),
+        func=_execute,
+    )
+
+
+@mcp.tool()
 def forecast_barrier_prob(
-    symbol: str,
-    timeframe: TimeframeLiteral = "H1",
-    horizon: int = 12,
-    method: Literal['mc', 'closed_form', 'auto'] = 'mc',
-    # MC params
-    mc_method: Literal['mc_gbm','mc_gbm_bb','hmm_mc','garch','bootstrap','heston','jump_diffusion','auto'] = 'hmm_mc',  # type: ignore
-    direction: Literal['long','short'] = 'long',  # trade direction context
-    tp_abs: Optional[float] = None,
-    sl_abs: Optional[float] = None,
-    tp_pct: Optional[float] = None,
-    sl_pct: Optional[float] = None,
-    tp_pips: Optional[float] = None,
-    sl_pips: Optional[float] = None,
-    params: Optional[Dict[str, Any]] = None,
-    denoise: Optional[DenoiseSpec] = None,
-    # Closed form params
-    barrier: float = 0.0,
-    mu: Optional[float] = None,
-    sigma: Optional[float] = None,
+    request: ForecastBarrierProbRequest,
 ) -> Dict[str, Any]:
     """Calculate probability of price hitting TP/SL barriers using Monte Carlo or Closed Form methods.
     
@@ -583,23 +1176,17 @@ def forecast_barrier_prob(
     horizon : int, optional (default=12)
         Number of bars to forecast ahead
     
-    method : str, optional (default="mc")
+    method : str, optional (default="hmm_mc")
         Calculation method:
-        - "mc": Monte Carlo simulation (more flexible, handles complex scenarios)
+        - "hmm_mc": Hidden Markov Model Monte Carlo
+        - "mc_gbm": Geometric Brownian Motion Monte Carlo
+        - "mc_gbm_bb": GBM Monte Carlo with Brownian-bridge correction
+        - "garch": GARCH(1,1) Monte Carlo
+        - "bootstrap": Historical bootstrap Monte Carlo
+        - "heston": Heston stochastic-volatility Monte Carlo
+        - "jump_diffusion": Merton jump-diffusion Monte Carlo
         - "closed_form": Analytical solution (faster, simpler assumptions)
-        - "auto": Alias for Monte Carlo with mc_method="auto"
-    
-    Monte Carlo Parameters (method="mc"):
-    -------------------------------------
-    mc_method : str, optional (default="hmm_mc")
-        - "hmm_mc": Hidden Markov Model-based MC
-        - "mc_gbm": Geometric Brownian Motion MC
-        - "mc_gbm_bb": GBM MC with Brownian-bridge barrier correction
-        - "heston": Heston stochastic volatility MC
-        - "jump_diffusion": Merton jump-diffusion MC
-        - "garch": GARCH(1,1) volatility model (requires 'arch' package)
-        - "bootstrap": Circular block bootstrap (historical simulation)
-        - "auto": auto-select based on symbol/timeframe + recent returns
+        - "auto": Auto-select a Monte Carlo engine
 
     direction : str, optional (default="long")
         Trade direction: "long" / "short"
@@ -616,10 +1203,10 @@ def forecast_barrier_prob(
     sl_pct : float, optional
         Stop loss as percentage
     
-    tp_pips : float, optional
+    tp_ticks : float, optional
         Take profit in ticks (trade_tick_size)
     
-    sl_pips : float, optional
+    sl_ticks : float, optional
         Stop loss in ticks (trade_tick_size)
     
     Closed Form Parameters (method="closed_form"):
@@ -632,6 +1219,10 @@ def forecast_barrier_prob(
     
     sigma : float, optional
         Volatility parameter (calculated if not provided)
+
+    params : dict, optional
+        Monte Carlo controls such as seed and n_sims. If seed is omitted, a
+        deterministic seed is derived from the request inputs and returned.
     
     Returns:
     --------
@@ -647,7 +1238,7 @@ def forecast_barrier_prob(
     # Check probability of hitting TP vs SL (Monte Carlo)
     forecast_barrier_prob(
         symbol="EURUSD",
-        method="mc",
+        method="hmm_mc",
         direction="long",
         tp_abs=1.1100,
         sl_abs=1.0950
@@ -669,146 +1260,828 @@ def forecast_barrier_prob(
         barrier=1.2700
     )
     """
-    method_val = str(method).lower().strip()
-    if method_val == 'auto':
-        method_val = 'mc'
-        mc_method = 'auto'  # type: ignore
-    if method_val == 'mc':
-        from ..forecast.barriers import forecast_barrier_hit_probabilities as _impl
-        # Ensure direction is valid for MC
-        d_raw = str(direction).lower().strip()
-        if d_raw in ('up', 'long'):
-            d = 'long'
-        elif d_raw in ('down', 'short'):
-            d = 'short'
-        else:
-            d = 'long'
-
-        barrier_kwargs = _build_barrier_kwargs_from(locals())
-        return _impl(
-            symbol=symbol,
-            timeframe=timeframe,
-            horizon=horizon,
-            method=mc_method,
-            direction=d, # type: ignore
-            **barrier_kwargs,
-            params=params,
-            denoise=denoise,
+    def _execute() -> Dict[str, Any]:
+        from ..forecast.barriers_probabilities import (
+            forecast_barrier_closed_form as _barrier_closed_form_impl,
         )
-    elif method_val == 'closed_form':
-        from ..forecast.barriers import forecast_barrier_closed_form as _impl
-        # Direction semantics match MC: long=upper barrier, short=lower barrier.
-        d_raw = str(direction).lower().strip()
-        if d_raw in ('up', 'long'):
-            d = 'long'
-        elif d_raw in ('down', 'short'):
-            d = 'short'
-        else:
-            d = 'long'
-
-        return _impl(
-            symbol=symbol,
-            timeframe=timeframe,
-            horizon=horizon,
-            direction=d, # type: ignore
-            barrier=barrier,
-            mu=mu,
-            sigma=sigma,
-            denoise=denoise,
+        from ..forecast.barriers_probabilities import (
+            forecast_barrier_hit_probabilities as _barrier_hit_probabilities_impl,
         )
-    else:
-        return {"error": f"Unknown method: {method}"}
+
+        return run_forecast_barrier_prob(
+            request,
+            build_barrier_kwargs=_build_barrier_kwargs_from,
+            normalize_trade_direction=normalize_trade_direction,
+            barrier_hit_probabilities_impl=_barrier_hit_probabilities_impl,
+            barrier_closed_form_impl=_barrier_closed_form_impl,
+        )
+
+    return _run_forecast_operation(
+        "forecast_barrier_prob",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        method=request.method,
+        direction=request.direction,
+        require_connection=True,
+        process_payload=_model_payload(request),
+        func=_execute,
+    )
 
 
 @mcp.tool()
-@_auto_connect_wrapper
 def forecast_barrier_optimize(
-    symbol: str,
-    timeframe: TimeframeLiteral = "H1",
-    horizon: int = 12,
-    method: Literal['mc_gbm','mc_gbm_bb','hmm_mc','garch','bootstrap','heston','jump_diffusion','auto'] = 'hmm_mc',  # type: ignore
-    direction: Literal['long','short'] = 'long',  # trade direction context for TP/SL
-    mode: Literal['pct','pips'] = 'pct',  # type: ignore
-    tp_min: float = 0.25,
-    tp_max: float = 1.5,
-    tp_steps: int = 7,
-    sl_min: float = 0.25,
-    sl_max: float = 2.5,
-    sl_steps: int = 9,
-    params: Optional[Dict[str, Any]] = None,
-    denoise: Optional[DenoiseSpec] = None,
-    objective: Literal[
-        'edge',
-        'prob_tp_first',
-        'prob_resolve',
-        'kelly',
-        'kelly_cond',
-        'ev',
-        'ev_cond',
-        'ev_per_bar',
-        'profit_factor',
-        'min_loss_prob',
-        'utility',
-    ] = 'edge',  # type: ignore
-    return_grid: bool = True,
-    top_k: Optional[int] = None,
-    output: Literal['full','summary'] = 'full',  # type: ignore
-    grid_style: Literal['fixed','volatility','ratio','preset'] = 'fixed',  # type: ignore
-    preset: Optional[str] = None,
-    vol_window: int = 250,
-    vol_min_mult: float = 0.5,
-    vol_max_mult: float = 4.0,
-    vol_steps: int = 7,
-    vol_sl_extra: float = 1.8,
-    vol_floor_pct: float = 0.15,
-    vol_floor_pips: float = 8.0,
-    ratio_min: float = 0.5,
-    ratio_max: float = 4.0,
-    ratio_steps: int = 8,
-    refine: bool = False,
-    refine_radius: float = 0.3,
-    refine_steps: int = 5,
-    min_prob_win: Optional[float] = None,
-    max_prob_no_hit: Optional[float] = None,
-    max_median_time: Optional[float] = None,
+    request: ForecastBarrierOptimizeRequest,
 ) -> Dict[str, Any]:
     """Optimize TP/SL barriers with support for presets, volatility scaling, ratios, and two-stage refinement."""
-    from ..forecast.barriers import forecast_barrier_optimize as _impl
-    return _impl(
-        symbol=symbol,
-        timeframe=timeframe,
-        horizon=horizon,
-        method=method,
-        direction=direction,
-        mode=mode,
-        tp_min=tp_min,
-        tp_max=tp_max,
-        tp_steps=tp_steps,
-        sl_min=sl_min,
-        sl_max=sl_max,
-        sl_steps=sl_steps,
-        params=params,
-        denoise=denoise,
-        objective=objective,
-        return_grid=return_grid,
-        top_k=top_k,
-        output=output,
-        grid_style=grid_style,
-        preset=preset,
-        vol_window=vol_window,
-        vol_min_mult=vol_min_mult,
-        vol_max_mult=vol_max_mult,
-        vol_steps=vol_steps,
-        vol_sl_extra=vol_sl_extra,
-        vol_floor_pct=vol_floor_pct,
-        vol_floor_pips=vol_floor_pips,
-        ratio_min=ratio_min,
-        ratio_max=ratio_max,
-        ratio_steps=ratio_steps,
-        refine=refine,
-        refine_radius=refine_radius,
-        refine_steps=refine_steps,
-        min_prob_win=min_prob_win,
-        max_prob_no_hit=max_prob_no_hit,
-        max_median_time=max_median_time,
+    def _execute() -> Dict[str, Any]:
+        from ..forecast.barriers_optimization import (
+            forecast_barrier_optimize as _barrier_optimize_impl,
+        )
+
+        return run_forecast_barrier_optimize(
+            request,
+            parse_kv_or_json=_parse_kv_or_json,
+            barrier_optimize_impl=_barrier_optimize_impl,
+        )
+
+    return _run_forecast_operation(
+        "forecast_barrier_optimize",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        method=request.method,
+        direction=request.direction,
+        require_connection=True,
+        process_payload=_model_payload(request),
+        func=_execute,
     )
+
+
+def _forecast_list_library_models_impl(
+    library: Literal["native", "statsforecast", "sktime", "pretrained", "mlforecast", "all"],
+    *,
+    show_unavailable: bool = False,
+    detail: DetailLiteral = "compact",
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    lib = str(library).strip().lower()
+    detail_mode = "full" if str(detail or "compact").strip().lower() == "full" else "compact"
+    try:
+        offset_value = max(0, int(offset or 0))
+    except Exception:
+        offset_value = 0
+    default_limit = (
+        _FORECAST_LIBRARY_MODELS_COMPACT_LIMIT
+        if detail_mode != "full" and limit is None
+        else None
+    )
+    try:
+        limit_value = default_limit if limit is None else max(0, int(limit))
+    except Exception:
+        limit_value = default_limit
+    supported_libraries = ("native", "statsforecast", "sktime", "pretrained", "mlforecast")
+    if lib == "all":
+        sections: List[Dict[str, Any]] = []
+        total_catalog_models = 0
+        total_models = 0
+        total_available = 0
+        total_unavailable_hidden = 0
+        for library_name in supported_libraries:
+            section = _forecast_list_library_models_impl(
+                library_name,
+                show_unavailable=show_unavailable,
+                detail=detail_mode,
+                limit=limit_value,
+                offset=offset_value,
+            )
+            if section.get("error"):
+                sections.append(
+                    {
+                        "library": library_name,
+                        "error": section.get("error"),
+                    }
+                )
+                continue
+            total_catalog_models += int(section.get("total") or 0)
+            total_models += int(section.get("total_filtered") or 0)
+            total_available += int(section.get("available") or 0)
+            total_unavailable_hidden += int(section.get("unavailable_hidden") or 0)
+            section_out = {
+                "library": library_name,
+                "models": section.get("models") or [],
+                "total": section.get("total"),
+                "total_filtered": section.get("total_filtered"),
+                "available": section.get("available"),
+                "has_more": section.get("has_more"),
+            }
+            if detail_mode == "full":
+                section_out.update(
+                    {
+                        "unavailable": section.get("unavailable"),
+                        "unavailable_hidden": section.get("unavailable_hidden"),
+                        "models_shown": section.get("models_shown"),
+                    }
+                )
+            if detail_mode == "full" and isinstance(section.get("capabilities"), list):
+                section_out["capabilities"] = section.get("capabilities")
+            sections.append(section_out)
+        out = {
+            "library": "all",
+            "detail": detail_mode,
+            "libraries": sections,
+            "total": total_catalog_models,
+            "total_filtered": total_models,
+            "available": total_available,
+            "filters": {
+                "show_unavailable": bool(show_unavailable),
+                "limit": limit_value,
+                "offset": offset_value,
+            },
+        }
+        if detail_mode == "full":
+            out["unavailable_hidden"] = total_unavailable_hidden
+        return out
+    capabilities_raw = _get_library_forecast_capabilities(
+        lib,
+        discover_sktime_forecasters=_discover_sktime_forecasters,
+    )
+    capabilities_all = capabilities_raw if isinstance(capabilities_raw, list) else []
+    capabilities = [
+        row
+        for row in capabilities_all
+        if show_unavailable or not _is_explicit_false(row.get("available"))
+    ]
+    if limit_value is None:
+        capabilities_page = capabilities[offset_value:]
+    else:
+        capabilities_page = capabilities[offset_value: offset_value + limit_value]
+    model_rows = _forecast_library_model_rows(capabilities_page)
+    if detail_mode != "full":
+        model_rows = _compact_forecast_library_model_rows(model_rows, library=lib)
+    available_selected = int(
+        sum(1 for row in capabilities if not _is_explicit_false(row.get("available")))
+    )
+    unavailable_selected = int(len(capabilities) - available_selected)
+    available_shown = int(
+        sum(1 for row in capabilities_page if not _is_explicit_false(row.get("available")))
+    )
+    unavailable_shown = int(len(capabilities_page) - available_shown)
+    unavailable_total = int(
+        sum(1 for row in capabilities_all if _is_explicit_false(row.get("available")))
+    )
+    availability_meta = {
+        "total": len(capabilities_all),
+        "total_filtered": len(capabilities),
+        "available": available_selected,
+        "has_more": offset_value + len(capabilities_page) < len(capabilities),
+        "filters": {
+            "show_unavailable": bool(show_unavailable),
+            "limit": limit_value,
+            "offset": offset_value,
+        },
+        "detail": detail_mode,
+    }
+    if detail_mode == "full":
+        availability_meta.update(
+            {
+                "unavailable": unavailable_selected,
+                "unavailable_hidden": 0 if show_unavailable else unavailable_total,
+                "models_shown": len(model_rows),
+                "available_shown": available_shown,
+                "unavailable_shown": unavailable_shown,
+            }
+        )
+
+    def _maybe_add_capabilities(payload: Dict[str, Any]) -> Dict[str, Any]:
+        if detail_mode == "full":
+            payload["capabilities"] = capabilities_page
+        return payload
+
+    if lib == "native":
+        return _maybe_add_capabilities({
+            "library": lib,
+            "models": model_rows,
+            **availability_meta,
+            "usage": [
+                "mtdata-cli forecast_generate SYMBOL --library native --method analog",
+                "mtdata-cli forecast_generate SYMBOL --library native --method theta",
+            ],
+        })
+
+    if lib == "statsforecast":
+        try:
+            import_module("statsforecast")
+        except Exception as exc:
+            return {"library": lib, "error": f"statsforecast import failed: {exc}"}
+
+        return _maybe_add_capabilities({
+            "library": lib,
+            "models": model_rows,
+            **availability_meta,
+            "usage": [
+                "mtdata-cli forecast_generate SYMBOL --library statsforecast --method AutoARIMA",
+            ],
+        })
+
+    if lib == "sktime":
+        return _maybe_add_capabilities({
+            "library": lib,
+            "models": model_rows,
+            **availability_meta,
+            "usage": [
+                "mtdata-cli forecast_generate SYMBOL --library sktime --method theta",
+                "mtdata-cli forecast_generate SYMBOL --library sktime --method ThetaForecaster",
+                "mtdata-cli forecast_generate SYMBOL --library sktime --method sktime.forecasting.theta.ThetaForecaster --params \"sp=24\"",
+            ],
+            "note": "The --method value is matched to the closest available forecaster name; you can also pass a dotted class path. Constructor kwargs go in --params (or use --set method.<k>=<v>).",
+        })
+
+    if lib == "pretrained":
+        return _maybe_add_capabilities({
+            "library": lib,
+            "models": model_rows,
+            **availability_meta,
+            "usage": [
+                "mtdata-cli forecast_generate SYMBOL --library pretrained --method chronos2",
+                "mtdata-cli forecast_generate SYMBOL --library pretrained --method timesfm",
+            ],
+        })
+
+    if lib == "mlforecast":
+        return _maybe_add_capabilities({
+            "library": lib,
+            "models": model_rows,
+            **availability_meta,
+            "note": "Use `--method <dotted sklearn/lightgbm regressor class>` plus optional constructor kwargs in --params (or use --set method.<k>=<v>).",
+            "usage": [
+                "mtdata-cli forecast_generate SYMBOL --library mlforecast --method sklearn.ensemble.RandomForestRegressor --params \"n_estimators=200\"",
+                "mtdata-cli forecast_generate SYMBOL --library native --method mlf_rf",
+            ],
+        })
+
+    return {"library": lib, "error": "Unsupported library (supported: native, statsforecast, sktime, pretrained, mlforecast, all)"}
+
+
+def _forecast_library_model_rows(capabilities: Any) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(capabilities, list):
+        return rows
+    for capability in capabilities:
+        if not isinstance(capability, dict):
+            continue
+        method = str(capability.get("method") or "").strip()
+        if not method:
+            continue
+        row: Dict[str, Any] = {"method": method}
+        row["available"] = not _is_explicit_false(capability.get("available"))
+        display_name = str(capability.get("display_name") or "").strip()
+        if display_name:
+            row["model"] = display_name
+        selector = capability.get("selector")
+        if isinstance(selector, dict):
+            selector_value = selector.get("value")
+            if selector_value is not None:
+                row["selector_value"] = selector_value
+            selector_key = selector.get("key")
+            if selector_key is not None:
+                row["selector_key"] = selector_key
+        execution = capability.get("execution")
+        if isinstance(execution, dict):
+            library = execution.get("library")
+            if library is not None:
+                row["library"] = library
+        rows.append(row)
+    return rows
+
+
+def _forecast_method_params(params: Any) -> List[Dict[str, Any]]:
+    if not isinstance(params, list):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for item in params:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            key: item.get(key)
+            for key in ("name", "type", "default", "description")
+            if item.get(key) not in (None, "", [], {})
+        }
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _compact_forecast_library_model_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    library: str,
+) -> List[Dict[str, Any]]:
+    compact_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        compact = dict(row)
+        if compact.get("model") == compact.get("method"):
+            compact.pop("model", None)
+        if str(compact.get("library") or "").strip().lower() == library:
+            compact.pop("library", None)
+        compact_rows.append(compact)
+    return compact_rows
+
+
+def _forecast_ci_method(item: Dict[str, Any]) -> Optional[str]:
+    explicit = str(item.get("ci_method") or "").strip().lower()
+    if explicit:
+        return explicit
+    method_name = str(item.get("method") or "").strip().lower()
+    category = str(item.get("category") or item.get("namespace") or "").strip().lower()
+    if method_name in {"ses", "holt", "holt_winters_add", "holt_winters_mul", "ets", "arima", "sarima"}:
+        return "statsmodels_prediction_interval"
+    if method_name == "theta":
+        return "native_theta_interval"
+    if method_name in {"mc_gbm", "hmm_mc"} or category == "monte_carlo":
+        return "simulation_quantile"
+    if method_name == "analog" or category == "analog":
+        return "analog_quantile"
+    if category in {"statsforecast", "sktime"}:
+        return "provider_prediction_interval"
+    if method_name in {"chronos2", "chronos_bolt", "timesfm"} or category == "pretrained":
+        return "probabilistic_model_quantile"
+    return None
+
+
+def _forecast_list_full_row(
+    item: Dict[str, Any],
+    *,
+    method_to_category: Dict[str, Any],
+) -> Dict[str, Any]:
+    method_name = str(item.get("method") or "")
+    category = item.get("category") or method_to_category.get(method_name) or "other"
+    params = _forecast_method_params(item.get("params"))
+    row: Dict[str, Any] = {
+        "method": method_name,
+        "category": str(category),
+        "available": bool(item.get("available")),
+        "params_count": len(params),
+    }
+    desc = str(item.get("description") or "").strip()
+    if desc and desc.lower() != method_name.lower():
+        row["description"] = desc.splitlines()[0].strip()
+    supports = item.get("supports")
+    if isinstance(supports, dict) and isinstance(supports.get("ci"), bool):
+        row["supports_ci"] = bool(supports.get("ci"))
+    elif isinstance(item.get("supports_ci"), bool):
+        row["supports_ci"] = bool(item.get("supports_ci"))
+    if row.get("supports_ci") is True:
+        ci_method = _forecast_ci_method(item)
+        if ci_method:
+            row["ci_method"] = ci_method
+    if isinstance(item.get("supports_training"), bool):
+        row["supports_training"] = bool(item.get("supports_training"))
+    if row.get("supports_training") is True and item.get("training_category") not in (None, ""):
+        row["training_category"] = item.get("training_category")
+    if params:
+        row["params"] = params
+    requires = item.get("requires")
+    if isinstance(requires, list) and requires:
+        row["requires"] = [str(req) for req in requires if str(req).strip()]
+    aliases = item.get("aliases")
+    if isinstance(aliases, list) and aliases:
+        row["aliases"] = [str(alias) for alias in aliases if str(alias).strip()]
+    metadata_namespace = str(item.get("namespace") or item.get("library") or "").strip().lower()
+    if metadata_namespace and metadata_namespace != "native":
+        for key in ("method_id", "capability_id", "adapter_method", "selector", "execution"):
+            value = item.get(key)
+            if value not in (None, "", [], {}):
+                row[key] = value
+    execution = item.get("execution")
+    if isinstance(execution, dict) and execution.get("library") not in (None, ""):
+        row["library"] = execution.get("library")
+    elif item.get("namespace") not in (None, ""):
+        row["library"] = item.get("namespace")
+    return row
+
+
+def _forecast_volatility_methods_section(
+    *,
+    detail: str,
+    show_unavailable: bool,
+) -> Dict[str, Any]:
+    note = (
+        "Dedicated volatility estimators for forecast_volatility_estimate; "
+        "forecast_generate quantity=volatility routes to this method namespace."
+    )
+    try:
+        data = _get_volatility_methods_data()
+    except Exception as exc:
+        return {
+            "tool": "forecast_volatility_estimate",
+            "note": note,
+            "error": f"Unable to list volatility methods: {exc}",
+        }
+    methods = data.get("methods") if isinstance(data, dict) else None
+    if not isinstance(methods, list):
+        return {
+            "tool": "forecast_volatility_estimate",
+            "note": note,
+            "error": "Volatility method metadata is unavailable.",
+        }
+
+    selected = [
+        item
+        for item in methods
+        if isinstance(item, dict) and (show_unavailable or bool(item.get("available")))
+    ]
+    if detail == "full":
+        return {
+            "tool": "forecast_volatility_estimate",
+            "note": note,
+            "total": len(methods),
+            "methods_shown": len(selected),
+            "methods": selected,
+        }
+    method_names = [
+        str(item.get("method"))
+        for item in selected
+        if item.get("method") not in (None, "")
+    ]
+    return {
+        "tool": "forecast_volatility_estimate",
+        "note": note,
+        "total": len(methods),
+        "methods_shown": len(method_names),
+        "methods": method_names,
+    }
+
+
+def _forecast_list_methods_impl(  # noqa: C901
+    *,
+    detail: DetailLiteral = "compact",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+    library: Optional[str] = None,
+    supports_ci: Optional[bool] = None,
+    supports_training: Optional[bool] = None,
+    profile: str = "quickstart",
+    show_unavailable: bool = False,
+) -> Dict[str, Any]:
+    try:
+        snapshot = _get_forecast_methods_snapshot()
+        data = snapshot.get("data") if isinstance(snapshot, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        detail_value = str(detail or "compact").strip().lower()
+        if detail_value in {"summary"}:
+            detail_value = "compact"
+        elif detail_value not in {"compact", "standard", "full"}:
+            detail_value = "compact"
+        search_value = str(search or "").strip().lower()
+        category_filter_value = str(category or "").strip().lower()
+        library_value = str(library or "").strip().lower()
+        profile_value = str(profile or "quickstart").strip().lower()
+        if profile_value not in _FORECAST_METHOD_PROFILES:
+            return {"error": "Invalid profile. Use all, quickstart, or core."}
+        profile_methods = _FORECAST_METHOD_PROFILES[profile_value]
+        supported_libraries = {
+            "native",
+            "statsforecast",
+            "sktime",
+            "pretrained",
+            "mlforecast",
+        }
+        if library_value and library_value not in supported_libraries:
+            return {
+                "error": (
+                    "Invalid library filter. Use native, statsforecast, sktime, "
+                    "pretrained, or mlforecast."
+                )
+            }
+        limit_value: Optional[int] = None
+        if limit is not None:
+            try:
+                limit_value = int(limit)
+            except Exception:
+                return {"error": f"Invalid limit: {limit}. Must be a positive integer."}
+            if limit_value <= 0:
+                return {"error": f"Invalid limit: {limit_value}. Must be >= 1."}
+        try:
+            offset_value = int(offset or 0)
+        except Exception:
+            return {"error": f"Invalid offset: {offset}. Must be a non-negative integer."}
+        if offset_value < 0:
+            return {"error": f"Invalid offset: {offset_value}. Must be >= 0."}
+        effective_limit_value = limit_value
+
+        method_to_category = snapshot.get("method_to_category") if isinstance(snapshot, dict) else {}
+        if not isinstance(method_to_category, dict):
+            method_to_category = {}
+
+        def _item_category(item: Dict[str, Any]) -> str:
+            method_name = str(item.get("method") or "")
+            return str(
+                item.get("category") or method_to_category.get(method_name) or "other"
+            ).strip().lower()
+
+        def _item_supports_ci(item: Dict[str, Any]) -> Optional[bool]:
+            supports = item.get("supports")
+            if isinstance(supports, dict) and isinstance(supports.get("ci"), bool):
+                return bool(supports.get("ci"))
+            if isinstance(item.get("supports_ci"), bool):
+                return bool(item.get("supports_ci"))
+            return None
+
+        def _item_supports_training(item: Dict[str, Any]) -> Optional[bool]:
+            if isinstance(item.get("supports_training"), bool):
+                return bool(item.get("supports_training"))
+            return None
+
+        def _item_library(item: Dict[str, Any]) -> str:
+            for key in ("namespace", "library"):
+                value = str(item.get(key) or "").strip().lower()
+                if value in supported_libraries:
+                    return value
+            execution = item.get("execution")
+            if isinstance(execution, dict):
+                value = str(execution.get("library") or "").strip().lower()
+                if value in supported_libraries:
+                    return value
+            category = _item_category(item)
+            if category in supported_libraries:
+                return category
+            return "native"
+
+        def _method_matches(item: Dict[str, Any]) -> bool:
+            method_name = str(item.get("method") or "")
+            if profile_methods is not None and method_name not in profile_methods:
+                return False
+            if library_value and _item_library(item) != library_value:
+                return False
+            if category_filter_value and _item_category(item) != category_filter_value:
+                return False
+            if supports_ci is not None and _item_supports_ci(item) is not bool(supports_ci):
+                return False
+            if (
+                supports_training is not None
+                and _item_supports_training(item) is not bool(supports_training)
+            ):
+                return False
+            if not show_unavailable and not bool(item.get("available")):
+                return False
+            if not search_value:
+                return True
+            desc = str(item.get("description") or "")
+            cat = _item_category(item)
+            namespace = str(item.get("namespace") or "")
+            haystack = " ".join((method_name, desc, cat, namespace)).lower()
+            return search_value in haystack
+
+        barrier_methods = {
+            "methods": list(BARRIER_MONTE_CARLO_METHODS),
+            "probability_only_methods": ["closed_form"],
+            "optimizer_only_methods": ["ensemble"],
+            "note": "Barrier methods are for forecast_barrier_prob and forecast_barrier_optimize; forecast_generate uses the main forecast method registry.",
+        }
+
+        def _profile_methods_hidden_count(method_rows: Any) -> int:
+            if profile_methods is None or not isinstance(method_rows, list):
+                return 0
+            profile_count = 0
+            for row in method_rows:
+                if not isinstance(row, dict):
+                    continue
+                method_name = str(row.get("method") or "")
+                if method_name in profile_methods:
+                    profile_count += 1
+            return int(max(0, len(method_rows) - profile_count))
+
+        volatility_methods = None
+        if detail_value in {"standard", "full"}:
+            volatility_methods = _forecast_volatility_methods_section(
+                detail=detail_value,
+                show_unavailable=bool(show_unavailable),
+            )
+
+        if detail_value == "full":
+            if not bool(snapshot.get("methods_valid")):
+                return data
+            methods_full = snapshot.get("methods")
+            if not isinstance(methods_full, list):
+                return data
+            filtered_full = [
+                _forecast_list_full_row(row, method_to_category=method_to_category)
+                for row in methods_full
+                if isinstance(row, dict) and _method_matches(row)
+            ]
+            total_filtered = len(filtered_full)
+            if offset_value:
+                filtered_full = filtered_full[offset_value:]
+            if limit_value is not None:
+                filtered_full = filtered_full[:limit_value]
+            available_count = int(sum(1 for row in filtered_full if bool(row.get("available"))))
+            out_full = dict(data)
+            out_full["detail"] = "full"
+            out_full["methods"] = filtered_full
+            out_full["total"] = int(data.get("total") or len(methods_full))
+            out_full["total_filtered"] = int(total_filtered)
+            out_full["available"] = available_count
+            out_full["unavailable"] = int(len(filtered_full) - available_count)
+            out_full["methods_shown"] = int(len(filtered_full))
+            out_full["methods_hidden"] = int(
+                max(0, total_filtered - offset_value - len(filtered_full))
+            )
+            out_full["pagination"] = build_pagination_meta(
+                total=total_filtered,
+                returned=len(filtered_full),
+                offset=offset_value,
+                limit=limit_value,
+            )
+            if offset_value:
+                out_full["methods_before"] = int(min(offset_value, total_filtered))
+                out_full["offset"] = int(offset_value)
+            if out_full["methods_hidden"] > 0 or offset_value:
+                out_full["has_more"] = bool(
+                    offset_value + len(filtered_full) < total_filtered
+                )
+            if out_full["methods_hidden"] > 0 and limit_value is not None:
+                if offset_value:
+                    out_full["truncation_reason"] = (
+                        f"Limit {limit_value} at offset {offset_value}; "
+                        f"set offset={offset_value + len(filtered_full)} for more filtered methods."
+                    )
+                else:
+                    out_full["truncation_reason"] = (
+                        f"Limit {limit_value}; set limit={total_filtered} for all filtered methods."
+                    )
+            out_full["filters"] = {
+                "search": search_value or None,
+                "category": category_filter_value or None,
+                "limit": limit_value,
+                "offset": offset_value,
+                "library": library_value or None,
+                "supports_ci": supports_ci,
+                "supports_training": supports_training,
+                "profile": profile_value,
+                "show_unavailable": bool(show_unavailable),
+            }
+            if profile_methods is not None:
+                profile_hidden_count = _profile_methods_hidden_count(methods_full)
+                if profile_hidden_count > 0:
+                    out_full["profile_methods_hidden"] = profile_hidden_count
+                    out_full["profile_hint"] = "Use profile=all to list all registered methods."
+                out_full["profile_note"] = (
+                    "quickstart/core shows native methods with no optional package dependency; use profile=all for the full catalog."
+                )
+            out_full["note"] = (
+                "Full view includes trader-facing method metadata and structured params; "
+                "use search_term, library, or limit to narrow large catalogs."
+            )
+            if volatility_methods is not None:
+                out_full["volatility_methods"] = volatility_methods
+            out_full["barrier_methods"] = barrier_methods
+            return out_full
+
+        if not bool(snapshot.get("methods_valid")):
+            return data
+        methods = snapshot.get("methods")
+        if not isinstance(methods, list):
+            return data
+
+        compact_methods: List[Dict[str, Any]] = []
+        available_count = 0
+        unavailable_count = 0
+        by_category: Dict[str, List[Dict[str, Any]]] = {}
+        for item in methods:
+            if not _method_matches(item):
+                continue
+            name = item.get("method")
+            if name in (None, ""):
+                continue
+            method_name = str(name)
+            available = bool(item.get("available"))
+            if available:
+                available_count += 1
+            else:
+                unavailable_count += 1
+
+            row: Dict[str, Any] = {
+                "method": method_name,
+                "available": available,
+            }
+            if detail_value == "standard":
+                desc = str(item.get("description") or "").strip()
+                if desc and desc.lower() != method_name.lower():
+                    row["description"] = desc.splitlines()[0].strip()
+            row["category"] = _item_category(item)
+            if detail_value == "standard" and row["category"] in {"statsforecast", "sktime", "mlforecast", "pretrained"}:
+                namespace = item.get("namespace")
+                if isinstance(namespace, str) and namespace.strip():
+                    row["namespace"] = namespace
+            supports = item.get("supports")
+            if isinstance(supports, dict) and isinstance(supports.get("ci"), bool):
+                row["supports_ci"] = bool(supports.get("ci"))
+            elif isinstance(item.get("supports_ci"), bool):
+                row["supports_ci"] = bool(item.get("supports_ci"))
+            if detail_value == "standard" and row.get("supports_ci") is True:
+                ci_method = _forecast_ci_method(item)
+                if ci_method:
+                    row["ci_method"] = ci_method
+            if isinstance(item.get("supports_training"), bool):
+                row["supports_training"] = bool(item.get("supports_training"))
+            if detail_value == "standard":
+                params = item.get("params")
+                if isinstance(params, list):
+                    row["params_count"] = len(params)
+            requires = item.get("requires")
+            if not available and isinstance(requires, list) and requires:
+                req_text = ", ".join(str(req) for req in requires if str(req).strip())
+                if req_text:
+                    row["unavailable_reason"] = "Requires: " + req_text
+            if not available and "unavailable_reason" not in row:
+                row["unavailable_reason"] = "Unavailable in the current environment."
+            compact_methods.append(row)
+            by_category.setdefault(str(row["category"]), []).append(row)
+
+        selected_methods: List[Dict[str, Any]] = []
+        for category in sorted(by_category.keys()):
+            rows = list(by_category.get(category, []))
+            rows.sort(key=lambda row: (not bool(row.get("available")), str(row.get("method"))))
+            selected_methods.extend(rows)
+
+        selected_methods.sort(
+            key=lambda row: (
+                str(row.get("category")) == "other",
+                str(row.get("category")),
+                not bool(row.get("available")),
+                str(row.get("method")),
+            )
+        )
+        if effective_limit_value is not None:
+            if offset_value:
+                selected_methods = selected_methods[offset_value:]
+            selected_methods = selected_methods[:effective_limit_value]
+        elif offset_value:
+            selected_methods = selected_methods[offset_value:]
+        hidden_count = int(max(0, len(compact_methods) - len(selected_methods)))
+        if offset_value:
+            hidden_count = int(
+                max(0, len(compact_methods) - offset_value - len(selected_methods))
+            )
+        truncation_reason = None
+        if hidden_count > 0 and effective_limit_value is not None:
+            if offset_value:
+                truncation_reason = (
+                    f"Limit {effective_limit_value} at offset {offset_value}; "
+                    f"set offset={offset_value + len(selected_methods)} for more filtered methods."
+                )
+            else:
+                truncation_reason = (
+                    f"Limit {effective_limit_value}; set limit={len(compact_methods)} "
+                    "for all filtered methods."
+                )
+        out = {
+            "total": int(data.get("total") or len(compact_methods)),
+            "total_filtered": int(len(compact_methods)),
+            "available": available_count,
+            "unavailable": unavailable_count,
+            "methods": selected_methods,
+            "methods_shown": int(len(selected_methods)),
+            "methods_hidden": hidden_count,
+            "pagination": build_pagination_meta(
+                total=len(compact_methods),
+                returned=len(selected_methods),
+                offset=offset_value,
+                limit=effective_limit_value,
+            ),
+        }
+        if detail_value == "standard":
+            out["detail"] = "standard"
+            if volatility_methods is not None:
+                out["volatility_methods"] = volatility_methods
+        if profile_methods is not None:
+            out["profile"] = profile_value
+            profile_hidden_count = _profile_methods_hidden_count(methods)
+            if profile_hidden_count > 0:
+                out["profile_methods_hidden"] = profile_hidden_count
+                out["profile_hint"] = "Use profile=all to list all registered methods."
+            if detail_value == "standard":
+                out["profile_note"] = (
+                    "Native quickstart methods with no optional package dependency; use profile=all for the full catalog."
+                )
+                out["usage"] = [
+                    "mtdata-cli forecast_generate SYMBOL --method theta",
+                    "mtdata-cli forecast_generate SYMBOL --method analog",
+                    "mtdata-cli forecast_generate SYMBOL --method mc_gbm",
+                    "mtdata-cli forecast_volatility_estimate SYMBOL --method ewma",
+                ]
+        if offset_value:
+            out["methods_before"] = int(min(offset_value, len(compact_methods)))
+            out["offset"] = int(offset_value)
+        if hidden_count > 0 or offset_value:
+            out["has_more"] = bool(
+                offset_value + len(selected_methods) < len(compact_methods)
+            )
+        if truncation_reason:
+            out["truncation_reason"] = truncation_reason
+        return out
+    except Exception as exc:
+        return {"error": f"Error listing forecast methods: {exc}"}

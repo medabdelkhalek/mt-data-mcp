@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, List
-import json
-import warnings
-import numpy as np
-import pandas as pd
 import inspect
+import json
+import logging
+import warnings
+from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+
+from ..common import build_ci_diagnostics as _build_ci_diagnostics
 from ..common import edge_pad_to_length as _edge_pad_to_length
-from ..interface import ForecastMethod, ForecastResult
-from ..registry import ForecastRegistry
+from ..interface import CancelToken, ForecastMethod, ForecastResult, ProgressReporter, TrainResult
+from ..forecast_registry import ForecastRegistry
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_param_value(value: Any) -> Any:
@@ -65,6 +69,158 @@ class StatsForecastMethod(ForecastMethod):
     def _get_model(self, seasonality: int, params: Dict[str, Any]):
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # Train / predict lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_training(self) -> bool:
+        return True
+
+    @property
+    def training_category(self):
+        return "moderate"
+
+    @property
+    def train_supports_cancel(self) -> bool:
+        return True
+
+    @property
+    def train_supports_progress(self) -> bool:
+        return True
+
+    def train(
+        self,
+        series: pd.Series,
+        horizon: int,
+        seasonality: int,
+        params: Dict[str, Any],
+        *,
+        progress_callback=None,
+        cancel_token: Optional[CancelToken] = None,
+        exog=None,
+        **kwargs,
+    ) -> TrainResult:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"pkg_resources.*",
+                    category=UserWarning,
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"Deprecated call to.*pkg_resources.*",
+                    category=DeprecationWarning,
+                )
+                from statsforecast import StatsForecast
+        except ImportError as ex:
+            raise RuntimeError(f"Failed to import statsforecast: {ex}") from ex
+        from ..common import _create_training_dataframes
+
+        p = dict(params or {})
+        exog_used = exog if exog is not None else p.get("exog_used")
+        exog_future_arr = p.get("exog_future")
+        reporter = ProgressReporter(progress_callback, total_steps=3)
+        reporter.stage(0, "Preparing training data", force=True)
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+
+        Y_df, X_df, _ = _create_training_dataframes(series.values, horizon, exog_used, exog_future_arr)
+        clean_params = _coerce_params(p)
+        model = self._get_model(seasonality, clean_params)
+        reporter.stage(1, "Fitting statsforecast model", force=True)
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sf = StatsForecast(models=[model], freq=1)
+            if X_df is not None:
+                sf.fit(Y_df, X_df=X_df)
+            else:
+                sf.fit(Y_df)
+
+        artifact_bytes = self.serialize_artifact(sf)
+        internal_keys = {'symbol', 'timeframe', 'as_of', 'exog_used', 'exog_future', 'seasonality'}
+        clean_out = {k: v for k, v in clean_params.items() if k not in internal_keys}
+        reporter.stage(3, "Training complete", force=True)
+        return TrainResult(
+            artifact_bytes=artifact_bytes,
+            params_used={"seasonality": seasonality, **clean_out},
+        )
+
+    def predict_with_model(
+        self,
+        model,
+        series: pd.Series,
+        horizon: int,
+        seasonality: int,
+        params: Dict[str, Any],
+        *,
+        exog_future=None,
+        **kwargs,
+    ) -> ForecastResult:
+        from ..common import _create_training_dataframes, _extract_forecast_values
+
+        p = dict(params or {})
+        exog_future_arr = kwargs.get('exog_future')
+        if exog_future_arr is None:
+            exog_future_arr = exog_future if exog_future is not None else p.get('exog_future')
+
+        _, _, Xf_df = _create_training_dataframes(series.values, horizon, None, exog_future_arr)
+
+        ci_alpha = kwargs.get('ci_alpha', p.get('ci_alpha'))
+        level = None
+        if ci_alpha is not None:
+            alpha_val = float(ci_alpha)
+            if 0.0 < alpha_val < 1.0:
+                level = [max(1, min(99, int(round((1.0 - alpha_val) * 100.0))))]
+
+        sf = model  # deserialized StatsForecast object
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if Xf_df is not None:
+                Yf = sf.predict(h=int(horizon), X_df=Xf_df, level=level)
+            else:
+                Yf = sf.predict(h=int(horizon), level=level)
+
+        # unique_id may be in the index or a column depending on statsforecast version
+        if 'unique_id' not in Yf.columns and Yf.index.name == 'unique_id':
+            Yf = Yf.reset_index()
+        if 'unique_id' in Yf.columns:
+            Yf = Yf[Yf['unique_id'] == 'ts']
+        f_vals = _extract_forecast_values(Yf, horizon, f"StatsForecast {self.name}")
+
+        ci_values = None
+        metadata: Dict[str, Any] = {}
+        if level:
+            from ..common import build_ci_diagnostics as _build_ci_diagnostics
+            from ..common import edge_pad_to_length as _edge_pad_to_length
+            lev_val = level[0]
+            lo_col = hi_col = None
+            for c in Yf.columns:
+                if str(c).endswith(f'-lo-{lev_val}'):
+                    lo_col = c
+                elif str(c).endswith(f'-hi-{lev_val}'):
+                    hi_col = c
+            if lo_col and hi_col:
+                lo_vals = _edge_pad_to_length(Yf[lo_col].values, int(horizon))
+                hi_vals = _edge_pad_to_length(Yf[hi_col].values, int(horizon))
+                ci_values = (lo_vals.astype(float), hi_vals.astype(float))
+                metadata = _build_ci_diagnostics(
+                    provider=self.name, requested=True, available=True,
+                    status="available", alpha=float(ci_alpha), level=lev_val,
+                )
+
+        internal_keys = {'symbol', 'timeframe', 'as_of', 'exog_used', 'exog_future', 'seasonality'}
+        clean_params = {k: v for k, v in _coerce_params(p).items() if k not in internal_keys}
+        return ForecastResult(
+            forecast=f_vals, ci_values=ci_values,
+            params_used={"seasonality": seasonality, **clean_params},
+            metadata=metadata or None,
+        )
+
     def forecast(
         self, 
         series: pd.Series, 
@@ -108,7 +264,10 @@ class StatsForecastMethod(ForecastMethod):
         ci_alpha = kwargs.get('ci_alpha', params.get('ci_alpha'))
         level = None
         if ci_alpha is not None:
-            level = [int((1 - float(ci_alpha)) * 100)]
+            alpha_val = float(ci_alpha)
+            if not 0.0 < alpha_val < 1.0:
+                raise ValueError("ci_alpha must be between 0 and 1")
+            level = [max(1, min(99, int(round((1.0 - alpha_val) * 100.0))))]
         
         try:
             with warnings.catch_warnings():
@@ -124,16 +283,18 @@ class StatsForecastMethod(ForecastMethod):
                 else:
                     Yf = sf.predict(h=int(horizon), level=level)
             
-            try:
-                Yf = Yf[Yf['unique_id'] == 'ts']
-            except Exception:
-                pass
+            if 'unique_id' not in Yf.columns:
+                raise RuntimeError("StatsForecast output missing unique_id column")
+            Yf = Yf[Yf['unique_id'] == 'ts']
+            if Yf.empty:
+                raise RuntimeError("StatsForecast output missing rows for unique_id='ts'")
             
             # Extract values
             f_vals = _extract_forecast_values(Yf, horizon, f"StatsForecast {self.name}")
             
             # CI extraction
             ci_values = None
+            metadata: Dict[str, Any] = {}
             if level:
                 lev_val = level[0]
                 cols = Yf.columns
@@ -153,6 +314,31 @@ class StatsForecastMethod(ForecastMethod):
                     hi_vals = _edge_pad_to_length(hi_vals, int(horizon))
                         
                     ci_values = (lo_vals.astype(float), hi_vals.astype(float))
+                    metadata = _build_ci_diagnostics(
+                        provider=self.name,
+                        requested=True,
+                        available=True,
+                        status="available",
+                        alpha=alpha_val,
+                        level=lev_val,
+                    )
+                else:
+                    interval_columns = [str(col) for col in cols]
+                    warning_text = (
+                        f"StatsForecast {self.name} did not return matching interval columns for level "
+                        f"{lev_val}; returning point forecast only."
+                    )
+                    logger.warning("%s Columns=%s", warning_text, interval_columns)
+                    metadata = _build_ci_diagnostics(
+                        provider=self.name,
+                        requested=True,
+                        available=False,
+                        status="unavailable",
+                        alpha=alpha_val,
+                        level=lev_val,
+                        warning=warning_text,
+                        interval_columns=interval_columns,
+                    )
 
             # Filter out internal context params and build clean params_used
             internal_keys = {'symbol', 'timeframe', 'as_of', 'exog_used', 'exog_future', 'seasonality'}
@@ -162,7 +348,8 @@ class StatsForecastMethod(ForecastMethod):
             return ForecastResult(
                 forecast=f_vals,
                 ci_values=ci_values,
-                params_used=params_used
+                params_used=params_used,
+                metadata=metadata or None,
             )
             
         except Exception as ex:
@@ -171,6 +358,10 @@ class StatsForecastMethod(ForecastMethod):
 @ForecastRegistry.register("statsforecast")
 class GenericStatsForecastMethod(StatsForecastMethod):
     """Generic wrapper for any StatsForecast model."""
+
+    CAPABILITY_EXECUTION_LIBRARY = "statsforecast"
+    CAPABILITY_SELECTOR_KEY = "model_name"
+    CAPABILITY_SELECTOR_MODE = "class_name"
 
     PARAMS: List[Dict[str, Any]] = [
         {"name": "model_name", "type": "str", "description": "StatsForecast model class name."},
@@ -209,13 +400,15 @@ class GenericStatsForecastMethod(StatsForecastMethod):
         if target not in available:
             raise ValueError(f"Unknown StatsForecast model: {model_name}. Available: {list(available.keys())}")
             
-        model_cls = getattr(models, available[target])
+        model_cls = getattr(models, available[target], None)
+        if not inspect.isclass(model_cls):
+            raise ValueError(f"StatsForecast model {model_name!r} is not available as a class")
         
         # Filter params for the model constructor
         try:
             sig = inspect.signature(model_cls)
             valid_params = set(sig.parameters.keys())
-        except ValueError:
+        except (TypeError, ValueError):
             valid_params = set()
             
         model_params = {k: v for k, v in params.items() if k in valid_params}
@@ -228,7 +421,12 @@ class GenericStatsForecastMethod(StatsForecastMethod):
         if 'periods' in valid_params and 'periods' not in model_params:
             model_params['periods'] = [max(1, seasonality)]
             
-        return model_cls(**model_params)
+        try:
+            return model_cls(**model_params)
+        except TypeError as ex:
+            raise ValueError(
+                f"Invalid parameters for StatsForecast model {available[target]}: {ex}"
+            ) from ex
 
 _SF_MODEL_CLASS_NAMES: Tuple[str, ...] = (
     # Keep this list lightweight (no import-time statsforecast dependency).
@@ -277,6 +475,12 @@ _SF_MODEL_CLASS_NAMES: Tuple[str, ...] = (
 
 def _build_sf_alias_class(model_name: str, alias: str):
     class _StatsForecastAlias(GenericStatsForecastMethod):
+        CAPABILITY_EXECUTION_LIBRARY = "statsforecast"
+        CAPABILITY_SELECTOR_KEY = "model_name"
+        CAPABILITY_SELECTOR_MODE = "class_name"
+        CAPABILITY_SELECTOR_VALUE = model_name
+        CAPABILITY_ALIASES = (alias,)
+
         @property
         def name(self) -> str:
             return alias
@@ -312,32 +516,3 @@ def _register_statsforecast_aliases() -> None:
 
 
 _register_statsforecast_aliases()
-
-# Backward compatibility wrapper
-def forecast_statsforecast(
-    *,
-    method: str,
-    series: np.ndarray,
-    fh: int,
-    timeframe: str,
-    m_eff: int,
-    exog_used: Optional[np.ndarray] = None,
-    exog_future: Optional[np.ndarray] = None,
-    future_times: Optional[list] = None,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Legacy wrapper for StatsForecast methods."""
-    forecaster = ForecastRegistry.get(method)
-    # Convert numpy series to pandas Series for the interface
-    # (Though our implementation converts it back to numpy for _create_training_dataframes, 
-    # the interface expects pd.Series)
-    s_pd = pd.Series(series)
-    
-    result = forecaster.forecast(
-        series=s_pd,
-        horizon=fh,
-        seasonality=m_eff,
-        params={},
-        exog_used=exog_used,
-        exog_future=exog_future
-    )
-    return result.forecast, result.params_used

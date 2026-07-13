@@ -28,8 +28,8 @@ Intervals calibrated from historical forecast errors. No distributional assumpti
 Request intervals with `--ci-alpha`:
 
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model theta --ci-alpha 0.1 --format json
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method theta --ci-alpha 0.1 --json
 ```
 
 **Parameters:**
@@ -64,8 +64,8 @@ Conformal prediction calibrates intervals from rolling backtest residuals, makin
 ### Usage
 
 ```bash
-python cli.py forecast_conformal_intervals EURUSD --timeframe H1 \
-  --method theta --horizon 12 --steps 25 --spacing 10 --alpha 0.1 --format json
+mtdata-cli forecast_conformal_intervals EURUSD --timeframe H1 \
+  --method theta --horizon 12 --steps 50 --spacing 20 --ci-alpha 0.1 --json
 ```
 
 **Parameters:**
@@ -73,9 +73,11 @@ python cli.py forecast_conformal_intervals EURUSD --timeframe H1 \
 |-----------|-------------|---------|
 | `--method` | Forecasting method | theta |
 | `--horizon` | Forecast horizon | 12 |
-| `--steps` | Number of backtest points | 25 |
-| `--spacing` | Bars between backtest points | 10 |
-| `--alpha` | Miscoverage rate (0.1 = 90% interval) | 0.1 |
+| `--steps` | Number of calibration anchors (default 50 for stabler quantiles) | 50 |
+| `--spacing` | Bars between calibration anchors | 20 |
+| `--ci-alpha` | Miscoverage rate (0.1 = 90% interval) | 0.1 |
+
+> When `--steps > 1`, `--spacing` must be `>= --horizon` so calibration windows do not overlap; otherwise the request is rejected.
 
 ### Output
 
@@ -90,7 +92,7 @@ python cli.py forecast_conformal_intervals EURUSD --timeframe H1 \
 
 **Interpretation:**
 - `lower_price` / `upper_price`: Empirically calibrated bounds
-- "Based on the last 25 forecasts, the actual price stayed within these bounds ~90% of the time."
+- "Based on the last 50 forecasts, the actual price stayed within these bounds ~90% of the time."
 
 ### When to Use
 - When you don't trust model-based intervals
@@ -112,11 +114,15 @@ For each historical bar, ask: "Within the next N bars, did price hit the take-pr
 - `-1` (Loss): SL hit first
 - `0` (Neutral): Neither hit within horizon
 
+In `high_low` mode, `same_bar_policy` resolves a bar that touches both
+barriers. The default is conservatively `sl_first`; `tp_first` and `neutral`
+are explicit alternatives.
+
 ### Usage
 
 ```bash
-python cli.py labels_triple_barrier EURUSD --timeframe H1 --horizon 12 \
-  --tp-pct 0.5 --sl-pct 0.3 --output compact --format json
+mtdata-cli labels_triple_barrier EURUSD --timeframe H1 --horizon 12 \
+  --tp-pct 0.5 --sl-pct 0.3 --json
 ```
 
 **Parameters:**
@@ -154,7 +160,7 @@ Use conformal intervals instead of model CIs:
 
 ```bash
 # Get conformal intervals
-python cli.py forecast_conformal_intervals EURUSD --horizon 12 --alpha 0.1
+mtdata-cli forecast_conformal_intervals EURUSD --horizon 12 --ci-alpha 0.1
 
 # Use lower_price as stop-loss floor
 # Size position so max loss (if lower_price is hit) is within risk budget
@@ -166,7 +172,7 @@ Use triple-barrier labels to evaluate entry signals:
 
 ```bash
 # Label historical entry points
-python cli.py labels_triple_barrier EURUSD --horizon 12 --tp-pct 0.5 --sl-pct 0.3
+mtdata-cli labels_triple_barrier EURUSD --horizon 12 --tp-pct 0.5 --sl-pct 0.3
 
 # Check win rate: counts.pos / (counts.pos + counts.neg)
 # If win rate < 50%, signal needs improvement
@@ -178,10 +184,10 @@ Backtest with conformal intervals to compare reliability:
 
 ```bash
 # Method A
-python cli.py forecast_conformal_intervals EURUSD --method theta --horizon 12 --steps 50
+mtdata-cli forecast_conformal_intervals EURUSD --method theta --horizon 12 --steps 50
 
 # Method B
-python cli.py forecast_conformal_intervals EURUSD --method sf_autoarima --horizon 12 --steps 50
+mtdata-cli forecast_conformal_intervals EURUSD --method sf_autoarima --horizon 12 --steps 50
 
 # Compare interval widths—narrower = more precise (if coverage is similar)
 ```
@@ -192,9 +198,9 @@ python cli.py forecast_conformal_intervals EURUSD --method sf_autoarima --horizo
 
 | Task | Command |
 |------|---------|
-| Model CI (90%) | `python cli.py forecast_generate EURUSD --model theta --ci-alpha 0.1` |
-| Conformal intervals | `python cli.py forecast_conformal_intervals EURUSD --method theta --horizon 12` |
-| Triple-barrier labels | `python cli.py labels_triple_barrier EURUSD --horizon 12 --tp-pct 0.5 --sl-pct 0.3` |
+| Method CI (90%) | `mtdata-cli forecast_generate EURUSD --method theta --ci-alpha 0.1` |
+| Conformal intervals | `mtdata-cli forecast_conformal_intervals EURUSD --method theta --horizon 12` |
+| Triple-barrier labels | `mtdata-cli labels_triple_barrier EURUSD --horizon 12 --tp-pct 0.5 --sl-pct 0.3` |
 
 ---
 

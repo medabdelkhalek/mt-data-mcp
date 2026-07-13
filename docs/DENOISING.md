@@ -30,23 +30,22 @@ Denoising helps:
 
 **Smooth closing prices:**
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 \
   --denoise ema --denoise-params "alpha=0.2"
 ```
 
 **Remove spikes:**
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 \
   --denoise median --denoise-params "window=5"
 ```
 
 ## Dependencies
 
-Some denoising methods require optional packages:
+Most denoising methods are available with the base install. A few require extras:
 
-- `statsmodels`: used by several statistical filters (for example HP/STL)
-- `PyWavelets`: required for wavelet denoising (`wavelet`)
-- `vmdpy`, `EMD-signal`: required for some decomposition-based methods
+- `statsmodels`: used by HP, STL, and related filters — install separately if missing
+- `PyWavelets`, `vmdpy`, `EMD-signal`: bundled as core dependencies, so wavelet, VMD, and EMD-family methods work out of the box
 
 Tip: `GET /api/denoise/methods` (see [WEB_API.md](WEB_API.md)) reports availability and required packages for the current environment.
 
@@ -60,7 +59,7 @@ Apply denoising to raw price, then calculate indicators on smoothed data.
 **Use when:** You want smoother inputs for trend estimation.
 
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 \
   --indicators "rsi(14)" \
   --denoise ema --denoise-params "columns=close,when=pre_ti,alpha=0.2"
 ```
@@ -71,7 +70,7 @@ Calculate indicators on raw data, then smooth the indicator output.
 **Use when:** You want to keep raw price intact but reduce indicator noise.
 
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 \
   --indicators "rsi(14)" \
   --denoise ema --denoise-params "columns=RSI_14,when=post_ti,alpha=0.3"
 ```
@@ -86,12 +85,12 @@ General-purpose smoothing.
 
 | Method | Description | Parameters |
 |--------|-------------|------------|
-| `ema` | Exponential Moving Average | `alpha` (0.1-0.5) |
+| `ema` | Exponential Moving Average | `span` (default 10) or `alpha` (0–1; overrides span) |
 | `sma` | Simple Moving Average | `window` |
 
 **Example:**
 ```bash
---denoise ema --denoise-params "alpha=0.2"
+--denoise ema --denoise-params "span=10"
 ```
 
 ### Robust Filters
@@ -101,7 +100,7 @@ Remove outliers and spikes without excessive smoothing.
 | Method | Description | Parameters |
 |--------|-------------|------------|
 | `median` | Median filter | `window` |
-| `hampel` | Hampel identifier | `window`, `threshold` |
+| `hampel` | Hampel identifier | `window`, `n_sigmas` (default 3.0) |
 
 **Example (spike removal):**
 ```bash
@@ -143,13 +142,27 @@ Automatically adjust smoothing based on data.
 
 | Method | Description | Parameters |
 |--------|-------------|------------|
-| `kalman` | Kalman filter | `transition_cov`, `observation_cov` |
-| `lms` | Least Mean Squares | `mu`, `order` |
-| `rls` | Recursive Least Squares | `delta`, `order` |
+| `kalman` | Kalman filter | `process_var`, `measurement_var` |
+| `lms` | Least Mean Squares | `mu`, `order`, `eps`, `leak` |
+| `rls` | Recursive Least Squares | `delta`, `lambda_`, `order` |
 
 **Example:**
 ```bash
---denoise kalman --denoise-params "transition_cov=0.01"
+--denoise kalman --denoise-params "process_var=0.01"
+```
+
+### Polynomial / Local Regression
+
+Fit local curves to smooth the data.
+
+| Method | Description | Parameters |
+|--------|-------------|------------|
+| `savgol` | Savitzky-Golay smoothing | `window`, `polyorder` |
+| `loess` | Local polynomial regression | `frac`, `it` |
+
+**Example:**
+```bash
+--denoise savgol --denoise-params "window=11,polyorder=3"
 ```
 
 ### Decomposition Methods
@@ -158,15 +171,28 @@ Split into components and reconstruct smoother parts.
 
 | Method | Description | Parameters |
 |--------|-------------|------------|
-| `stl` | Seasonal-Trend decomposition | `period` |
+| `stl` | Seasonal-Trend decomposition | `period`, `component` (default `trend`) |
 | `ssa` | Singular Spectrum Analysis | `window` |
-| `vmd` | Variational Mode Decomposition | `K`, `alpha` |
+| `vmd` | Variational Mode Decomposition | `k`, `alpha`, `drop_modes` |
 | `wavelet` | Wavelet denoising | `wavelet`, `level` |
+| `wavelet_packet` | Wavelet packet denoising | `wavelet`, `level` |
+| `emd` | Empirical Mode Decomposition | `drop_imfs` |
+| `eemd` | Ensemble EMD | `drop_imfs`, `noise_strength` |
+| `ceemdan` | Complete EEMD with Adaptive Noise | `drop_imfs` |
 
 **Example:**
 ```bash
 --denoise wavelet --denoise-params "wavelet=db4,level=3"
 ```
+
+### Kernel / Smoothing Filters
+
+| Method | Description | Parameters |
+|--------|-------------|------------|
+| `gaussian` | Gaussian kernel smoothing | `sigma` |
+| `bilateral` | Bilateral filter (edge-preserving) | `sigma_s`, `sigma_r` |
+| `whittaker` | Whittaker smoother | `lambda` |
+| `beta` | Robust beta smoother | `alpha`, `beta` |
 
 ---
 
@@ -212,27 +238,27 @@ Split into components and reconstruct smoother parts.
 
 ### Smooth Closing Prices
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 500 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 500 \
   --denoise ema --denoise-params "alpha=0.2,keep_original=true"
 ```
 
 ### Remove Price Spikes
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 500 \
-  --denoise hampel --denoise-params "window=7,threshold=3"
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 500 \
+  --denoise hampel --denoise-params "window=7,n_sigmas=3"
 ```
 
 ### Smooth RSI Output
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 500 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 500 \
   --indicators "rsi(14)" \
   --denoise ema --denoise-params "columns=RSI_14,when=post_ti,alpha=0.3"
 ```
 
 ### Kalman Filter (Adaptive)
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 500 \
-  --denoise kalman --denoise-params "transition_cov=0.01"
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 500 \
+  --denoise kalman --denoise-params "process_var=0.01"
 ```
 
 ---
@@ -246,6 +272,18 @@ python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 500 \
 | Adaptive filter | `--denoise kalman` |
 | Keep original column | `--denoise-params "keep_original=true"` |
 | Post-indicator smoothing | `--denoise-params "when=post_ti"` |
+
+---
+
+## Discovering Methods
+
+Two read-only helpers describe the available denoise filters and their parameters:
+
+```bash
+mtdata-cli denoise_list_methods --json                 # all methods, dependencies, causality support
+mtdata-cli denoise_list_methods --available-only --json # only methods whose dependencies are installed
+mtdata-cli denoise_describe kalman --json               # parameters and defaults for one method
+```
 
 ---
 

@@ -1,25 +1,58 @@
-from __future__ import annotations
-
-"""Monte Carlo simulation utilities, including a simple HMM-based regime model.
+"""Monte Carlo simulation utilities, including a Gaussian-HMM regime model.
 
 This module provides two primary helpers:
 - simulate_gbm_mc: Calibrate GBM from recent log-returns and simulate paths
-- simulate_hmm_mc: Fit a light-weight Gaussian HMM (2–3 states) to log-returns
-  using an EM-like procedure and simulate regime-switching returns forward.
+- simulate_hmm_mc: Fit a Gaussian HMM (Baum-Welch via hmmlearn) to log-returns
+  and simulate regime-switching returns forward.
 - simulate_garch_mc: Fit a GARCH(1,1) model (requires 'arch' package) and simulate.
 - simulate_bootstrap_mc: Circular block bootstrap from historical returns.
 - simulate_heston_mc: Heston stochastic volatility simulation (Euler).
 - simulate_jump_diffusion_mc: Merton-style jump diffusion simulation.
 
-This module relies on numpy/pandas plus sklearn (GaussianMixture) and arch
-(bootstrap/GARCH).
+This module relies on numpy/pandas plus sklearn (GaussianMixture), hmmlearn
+(Gaussian HMM), and arch (bootstrap/GARCH).
 """
 
-from typing import Dict, Tuple, Optional
-import numpy as np
+from __future__ import annotations
+
 import warnings
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, Union
+
+import numpy as np
 from sklearn.mixture import GaussianMixture
-from arch.bootstrap import CircularBlockBootstrap
+
+try:
+    from sklearn.exceptions import ConvergenceWarning as _SklearnConvergenceWarning
+except Exception:  # pragma: no cover - defensive fallback
+    _SklearnConvergenceWarning = Warning
+
+HmmSimulationValue = Union[np.ndarray, str]
+
+
+@dataclass(frozen=True)
+class _SimulationRequirements:
+    min_prices: int
+    min_returns: int
+    label: str
+
+
+_SIMULATION_REQUIREMENTS: Dict[str, _SimulationRequirements] = {
+    "hmm": _SimulationRequirements(min_prices=5, min_returns=4, label="HMM calibration"),
+    "gbm": _SimulationRequirements(min_prices=5, min_returns=2, label="GBM calibration"),
+    "heston": _SimulationRequirements(min_prices=10, min_returns=5, label="Heston calibration"),
+    "jump_diffusion": _SimulationRequirements(min_prices=10, min_returns=5, label="jump diffusion calibration"),
+    "garch": _SimulationRequirements(min_prices=50, min_returns=10, label="GARCH calibration (need > 50)"),
+    "bootstrap": _SimulationRequirements(min_prices=11, min_returns=10, label="bootstrapping"),
+}
+
+
+def _load_circular_block_bootstrap():
+    try:
+        from arch.bootstrap import CircularBlockBootstrap
+    except ImportError as ex:
+        raise RuntimeError("simulate_bootstrap_mc requires the 'arch' package.") from ex
+    return CircularBlockBootstrap
 
 
 def _normalize_probability_vector(
@@ -60,6 +93,63 @@ def _safe_log(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return np.log(np.clip(x, eps, None))
 
 
+def _prepare_price_history(
+    prices: np.ndarray,
+    *,
+    min_prices: int,
+    min_returns: int,
+    label: str,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    arr = np.asarray(prices, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < int(min_prices):
+        raise ValueError(f"Not enough prices for {label}")
+    if np.any(arr <= 0.0):
+        raise ValueError(f"{label} requires strictly positive prices")
+    rets = np.diff(_safe_log(arr))
+    rets = rets[np.isfinite(rets)]
+    if rets.size < int(min_returns):
+        raise ValueError(f"Not enough returns for {label}")
+    return arr, rets, float(arr[-1])
+
+
+def _prepare_simulation_history(prices: np.ndarray, method: str) -> tuple[np.ndarray, np.ndarray, float]:
+    requirements = _SIMULATION_REQUIREMENTS[str(method)]
+    return _prepare_price_history(
+        prices,
+        min_prices=requirements.min_prices,
+        min_returns=requirements.min_returns,
+        label=requirements.label,
+    )
+
+
+def _reconstruct_price_paths(last_price: float, return_paths: np.ndarray) -> np.ndarray:
+    return float(last_price) * np.exp(np.cumsum(np.asarray(return_paths, dtype=float), axis=1))
+
+
+def _gaussian_mixture_init_kwargs(x: np.ndarray, n_states: int) -> Dict[str, np.ndarray | str]:
+    """Build deterministic non-KMeans initialization for 1D GaussianMixture.
+
+    The default sklearn initialization path runs a KMeans seed step which can
+    block indefinitely in stdio/MCP worker-thread execution on Windows when
+    joblib probes CPU topology. A simple percentile-based seed avoids that
+    branch while keeping the fitted model stable and deterministic.
+    """
+    x = np.asarray(x, dtype=float).reshape(-1)
+    K = max(1, int(n_states))
+    quantiles = np.linspace(0.0, 1.0, K + 2, dtype=float)[1:-1]
+    means = np.quantile(x, quantiles).reshape(K, 1)
+    variance = float(np.var(x))
+    if not np.isfinite(variance) or variance <= 0.0:
+        variance = 1.0
+    return {
+        "init_params": "random",
+        "weights_init": np.full(K, 1.0 / float(K), dtype=float),
+        "means_init": means,
+        "precisions_init": np.full((K, 1), 1.0 / variance, dtype=float),
+    }
+
+
 def fit_gaussian_mixture_1d(
     x: np.ndarray, n_states: int = 2, max_iter: int = 50, tol: float = 1e-6, seed: Optional[int] = 42
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
@@ -95,9 +185,12 @@ def fit_gaussian_mixture_1d(
         tol=float(tol),
         n_init=1,
         random_state=seed,
+        **_gaussian_mixture_init_kwargs(x, K),
     )
     x2 = x.reshape(-1, 1)
-    model.fit(x2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=_SklearnConvergenceWarning)
+        model.fit(x2)
     gamma = np.asarray(model.predict_proba(x2), dtype=float)
     w = np.asarray(model.weights_, dtype=float).reshape(-1)
     mu = np.asarray(model.means_, dtype=float).reshape(-1)
@@ -106,6 +199,181 @@ def fit_gaussian_mixture_1d(
 
     order = np.argsort(mu)
     return w[order], mu[order], sigma[order], gamma[:, order], ll
+
+
+# ---------------------------------------------------------------------------
+# HMM degeneracy detection constants
+# ---------------------------------------------------------------------------
+_DEGEN_MAX_SIGMA_RATIO: float = 100.0
+"""Standalone trigger: if max(σ)/min(σ) across states exceeds this, the
+model has a ghost state with an implausible variance."""
+
+_DEGEN_MIN_OCCUPANCY_ABS: int = 5
+"""Absolute floor on posterior occupancy (expected observation count)."""
+
+_DEGEN_MIN_OCCUPANCY_FRAC: float = 0.01
+"""Relative floor on posterior occupancy (fraction of N)."""
+
+_DEGEN_COMBINED_SELF_TRANS: float = 0.99
+"""Self-transition threshold used *together* with low occupancy."""
+
+
+def _is_hmm_degenerate(
+    model: object, x2: np.ndarray, K: int, N: int,
+) -> bool:
+    """Return *True* if the fitted HMM has collapsed/ghost states.
+
+    Two independent criteria (either triggers fallback):
+
+    1. **Extreme variance pathology** — any state's σ is > 100× another's.
+       This catches ghost states with physically impossible volatility.
+
+    2. **Low occupancy + absorbing transition** — a state's posterior
+       occupancy (soft count from ``predict_proba``) is below
+       ``max(5, 0.01 * N)`` *and* the highest diagonal entry in the
+       transition matrix exceeds 0.99.  Neither alone is sufficient:
+       rare-but-real regimes can have low occupancy, and persistent
+       regimes can have high self-transition.
+    """
+    if K <= 1:
+        return False
+
+    # --- criterion 1: sigma ratio ---
+    covars = np.asarray(model.covars_, dtype=float).reshape(K, -1)[:, 0]
+    sigma = np.sqrt(np.clip(covars, 1e-12, None))
+    if sigma.max() / max(sigma.min(), 1e-12) > _DEGEN_MAX_SIGMA_RATIO:
+        return True
+
+    # --- criterion 2: low posterior occupancy + absorbing transition ---
+    gamma = np.asarray(model.predict_proba(x2), dtype=float)
+    min_occupancy = float(gamma.sum(axis=0).min())
+    occ_threshold = max(_DEGEN_MIN_OCCUPANCY_ABS, _DEGEN_MIN_OCCUPANCY_FRAC * N)
+
+    if min_occupancy < occ_threshold:
+        diag = np.diag(np.asarray(model.transmat_, dtype=float))
+        if float(diag.max()) > _DEGEN_COMBINED_SELF_TRANS:
+            return True
+
+    return False
+
+
+def fit_gaussian_hmm_1d(
+    x: np.ndarray,
+    n_states: int = 2,
+    max_iter: int = 80,
+    tol: float = 1e-6,
+    seed: Optional[int] = 42,
+) -> Dict[str, Any]:
+    """Fit a 1D GaussianHMM and expose filtered and smoothed posteriors.
+
+    If the fitted model has ghost/collapsed states (detected via
+    ``_is_hmm_degenerate``), the function silently re-fits with fewer
+    components until a non-degenerate fit is found (minimum K=1).
+
+    The filtered posterior is computed with a scaled forward recursion. The
+    smoothed posterior comes from hmmlearn and is retrospective.
+    """
+    from hmmlearn.hmm import GaussianHMM
+
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    N = int(x.size)
+    requested_K = max(1, int(n_states))
+    if N < max(4, requested_K + 1):
+        raise ValueError("Not enough returns for GaussianHMM calibration")
+
+    x2 = x.reshape(-1, 1)
+
+    # Try from requested K down to 1; stop at first non-degenerate fit.
+    for K in range(requested_K, 0, -1):
+        # Exclude 'm' from init_params so hmmlearn respects our pre-set
+        # means and skips its KMeans initialization step.  KMeans blocks
+        # indefinitely in asyncio.to_thread workers on Windows (joblib
+        # CPU-topology probe).
+        model = GaussianHMM(
+            n_components=K,
+            covariance_type='diag',
+            n_iter=int(max_iter),
+            tol=float(tol),
+            random_state=seed,
+            init_params='stc',
+        )
+        quantiles = np.linspace(0.0, 1.0, K + 2, dtype=float)[1:-1]
+        model.means_ = np.quantile(x, quantiles).reshape(K, 1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(x2)
+
+        if K == 1 or not _is_hmm_degenerate(model, x2, K, N):
+            break
+
+    # Extract parameters from the accepted fit.
+    gamma = np.asarray(model.predict_proba(x2), dtype=float)
+    mu = np.asarray(model.means_, dtype=float).reshape(-1)
+    covars = np.asarray(model.covars_, dtype=float)
+    sigma = np.sqrt(np.clip(covars.reshape(K, -1)[:, 0], 1e-12, None))
+    A = _normalize_transition_matrix(np.asarray(model.transmat_, dtype=float))
+    start_prob = _normalize_probability_vector(
+        np.asarray(model.startprob_, dtype=float)
+    )
+
+    # Scaled forward filtering: alpha_t = p(S_t | x_1:t, fitted parameters).
+    variance = np.maximum(sigma * sigma, 1e-12)
+    centered = x[:, None] - mu[None, :]
+    emission = np.exp(-0.5 * centered * centered / variance[None, :]) / np.sqrt(
+        2.0 * np.pi * variance[None, :]
+    )
+    filtered = np.zeros_like(emission)
+    alpha = start_prob * emission[0]
+    alpha = _normalize_probability_vector(alpha)
+    filtered[0] = alpha
+    for row in range(1, N):
+        alpha = (alpha @ A) * emission[row]
+        alpha = _normalize_probability_vector(alpha)
+        filtered[row] = alpha
+
+    # Keep stable state ordering (ascending mean) and reorder transition
+    # matrix/initial distribution accordingly.
+    order = np.argsort(mu)
+    mu = mu[order]
+    sigma = sigma[order]
+    A = A[np.ix_(order, order)]
+    start_prob = _normalize_probability_vector(start_prob[order])
+    gamma = gamma[:, order]
+    filtered = filtered[:, order]
+    return {
+        "mu": mu,
+        "sigma": sigma,
+        "trans": A,
+        "start_prob": start_prob,
+        "filtered_probabilities": filtered,
+        "smoothed_probabilities": gamma,
+        "last_filtered_probabilities": _normalize_probability_vector(filtered[-1]),
+        "state_occupancy": np.mean(gamma, axis=0),
+        "log_likelihood": float(model.score(x2)),
+        "converged": bool(getattr(getattr(model, "monitor_", None), "converged", False)),
+        "requested_n_states": int(requested_K),
+        "fitted_n_states": int(K),
+    }
+
+
+def _fit_hmmlearn_gaussian_hmm_1d(
+    x: np.ndarray,
+    n_states: int = 2,
+    max_iter: int = 80,
+    tol: float = 1e-6,
+    seed: Optional[int] = 42,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compatibility helper for the Monte Carlo simulator."""
+    fit = fit_gaussian_hmm_1d(
+        x, n_states=n_states, max_iter=max_iter, tol=tol, seed=seed
+    )
+    return (
+        np.asarray(fit["mu"], dtype=float),
+        np.asarray(fit["sigma"], dtype=float),
+        np.asarray(fit["trans"], dtype=float),
+        np.asarray(fit["last_filtered_probabilities"], dtype=float),
+    )
 
 
 def estimate_transition_matrix_from_gamma(gamma: np.ndarray) -> np.ndarray:
@@ -118,11 +386,7 @@ def estimate_transition_matrix_from_gamma(gamma: np.ndarray) -> np.ndarray:
     N, K = gamma.shape
     if N <= 1 or K <= 0:
         return np.eye(max(1, K), dtype=float)
-    counts = np.zeros((K, K), dtype=float)
-    for t in range(N - 1):
-        gi = gamma[t].reshape(-1, 1)
-        gj = gamma[t + 1].reshape(1, -1)
-        counts += gi @ gj
+    counts = gamma[:-1].T @ gamma[1:]
     return _normalize_transition_matrix(counts)
 
 
@@ -136,13 +400,21 @@ def simulate_markov_chain(A: np.ndarray, init: np.ndarray, steps: int, sims: int
     A = _normalize_transition_matrix(np.asarray(A, dtype=float))
     init = _normalize_probability_vector(np.asarray(init, dtype=float))
     K = A.shape[0]
-    out = np.zeros((int(sims), int(steps)), dtype=int)
-    for s in range(int(sims)):
-        # initial state by init distribution
-        st = int(rng.choice(K, p=init))
-        for t in range(int(steps)):
-            out[s, t] = st
-            st = int(rng.choice(K, p=A[st]))
+    sims_i = max(0, int(sims))
+    steps_i = max(0, int(steps))
+    out = np.zeros((sims_i, steps_i), dtype=int)
+    if sims_i == 0 or steps_i == 0:
+        return out
+
+    # Vectorize across all simulation paths; only iterate across timesteps.
+    states = rng.choice(K, p=init, size=sims_i).astype(int)
+    cdf = np.cumsum(A, axis=1)
+    cdf[:, -1] = 1.0
+    for t in range(steps_i):
+        out[:, t] = states
+        u = rng.rand(sims_i)
+        next_states = np.sum(u[:, None] > cdf[states], axis=1)
+        states = np.clip(next_states, 0, K - 1).astype(int)
     return out
 
 
@@ -152,8 +424,11 @@ def simulate_hmm_mc(
     n_states: int = 2,
     n_sims: int = 500,
     seed: Optional[int] = 42,
-) -> Dict[str, np.ndarray]:
-    """Fit a simple Gaussian HMM to log-returns and simulate future price paths.
+) -> Dict[str, HmmSimulationValue]:
+    """Fit a regime model to log-returns and simulate future price paths.
+
+    Calibration backend:
+    - `hmmlearn` GaussianHMM (Baum-Welch)
 
     Returns a dict with keys:
     - price_paths: (sims, horizon)
@@ -163,21 +438,19 @@ def simulate_hmm_mc(
     - sigma: (K,)
     - trans: (K,K)
     - init: (K,)
+    - requested_n_states: int
+    - fitted_n_states: int  (may be < requested if model degenerated)
     """
     rng = np.random.RandomState(seed)
-    prices = np.asarray(prices, dtype=float)
-    prices = prices[np.isfinite(prices)]
-    if prices.size < 5:
-        raise ValueError("Not enough prices for HMM calibration")
-    rets = np.diff(_safe_log(prices))
-    rets = rets[np.isfinite(rets)]
-    if rets.size < 4:
-        raise ValueError("Not enough returns for HMM calibration")
+    _, rets, last_price = _prepare_simulation_history(prices, "hmm")
 
-    # Fit mixture and derive transition matrix
-    w, mu, sigma, gamma, _ = fit_gaussian_mixture_1d(rets, n_states=n_states, max_iter=80, tol=1e-6, seed=seed)
-    A = estimate_transition_matrix_from_gamma(gamma)
-    init = _normalize_probability_vector(gamma[-1])
+    mu, sigma, A, init = _fit_hmmlearn_gaussian_hmm_1d(
+        rets,
+        n_states=n_states,
+        max_iter=80,
+        tol=1e-6,
+        seed=seed,
+    )
     K = mu.shape[0]
 
     # Simulate state paths
@@ -192,12 +465,7 @@ def simulate_hmm_mc(
             ret_paths[idx] = rng.normal(loc=mu[k], scale=max(sigma[k], 1e-12), size=n_k)
 
     # Build price paths from last observed price
-    last_price = float(prices[-1])
-    price_paths = np.zeros_like(ret_paths, dtype=float)
-    cur = np.full(int(n_sims), last_price, dtype=float)
-    for t in range(int(horizon)):
-        cur = cur * np.exp(ret_paths[:, t])
-        price_paths[:, t] = cur
+    price_paths = _reconstruct_price_paths(last_price, ret_paths)
 
     return {
         'price_paths': price_paths,
@@ -207,6 +475,9 @@ def simulate_hmm_mc(
         'sigma': sigma,
         'trans': A,
         'init': init,
+        'model_type': "gaussian_hmm_baum_welch",
+        'requested_n_states': int(n_states),
+        'fitted_n_states': K,
     }
 
 
@@ -215,30 +486,31 @@ def simulate_gbm_mc(
     horizon: int,
     n_sims: int = 500,
     seed: Optional[int] = 42,
+    antithetic: bool = True,
+    mu: Optional[float] = None,
+    sigma: Optional[float] = None,
 ) -> Dict[str, np.ndarray]:
     """Calibrate GBM from historical log-returns and simulate forward paths.
 
     Returns dict with keys 'price_paths', 'return_paths', 'mu', and 'sigma'.
     """
     rng = np.random.RandomState(seed)
-    prices = np.asarray(prices, dtype=float)
-    prices = prices[np.isfinite(prices)]
-    if prices.size < 5:
-        raise ValueError("Not enough prices for GBM calibration")
-    rets = np.diff(_safe_log(prices))
-    rets = rets[np.isfinite(rets)]
-    if rets.size < 2:
-        raise ValueError("Not enough returns for GBM calibration")
-    mu = float(np.mean(rets))
-    sigma = float(np.std(rets) + 1e-12)
-    last_price = float(prices[-1])
+    _, rets, last_price = _prepare_simulation_history(prices, "gbm")
+    calibrated_mu = float(np.mean(rets))
+    calibrated_sigma = float(np.std(rets, ddof=1) + 1e-12)
+    mu = float(mu) if mu is not None else calibrated_mu
+    sigma = float(sigma) if sigma is not None else calibrated_sigma
+    sims_i = int(n_sims)
+    horizon_i = int(horizon)
 
-    ret_paths = rng.normal(loc=mu, scale=sigma, size=(int(n_sims), int(horizon)))
-    price_paths = np.zeros_like(ret_paths)
-    cur = np.full(int(n_sims), last_price, dtype=float)
-    for t in range(int(horizon)):
-        cur = cur * np.exp(ret_paths[:, t])
-        price_paths[:, t] = cur
+    if bool(antithetic) and sims_i > 1 and horizon_i > 0:
+        half = (sims_i + 1) // 2
+        z = rng.normal(size=(half, horizon_i))
+        z = np.vstack([z, -z])[:sims_i]
+        ret_paths = mu + sigma * z
+    else:
+        ret_paths = rng.normal(loc=mu, scale=sigma, size=(sims_i, horizon_i))
+    price_paths = _reconstruct_price_paths(last_price, ret_paths)
     return {
         'price_paths': price_paths,
         'return_paths': ret_paths,
@@ -261,28 +533,56 @@ def simulate_heston_mc(
 ) -> Dict[str, np.ndarray]:
     """Simulate a Heston stochastic volatility model using Euler discretization."""
     rng = np.random.RandomState(seed)
-    prices = np.asarray(prices, dtype=float)
-    prices = prices[np.isfinite(prices)]
-    if prices.size < 10:
-        raise ValueError("Not enough prices for Heston calibration")
+    _, rets, last_price = _prepare_simulation_history(prices, "heston")
 
-    rets = np.diff(_safe_log(prices))
-    rets = rets[np.isfinite(rets)]
-    if rets.size < 5:
-        raise ValueError("Not enough returns for Heston calibration")
-
-    mu = float(np.mean(rets))
+    mu_log = float(np.mean(rets))
     ret_var = float(np.var(rets, ddof=1))
     ret_var = max(ret_var, 1e-10)
 
     theta_val = float(theta) if theta is not None else ret_var
+    mu_price = float(mu_log + 0.5 * theta_val)
     v0_val = float(v0) if v0 is not None else float(np.var(rets[-50:], ddof=1) if rets.size >= 50 else ret_var)
-    kappa_val = float(kappa) if kappa is not None else 2.0
-    xi_val = float(xi) if xi is not None else max(1e-6, 0.5 * np.sqrt(theta_val))
-    rho_val = float(rho) if rho is not None else -0.3
+    rv = np.clip(rets * rets, 1e-12, None)
+    kappa_emp = 2.0
+    if rv.size >= 3:
+        x_prev = rv[:-1]
+        x_next = rv[1:]
+        sx = float(np.std(x_prev))
+        sy = float(np.std(x_next))
+        if sx > 0.0 and sy > 0.0:
+            phi = float(np.corrcoef(x_prev, x_next)[0, 1])
+            if np.isfinite(phi):
+                phi = float(np.clip(phi, 1e-4, 0.9999))
+                kappa_emp = float(max(1e-6, -np.log(phi) / max(float(dt), 1e-12)))
+
+    xi_emp = max(1e-6, 0.5 * np.sqrt(theta_val))
+    if rv.size >= 4:
+        d_rv = np.diff(rv)
+        if d_rv.size >= 2:
+            d_std = float(np.std(d_rv, ddof=1))
+        else:
+            d_std = float(np.std(d_rv))
+        if np.isfinite(d_std):
+            xi_emp = float(np.clip(d_std / max(np.sqrt(theta_val), 1e-8), 1e-6, 3.0))
+
+    rho_emp = -0.3
+    if rets.size >= 20:
+        r_prev = rets[:-1]
+        rv_next = rv[1:]
+        sr = float(np.std(r_prev))
+        sv = float(np.std(rv_next))
+        if sr > 0.0 and sv > 0.0:
+            rho_guess = float(np.corrcoef(r_prev, rv_next)[0, 1])
+            if np.isfinite(rho_guess):
+                rho_emp = float(np.clip(rho_guess, -0.99, 0.99))
+
+    kappa_val = float(kappa) if kappa is not None else kappa_emp
+    xi_val = float(xi) if xi is not None else xi_emp
+    rho_val = float(rho) if rho is not None else rho_emp
+    kappa_val = float(max(1e-6, kappa_val))
+    xi_val = float(max(1e-6, xi_val))
     rho_val = float(np.clip(rho_val, -0.99, 0.99))
 
-    last_price = float(prices[-1])
     price_paths = np.zeros((int(n_sims), int(horizon)), dtype=float)
     ret_paths = np.zeros_like(price_paths, dtype=float)
     vol_paths = np.zeros_like(price_paths, dtype=float)
@@ -300,7 +600,7 @@ def simulate_heston_mc(
         dv = kappa_val * (theta_val - v_pos) * dt + xi_val * np.sqrt(v_pos) * sqrt_dt * z2
         v = np.clip(v_pos + dv, 1e-10, None)
 
-        ret = (mu - 0.5 * v_pos) * dt + np.sqrt(v_pos) * sqrt_dt * z1
+        ret = (mu_price - 0.5 * v_pos) * dt + np.sqrt(v_pos) * sqrt_dt * z1
         cur = cur * np.exp(ret)
 
         ret_paths[:, t] = ret
@@ -312,7 +612,8 @@ def simulate_heston_mc(
         'return_paths': ret_paths,
         'vol_paths': vol_paths,
         'params': {
-            'mu': mu,
+            'mu': mu_log,
+            'price_drift': mu_price,
             'kappa': kappa_val,
             'theta': theta_val,
             'xi': xi_val,
@@ -335,15 +636,7 @@ def simulate_jump_diffusion_mc(
 ) -> Dict[str, np.ndarray]:
     """Simulate a Merton jump-diffusion model."""
     rng = np.random.RandomState(seed)
-    prices = np.asarray(prices, dtype=float)
-    prices = prices[np.isfinite(prices)]
-    if prices.size < 10:
-        raise ValueError("Not enough prices for jump diffusion calibration")
-
-    rets = np.diff(_safe_log(prices))
-    rets = rets[np.isfinite(rets)]
-    if rets.size < 5:
-        raise ValueError("Not enough returns for jump diffusion calibration")
+    _, rets, last_price = _prepare_simulation_history(prices, "jump_diffusion")
 
     mu = float(np.mean(rets))
     sigma = float(np.std(rets, ddof=1)) + 1e-12
@@ -359,10 +652,12 @@ def simulate_jump_diffusion_mc(
         mu_j = float(jump_mu) if jump_mu is not None else 0.0
         sigma_j = float(jump_sigma) if jump_sigma is not None else float(max(0.5 * sigma, 1e-6))
 
-    k = np.exp(mu_j + 0.5 * sigma_j * sigma_j) - 1.0
-    drift = mu - lambda_val * k
+    # ``mu`` is calibrated as a mean log return. Compensate the compound
+    # Poisson term by E[log jump] so expected simulated log return remains
+    # anchored to that estimate.
+    jump_log_mean = lambda_val * mu_j
+    drift = mu - jump_log_mean
 
-    last_price = float(prices[-1])
     price_paths = np.zeros((int(n_sims), int(horizon)), dtype=float)
     ret_paths = np.zeros_like(price_paths, dtype=float)
 
@@ -388,6 +683,8 @@ def simulate_jump_diffusion_mc(
             'jump_mu': mu_j,
             'jump_sigma': sigma_j,
             'jump_threshold': float(jump_threshold),
+            'continuous_log_drift': drift,
+            'expected_log_return': drift + jump_log_mean,
         },
     }
 
@@ -409,13 +706,7 @@ def simulate_garch_mc(
     except ImportError:
         raise ImportError("The 'arch' library is required for GARCH simulations.")
 
-    prices = np.asarray(prices, dtype=float)
-    prices = prices[np.isfinite(prices)]
-    if prices.size < 50:  # GARCH needs decent history
-        raise ValueError("Not enough prices for GARCH calibration (need > 50)")
-    
-    rets = np.diff(_safe_log(prices))
-    rets = rets[np.isfinite(rets)]
+    _, rets, last_price = _prepare_simulation_history(prices, "garch")
     
     # Scale returns for numerical stability (common practice with GARCH)
     scale = 100.0
@@ -424,7 +715,7 @@ def simulate_garch_mc(
     # Fit GARCH(p,q)
     # Use Mean='Zero' assuming daily drift is negligible compared to vol for short horizons,
     # or 'Constant' to capture drift. Let's use Constant.
-    am = arch_model(rets_scaled, vol='Garch', p=p_order, q=q_order, dist='Normal', mean='Constant')
+    am = arch_model(rets_scaled, vol='GARCH', p=p_order, q=q_order, dist='normal', mean='Constant')
     
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -443,18 +734,25 @@ def simulate_garch_mc(
         reindex=False,
     )
     
-    # Get simulated paths (1, n_sims, horizon) -> (n_sims, horizon)
-    # forecasts.simulations.values contains the simulated returns
-    sim_rets_scaled = forecasts.simulations.values[-1]
+    simulations = getattr(forecasts, "simulations", None)
+    simulation_values = getattr(simulations, "values", None) if simulations is not None else None
+    if simulation_values is None:
+        raise RuntimeError("GARCH forecast did not return simulation paths")
+    simulation_values = np.asarray(simulation_values, dtype=float)
+    if simulation_values.size == 0:
+        raise RuntimeError("GARCH forecast returned empty simulation paths")
+    if simulation_values.ndim == 3:
+        sim_rets_scaled = simulation_values[-1]
+    elif simulation_values.ndim == 2:
+        sim_rets_scaled = simulation_values
+    else:
+        raise RuntimeError("GARCH forecast simulation paths have unexpected shape")
     
     # Unscale
     sim_rets = sim_rets_scaled / scale
     
     # Reconstruct prices
-    last_price = float(prices[-1])
-    # cumsum of log returns
-    cum_rets = np.cumsum(sim_rets, axis=1)
-    price_paths = last_price * np.exp(cum_rets)
+    price_paths = _reconstruct_price_paths(last_price, sim_rets)
     
     return {
         'price_paths': price_paths,
@@ -471,33 +769,41 @@ def simulate_bootstrap_mc(
     block_size: Optional[int] = None
 ) -> Dict[str, np.ndarray]:
     """Circular Block Bootstrap simulation."""
-    prices = np.asarray(prices, dtype=float)
-    prices = prices[np.isfinite(prices)]
-    rets = np.diff(_safe_log(prices))
-    rets = rets[np.isfinite(rets)]
+    _, rets, last_price = _prepare_simulation_history(prices, "bootstrap")
     n = len(rets)
-    
-    if n < 10:
-        raise ValueError("Not enough returns for bootstrapping")
     
     if block_size is None:
         # Politis & White rule of thumb approx n^(1/3)
         block_size = int(max(1, n ** (1.0/3.0)))
     
     block_size = max(1, int(block_size))
+    CircularBlockBootstrap = _load_circular_block_bootstrap()
     bs = CircularBlockBootstrap(block_size, rets, seed=seed)
-    sim_rets = np.zeros((int(n_sims), int(horizon)), dtype=float)
+    horizon_i = int(horizon)
+    sims_i = int(n_sims)
+    sampled_paths: list[np.ndarray] = []
     for s_idx, boot in enumerate(bs.bootstrap(int(n_sims))):
+        if s_idx >= sims_i:
+            break
         sample = np.asarray(boot[0][0], dtype=float).reshape(-1)
-        if sample.size < int(horizon):
-            reps = int(np.ceil(int(horizon) / max(1, sample.size)))
-            sample = np.tile(sample, reps)
-        sim_rets[s_idx] = sample[: int(horizon)]
-    
-    # Reconstruct prices
-    last_price = float(prices[-1])
-    cum_rets = np.cumsum(sim_rets, axis=1)
-    price_paths = last_price * np.exp(cum_rets)
+        if sample.size < horizon_i:
+            raise RuntimeError(
+                "Bootstrap simulator returned an undersized path "
+                f"({sample.size} < {horizon_i}); refusing to tile returns "
+                "without an explicit continuation policy."
+            )
+        sampled_paths.append(sample[:horizon_i].astype(float, copy=False))
+    if not sampled_paths:
+        raise RuntimeError("Bootstrap simulation produced no return paths")
+    if len(sampled_paths) < sims_i:
+        rng = np.random.RandomState(seed)
+        existing = np.asarray(sampled_paths, dtype=float)
+        extra_idx = rng.choice(existing.shape[0], size=(sims_i - len(sampled_paths)), replace=True)
+        for idx in extra_idx.tolist():
+            sampled_paths.append(existing[int(idx)].copy())
+    sim_rets = np.asarray(sampled_paths[:sims_i], dtype=float)
+
+    price_paths = _reconstruct_price_paths(last_price, sim_rets)
     
     return {
         'price_paths': price_paths,
@@ -581,22 +887,34 @@ def gbm_single_barrier_upcross_prob(
     if T_f <= 0.0:
         return 0.0
 
+    x0 = math.log(s0_f)
+    a = math.log(barrier_f)
+
     # Deterministic limiting case.
     if sigma_f <= 0.0:
         if mu_f <= 0.0:
             return 0.0
-        return 1.0 if (s0_f * math.exp(mu_f * T_f) >= barrier_f) else 0.0
+        return 1.0 if (x0 + mu_f * T_f >= a) else 0.0
+
+    sigma_var = sigma_f * sigma_f
+    m = mu_f - 0.5 * sigma_var
+    srt = sigma_f * math.sqrt(T_f)
+    if srt <= 0.0 or sigma_var <= 0.0:
+        if mu_f <= 0.0:
+            return 0.0
+        return 1.0 if (x0 + mu_f * T_f >= a) else 0.0
 
     from scipy.stats import norm
 
-    x0 = math.log(s0_f)
-    a = math.log(barrier_f)
-    m = mu_f - 0.5 * sigma_f * sigma_f
-    srt = sigma_f * math.sqrt(T_f)
     z1 = (x0 - a + m * T_f) / srt
     z2 = (x0 - a - m * T_f) / srt
-    term = math.exp(2.0 * m * (a - x0) / (sigma_f * sigma_f))
-    p = float(norm.cdf(z1) + term * norm.cdf(z2))
+    log_term = 2.0 * m * (a - x0) / sigma_var
+    log_second_term = float(log_term + norm.logcdf(z2))
+    if log_second_term <= -745.0:
+        second_term = 0.0
+    else:
+        second_term = math.exp(min(log_second_term, 709.0))
+    p = float(norm.cdf(z1) + second_term)
     if not math.isfinite(p):
-        return 0.0
+        return 1.0 if log_term > 0.0 else float(min(1.0, max(0.0, norm.cdf(z1))))
     return float(min(1.0, max(0.0, p)))

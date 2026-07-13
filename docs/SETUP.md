@@ -1,9 +1,10 @@
 # Setup & Configuration
 
-Installation and configuration guide for mtdata.
+Use this guide to install mtdata, connect it to MetaTrader 5, and verify a safe read-only workflow before enabling any trading actions.
 
 **Related:**
 - [README.md](../README.md) — Project overview
+- [ENV_VARS.md](ENV_VARS.md) — Complete environment variables reference
 - [CLI.md](CLI.md) — Command usage
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Common issues
 
@@ -14,44 +15,152 @@ Installation and configuration guide for mtdata.
 ## Requirements
 
 - **Operating System:** Windows (required for MetaTrader 5)
-- **Python:** 3.10 or higher
+- **Python:** 3.14
 - **MetaTrader 5:** Installed and running
+- **Windows Build Tools:** Visual Studio Build Tools 2022 with the **Desktop development with C++** workload for `pip install -r requirements.txt`, Git-backed extras, and optional native accelerators
+
+---
+
+## Recommended First-Run Path
+
+1. Install the lean package with `pip install -e .`.
+2. Confirm MT5 connectivity with `mtdata-cli symbols_list --limit 10`.
+3. Set broker timezone configuration before relying on timestamps or backtests.
+4. Run read-only examples first: symbols, candles, forecast, and report commands.
+5. Use a demo account and `--dry-run true` before testing any `trade_*` command that supports it.
+
+Choose the smallest install that fits your current task:
+
+| Need | Install Path |
+|------|--------------|
+| CLI, MT5 data, indicators, core analysis | `pip install -e .` |
+| Validated local research stack used by most docs | `pip install -r requirements.txt` |
+| Web API / Web UI backend only | `pip install -e .[web]` |
+| Heavy forecasting and optimization extras | `pip install -e .[forecast-classical]` and/or `pip install -e .[forecast-foundation]` |
+| Git-backed experimental integrations | Install the specific Git-backed extra only when needed |
 
 ---
 
 ## Installation
 
-### 1. Install Python Dependencies
+### 1. Create an Isolated Conda Environment (Optional but Recommended)
 
-From the repository root:
+If you use Conda/Miniconda, start with a clean Python 3.14 environment:
 
 ```bash
-pip install -r requirements.txt
+conda create -n mtdata python=3.14 -y
+conda activate mtdata
+python --version
 ```
 
-### 2. Editable Install (Optional)
+If you prefer not to use conda, make sure the active interpreter is Python 3.14 before continuing.
 
-For development or to use entry points (`mtdata-server`, `mtdata-cli`):
+### 2. Install the Lean Core Package
+
+From the repository root:
 
 ```bash
 pip install -e .
 ```
 
-### 3. Optional Dependencies
+### 3. Install the Full Stable Feature Set (Optional)
 
-`requirements.txt` installs a broad set of optional capabilities. If you are installing selectively, these features require extra packages:
+For the validated research/web environment used in local development and most docs/examples:
+
+```bash
+pip install -r requirements.txt
+```
+
+This path intentionally stays on package-index releases. Git-backed add-ons such as TimesFM, `stock-pattern`, and `ycnbc` stay opt-in so the default install does not depend on Git checkouts.
+NeuralForecast-based models are also kept out of this default path; current Windows Python 3.14 resolution can fail on transitive dependencies, so treat `nhits`, `tft`, `patchtst`, and `nbeatsx` as manual/nonstandard setup.
+
+### 4. Optional Dependencies
+
+The base package is intentionally lean. Install extras as needed:
+
+> Windows note: install Visual Studio Build Tools 2022 with the **Desktop development with C++** workload before the full install or any Git-backed extra. Several optional dependencies include native extensions, and pip may need MSVC when a compatible wheel is unavailable. Git-backed extras also require Git on `PATH`.
+
+- Classical forecasting / optimization:
+  `pip install -e .[forecast-classical]`
+- Foundation-model forecasting (Chronos / Chronos-Bolt):
+  `pip install -e .[forecast-foundation]`
+- TimesFM (Git-backed):
+  `pip install -e .[forecast-timesfm]`
+- Web API:
+  `pip install -e .[web]`
+- Experimental pattern engines (Git-backed, requires manual install):
+  `pip install -e .[patterns-ext]` (Note: stock-pattern requires manual copy to site-packages; see below)
+- News embeddings (semantic reranking):
+  `pip install -e .[news-embeddings]`
+- CNBC news source (Git-backed):
+  `pip install -e .[news-ycnbc]`
+- Everything from package indexes:
+  `pip install -e .[all]`
+- Everything including Git-backed extras:
+  `pip install -e .[all-git]`
+
+Feature notes:
 
 - Causal discovery (`causal_discover_signals`) and classical ARIMA/ETS: `statsmodels`
 - Wavelet denoising: `PyWavelets`
 - Dimred UMAP (Web UI / analysis): `umap-learn`
 - Foundation models:
   - Chronos (`chronos2`, `chronos_bolt`): `chronos-forecasting`, `torch`
-  - TimesFM (`timesfm`): `timesfm`, `torch` (installed from Git in `requirements.txt`)
-  - Lag-Llama (`lag_llama`): `lag-llama`, `gluonts[torch]`, `torch` (may not be installable on all Python versions due to upstream pins)
+  - TimesFM (`timesfm`): `timesfm`, `torch` (install with `pip install -e .[forecast-timesfm]`; Git-backed extra)
+  - GluonTS / Lag-Llama are not shipped in mtdata because they are unsupported on the project's Python 3.14 runtime
 - Forecasting libraries: `statsforecast`, `sktime`, `mlforecast` (plus `lightgbm` for GBMs)
 - Volatility (GARCH/ARCH): `arch`
+- Simplification accelerator: `tsdownsample` is included in the full package-index install path (`requirements.txt` / `[all]`) and remains optional for lean installs
+- Optional pattern-search accelerator omitted from the default Python 3.14 install: `hnswlib` (see the opt-in helper file `requirements-optional-src.txt` below)
+- Barrier option pricing & Heston calibration: `QuantLib`
+- Bayesian hyperparameter optimization: `optuna`
+- Neural network forecasters (`nhits`, `tft`, `patchtst`, `nbeatsx`): manual/nonstandard setup only; not included in `requirements.txt` or a package extra
 
-Tip: `python cli.py forecast_list_methods --format json` shows `available` and `requires` per method.
+### 5. Optional Native Accelerator Source-Build Path
+
+Use this only if you explicitly want the extra accelerator that is omitted from the validated default Python 3.14 stack:
+
+- `hnswlib` for the `hnsw` analog-search engine
+
+Helper file:
+
+```bash
+pip install -r requirements-optional-src.txt
+```
+
+Notes:
+
+- This path is opt-in and not part of the project's supported default Python 3.14 environment.
+- On Python 3.14, pip builds `hnswlib` from source because a compatible Windows wheel is unavailable.
+- `hnswlib` is a C++ extension build. On Windows, install Visual Studio Build Tools 2022 with the **Desktop development with C++** workload first.
+- If you only want this accelerator, install it directly instead of the helper file:
+  - `pip install hnswlib==0.8.0`
+- If you want the LTTB simplification accelerator without the full `[all]` extra, install it directly with `pip install "tsdownsample>=0.1.5"`.
+
+Tip: `mtdata-cli forecast_list_methods --json` shows `available` and `requires` per method.
+
+### 6. Manual stock-pattern Installation
+
+The `stock-pattern` library (used by `patterns-ext`) does not have a `setup.py` or `pyproject.toml`, so it cannot be installed via pip. Install manually:
+
+**Windows:**
+```powershell
+# Clone and copy to site-packages
+git clone --depth 1 https://github.com/BennyThadikaran/stock-pattern.git $env:TEMP\stock-pattern-src
+robocopy $env:TEMP\stock-pattern-src\src $env:CONDA_PREFIX\Lib\site-packages\stock_pattern /E
+```
+
+**Linux/macOS:**
+```bash
+# Clone and copy to site-packages
+git clone --depth 1 https://github.com/BennyThadikaran/stock-pattern.git /tmp/stock-pattern-src
+cp -r /tmp/stock-pattern-src/src/* $(python -c "import site; print(site.getsitepackages()[0])")/stock_pattern/
+```
+
+Verify installation:
+```python
+python -c "import stock_pattern.utils; print('stock_pattern installed')"
+```
 
 ---
 
@@ -74,12 +183,12 @@ If you don't have a broker account yet, you can still get started:
 ### 3. Verify Connection
 
 ```bash
-python cli.py symbols_list --limit 10
+mtdata-cli symbols_list --limit 10
 ```
 
 Optional deeper check:
 ```bash
-python cli.py trade_account_info --format json
+mtdata-cli trade_account_info --json
 ```
 
 Expected output:
@@ -94,11 +203,13 @@ If you don't see symbols (or you get a connection error):
 - Make sure MT5 is **running** and **logged in**
 - Make sure the symbol is visible in **Market Watch** (right-click → “Show All”)
 - If you have multiple MT5 terminals installed, close extras and retry
-- See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#connection-issues)
+- See [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 
 ---
 
 ## Environment Variables
+
+> **Full reference:** [ENV_VARS.md](ENV_VARS.md) documents the full environment-variable surface (MCP server, Web API, news embeddings, Finviz, GPU, market depth, CLI debug, and more) with a starter `.env` template.
 
 Create a `.env` file in the project root for configuration:
 
@@ -108,15 +219,25 @@ MT5_LOGIN=12345678
 MT5_PASSWORD=your_password
 MT5_SERVER=your_broker_server
 
-# Timezone Configuration (choose one method)
-MT5_TIME_OFFSET_MINUTES=120  # If server is UTC+2
-# OR
+# Timezone Configuration (choose one server-time method)
 MT5_SERVER_TZ=Europe/Athens  # Timezone name
+# OR
+MT5_TIME_OFFSET_MINUTES=120  # If server is UTC+2
+
+# Optional trade guardrails
+MTDATA_TRADE_GUARDRAILS_ENABLED=1
+MTDATA_TRADE_ALLOWED_SYMBOLS=EURUSD,BTCUSD,XAUUSD
+MTDATA_TRADE_MAX_VOLUME_BY_SYMBOL=EURUSD:0.50,BTCUSD:0.03
+MTDATA_TRADE_MAX_RISK_PCT_OF_EQUITY=1.5
 ```
+
+For the full guardrail surface, including blocklists, wallet-risk limits, and pending-order modification behavior, see [ENV_VARS.md](ENV_VARS.md#trade-guardrails).
 
 ### Timezone Configuration
 
 MT5 server times vary by broker. Configure timezone for correct timestamp normalization.
+
+Use one method at a time. `MT5_SERVER_TZ` is preferred because it handles DST; `MT5_TIME_OFFSET_MINUTES` is useful when you only know a fixed broker offset. If both are set and `MT5_TIME_OFFSET_MINUTES` is non-zero, the fixed offset wins and mtdata logs a warning because static offsets do not adjust for DST.
 
 **Option 1: Offset in minutes**
 ```ini
@@ -138,7 +259,7 @@ MT5_SERVER_TZ=America/New_York
    ```
    Then set `MT5_TIME_OFFSET_MINUTES` to the recommended value.
 
-Tip: `python webui.py` will attempt to auto-detect and apply `MT5_TIME_OFFSET_MINUTES` at startup if neither `MT5_SERVER_TZ` nor `MT5_TIME_OFFSET_MINUTES` is set. This is best-effort and may return 0 when the market is closed.
+Set `MT5_SERVER_TZ` or `MT5_TIME_OFFSET_MINUTES` explicitly before starting `mtdata-webapi`; the Web API no longer mutates process environment state at startup.
 
 What happens if it's wrong?
 - Candle timestamps may be shifted, which can affect **daily pivots**, **session filters**, and **backtests**.
@@ -150,35 +271,83 @@ What happens if it's wrong?
 ### CLI
 
 ```bash
-# Direct execution
-python cli.py <command> [options]
-
-# After editable install
+# After `pip install -e .`
 mtdata-cli <command> [options]
 ```
 
 ### MCP Server
 
-```bash
-# Direct execution
-python server.py
+mtdata supports three MCP transport modes:
 
-# After editable install
-mtdata-server
+```bash
+# SSE transport (default) — for browser/HTTP-based MCP clients
+mtdata-sse
+
+# stdio transport — for IDE integrations (Claude Desktop, VS Code, etc.)
+mtdata-stdio
+
+# Streamable HTTP transport
+mtdata-streamable-http
+```
+
+After editable install, these entry points are available:
+
+| Entry Point | Transport | Usage |
+|-------------|-----------|-------|
+| `mtdata-sse` | SSE (default) | `mtdata-sse` |
+| `mtdata-stdio` | stdio | `mtdata-stdio` |
+| `mtdata-streamable-http` | Streamable HTTP | `mtdata-streamable-http` |
+| `mtdata-webapi` | Web API (FastAPI) | `mtdata-webapi` |
+| `mtdata-cli` | CLI | `mtdata-cli <command>` |
+
+**MCP server environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_TRANSPORT` | `sse` | Transport mode: `sse`, `stdio`, `streamable-http` |
+| `FASTMCP_HOST` | `127.0.0.1` | Bind address |
+| `FASTMCP_ALLOW_REMOTE` | `0` | Set to `1` to allow non-loopback binds such as `0.0.0.0` |
+| `FASTMCP_PORT` | `8000` | Listen port |
+| `FASTMCP_MOUNT_PATH` | `/` | Mount path |
+| `FASTMCP_SSE_PATH` | `/sse` | SSE event stream path |
+| `FASTMCP_MESSAGE_PATH` | `/message` | Message endpoint path |
+| `FASTMCP_LOG_LEVEL` | (default) | Logging level |
+
+**Claude Desktop configuration example** (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "mtdata": {
+      "command": "mtdata-stdio"
+    }
+  }
+}
 ```
 
 ### Web API
 
 ```bash
-python webui.py
+mtdata-webapi
 ```
 
-Starts a FastAPI server with a React UI at `http://localhost:8000`.
+Starts a FastAPI server.
+
+- Health check: `http://localhost:8000/health`
+- API base paths: `http://localhost:8000/api` and `http://localhost:8000/api/v1`
+- React UI after `cd webui && npm install && npm run build`:
+  `http://localhost:8000/app`
 
 Web UI / API configuration:
-- `MTDATA_WEBUI_HOST` (default `127.0.0.1`)
-- `MTDATA_WEBUI_PORT` (default `8000`)
-- `MTDATA_WEBUI_RELOAD=1` for auto-reload (dev only)
+- `WEBAPI_HOST` (default `127.0.0.1`)
+- `WEBAPI_PORT` (default `8000`)
+- `WEBAPI_ALLOW_REMOTE=1` to permit a non-loopback bind
+- `WEBAPI_AUTH_TOKEN` to require `Authorization: Bearer <token>` or `X-API-Key: <token>` on API requests
+- `CORS_ORIGINS` with explicit origins only (wildcard `*` is rejected when credentials are enabled)
+- `WEBUI_DIST_DIR` to override the built UI directory
+
+The Python package does not ship generated `webui/dist/` assets. Without a
+production build, the REST API remains available and `/app` is not mounted; use
+`npm run dev` for frontend development or `npm run build` before deployment.
 
 See [WEB_API.md](WEB_API.md) for endpoint details.
 
@@ -190,19 +359,19 @@ Run these commands to verify everything works:
 
 ```bash
 # List symbols
-python cli.py symbols_list --limit 5
+mtdata-cli symbols_list --limit 5
 
 # Get symbol details
-python cli.py symbols_describe EURUSD --format json
+mtdata-cli symbols_describe EURUSD --json
 
 # Fetch candles
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 100
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 100
 
 # List forecast methods
-python cli.py forecast_list_methods
+mtdata-cli forecast_list_methods
 
 # Generate a forecast
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --model theta
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta
 ```
 
 ---
@@ -211,18 +380,24 @@ python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --model theta
 
 ```
 mtdata/
-├── cli.py              # CLI entry point
-├── server.py           # MCP server entry point
-├── webui.py            # Web API entry point
 ├── requirements.txt    # Python dependencies
+├── requirements-optional-src.txt  # Opt-in native/source-built accelerators
 ├── pyproject.toml      # Package configuration
 ├── .env                # Local configuration (create this)
 ├── src/mtdata/
-│   ├── core/           # Tool registry, server, CLI logic
+│   ├── bootstrap/      # Runtime startup, settings, tool loading
+│   ├── core/           # Tool registry, server, CLI logic, all MCP tool modules
+│   │   ├── cli/        # Dynamic CLI (argparse) + parsing/, runtime/ subpackages
+│   │   ├── data/       # `data_fetch_*` and `wait_event` tools
+│   │   ├── regime/     # Regime detection (HMM, BOCPD, MS-AR)
+│   │   ├── report/     # `report_generate` runtime
+│   │   ├── report_templates/  # Per-style report templates
+│   │   └── trading/    # `trade_*` tools and account / risk modules
 │   ├── forecast/       # Forecasting methods
 │   ├── patterns/       # Pattern detection
-│   ├── services/       # MT5 data access
-│   └── utils/          # Shared utilities
+│   ├── services/       # MT5 data access, Finviz, options data
+│   ├── shared/         # Shared constants, schemas, validators
+│   └── utils/          # Shared utilities (indicators, denoising, etc.)
 ├── webui/              # React frontend
 ├── docs/               # Documentation
 └── tests/              # Test suite
@@ -263,15 +438,15 @@ npm run build   # Production build
 
 ### Import Errors
 
-1. Verify Python version: `python --version` (need 3.10+)
+1. Verify Python version: `python --version` (need 3.14)
 2. Reinstall dependencies: `pip install -r requirements.txt`
 3. Try editable install: `pip install -e .`
 
 ### Timezone Issues
 
 1. Check server time in MT5: Tools → Options → Server
-2. Set `MT5_TIME_OFFSET_MINUTES` in `.env`
-3. Verify with: `python cli.py data_fetch_candles EURUSD --limit 1 --format json`
+2. Set `MT5_SERVER_TZ` in `.env` when you know the broker's IANA timezone, or `MT5_TIME_OFFSET_MINUTES` when you only know a fixed offset
+3. Verify with: `mtdata-cli data_fetch_candles EURUSD --limit 1 --json`
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for more issues.
 
@@ -282,3 +457,6 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for more issues.
 - [CLI.md](CLI.md) — Learn command usage
 - [EXAMPLE.md](EXAMPLE.md) — Follow an end-to-end workflow
 - [GLOSSARY.md](GLOSSARY.md) — Understand terminology
+- [LIMITATIONS.md](LIMITATIONS.md) — Review practical caveats before deeper integrations
+- [FINVIZ.md](FINVIZ.md) — Fundamental data and screening
+- [TEMPORAL.md](TEMPORAL.md) — Session and seasonal analysis

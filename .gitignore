@@ -8,6 +8,7 @@ __pycache__/
 venv/
 .env
 .env.*
+!.env.example
 
 # Build and packaging
 build/
@@ -35,6 +36,7 @@ logs/
 # IDE/Editor settings
 .vscode/
 .idea/
+.swival/
 
 # OS files
 .DS_Store
@@ -42,6 +44,12 @@ Thumbs.db
 
 # Project-specific
 .claude/
+.opencode/
+.antigravity/
+.antigravitycli/
+.commandcode/
+.grok/
+
 
 .mtdata_cache/*
 lightning_logs/*
@@ -49,3 +57,16 @@ jscpd_report.xml/*
 backtests/*
 webui/node_modules/*
 webui/dist/*
+
+prompts/*
+!prompts/trader.md
+!prompts/trading_agent_prompt.md
+!prompts/trader_active.md
+!prompts/trader_grid_scalper.md
+!prompts/mtdata_tool_playbook.md
+!prompts/agent_liquidity_scalper.md
+!prompts/agent_intraday_trend.md
+!prompts/agent_range_reversion.md
+!prompts/agent_risk_supervisor.md
+code-reports/*
+.soulforge

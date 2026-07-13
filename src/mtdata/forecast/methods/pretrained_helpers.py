@@ -7,7 +7,8 @@ forecasting models to reduce code duplication and improve maintainability.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Union
+
 import numpy as np
 
 from ..common import edge_pad_to_length as _edge_pad_to_length
@@ -39,90 +40,6 @@ def extract_context_window(
     return np.asarray(context, dtype=dtype)
 
 
-def validate_and_clean_data(
-    data: np.ndarray,
-    method_name: str = "forecast"
-) -> Tuple[np.ndarray, Optional[str]]:
-    """
-    Validate and clean time series data by handling NaN values.
-    
-    Args:
-        data: Input time series data
-        method_name: Name of the forecasting method for error messages
-        
-    Returns:
-        Tuple of (cleaned_data, error_message)
-        If validation fails, returns (empty_array, error_message)
-    """
-    if len(data) == 0:
-        return np.array([]), f"{method_name} error: empty context data"
-    
-    # Check for all NaN values
-    if not np.any(np.isfinite(data)):
-        return np.array([]), f"{method_name} error: context contains no finite values"
-    
-    # Clean the data - replace NaN with mean of finite values
-    finite_mean = np.nanmean(data[np.isfinite(data)])
-    if not np.isfinite(finite_mean):
-        finite_mean = 0.0
-    
-    cleaned_data = np.nan_to_num(data, nan=float(finite_mean))
-    
-    # Validate cleaned data
-    if not np.any(np.isfinite(cleaned_data)):
-        return np.array([]), f"{method_name} error: cleaned context contains no finite values"
-    
-    return cleaned_data, None
-
-
-def extract_forecast_values(
-    forecast_obj: Any,
-    fh: int,
-    method_name: str = "forecast",
-    do_mean: bool = True,
-    do_median: bool = True
-) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """
-    Extract point forecast values from forecast object with fallback logic.
-    
-    Args:
-        forecast_obj: Forecast object with mean, median, or samples attributes
-        fh: Forecast horizon
-        method_name: Name of the forecasting method for error messages
-        do_mean: Whether to prefer mean estimate
-        do_median: Whether to fallback to median estimate
-        
-    Returns:
-        Tuple of (forecast_values, error_message)
-    """
-    f_vals = None
-    
-    try:
-        # Try mean first if requested
-        if do_mean and hasattr(forecast_obj, 'mean') and forecast_obj.mean is not None:
-            f_vals = np.asarray(forecast_obj.mean, dtype=float)
-        # Try median if requested and mean not available
-        elif do_median and hasattr(forecast_obj, 'median') and forecast_obj.median is not None:
-            f_vals = np.asarray(forecast_obj.median, dtype=float)
-        # Fallback to samples if available
-        elif hasattr(forecast_obj, 'samples') and forecast_obj.samples is not None:
-            samples = np.asarray(forecast_obj.samples, dtype=float)
-            if samples.ndim >= 2:
-                f_vals = np.mean(samples, axis=0)
-            else:
-                f_vals = samples
-        else:
-            return None, f"{method_name} error: no forecast values available (no mean, median, or samples)"
-    except Exception as extract_ex:
-        return None, f"{method_name} error: failed to extract forecast values: {extract_ex}"
-    
-    # Validate extracted forecast
-    if f_vals is None or len(f_vals) == 0:
-        return None, f"{method_name} error: extracted forecast is empty or invalid"
-    
-    return f_vals, None
-
-
 def adjust_forecast_length(
     values: np.ndarray,
     fh: int,
@@ -140,42 +57,6 @@ def adjust_forecast_length(
         Adjusted forecast values array
     """
     return _edge_pad_to_length(values, int(fh))
-
-
-def extract_quantiles_from_forecast(
-    forecast_obj: Any,
-    quantiles: Optional[List[Union[str, float, int]]],
-    fh: int,
-    method_name: str = "forecast"
-) -> Dict[str, List[float]]:
-    """
-    Extract quantile forecasts from forecast object.
-    
-    Args:
-        forecast_obj: Forecast object with quantile method
-        quantiles: List of quantile levels to extract
-        fh: Forecast horizon
-        method_name: Name of the forecasting method for error messages
-        
-    Returns:
-        Dictionary mapping quantile strings to forecast value lists
-    """
-    fq: Dict[str, List[float]] = {}
-    
-    if quantiles and hasattr(forecast_obj, 'quantile'):
-        for q in quantiles:
-            try:
-                qf = float(q)
-                q_value = forecast_obj.quantile(qf)
-                if q_value is not None:
-                    q_array = np.asarray(q_value, dtype=float)
-                    # Adjust length to match forecast horizon
-                    q_array = _edge_pad_to_length(q_array, int(fh))
-                    fq[str(qf)] = q_array.tolist()
-            except Exception:
-                continue
-    
-    return fq
 
 
 def process_quantile_levels(
@@ -276,49 +157,3 @@ def safe_import_modules(
     return imported_modules, None
 
 
-def validate_required_params(
-    params: Dict[str, Any],
-    required_keys: List[str],
-    method_name: str = "forecast"
-) -> Tuple[bool, Optional[str]]:
-    """
-    Validate that required parameters are present.
-    
-    Args:
-        params: Parameters dictionary
-        required_keys: List of required parameter keys
-        method_name: Name of the forecasting method for error messages
-        
-    Returns:
-        Tuple of (is_valid, error_message)
-    """
-    missing_keys = []
-    for key in required_keys:
-        if key not in params or params[key] is None:
-            missing_keys.append(key)
-    
-    if missing_keys:
-        return False, f"{method_name} requires parameters: {', '.join(missing_keys)}"
-    
-    return True, None
-
-
-def create_return_tuple(
-    f_vals: Optional[np.ndarray],
-    fq: Optional[Dict[str, List[float]]],
-    params_used: Dict[str, Any],
-    error: Optional[str]
-) -> Tuple[Optional[np.ndarray], Optional[Dict[str, List[float]]], Dict[str, Any], Optional[str]]:
-    """
-    Create standardized return tuple for forecast functions.
-    
-    Args:
-        f_vals: Forecast values
-        fq: Quantile forecasts
-        params_used: Parameters used
-        error: Error message
-        
-    Returns:
-        Standardized return tuple
-    """
-    return (f_vals, fq, params_used, error)

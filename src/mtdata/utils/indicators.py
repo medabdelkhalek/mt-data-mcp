@@ -1,18 +1,60 @@
-from typing import Any, Dict, List, Optional, Tuple
-
 import inspect
+import importlib
+import logging
 import pydoc
 import re
+from functools import lru_cache
+from types import ModuleType
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
+
 try:
-    import pandas_ta as pta  # preferred module name
-except ModuleNotFoundError:  # fallback for alternate distribution import
-    try:
-        import pandas_ta_classic as pta
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "pandas_ta not found. Install 'pandas-ta-classic' (or 'pandas-ta')."
-        ) from e
+    import pandas_ta_classic as pta
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "pandas-ta-classic not found. Install with: pip install pandas-ta-classic"
+    ) from exc
+
+
+_INDICATOR_SERIES_NAMES = ("open", "high", "low", "close", "volume")
+_VOLUME_SOURCE_COLUMNS = ("volume", "real_volume", "tick_volume")
+_TA_INDICATOR_CATEGORIES = (
+    "candles",
+    "momentum",
+    "overlap",
+    "performance",
+    "statistics",
+    "trend",
+    "volatility",
+    "volume",
+    "cycles",
+)
+logger = logging.getLogger(__name__)
+_DEFAULT_TOKEN_RE = r"(?:'[^']*'|\"[^\"]*\"|True|False|None|null|[+-]?\d+(?:\.\d+)?|[A-Za-z_][A-Za-z0-9_]*)"
+_DEFAULT_MISSING = object()
+
+
+def _normalize_ta_indicator_name(name: str) -> str:
+    """Return the canonical lowercase indicator name (no historical nicknames)."""
+    return str(name or "").strip().lower()
+
+
+def _resolve_ta_category_module(category: str) -> Optional[ModuleType]:
+    """Resolve a pandas_ta category module even when a top-level function shadows it."""
+    package_name = str(getattr(pta, "__name__", "") or "").strip()
+    if package_name:
+        try:
+            module = importlib.import_module(f"{package_name}.{category}")
+            if isinstance(module, ModuleType):
+                return module
+        except Exception:
+            logger.debug("Unable to import pandas_ta category module %s", category, exc_info=True)
+
+    module = getattr(pta, category, None)
+    if isinstance(module, ModuleType):
+        return module
+    return None
 
 
 def clean_help_text(text: str, func_name: Optional[str] = None) -> str:
@@ -41,6 +83,27 @@ def _try_number(s: str):
         return int(s)
     except Exception:
         return None
+
+
+def _parse_doc_default_value(raw: str) -> Any:
+    text = str(raw or "").strip().rstrip(".,)")
+    if not text:
+        return _DEFAULT_MISSING
+    if (text.startswith("'") and text.endswith("'")) or (text.startswith('"') and text.endswith('"')):
+        return text[1:-1]
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered in {"none", "null"}:
+        return None
+    number = _try_number(text)
+    if number is not None:
+        return number
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        return text
+    return _DEFAULT_MISSING
 
 
 def _parse_ti_number(token: str) -> int | float | None:
@@ -74,20 +137,22 @@ def infer_defaults_from_doc(func_name: str, doc_text: str, params: List[Dict[str
                 k, v = part.split('=', 1)
                 k = k.strip()
                 v = v.strip().strip(',)')
-                num = _try_number(v)
-                if num is not None:
+                default_value = _parse_doc_default_value(v)
+                if default_value is not _DEFAULT_MISSING and default_value is not None:
                     for p in params:
                         if p.get('name') == k and 'default' not in p:
-                            p['default'] = num
+                            p['default'] = default_value
     for p in params:
         if 'default' in p:
             continue
         k = p.get('name')
         if not k:
             continue
-        m = re.search(rf"{re.escape(k)}[^\n]*?(?:Default|default)\s*:?[\s]*([0-9]+(?:\.[0-9]+)?)", text)
+        m = re.search(rf"{re.escape(k)}[^\n]*?(?:Default|default)\s*:?\s*({_DEFAULT_TOKEN_RE})", text)
         if m:
-            p['default'] = _try_number(m.group(1))
+            default_value = _parse_doc_default_value(m.group(1))
+            if default_value is not _DEFAULT_MISSING:
+                p['default'] = default_value
 
 
 def list_ta_indicators(*, detailed: bool = False) -> List[Dict[str, Any]]:
@@ -95,15 +160,10 @@ def list_ta_indicators(*, detailed: bool = False) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     seen = set()
 
-    categories = [
-        'candles', 'momentum', 'overlap', 'performance', 'statistics',
-        'trend', 'volatility', 'volume', 'cycles'
-    ]
-
-    for category in categories:
+    for category in _TA_INDICATOR_CATEGORIES:
         try:
-            cat_module = getattr(pta, category, None)
-            if not cat_module or not hasattr(cat_module, '__file__'):
+            cat_module = _resolve_ta_category_module(category)
+            if cat_module is None:
                 continue
 
             for func_name in dir(cat_module):
@@ -160,12 +220,6 @@ def list_ta_indicators(*, detailed: bool = False) -> List[Dict[str, Any]]:
             continue
     items.sort(key=lambda x: x["name"])
     return items
-
-
-def _list_ta_indicators() -> List[Dict[str, Any]]:
-    """Dynamically list TA indicators available via pandas_ta."""
-    return list_ta_indicators(detailed=False)
-
 
 def _parse_ti_specs(spec: str) -> List[Tuple[str, List[int | float], Dict[str, int | float]]]:
     """Parse a compact indicator spec string into [(name, args, kwargs)].
@@ -227,117 +281,232 @@ def _parse_ti_specs(spec: str) -> List[Tuple[str, List[int | float], Dict[str, i
                     if num is not None:
                         args.append(num)
         # Flex: detect trailing number in name (EMA21 -> length=21)
-        import re
+        normalized_name = _normalize_ta_indicator_name(name.strip())
         m = re.search(r"(.*?)[_\-]?([0-9]{1,3})$", name)
-        if m and not args and 'length' not in kwargs:
+        if (
+            m
+            and str(m.group(1) or "").strip()
+            and not normalized_name.startswith("cdl_")
+            and not args
+            and 'length' not in kwargs
+        ):
             try:
                 kwargs['length'] = int(m.group(2))
                 name = m.group(1)
             except Exception:
                 pass
-        specs.append((name.strip(), args, kwargs))
+        specs.append((_normalize_ta_indicator_name(name.strip()), args, kwargs))
     return specs
 
 
-def _apply_ta_indicators(df: pd.DataFrame, ti_spec: str) -> List[str]:
+@lru_cache(maxsize=512)
+def _is_available_ta_indicator(name: str) -> bool:
+    return callable(getattr(pta, str(name or "").strip(), None))
+
+
+def _find_unknown_ta_indicators(spec: str) -> List[str]:
+    """Return normalized indicator names not available in pandas_ta."""
+    text = str(spec or "").strip()
+    if not text:
+        return []
+    unknown: List[str] = []
+    for name, _args, _kwargs in _parse_ti_specs(text):
+        lname = _normalize_ta_indicator_name(str(name or "").strip())
+        if not lname:
+            continue
+        if not _is_available_ta_indicator(lname):
+            unknown.append(lname)
+    return sorted(set(unknown))
+
+
+def _format_unknown_ta_indicators_error(indicator_names: List[str]) -> str:
+    names = [str(name).strip() for name in indicator_names if str(name).strip()]
+    return (
+        "Unknown indicator(s): "
+        + ", ".join(names)
+        + ". Parameters use name(params) syntax, e.g. rsi(14) or "
+        "macd(12,26,9); use indicators_list to view valid indicator names."
+    )
+
+
+def _format_missing_indicator_columns(
+    indicator_name: str,
+    required: List[str],
+    missing: List[str],
+    available: List[str],
+) -> str:
+    def _display(col: str) -> str:
+        if col == "volume":
+            return "volume (or real_volume/tick_volume)"
+        return col
+
+    required_display = ", ".join(_display(col) for col in required)
+    missing_display = ", ".join(_display(col) for col in missing)
+    available_display = ", ".join(sorted(str(col) for col in available)) or "<none>"
+    return (
+        f"Indicator '{indicator_name}' requires columns: {required_display}. "
+        f"Missing: {missing_display}. Available columns: {available_display}."
+    )
+
+
+def _resolve_indicator_volume_series(df: pd.DataFrame) -> Optional[pd.Series]:
+    fallback: Optional[pd.Series] = None
+    for col_name in _VOLUME_SOURCE_COLUMNS:
+        if col_name not in df.columns:
+            continue
+        series = df[col_name]
+        if fallback is None:
+            fallback = series
+        try:
+            numeric = pd.to_numeric(series, errors="coerce")
+        except Exception:
+            numeric = series
+        try:
+            if bool((numeric.fillna(0) != 0).any()):
+                return series
+        except Exception:
+            pass
+    return fallback
+
+
+def _resolve_indicator_series_inputs(
+    df: pd.DataFrame,
+    indicator_name: str,
+    params: Dict[str, inspect.Parameter],
+    *,
+    volume_series: Optional[pd.Series] = None,
+) -> Dict[str, pd.Series]:
+    required = [name for name in _INDICATOR_SERIES_NAMES if name in params]
+    resolved: Dict[str, pd.Series] = {}
+    missing: List[str] = []
+
+    for name in required:
+        if name == "volume":
+            if volume_series is None:
+                volume_series = _resolve_indicator_volume_series(df)
+            if volume_series is None:
+                missing.append(name)
+            else:
+                resolved[name] = volume_series
+            continue
+
+        if name not in df.columns:
+            missing.append(name)
+            continue
+        resolved[name] = df[name]
+
+    if missing:
+        raise ValueError(
+            _format_missing_indicator_columns(
+                indicator_name,
+                required=required,
+                missing=missing,
+                available=list(df.columns),
+            )
+        )
+
+    return resolved
+
+
+def _apply_ta_indicators(df: pd.DataFrame, ti_spec: str) -> List[str]:  # noqa: C901
     """Apply indicators specified by ti_spec to df in-place, return list of added column names."""
     added_cols: List[str] = []
     if not ti_spec:
         return added_cols
+    unknown_indicators = _find_unknown_ta_indicators(ti_spec)
+    if unknown_indicators:
+        raise ValueError(_format_unknown_ta_indicators_error(unknown_indicators))
     # Many TA funcs expect a DatetimeIndex
     original_index = df.index
-    if not isinstance(df.index, pd.DatetimeIndex):
-        try:
-            df.index = pd.to_datetime(df['time'], unit='s', utc=True)
-        except Exception:
+    try:
+        if not isinstance(df.index, pd.DatetimeIndex):
             try:
-                df.index = pd.to_datetime(df['time'])
-            except Exception:
-                pass
-    before = set(df.columns)
-    specs = _parse_ti_specs(ti_spec)
-    for name, args, kwargs in specs:
-        lname = name.lower()
-        func = getattr(pta, lname, None)
-        if not callable(func):
-            continue
-        try:
-            sig = inspect.signature(func)
-            params = sig.parameters
-            # Prepare positional and keyword arguments safely
-            call_kwargs = dict(kwargs)
-            call_args = []
-            # Provide price/series inputs
-            if 'close' in params and 'close' in df.columns:
-                # Use positional for 'close' to prevent numeric args binding to it
-                call_args.append(df['close'])
-                call_kwargs.pop('close', None)
-            # Additional series as keywords if accepted
-            if 'open' in params and 'open' not in call_kwargs and 'open' in df.columns:
-                call_kwargs['open'] = df['open']
-            if 'high' in params and 'high' not in call_kwargs and 'high' in df.columns:
-                call_kwargs['high'] = df['high']
-            if 'low' in params and 'low' not in call_kwargs and 'low' in df.columns:
-                call_kwargs['low'] = df['low']
-            if 'volume' in params and 'volume' not in call_kwargs and 'volume' in df.columns:
-                call_kwargs['volume'] = df['volume']
-
-            # Generic mapping: map provided numeric args to function parameters in declared order
-            # Skip series parameters and any already supplied in call_kwargs
-            series_names = {'open', 'high', 'low', 'close', 'volume'}
-            ordered_param_names = []
-            for pname, p in params.items():
-                if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
-                    continue
-                if pname in series_names:
-                    continue
-                ordered_param_names.append(pname)
-            # Assign args to next available param name not already set
-            ai = 0
-            for pname in ordered_param_names:
-                if ai >= len(args):
-                    break
-                if pname in call_kwargs:
-                    continue
-                # Use provided arg in order
-                call_kwargs[pname] = args[ai]
-                ai += 1
-
-            # Call indicator function with constructed arguments, with fallbacks
-            out = None
-            try:
-                out = func(*call_args, **call_kwargs)
+                df.index = pd.to_datetime(df['time'], unit='s', utc=True)
             except Exception:
                 try:
-                    # Fallback: also pass numeric args positionally after series
-                    out = func(*([*call_args, *args]), **call_kwargs)
+                    df.index = pd.to_datetime(df['time'])
                 except Exception:
-                    try:
-                        # Fallback: keyword-only attempt including close
-                        kw_only = dict(call_kwargs)
-                        if 'close' in params and 'close' in df.columns:
-                            kw_only['close'] = df['close']
-                        out = func(**kw_only)
-                    except Exception:
-                        out = None
-            if isinstance(out, pd.DataFrame):
-                for c in out.columns:
-                    df[c] = out[c]
-            elif isinstance(out, pd.Series):
-                df[out.name or lname] = out
-        except Exception:
-            continue
-        new_cols = [c for c in df.columns if c not in before]
-        added_cols.extend(new_cols)
+                    pass
         before = set(df.columns)
+        specs = _parse_ti_specs(ti_spec)
+        volume_series = _resolve_indicator_volume_series(df)
+        for name, args, kwargs in specs:
+            lname = _normalize_ta_indicator_name(name)
+            func = getattr(pta, lname, None)
+            if not callable(func):
+                continue
+            try:
+                sig = inspect.signature(func)
+                params = sig.parameters
+                series_inputs = _resolve_indicator_series_inputs(
+                    df,
+                    lname,
+                    params,
+                    volume_series=volume_series,
+                )
+                # Prepare keyword arguments safely. Passing resolved series by
+                # name avoids binding collisions for multi-series indicators
+                # such as supertrend(high, low, close, ...).
+                call_kwargs = dict(kwargs)
+                for series_name, series_value in series_inputs.items():
+                    if series_name not in call_kwargs:
+                        call_kwargs[series_name] = series_value
 
-    if original_index is not None:
-        df.index = original_index
+                # Generic mapping: map provided numeric args to function parameters in declared order
+                # Skip series parameters and any already supplied in call_kwargs
+                series_names = {'open', 'high', 'low', 'close', 'volume'}
+                ordered_param_names = []
+                for pname, p in params.items():
+                    if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                        continue
+                    if pname in series_names:
+                        continue
+                    ordered_param_names.append(pname)
+                # Assign args to next available param name not already set
+                ai = 0
+                for pname in ordered_param_names:
+                    if ai >= len(args):
+                        break
+                    if pname in call_kwargs:
+                        continue
+                    # Use provided arg in order
+                    call_kwargs[pname] = args[ai]
+                    ai += 1
+
+                # Call once with the signature-derived argument mapping. Retrying with
+                # different bindings can silently change indicator semantics.
+                try:
+                    out = func(**call_kwargs)
+                except Exception as exc:
+                    parameter_names = ", ".join(sorted(call_kwargs)) or "defaults"
+                    raise ValueError(
+                        f"Indicator '{lname}' failed with parameters {parameter_names}: {exc}"
+                    ) from exc
+                if isinstance(out, pd.DataFrame):
+                    for c in out.columns:
+                        df[c] = out[c]
+                elif isinstance(out, pd.Series):
+                    df[out.name or lname] = out
+            except ValueError:
+                raise
+            except Exception as apply_exc:
+                # Surface unexpected apply failures instead of silently omitting columns.
+                logger.warning(
+                    "Indicator %s failed while applying output: %s",
+                    lname,
+                    apply_exc,
+                    exc_info=True,
+                )
+                raise ValueError(
+                    f"Indicator '{lname}' produced unusable output: {apply_exc}"
+                ) from apply_exc
+            new_cols = [c for c in df.columns if c not in before]
+            added_cols.extend(new_cols)
+            before = set(df.columns)
+    finally:
+        if original_index is not None:
+            df.index = original_index
     return added_cols
-
-# Backwards-compat alias
-_apply_ta_indicators_util = _apply_ta_indicators
-
 
 def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
     if not ti_spec:
@@ -345,7 +514,7 @@ def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
     max_warmup = 0
     specs = _parse_ti_specs(ti_spec)
     for name, args, kwargs in specs:
-        lname = name.lower()
+        lname = _normalize_ta_indicator_name(name)
         def geti(key, default):
             if key in kwargs:
                 try:
@@ -362,12 +531,23 @@ def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
         if lname in ("sma", "ema", "rsi"):
             warm = geti("length", 14)
         elif lname == "macd":
-            fast = kwargs.get("fast", args[0] if len(args) > 0 else 12)
-            slow = kwargs.get("slow", args[1] if len(args) > 1 else 26)
+            # Accept both short names and pandas_ta-style *_period kwargs.
+            fast = kwargs.get(
+                "fast",
+                kwargs.get("fast_period", args[0] if len(args) > 0 else 12),
+            )
+            slow = kwargs.get(
+                "slow",
+                kwargs.get("slow_period", args[1] if len(args) > 1 else 26),
+            )
+            signal = kwargs.get(
+                "signal",
+                kwargs.get("signal_period", args[2] if len(args) > 2 else 9),
+            )
             try:
-                warm = int(max(int(fast), int(slow)))
+                warm = max(int(fast), int(slow)) + int(signal)
             except Exception:
-                warm = 26
+                warm = 35
         elif lname == "stoch":
             k = kwargs.get("k", args[0] if len(args) > 0 else 14)
             d = kwargs.get("d", args[1] if len(args) > 1 else 3)
@@ -376,7 +556,7 @@ def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
                 warm = int(k) + int(d) + int(s)
             except Exception:
                 warm = 20
-        elif lname in ("bbands", "bb"):
+        elif lname == "bbands":
             length = kwargs.get("length", args[0] if len(args) > 0 else 20)
             try:
                 warm = int(length)
@@ -388,6 +568,3 @@ def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
             max_warmup = warm
     scaled = max(int(max_warmup * 3), 50) if max_warmup > 0 else 0
     return scaled
-
-# Backwards-compat alias
-_estimate_warmup_bars_util = _estimate_warmup_bars

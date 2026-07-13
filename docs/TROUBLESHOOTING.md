@@ -8,6 +8,29 @@ Common issues when running mtdata and how to resolve them.
 
 ---
 
+## Start Here: Diagnostic Snapshot
+
+When something fails, collect a small read-only snapshot first. It usually separates install, MT5 connection, symbol, and data-history problems quickly.
+
+```bash
+python --version
+mtdata-cli --help
+mtdata-cli symbols_list --limit 10
+mtdata-cli symbols_describe EURUSD --json
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 5 --json
+```
+
+If the Web API is involved, also check:
+
+```bash
+mtdata-webapi
+curl http://127.0.0.1:8000/api/v1/health
+```
+
+Keep the first troubleshooting pass read-only. Do not use `trade_place`, `trade_modify`, or `trade_close` while diagnosing setup issues unless you are intentionally testing on a demo account.
+
+---
+
 ## Connection Issues
 
 ### "Could not connect to MT5" or Empty Data
@@ -19,7 +42,7 @@ Common issues when running mtdata and how to resolve them.
 
 **Test connection:**
 ```bash
-python cli.py symbols_list --limit 10
+mtdata-cli symbols_list --limit 10
 ```
 
 If this works but candles fail:
@@ -57,8 +80,8 @@ symbol
 
 **Solution:** Check command help and provide required arguments:
 ```bash
-python cli.py forecast_generate --help
-python cli.py forecast_generate EURUSD --horizon 12  # symbol is positional
+mtdata-cli forecast_generate --help
+mtdata-cli forecast_generate EURUSD --horizon 12  # symbol is positional
 ```
 
 ### "Invalid choice" for Timeframe/Method/Mode
@@ -67,11 +90,11 @@ python cli.py forecast_generate EURUSD --horizon 12  # symbol is positional
 
 **Solution:** Use `--help` to see allowed values:
 ```bash
-python cli.py forecast_volatility_estimate --help
-python cli.py patterns_detect --help
+mtdata-cli forecast_volatility_estimate --help
+mtdata-cli patterns_detect --help
 ```
 
-**Common timeframes:** `M1`, `M5`, `M15`, `M30`, `H1`, `H4`, `D1`, `W1`, `MN1`
+**Supported timeframes:** `M1`, `M2`, `M3`, `M4`, `M5`, `M6`, `M10`, `M12`, `M15`, `M20`, `M30`, `H1`, `H2`, `H3`, `H4`, `H6`, `H8`, `H12`, `D1`, `W1`, `MN1`. Broker history availability may vary.
 
 ### "Unknown parameter" in --params
 
@@ -82,8 +105,8 @@ python cli.py patterns_detect --help
 
 **Solution:** Check method documentation:
 ```bash
-python cli.py forecast_list_methods --format json
-python cli.py indicators_describe rsi --format json
+mtdata-cli forecast_list_methods --json
+mtdata-cli indicators_describe rsi --json
 ```
 
 ---
@@ -96,20 +119,23 @@ python cli.py indicators_describe rsi --format json
 
 **Solution:** Check availability:
 ```bash
-python cli.py forecast_list_methods --format json
+mtdata-cli forecast_list_methods --json
 ```
 
 Look for `available: false` and the `requires` field. Install missing packages:
+
+If you're installing mtdata extras, run the extra commands below from the repository root.
+
 ```bash
 pip install chronos-forecasting torch  # For Chronos
 pip install statsforecast              # For StatsForecast models
 pip install arch                       # For GARCH
 pip install statsmodels                # For ARIMA/ETS + causal_discover_signals
-pip install PyWavelets                 # For wavelet denoising
 pip install umap-learn                 # For UMAP dimred (Web UI / analysis)
-pip install gluonts[torch]             # For Lag-Llama (pretrained)
-# TimesFM is installed from Git (pinned in `requirements.txt`); re-run `pip install -r requirements.txt`.
-# Lag-Llama may require a separate Python env due to upstream pins (see `requirements.txt`).
+pip install QuantLib                   # For barrier option pricing & Heston calibration
+pip install optuna                     # For Bayesian hyperparameter tuning
+pip install neuralforecast torch       # For neural models; may not resolve on Windows Python 3.14
+pip install -e .[forecast-timesfm]     # From the repo root; installs the TimesFM Git-backed extra
 ```
 
 ### "Import error" or "Module not found"
@@ -121,7 +147,7 @@ pip install <missing_package>
 
 Or check if a similar method is available without extra dependencies:
 ```bash
-python cli.py forecast_list_library_models native  # Native methods have minimal deps
+mtdata-cli forecast_list_library_models native  # Native methods have minimal deps
 ```
 
 ---
@@ -132,13 +158,13 @@ python cli.py forecast_list_library_models native  # Native methods have minimal
 
 **Solution:** Use JSON format:
 ```bash
-python cli.py symbols_describe EURUSD --format json
-python cli.py forecast_generate EURUSD --horizon 12 --format json
+mtdata-cli symbols_describe EURUSD --json
+mtdata-cli forecast_generate EURUSD --horizon 12 --json
 ```
 
 Pipe to `jq` for processing:
 ```bash
-python cli.py forecast_generate EURUSD --format json | jq '.forecast'
+mtdata-cli forecast_generate EURUSD --json | jq '.forecast'
 ```
 
 ### Output is Too Verbose
@@ -155,10 +181,10 @@ python cli.py forecast_generate EURUSD --format json | jq '.forecast'
 
 ```bash
 # Check indicator syntax
-python cli.py indicators_describe rsi
+mtdata-cli indicators_describe rsi
 
 # Fetch enough bars (at least period + some buffer)
-python cli.py data_fetch_candles EURUSD --limit 200 --indicators "rsi(14)"
+mtdata-cli data_fetch_candles EURUSD --limit 200 --indicators "rsi(14)"
 ```
 
 ---
@@ -175,38 +201,55 @@ python cli.py data_fetch_candles EURUSD --limit 200 --indicators "rsi(14)"
 **Solution:**
 ```bash
 # Check if symbol exists
-python cli.py symbols_list --limit 100
+mtdata-cli symbols_list --limit 100
 
 # Try without date filters
-python cli.py data_fetch_candles EURUSD --limit 100
+mtdata-cli data_fetch_candles EURUSD --limit 100
 ```
 
 ### Timestamps Look Wrong
 
 **Cause:** Server timezone offset not configured.
 
-**Solution:** Set timezone in `.env`:
+**Solution:** Set one timezone method in `.env`. Prefer an IANA timezone name because it handles DST:
+```ini
+MT5_SERVER_TZ=Europe/Athens
+```
+
+If you only know a fixed broker offset, use minutes from UTC instead:
 ```ini
 MT5_TIME_OFFSET_MINUTES=120  # If server is UTC+2
 ```
 
-Or use server timezone name:
-```ini
-MT5_SERVER_TZ=Europe/Athens
-```
+Avoid setting both unless you intentionally want a non-zero `MT5_TIME_OFFSET_MINUTES` value to override `MT5_SERVER_TZ`.
 
 To estimate an offset quickly (run during active market hours so ticks are current):
 ```bash
 python scripts/detect_mt5_time_offset.py --symbol EURUSD
 ```
 
-Tip: if you're launching the Web UI via `python webui.py`, mtdata will attempt to auto-detect and apply `MT5_TIME_OFFSET_MINUTES` when neither `MT5_SERVER_TZ` nor `MT5_TIME_OFFSET_MINUTES` is set. This is best-effort and may return 0 when the market is closed.
+Set `MT5_SERVER_TZ` or `MT5_TIME_OFFSET_MINUTES` explicitly before starting `mtdata-webapi`. The Web API no longer auto-detects broker offset or mutates environment variables at startup.
 
 ### Volume is Always Zero
 
 **Cause:** Forex spot typically has indicative volume (tick count, not real volume).
 
 **Note:** This is expected for most forex pairs. Use volume-based indicators cautiously.
+
+### Time Range Looks Valid but Still Returns No Rows
+
+**Possible causes:**
+- The market was closed for the requested interval.
+- Your broker has limited historical depth for that symbol/timeframe.
+- The symbol name differs by broker suffix, for example `EURUSD.r` or `EURUSDm`.
+
+**Solution:**
+```bash
+mtdata-cli symbols_list --search-term EURUSD --limit 20
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 100 --json
+```
+
+If the broker uses a suffix, rerun the command with the exact symbol shown by `symbols_list`.
 
 ---
 
@@ -235,25 +278,136 @@ Tip: if you're launching the Web UI via `python webui.py`, mtdata will attempt t
 
 ---
 
+## Trading Safety Issues
+
+### A Trading Command Might Execute Live
+
+**Cause:** `trade_*` commands operate on the MT5 account currently logged into the terminal. Some commands support `--dry-run true`, but live execution is still possible when you omit dry-run.
+
+**Immediate checks:**
+```bash
+mtdata-cli trade_account_info --json
+mtdata-cli trade_get_open --json
+mtdata-cli trade_get_pending --json
+```
+
+**Safer next steps:**
+1. Confirm whether the MT5 terminal is logged into demo or live.
+2. Use exact tickets for `trade_close` and `trade_modify`.
+3. Preview supported actions with `--dry-run true`.
+4. Configure guardrails such as `MTDATA_TRADING_ENABLED=0`, `MTDATA_TRADE_ALLOWED_SYMBOLS`, and `MTDATA_TRADE_MAX_RISK_PCT_OF_EQUITY` in [ENV_VARS.md](ENV_VARS.md#trade-guardrails).
+
+---
+
 ## Getting Help
 
 ### Search Commands by Topic
 ```bash
-python cli.py --help forecast
-python cli.py --help barrier
-python cli.py --help indicators
+mtdata-cli --help forecast
+mtdata-cli --help barrier
+mtdata-cli --help indicators
 ```
 
 ### Get Command-Specific Help
 ```bash
-python cli.py forecast_generate --help
-python cli.py regime_detect --help
+mtdata-cli forecast_generate --help
+mtdata-cli regime_detect --help
 ```
 
 ### Enable Debug Mode
-```bash
-MTDATA_CLI_DEBUG=1 python cli.py forecast_generate EURUSD --horizon 12
+PowerShell:
+```powershell
+$env:MTDATA_CLI_DEBUG = "1"
+mtdata-cli forecast_generate EURUSD --horizon 12
+$env:MTDATA_CLI_DEBUG = $null
 ```
+
+Bash:
+```bash
+MTDATA_CLI_DEBUG=1 mtdata-cli forecast_generate EURUSD --horizon 12
+```
+
+---
+
+## Optional Dependency Issues
+
+### Git-backed Extra Fails to Install
+
+**Symptom:** `pip install -e .[forecast-timesfm]`, `pip install -e .[patterns-ext]`, or `pip install -e .[news-ycnbc]` fails during clone/build on Windows.
+
+**Solution:**
+1. Install Visual Studio Build Tools 2022 with the **Desktop development with C++** workload.
+2. Make sure Git is installed and available on `PATH`.
+3. Install the stable base stack first:
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. From the repository root, retry only the extra you need:
+   ```bash
+   pip install -e .[forecast-timesfm]
+   pip install -e .[patterns-ext]
+   pip install -e .[news-ycnbc]
+   ```
+
+If a Git-backed extra still fails, leave it out and use the rest of mtdata without that integration. For pretrained forecasts, `chronos2` and `chronos_bolt` remain available from the stable install path.
+
+### Optional hnswlib Source Build Fails
+
+**Symptom:** `pip install -r requirements-optional-src.txt` fails while building `hnswlib` on Python 3.14.
+
+**What this path is for:**
+- `hnswlib`: optional accelerator for `search_engine=hnsw`
+
+**Requirements by package:**
+- Visual Studio Build Tools 2022 with the **Desktop development with C++** workload
+
+**Recommended recovery steps:**
+```bash
+pip install hnswlib==0.8.0
+```
+
+If `hnswlib` fails, leave it out and use `search_engine=ckdtree` instead.
+
+`tsdownsample` is no longer part of this source-build helper. It is included in the full package-index install path and can also be installed directly with `pip install "tsdownsample>=0.1.5"`. If it is absent, mtdata falls back to the built-in Python simplification path.
+
+### QuantLib Import Error
+
+**Symptom:** `ModuleNotFoundError: No module named 'QuantLib'` when using `options_barrier_price` or `options_heston_calibrate`.
+
+**Solution:**
+```bash
+pip install QuantLib
+```
+On Windows, a pre-built wheel is available. On Linux, you may need build tools (`cmake`, `swig`).
+
+### Finviz Errors
+
+**Symptom:** `finviz_*` commands return empty data or connection errors.
+
+**Possible causes:**
+- Network/firewall blocking finviz.com
+- Rate limiting (finviz throttles rapid requests)
+
+**Note:** `finvizfinance` is a core dependency — it is installed automatically with `pip install -e .`. If you see an import error, your install may be incomplete; reinstall with `pip install -e .` or `pip install -r requirements.txt`. Finviz data is US equities only and delayed 15–20 minutes.
+
+### Optuna Not Available
+
+**Symptom:** `forecast_tune_optuna` fails with import error.
+
+**Solution:**
+```bash
+pip install optuna
+```
+
+### Neural Forecast Models Unavailable
+
+**Symptom:** NHiTS, TFT, PatchTST, or NBEATSx show `available: false` in `forecast_list_methods`.
+
+**Solution:**
+```bash
+pip install neuralforecast torch
+```
+These models require PyTorch and a NeuralForecast dependency stack compatible with your Python version. On Windows Python 3.14, current releases may fail to resolve because some transitive dependencies do not publish compatible wheels.
 
 ---
 
@@ -263,11 +417,15 @@ MTDATA_CLI_DEBUG=1 python cli.py forecast_generate EURUSD --horizon 12
 |-------|-----------|
 | MT5 not connecting | Restart MT5 terminal, ensure login |
 | Missing parameter | Check `--help` for required arguments |
-| Invalid timeframe | Use: M1, M5, M15, M30, H1, H4, D1, W1, MN1 |
+| Invalid timeframe | Use a supported MT5 interval listed in the Timeframe section above |
 | Method not available | Check `forecast_list_methods` and install deps |
-| Output hard to read | Add `--format json` |
-| Wrong timestamps | Set `MT5_TIME_OFFSET_MINUTES` in `.env` |
+| Output hard to read | Add `--json` |
+| Wrong timestamps | Set `MT5_SERVER_TZ` in `.env`, or `MT5_TIME_OFFSET_MINUTES` if you only know a fixed offset |
 | Command slow | Reduce `--limit`, use faster method |
+| QuantLib import error | `pip install QuantLib` |
+| Finviz empty data | Check network / firewall (finvizfinance is pre-installed) |
+| Optuna not found | `pip install optuna` |
+| Neural models unavailable | Use `forecast_list_methods --json`; NeuralForecast is manual/nonstandard on Windows Python 3.14 |
 
 ---
 
@@ -276,3 +434,5 @@ MTDATA_CLI_DEBUG=1 python cli.py forecast_generate EURUSD --horizon 12
 - [SETUP.md](SETUP.md) — Installation guide
 - [CLI.md](CLI.md) — Command usage
 - [GLOSSARY.md](GLOSSARY.md) — Term definitions
+- [FINVIZ.md](FINVIZ.md) — Finviz fundamental data reference
+- [OPTIONS_QUANTLIB.md](OPTIONS_QUANTLIB.md) — Options & QuantLib tools

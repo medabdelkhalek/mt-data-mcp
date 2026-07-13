@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from types import SimpleNamespace
+
+from mtdata.core import schema_attach as schema_attach_mod
+from mtdata.shared.parameter_contracts import (
+    OUTPUT_EXTRAS,
+)
+
+
+def _attach_tool_schema(monkeypatch, tool_name: str, base_schema: dict, *, shared_enums: dict | None = None):
+    def tool_func():
+        return None
+
+    tool_func.__name__ = tool_name
+    tool_obj = SimpleNamespace(func=tool_func)
+    apply_calls: list[dict] = []
+
+    monkeypatch.setattr(schema_attach_mod, "get_mcp_registry", lambda _mcp: {tool_name: tool_obj})
+    monkeypatch.setattr(schema_attach_mod, "_get_function_info", lambda func: {"name": tool_name, "parameters": []})
+    monkeypatch.setattr(schema_attach_mod, "_build_minimal_schema", lambda info: deepcopy(base_schema))
+    monkeypatch.setattr(schema_attach_mod, "_enrich_schema_with_shared_defs", lambda schema, info: schema)
+    monkeypatch.setattr(
+        schema_attach_mod,
+        "_complex_defs",
+        lambda: {
+            "IndicatorSpec": {"type": "object"},
+            "DenoiseSpec": {"type": "object"},
+            "SimplifySpec": {"type": "object"},
+        },
+    )
+    monkeypatch.setattr(schema_attach_mod, "_apply_param_hints", lambda schema: apply_calls.append(deepcopy(schema)))
+
+    schema_attach_mod.attach_schemas_to_tools(object(), shared_enums or {})
+    return tool_obj, tool_func, apply_calls
+
+
+def test_schema_attachment_failure_is_isolated_per_tool(monkeypatch, caplog) -> None:
+    calls = []
+    monkeypatch.setattr(
+        schema_attach_mod,
+        "get_mcp_registry",
+        lambda _mcp: {"bad": object(), "good": object()},
+    )
+    monkeypatch.setattr(schema_attach_mod, "_iter_manager_tools", lambda _mcp: [])
+    monkeypatch.setattr(schema_attach_mod, "server_shared_defs", lambda _enums: {})
+
+    def attach(name, *_args):
+        calls.append(name)
+        if name == "bad":
+            raise TypeError("bad annotation")
+        return True
+
+    monkeypatch.setattr(schema_attach_mod, "_attach_schema_to_tool", attach)
+
+    with caplog.at_level("WARNING"):
+        schema_attach_mod.attach_schemas_to_tools(object(), {})
+
+    assert calls == ["bad", "good"]
+    assert "schema attachment failed for tool bad" in caplog.text
+    assert "attached=1 failed=1" in caplog.text
+
+
+def test_attach_schemas_to_tools_patches_forecast_generate(monkeypatch) -> None:
+    tool_obj, tool_func, apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "forecast_generate",
+        {
+            "parameters": {
+                "properties": {
+                    "quantity": {"type": "string"},
+                    "denoise": {"type": "object"},
+                    "params": {"type": "string"},
+                },
+                "required": ["quantity"],
+            }
+        },
+    )
+
+    schema = tool_obj.schema
+    params = schema["parameters"]["properties"]
+    assert params["quantity"] == {"$ref": "#/$defs/QuantitySpec"}
+    assert params["denoise"] == {"$ref": "#/$defs/DenoiseSpec"}
+    assert params["params"] == {"type": "object"}
+    assert tool_func.schema == schema
+    assert len(apply_calls) == 1
+
+
+def test_attach_schemas_to_tools_preserves_tool_params_and_adds_public_output_contract(monkeypatch) -> None:
+    tool_obj, _tool_func, _apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "sample_tool",
+        {
+            "parameters": {
+                "properties": {
+                    "detail": {"type": "string"},
+                    "output": {"type": "string"},
+                },
+                "required": ["detail"],
+            }
+        },
+    )
+
+    params = tool_obj.schema["parameters"]
+    props = params["properties"]
+    assert props["detail"]["type"] == "string"
+    assert props["output"]["type"] == "string"
+    assert "detail" in params.get("required", [])
+    assert props["json"]["type"] == "boolean"
+    assert set(props["extras"]["anyOf"][0]["items"]["enum"]) == set(OUTPUT_EXTRAS)
+
+
+def test_attach_schemas_to_tools_patches_indicator_and_data_refs(monkeypatch) -> None:
+    tool_obj, _tool_func, _apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "data_fetch_candles",
+        {
+            "parameters": {
+                "properties": {
+                    "indicators": {"type": "string"},
+                    "denoise": {"type": "object"},
+                    "simplify": {"type": "object"},
+                },
+                "required": [],
+            }
+        },
+    )
+
+    params = tool_obj.schema["parameters"]["properties"]
+    indicator_any_of = params["indicators"]["anyOf"]
+    assert {"type": "array", "items": {"$ref": "#/$defs/IndicatorSpec"}} in indicator_any_of
+    assert any(option.get("type") == "string" for option in indicator_any_of)
+    assert {"type": "null"} not in indicator_any_of
+    assert params["denoise"] == {"$ref": "#/$defs/DenoiseSpec"}
+    simplify_schema = params["simplify"]
+    simplify_any_of = simplify_schema["anyOf"]
+    assert {"$ref": "#/$defs/SimplifySpec"} in simplify_any_of
+    assert {"type": "boolean"} in simplify_any_of
+    assert {"type": "string", "enum": ["on", "off", "auto"]} in simplify_any_of
+    assert {"method": "lttb", "points": 100} in simplify_schema["examples"]
+
+    indicator_obj, _indicator_func, _apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "indicators_list",
+        {
+            "parameters": {
+                "properties": {
+                    "category": {"type": "string"},
+                },
+                "required": [],
+            }
+        },
+        shared_enums={"CATEGORY_CHOICES": ["trend", "momentum"]},
+    )
+
+    indicator_params = indicator_obj.schema["parameters"]["properties"]
+    assert indicator_params["category"] == {"$ref": "#/$defs/IndicatorCategory"}
+
+
+def test_attach_schemas_to_tools_patches_barrier_method_enums(monkeypatch) -> None:
+    prob_obj, _prob_func, _apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "forecast_barrier_prob",
+        {
+            "parameters": {
+                "properties": {
+                    "method": {"type": "string"},
+                },
+                "required": [],
+            }
+        },
+    )
+    prob_method = prob_obj.schema["parameters"]["properties"]["method"]
+    assert "closed_form" in prob_method["enum"]
+    assert "auto" in prob_method["enum"]
+
+    opt_obj, _opt_func, _apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "forecast_barrier_optimize",
+        {
+            "parameters": {
+                "properties": {
+                    "method": {"type": "string"},
+                },
+                "required": [],
+            }
+        },
+    )
+    opt_method = opt_obj.schema["parameters"]["properties"]["method"]
+    assert "closed_form" not in opt_method["enum"]
+    assert "auto" in opt_method["enum"]
+    assert "ensemble" in opt_method["enum"]
+
+
+def test_attach_schemas_to_tools_keeps_barrier_inputs_flat(monkeypatch) -> None:
+    for tool_name in ("forecast_barrier_prob", "labels_triple_barrier"):
+        tool_obj, _tool_func, _apply_calls = _attach_tool_schema(
+            monkeypatch,
+            tool_name,
+            {
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tp_abs": {"type": "number"},
+                        "sl_abs": {"type": "number"},
+                        "tp_pct": {"type": "number"},
+                        "sl_pct": {"type": "number"},
+                        "tp_ticks": {"type": "number"},
+                        "sl_ticks": {"type": "number"},
+                    },
+                    "required": [],
+                }
+            },
+        )
+
+        params_obj = tool_obj.schema["parameters"]
+        assert params_obj["type"] == "object"
+        for key in ("allOf", "anyOf", "oneOf", "not", "enum"):
+            assert key not in params_obj
+
+
+def test_attach_schemas_to_tools_patches_wait_event_with_discriminated_watch_specs(monkeypatch) -> None:
+    tool_obj, _tool_func, _apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "wait_event",
+        {
+            "parameters": {
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "timeframe": {"type": "string"},
+                    "watch_tick_count_spike": {"type": "boolean"},
+                    "watch_for": {"type": "array", "items": {"type": "object"}},
+                    "end_on": {"type": "array", "items": {"type": "object"}},
+                    "verbose": {"type": "boolean"},
+                },
+                "required": [],
+            }
+        },
+    )
+
+    params = tool_obj.schema["parameters"]["properties"]
+    watch_for = params["watch_for"]
+    end_on = params["end_on"]
+    watch_items = watch_for["items"]
+    price_break_level = tool_obj.schema["$defs"]["PriceBreakLevelEventSpec"]
+
+    assert watch_for["type"] == "array"
+    assert watch_items["discriminator"]["propertyName"] == "type"
+    assert "#/$defs/PriceBreakLevelEventSpec" in watch_items["discriminator"]["mapping"].values()
+    assert any(
+        option.get("$ref") == "#/$defs/PriceBreakLevelEventSpec"
+        for option in watch_items["oneOf"]
+        if isinstance(option, dict)
+    )
+    assert end_on["items"] == {"$ref": "#/$defs/CandleCloseEventSpec"}
+    assert "level" in price_break_level["required"]
+
+
+def test_attach_schemas_to_tools_patches_trade_place(monkeypatch) -> None:
+    tool_obj, _tool_func, _apply_calls = _attach_tool_schema(
+        monkeypatch,
+        "trade_place",
+        {
+            "parameters": {
+                "properties": {
+                    "order_type": {"type": "string"},
+                    "expiration": {"type": "string"},
+                },
+                "required": [],
+            }
+        },
+    )
+
+    schema = tool_obj.schema
+    params_obj = schema["parameters"]
+    params = params_obj["properties"]
+
+    assert params_obj["required"] == ["symbol", "volume", "order_type"]
+    assert params["order_type"]["type"] == "string"
+    assert params["order_type"]["enum"] == [
+        "BUY",
+        "SELL",
+        "BUY_LIMIT",
+        "BUY_STOP",
+        "SELL_LIMIT",
+        "SELL_STOP",
+    ]
+    assert params["expiration"]["anyOf"] == [
+        {"type": "string"},
+        {"type": "number"},
+    ]

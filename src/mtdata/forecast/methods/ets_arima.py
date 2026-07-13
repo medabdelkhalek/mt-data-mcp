@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, List
 import warnings
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 
+from ..common import build_ci_diagnostics as _build_ci_diagnostics
 from ..interface import ForecastMethod, ForecastResult
-from ..registry import ForecastRegistry
+from ..forecast_registry import ForecastRegistry
 
 try:
-    from statsmodels.tsa.holtwinters import SimpleExpSmoothing as _SES, ExponentialSmoothing as _ETS  # type: ignore
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing as _ETS
+    from statsmodels.tsa.holtwinters import SimpleExpSmoothing as _SES  # type: ignore
     _SM_ETS_AVAILABLE = True
 except Exception:
     _SM_ETS_AVAILABLE = False
@@ -34,6 +37,14 @@ class ETSArimaMethod(ForecastMethod):
     @property
     def supports_features(self) -> Dict[str, bool]:
         return {"price": True, "return": True, "volatility": True, "ci": True}
+
+    @property
+    def supports_training(self) -> bool:
+        return False
+
+    @property
+    def training_category(self):
+        return "fast"
 
 @ForecastRegistry.register("ses")
 class SESMethod(ETSArimaMethod):
@@ -276,6 +287,19 @@ class ETSMethod(ETSArimaMethod):
 
         if seasonal is not None and m < 2:
             raise ValueError("ETS seasonal component requires seasonality >= 2")
+        if seasonal is not None:
+            min_required = int(m * 2)
+            obs = int(len(vals))
+            if obs < min_required:
+                timeframe = str(kwargs.get("timeframe") or "").strip().upper()
+                cycle_label = f"{m} bars"
+                if timeframe:
+                    cycle_label = f"{m} bars on {timeframe}"
+                raise ValueError(
+                    "ETS seasonal fitting requires at least "
+                    f"{min_required} observations (2 full cycles of {cycle_label}); "
+                    f"got {obs}. Increase lookback/history, disable seasonality, or use 'ses'/'holt'."
+                )
 
         damped = bool(params.get("damped", False))
         if trend is None:
@@ -375,15 +399,16 @@ class ARIMAMethod(ETSArimaMethod):
             order = (p, d, q)
 
         if params.get('seasonal_order') is not None:
-            seasonal_order = params.get('seasonal_order')
+            seasonal_order = tuple(int(v) for v in params.get('seasonal_order'))
         else:
             P = int(params.get('P', 0))
             D = int(params.get('D', 0))
             Q = int(params.get('Q', 0))
             seasonal_order = (P, D, Q, int(seasonality or 0))
+            if seasonal and seasonality > 1 and P == 0 and D == 0 and Q == 0:
+                seasonal_order = (0, 1, 1, int(seasonality))
         if seasonal and seasonality > 1 and seasonal_order == (0, 0, 0, 0):
-             # Auto-guess seasonal order if not provided but requested
-             seasonal_order = (0, 1, 1, seasonality)
+            seasonal_order = (0, 1, 1, int(seasonality))
              
         trend = params.get('trend', 'c')
         ci_alpha = kwargs.get('ci_alpha', params.get('alpha', 0.05))
@@ -395,10 +420,8 @@ class ARIMAMethod(ETSArimaMethod):
         if exog_future_arr is None:
             exog_future_arr = params.get('exog_future')
         
-        # If exog_future was passed as explicit arg, use it (it might be DataFrame)
-        # The interface defines exog_future as Optional[pd.DataFrame]
-        # But legacy wrapper passes numpy array.
-        # We need to handle both.
+        # The interface defines exog_future as Optional[pd.DataFrame], but some
+        # call sites still pass numpy arrays, so handle both.
         
         exog_u = exog_used
         exog_f = exog_future_arr if exog_future_arr is not None else exog_future
@@ -430,20 +453,44 @@ class ARIMAMethod(ETSArimaMethod):
         f_vals = np.asarray(pm, dtype=float)
         
         ci = None
+        metadata: Optional[Dict[str, Any]] = None
+        _alpha = float(ci_alpha) if ci_alpha is not None else 0.05
         try:
-            _alpha = float(ci_alpha) if ci_alpha is not None else 0.05
             ci_df = pred.conf_int(alpha=_alpha)
             ci_arr = np.asarray(ci_df)
             if ci_arr.ndim == 2 and ci_arr.shape[1] >= 2:
                 ci = (ci_arr[:, 0], ci_arr[:, 1])
-        except Exception:
-            pass
+            else:
+                warning_text = "Confidence interval output did not include two numeric bounds."
+                metadata = _build_ci_diagnostics(
+                    provider=self.name,
+                    requested=True,
+                    available=False,
+                    status="unavailable",
+                    alpha=_alpha,
+                    warning=warning_text,
+                    interval_columns=list(getattr(ci_df, "columns", [])),
+                )
+                metadata["ci_warning"] = warning_text
+        except Exception as ex:
+            warning_text = f"Failed to compute confidence intervals: {ex}"
+            metadata = _build_ci_diagnostics(
+                provider=self.name,
+                requested=True,
+                available=False,
+                status="failed",
+                alpha=_alpha,
+                warning=warning_text,
+                error=str(ex),
+                error_type=type(ex).__name__,
+            )
+            metadata["ci_warning"] = warning_text
             
         params_used = {"order": tuple(order), "seasonal_order": tuple(seasonal_order), "trend": str(trend)}
         if exog_u is not None:
             params_used["exog"] = {"n_features": int(exog_u.shape[1])}
             
-        return ForecastResult(forecast=f_vals, ci_values=ci, params_used=params_used)
+        return ForecastResult(forecast=f_vals, ci_values=ci, params_used=params_used, metadata=metadata)
 
 @ForecastRegistry.register("sarima")
 class SARIMAMethod(ARIMAMethod):
@@ -477,51 +524,4 @@ class SARIMAMethod(ARIMAMethod):
         return self._forecast_sarimax(series, horizon, seasonality, params, seasonal=True, exog_future=exog_future, **kwargs)
 
 
-# Backward compatibility wrappers
-def forecast_ses(series: np.ndarray, fh: int, alpha: Optional[float] = None) -> Tuple[np.ndarray, Dict[str, Any], Optional[np.ndarray]]:
-    res = ForecastRegistry.get("ses").forecast(pd.Series(series), fh, 0, {"alpha": alpha})
-    # Note: original returned fitted values as 3rd element. New interface doesn't strictly require it but we can add to metadata if needed.
-    # For now, returning None for fitted to match signature
-    return res.forecast, res.params_used, None
-
-def forecast_holt(series: np.ndarray, fh: int, damped: bool = True) -> Tuple[np.ndarray, Dict[str, Any], Optional[np.ndarray]]:
-    res = ForecastRegistry.get("holt").forecast(pd.Series(series), fh, 0, {"damped": damped})
-    return res.forecast, res.params_used, None
-
-def forecast_holt_winters(series: np.ndarray, fh: int, m: int, seasonal: str = 'add') -> Tuple[np.ndarray, Dict[str, Any], Optional[np.ndarray]]:
-    method_name = "holt_winters_add" if seasonal == 'add' else "holt_winters_mul"
-    res = ForecastRegistry.get(method_name).forecast(pd.Series(series), fh, m, {"damped": False}) # Original wrapper didn't expose damped param?
-    return res.forecast, res.params_used, None
-
-def forecast_sarimax(
-    series: np.ndarray,
-    fh: int,
-    order: Tuple[int, int, int],
-    seasonal_order: Tuple[int, int, int, int] = (0, 0, 0, 0),
-    trend: str = 'c',
-    exog_used: Optional[np.ndarray] = None,
-    exog_future: Optional[np.ndarray] = None,
-    ci_alpha: Optional[float] = 0.05,
-) -> Tuple[np.ndarray, Dict[str, Any], Optional[Tuple[np.ndarray, np.ndarray]]]:
-    
-    # Determine if it's ARIMA or SARIMA based on seasonal_order
-    method_name = "sarima" if sum(seasonal_order) > 0 else "arima"
-    
-    params = {
-        "order": order,
-        "seasonal_order": seasonal_order,
-        "trend": trend,
-        "alpha": ci_alpha
-    }
-    
-    res = ForecastRegistry.get(method_name).forecast(
-        pd.Series(series), 
-        fh, 
-        seasonal_order[3] if len(seasonal_order) > 3 else 0, 
-        params, 
-        exog_used=exog_used, 
-        exog_future=exog_future
-    )
-    
-    return res.forecast, res.params_used, res.ci_values
 

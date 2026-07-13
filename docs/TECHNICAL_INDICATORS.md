@@ -14,20 +14,20 @@ Technical indicators transform OHLCV data into signals for trend, momentum, vola
 
 **List available indicators:**
 ```bash
-python cli.py indicators_list --limit 20
+mtdata-cli indicators_list --limit 20
 ```
 
 **Filter by category:**
 ```bash
-python cli.py indicators_list --category momentum
-python cli.py indicators_list --category trend
-python cli.py indicators_list --category volatility
+mtdata-cli indicators_list --category momentum
+mtdata-cli indicators_list --category trend
+mtdata-cli indicators_list --category volatility
 ```
 
 **Get indicator details:**
 ```bash
-python cli.py indicators_describe rsi --format json
-python cli.py indicators_describe macd --format json
+mtdata-cli indicators_describe rsi --json
+mtdata-cli indicators_describe macd --json
 ```
 
 ---
@@ -38,7 +38,7 @@ python cli.py indicators_describe macd --format json
 
 Add indicators directly when fetching candles:
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 \
   --indicators "ema(20),ema(50),rsi(14),macd(12,26,9)"
 ```
 
@@ -60,14 +60,16 @@ Column naming convention: `INDICATOR_PARAM1_PARAM2`
 
 ## Indicator Categories
 
+> The tables below highlight commonly used indicators. The engine exposes **~190 indicators** discovered dynamically from `pandas_ta` at runtime, so the authoritative, environment-specific list comes from `mtdata-cli indicators_list` (optionally `--category <name>`). Use canonical names only (for example `bbands`, not historical nicknames like `bb`/`boll`).
+
 ### Trend / Overlap
 
 Show direction and dynamic support/resistance levels.
 
 | Indicator | Description | Example |
 |-----------|-------------|---------|
-| `ema` | Exponential Moving Average | `ema(20)` |
-| `sma` | Simple Moving Average | `sma(50)` |
+| `ema` | Exponential Moving Average (default: 10) | `ema(20)` |
+| `sma` | Simple Moving Average (default: 10) | `sma(50)` |
 | `dema` | Double EMA | `dema(20)` |
 | `tema` | Triple EMA | `tema(20)` |
 | `wma` | Weighted Moving Average | `wma(20)` |
@@ -78,7 +80,7 @@ Show direction and dynamic support/resistance levels.
 
 **Usage example:**
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 100 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 100 \
   --indicators "ema(20),ema(50),bbands(20,2)"
 ```
 
@@ -93,7 +95,7 @@ Measure speed and strength of price changes.
 
 | Indicator | Description | Example |
 |-----------|-------------|---------|
-| `rsi` | Relative Strength Index | `rsi(14)` |
+| `rsi` | Relative Strength Index (default: 14) | `rsi(14)` |
 | `macd` | Moving Average Convergence Divergence | `macd(12,26,9)` |
 | `stoch` | Stochastic Oscillator | `stoch(14,3,3)` |
 | `cci` | Commodity Channel Index | `cci(20)` |
@@ -118,8 +120,8 @@ Measure price movement magnitude.
 
 | Indicator | Description | Example |
 |-----------|-------------|---------|
-| `atr` | Average True Range | `atr(14)` |
-| `natr` | Normalized ATR | `natr(14)` |
+| `atr` | Average True Range (default: 14) | `atr(14)` |
+| `natr` | Normalized ATR (default: 14) | `natr(14)` |
 | `bbands` | Bollinger Bands width | `bbands(20,2)` |
 | `kc` | Keltner Channels | `kc(20,2)` |
 | `donchian` | Donchian Channels | `donchian(20)` |
@@ -143,6 +145,15 @@ Analyze trading activity and participation.
 
 **Note:** Volume indicators are most useful for instruments with reliable volume data (equities, futures). Forex volume is typically indicative only.
 
+### Additional Categories
+
+The indicator engine (via pandas_ta) supports additional categories beyond the four above:
+- **candles** — candlestick pattern indicators (e.g. `cdl_doji`, `cdl_hammer`)
+- **performance** — return and cumulative performance metrics
+- **statistics** — statistical measures (e.g. `zscore`, `variance`, `kurtosis`)
+
+Use `mtdata-cli indicators_list --category <name>` to explore them.
+
 ---
 
 ## Denoising Indicators
@@ -151,14 +162,14 @@ Smooth noisy indicator outputs to reduce false signals:
 
 **Smooth RSI after calculation:**
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 \
   --indicators "rsi(14)" \
   --denoise ema --denoise-params "columns=RSI_14,when=post_ti,alpha=0.3"
 ```
 
 **Smooth price before calculating indicators:**
 ```bash
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 200 \
   --indicators "rsi(14)" \
   --denoise ema --denoise-params "columns=close,when=pre_ti,alpha=0.2"
 ```
@@ -195,10 +206,10 @@ See [DENOISING.md](DENOISING.md) for more options.
 
 | Task | Command |
 |------|---------|
-| List indicators | `python cli.py indicators_list` |
-| Momentum indicators | `python cli.py indicators_list --category momentum` |
-| Indicator details | `python cli.py indicators_describe rsi` |
-| Fetch with indicators | `python cli.py data_fetch_candles EURUSD --indicators "ema(20),rsi(14)"` |
+| List indicators | `mtdata-cli indicators_list` |
+| Momentum indicators | `mtdata-cli indicators_list --category momentum` |
+| Indicator details | `mtdata-cli indicators_describe rsi` |
+| Fetch with indicators | `mtdata-cli data_fetch_candles EURUSD --indicators "ema(20),rsi(14)"` |
 
 ---
 
@@ -207,3 +218,4 @@ See [DENOISING.md](DENOISING.md) for more options.
 - [GLOSSARY.md](GLOSSARY.md) — Term definitions
 - [DENOISING.md](DENOISING.md) — Smoothing techniques
 - [FORECAST.md](FORECAST.md) — Using indicators in forecasts
+

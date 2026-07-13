@@ -1,0 +1,2277 @@
+"""
+Tests for finviz service and tools.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+
+
+def test_finviz_fundamental_percent_units_are_explicit() -> None:
+    from mtdata.core.finviz import _finviz_fundamental_units
+
+    assert _finviz_fundamental_units({"change_pct": 1.2}) == {
+        "change_pct": "percentage_points (1.0 = 1%)"
+    }
+
+
+class TestFinvizService:
+    """Tests for the canonical finviz package functions."""
+
+    @patch('finvizfinance.quote.finvizfinance')
+    def test_get_stock_fundamentals_success(self, mock_finviz):
+        """Test successful fundamentals fetch."""
+        from mtdata.services.finviz import get_stock_fundamentals
+        
+        mock_stock = MagicMock()
+        mock_stock.ticker_fundament.return_value = {
+            "P/E": "28.5",
+            "Market Cap": "3.0T",
+            "EPS (ttm)": "6.05",
+        }
+        mock_finviz.return_value = mock_stock
+        
+        result = get_stock_fundamentals("AAPL")
+        
+        assert result["success"] is True
+        assert result["symbol"] == "AAPL"
+        assert "fundamentals" in result
+        assert result["fundamentals"]["P/E"] == "28.5"
+
+    @patch('finvizfinance.quote.finvizfinance')
+    def test_get_stock_fundamentals_error(self, mock_finviz):
+        """Test fundamentals fetch with error."""
+        from mtdata.services.finviz import get_stock_fundamentals
+        
+        mock_finviz.side_effect = Exception("Network error")
+        
+        result = get_stock_fundamentals("INVALID")
+        
+        assert "error" in result
+
+    @patch('finvizfinance.quote.finvizfinance')
+    def test_get_stock_news_success(self, mock_finviz):
+        """Test successful news fetch."""
+        from mtdata.services.finviz import get_stock_news
+        
+        mock_stock = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Title": "\r\n    News 1   ", "Link": "  http://example.com/1  ", "Date": " 2024-01-01 "},
+            {"Title": "News 2", "Link": "http://example.com/2", "Date": "2024-01-02"},
+        ])
+        mock_stock.ticker_news.return_value = mock_df
+        mock_finviz.return_value = mock_stock
+        
+        result = get_stock_news("AAPL", limit=10)
+        
+        assert result["success"] is True
+        assert result["symbol"] == "AAPL"
+        assert result["count"] == 2
+        assert len(result["news"]) == 2
+        assert result["news"][0]["Title"] == "News 1"
+        assert result["news"][0]["Link"] == "http://example.com/1"
+        assert result["news"][0]["Date"] == "2024-01-01"
+
+    @patch('finvizfinance.quote.finvizfinance')
+    def test_get_stock_insider_trades_success(self, mock_finviz):
+        """Test successful insider trades fetch."""
+        from mtdata.services.finviz import get_stock_insider_trades
+        
+        mock_stock = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Owner": "John Doe", "Relationship": "CEO", "Transaction": "Buy", "Date": "Nov 07 '25"},
+        ])
+        mock_stock.ticker_inside_trader.return_value = mock_df
+        mock_finviz.return_value = mock_stock
+        
+        result = get_stock_insider_trades("AAPL")
+        
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["insider_trades"][0]["Date"] == "2025-11-07"
+
+    def test_finviz_error_kind_classification(self):
+        from mtdata.services.finviz.api import _finviz_error_kind
+
+        assert _finviz_error_kind("Finviz request timed out. Retry later.") == ("finviz_timeout", True)
+        assert _finviz_error_kind("Finviz rejected the request as unauthorized.") == ("finviz_unauthorized", False)
+        assert _finviz_error_kind("Finviz response could not be parsed.") == ("finviz_parse_error", False)
+        assert _finviz_error_kind("Unable to fetch data from Finviz. Please try again later.") == ("finviz_unavailable", True)
+
+    def test_get_insider_activity_error_is_structured(self):
+        from mtdata.services.finviz import api as finviz_api
+
+        def _boom(*_a, **_k):
+            raise TimeoutError("connection timeout while contacting Finviz")
+
+        with patch.object(finviz_api, "_apply_finvizfinance_timeout_patch", _boom):
+            result = finviz_api.get_insider_activity(option="latest")
+
+        assert "error" in result
+        assert result["error_code"] == "finviz_timeout"
+        assert result["retryable"] is True
+        assert result["option"] == "latest"
+
+    @patch('finvizfinance.quote.finvizfinance')
+    def test_get_stock_ratings_success(self, mock_finviz):
+        """Test successful ratings fetch."""
+        from mtdata.services.finviz import get_stock_ratings
+        
+        mock_stock = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Date": "2024-01-01", "Analyst": "Goldman Sachs", "Rating": "Buy"},
+        ])
+        mock_stock.ticker_outer_ratings.return_value = mock_df
+        mock_finviz.return_value = mock_stock
+        
+        result = get_stock_ratings("AAPL")
+        
+        assert result["success"] is True
+        assert result["count"] == 1
+
+    @patch('finvizfinance.screener.overview.Overview')
+    def test_screen_stocks_success(self, mock_overview_class):
+        """Test successful stock screening."""
+        from mtdata.services.finviz import screen_stocks
+        
+        mock_screener = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Ticker": "AAPL", "Company": "Apple Inc.", "Market Cap": "3.0T"},
+            {"Ticker": "MSFT", "Company": "Microsoft", "Market Cap": "2.8T"},
+        ])
+        mock_screener.screener_view.return_value = mock_df
+        mock_overview_class.return_value = mock_screener
+        
+        result = screen_stocks(
+            filters={"Exchange": "NASDAQ", "Sector": "Technology"},
+            limit=10
+        )
+        
+        assert result["success"] is True
+        assert result["count"] == 2
+
+    @patch('finvizfinance.screener.overview.Overview')
+    def test_screen_stocks_no_results(self, mock_overview_class):
+        """Test screening with no results."""
+        from mtdata.services.finviz import screen_stocks
+        
+        mock_screener = MagicMock()
+        mock_screener.screener_view.return_value = pd.DataFrame()
+        mock_overview_class.return_value = mock_screener
+        
+        result = screen_stocks(filters={"Market Cap": "Mega (>$200bln)"})
+        
+        assert result["success"] is True
+        assert result["count"] == 0
+
+    @patch('finvizfinance.forex.Forex')
+    def test_get_forex_performance(self, mock_forex_class):
+        """Test forex performance fetch."""
+        from mtdata.services.finviz import get_forex_performance
+        
+        mock_forex = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Ticker": "EUR/USD", "Price": "1.08", "Change": "0.5%"},
+        ])
+        mock_forex.performance.return_value = mock_df
+        mock_forex_class.return_value = mock_forex
+        
+        result = get_forex_performance()
+        
+        assert result["success"] is True
+        assert result["market"] == "forex"
+
+    @patch('finvizfinance.crypto.Crypto')
+    def test_get_crypto_performance(self, mock_crypto_class):
+        """Test crypto performance fetch."""
+        from mtdata.services.finviz import get_crypto_performance
+        
+        mock_crypto = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Ticker": "BTC", "Price": "45000", "Change": "2.5%"},
+        ])
+        mock_crypto.performance.return_value = mock_df
+        mock_crypto_class.return_value = mock_crypto
+        
+        result = get_crypto_performance()
+        
+        assert result["success"] is True
+        assert result["market"] == "crypto"
+        assert result["coins"][0]["Price"] == "45000.00"
+        assert "Price_display" not in result["coins"][0]
+
+    @patch('finvizfinance.crypto.Crypto')
+    def test_get_crypto_performance_preserves_subcent_price_display(self, mock_crypto_class):
+        """Sub-cent tokens should include a non-truncated display price."""
+        from mtdata.services.finviz import get_crypto_performance
+
+        mock_crypto = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Ticker": "SHIBUSD", "Price": "0.00001234", "Change": "2.5%"},
+        ])
+        mock_crypto.performance.return_value = mock_df
+        mock_crypto_class.return_value = mock_crypto
+
+        result = get_crypto_performance()
+
+        assert result["success"] is True
+        assert result["coins"][0]["Price"] == "0.00001234"
+        assert "Price_display" not in result["coins"][0]
+
+    @patch('finvizfinance.crypto.Crypto')
+    def test_get_crypto_performance_uses_scientific_notation_for_tiny_prices(self, mock_crypto_class):
+        """Tiny nonzero token prices should not round down to zero."""
+        from mtdata.services.finviz import get_crypto_performance
+
+        mock_crypto = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Ticker": "TINY", "Price": "0.0000000015", "Change": "2.5%"},
+        ])
+        mock_crypto.performance.return_value = mock_df
+        mock_crypto_class.return_value = mock_crypto
+
+        result = get_crypto_performance()
+
+        assert result["success"] is True
+        assert result["coins"][0]["Price"] == "1.5e-09"
+
+    @patch('finvizfinance.crypto.Crypto')
+    def test_get_crypto_performance_drops_week_when_day_week_identical(self, mock_crypto_class):
+        """When day/week values are identical, drop unreliable week fields and warn."""
+        from mtdata.services.finviz import get_crypto_performance
+
+        mock_crypto = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Ticker": "BTCUSD", "Perf Day": -0.0242, "Perf Week": -0.0242, "Perf WTD": -0.0242},
+            {"Ticker": "ETHUSD", "Perf Day": -0.0310, "Perf Week": -0.0310, "Perf WTD": -0.0310},
+        ])
+        mock_crypto.performance.return_value = mock_df
+        mock_crypto_class.return_value = mock_crypto
+
+        result = get_crypto_performance()
+
+        assert result["success"] is True
+        assert "warnings" in result
+        assert "identical 'Perf Day' and 'Perf Week'" in result["warnings"][0]
+        assert "Perf Day" in result["coins"][0]
+        assert "Perf Week" not in result["coins"][0]
+        assert "Perf WTD" not in result["coins"][0]
+        assert "Perf Week" not in result["coins"][1]
+        assert "Perf WTD" not in result["coins"][1]
+
+    @patch('finvizfinance.crypto.Crypto')
+    def test_get_crypto_performance_no_wtd_alias_when_values_differ(self, mock_crypto_class):
+        """Do not add WTD alias when day/week values differ."""
+        from mtdata.services.finviz import get_crypto_performance
+
+        mock_crypto = MagicMock()
+        mock_df = pd.DataFrame([
+            {"Ticker": "BTCUSD", "Perf Day": -0.0242, "Perf Week": -0.0500},
+            {"Ticker": "ETHUSD", "Perf Day": -0.0310, "Perf Week": -0.0600},
+        ])
+        mock_crypto.performance.return_value = mock_df
+        mock_crypto_class.return_value = mock_crypto
+
+        result = get_crypto_performance()
+
+        assert result["success"] is True
+        assert "warnings" not in result
+        assert "Perf WTD" not in result["coins"][0]
+        assert "Perf WTD" not in result["coins"][1]
+
+    @patch("mtdata.services.finviz.api._finviz_http_get")
+    def test_get_futures_performance_parses_current_page_payload(self, mock_get):
+        from mtdata.services.finviz import get_futures_performance
+
+        response = MagicMock()
+        response.text = (
+            "<script>FinvizDispatch('FuturesPerformance', () => "
+            'window.FinvizInitFuturesPerformance([{"ticker":"NG","label":"Natural Gas",'
+            '"group":"ENERGY","perf":6.14}]);)</script>'
+        )
+        mock_get.return_value = response
+
+        result = get_futures_performance()
+
+        assert result["success"] is True
+        assert result["market"] == "futures"
+        assert result["count"] == 1
+        assert result["futures"] == [
+            {"ticker": "NG", "label": "Natural Gas", "group": "ENERGY", "perf": 6.14}
+        ]
+        response.raise_for_status.assert_called_once_with()
+        response.close.assert_called_once_with()
+
+    @patch("finvizfinance.screener.financial.Financial")
+    def test_get_earnings_calendar_success(self, mock_financial_class):
+        """Test earnings calendar fetch via Financial screener filter."""
+        from mtdata.services.finviz import get_earnings_calendar
+
+        mock_screener = MagicMock()
+        mock_df = pd.DataFrame(
+            [
+                {"Ticker": "AAPL", "Earnings": "2026-01-10", "EPS Est": "2.10"},
+                {"Ticker": "MSFT", "Earnings": "2026-01-11", "EPS Est": "3.20"},
+            ]
+        )
+        mock_screener.screener_view.return_value = mock_df
+        mock_financial_class.return_value = mock_screener
+
+        result = get_earnings_calendar(period="This Week", limit=10, page=1)
+
+        mock_financial_class.assert_called_once_with()
+        mock_screener.set_filter.assert_called_once_with(
+            filters_dict={"Earnings Date": "This Week"}
+        )
+        mock_screener.screener_view.assert_called_once()
+        assert result["success"] is True
+        assert result["period"] == "This Week"
+        assert result["count"] == 2
+        assert len(result["earnings"]) == 2
+
+    def test_get_earnings_calendar_invalid_period(self):
+        """Test earnings calendar with invalid period."""
+        from mtdata.services.finviz import get_earnings_calendar
+
+        result = get_earnings_calendar(period="Bad")
+
+        assert "error" in result
+        assert "Invalid period" in result["error"]
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_economic_calendar_items")
+    def test_get_economic_calendar_success(self, mock_fetch_items):
+        """Test economic calendar fetch."""
+        from mtdata.services.finviz import get_economic_calendar
+
+        mock_fetch_items.return_value = [
+            {
+                "calendarId": 0,
+                "ticker": "USD",
+                "event": "Out of range",
+                "category": "Test",
+                "date": "2026-01-03T08:30:00",
+                "actual": "",
+                "forecast": "",
+                "previous": "",
+                "importance": 1,
+            },
+            {
+                "calendarId": 1,
+                "ticker": "UNITEDSTANONFAR",
+                "event": "Nonfarm Payrolls",
+                "category": "Employment",
+                "date": "2026-01-04T08:30:00",
+                "actual": "",
+                "forecast": "",
+                "previous": "",
+                "importance": 3,
+            },
+            {
+                "calendarId": 2,
+                "ticker": "USD",
+                "event": "ISM Services",
+                "category": "Business",
+                "date": "2026-01-04T10:00:00",
+                "actual": "",
+                "forecast": "",
+                "previous": "",
+                "importance": 2,
+            },
+        ]
+
+        result = get_economic_calendar(limit=10, page=1, date_from="2026-01-04", date_to="2026-01-04")
+
+        assert result["success"] is True
+        assert result["source"] == "finviz_api"
+        assert result["count"] == 2
+        assert result["total"] == 2
+        assert len(result["items"]) == 2
+        assert "events" not in result
+        assert result["items"][0]["ticker"] == "UNITEDSTANONFAR"
+        assert result["items"][0]["event"] == "Nonfarm Payrolls"
+        assert result["items"][0]["importance"] == 3
+        assert "For" not in result["items"][0]
+        assert "Country" not in result["items"][0]
+
+        result_high = get_economic_calendar(
+            impact="high",
+            limit=10,
+            page=1,
+            date_from="2026-01-04",
+            date_to="2026-01-05",
+        )
+        assert result_high["success"] is True
+        assert result_high["impact"] == "high"
+        assert result_high["total"] == 1
+        assert len(result_high["items"]) == 1
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_economic_calendar_items")
+    def test_get_economic_calendar_invalid_impact(self, mock_fetch_items):
+        """Test economic calendar with invalid impact filter."""
+        from mtdata.services.finviz import get_economic_calendar
+
+        mock_fetch_items.return_value = []
+
+        result = get_economic_calendar(impact="extreme")
+
+        assert "error" in result
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_economic_calendar_items")
+    def test_get_economic_calendar_date_from_defaults_to_week(self, mock_fetch_items):
+        """If date_from is provided without date_to, default to a 7-day window."""
+        from mtdata.services.finviz import get_economic_calendar
+
+        mock_fetch_items.return_value = []
+
+        get_economic_calendar(date_from="2026-01-05", limit=10, page=1)
+
+        _, kwargs = mock_fetch_items.call_args
+        assert kwargs["date_from"] == "2026-01-05"
+        assert kwargs["date_to"] == "2026-01-12"
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_economic_calendar_items")
+    def test_get_economic_calendar_weekend_anchor_shifts_to_monday(self, mock_fetch_items):
+        """If date_from is a weekend, shift the API anchor to the next Monday but keep the requested range."""
+        from mtdata.services.finviz import get_economic_calendar
+
+        mock_fetch_items.return_value = [
+            {
+                "calendarId": 1,
+                "ticker": "USD",
+                "event": "Test",
+                "category": "Test",
+                "date": "2025-01-06T10:00:00",
+                "actual": "",
+                "forecast": "",
+                "previous": "",
+                "importance": 2,
+            },
+        ]
+
+        result = get_economic_calendar(date_from="2025-01-05", limit=10, page=1)
+
+        assert result["success"] is True
+        assert result["dateFrom"] == "2025-01-05"
+        assert result["dateTo"] == "2025-01-12"
+
+        _, kwargs = mock_fetch_items.call_args
+        assert kwargs["date_from"] == "2025-01-06"
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_economic_calendar_items")
+    def test_get_economic_calendar_accepts_iso_datetime_date_from(self, mock_fetch_items):
+        """ISO datetime date_from inputs should normalize before weekend alignment."""
+        from mtdata.services.finviz import get_economic_calendar
+
+        mock_fetch_items.return_value = []
+
+        result = get_economic_calendar(date_from="2025-01-05T08:30:00", limit=10, page=1)
+
+        assert result["success"] is True
+        assert result["dateFrom"] == "2025-01-05"
+        assert result["dateTo"] == "2025-01-12"
+
+        _, kwargs = mock_fetch_items.call_args
+        assert kwargs["date_from"] == "2025-01-06"
+        assert kwargs["date_to"] == "2025-01-12"
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_calendar_paged")
+    def test_get_earnings_calendar_api_success(self, mock_fetch_paged):
+        """Test earnings calendar API fetch."""
+        from mtdata.services.finviz import get_earnings_calendar_api
+
+        mock_fetch_paged.return_value = {
+            "items": [{"ticker": "AAPL", "date": "2026-01-05", "eps": "2.10"}],
+            "page": 1,
+            "pageSize": 50,
+            "totalItemsCount": 1,
+            "totalPages": 1,
+        }
+
+        result = get_earnings_calendar_api(date_from="2026-01-05", date_to="2026-01-12", limit=50, page=1)
+
+        assert result["success"] is True
+        assert result["calendar"] == "earnings"
+        assert result["dateFrom"] == "2026-01-05"
+        assert result["dateTo"] == "2026-01-12"
+        assert result["count"] == 1
+        assert result["total"] == 1
+        assert len(result["items"]) == 1
+        assert "earnings" not in result
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_calendar_paged")
+    def test_get_earnings_calendar_api_applies_client_limit(self, mock_fetch_paged):
+        from mtdata.services.finviz import get_earnings_calendar_api
+
+        mock_fetch_paged.return_value = {
+            "items": [{"ticker": f"SYM{i}", "date": "2026-01-05"} for i in range(5)],
+            "page": 1,
+            "pageSize": 50,
+            "totalItemsCount": 5,
+            "totalPages": 1,
+        }
+
+        result = get_earnings_calendar_api(date_from="2026-01-05", date_to="2026-01-12", limit=3, page=1)
+
+        assert result["count"] == 3
+        assert result["total"] == 5
+        assert result["pages"] == 2
+        assert [item["ticker"] for item in result["items"]] == ["SYM0", "SYM1", "SYM2"]
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_calendar_paged")
+    def test_get_dividends_calendar_api_success(self, mock_fetch_paged):
+        """Test dividends calendar API fetch."""
+        from mtdata.services.finviz import get_dividends_calendar_api
+
+        mock_fetch_paged.return_value = {
+            "items": [{"ticker": "MSFT", "exDate": "2026-01-06", "amount": "0.75"}],
+            "page": 1,
+            "pageSize": 50,
+            "totalItemsCount": 1,
+            "totalPages": 1,
+        }
+
+        result = get_dividends_calendar_api(date_from="2026-01-05", date_to="2026-01-12", limit=50, page=1)
+
+        assert result["success"] is True
+        assert result["calendar"] == "dividends"
+        assert result["dateFrom"] == "2026-01-05"
+        assert result["dateTo"] == "2026-01-12"
+        assert result["count"] == 1
+        assert result["total"] == 1
+        assert len(result["items"]) == 1
+
+    @patch("mtdata.services.finviz.api._fetch_finviz_calendar_paged")
+    def test_get_dividends_calendar_api_applies_client_limit(self, mock_fetch_paged):
+        from mtdata.services.finviz import get_dividends_calendar_api
+
+        mock_fetch_paged.return_value = {
+            "items": [{"ticker": f"SYM{i}", "exDate": "2026-01-06"} for i in range(6)],
+            "page": 1,
+            "pageSize": 50,
+            "totalItemsCount": 6,
+            "totalPages": 1,
+        }
+
+        result = get_dividends_calendar_api(date_from="2026-01-05", date_to="2026-01-12", limit=4, page=1)
+
+        assert result["count"] == 4
+        assert result["total"] == 6
+        assert result["pages"] == 2
+        assert [item["ticker"] for item in result["items"]] == ["SYM0", "SYM1", "SYM2", "SYM3"]
+        assert "dividends" not in result
+
+
+class TestFinvizTools:
+    """Tests for finviz MCP tools."""
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_finviz_forex_uses_items_with_snake_case_rows(self, mock_get_forex):
+        from mtdata.core.finviz import finviz_forex
+
+        mock_get_forex.return_value = {
+            "success": True,
+            "market": "forex",
+            "count": 1,
+            "pairs": [
+                {
+                    "Pair": "EUR/USD",
+                    "Price": "1.10",
+                    "Perf 5Min": "0.1%",
+                    "Perf Day": "0.2%",
+                    "Perf Week": "-0.3%",
+                    "Perf Month": "0.4%",
+                    "Perf Quart": "0.5%",
+                    "Perf Year": "1.6%",
+                }
+            ],
+        }
+
+        raw = getattr(finviz_forex, "__wrapped__", finviz_forex)
+        result = raw()
+
+        assert "pairs" not in result
+        assert result["detail"] == "compact"
+        assert result["data_limitations"] == {
+            "performance_periods": ["day", "week", "month", "quarter", "year"],
+            "price": "delayed_web_quote_not_executable",
+        }
+        assert result["price_currency_basis"] == "quote_currency"
+        assert result["price_source"] == "finviz_delayed"
+        assert result["freshness"] == "finviz_delayed"
+        assert result["data_quality"] == "delayed_15_to_20_min"
+        assert result["data_delayed"] is True
+        assert result["delay_minutes_min"] == 15
+        assert result["delay_minutes_max"] == 20
+        assert result["warnings"] == [
+            "Finviz forex prices are delayed web quotes, not executable MT5 bid/ask; "
+            "use market_ticker before order placement."
+        ]
+        assert result["items"] == [
+            {
+                "symbol": "EURUSD",
+                "display_symbol": "EUR/USD",
+                "name": "Euro / US Dollar",
+                "delayed_price": 1.1,
+                "price_currency": "USD",
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
+                "perf_day_pct": 0.2,
+                "perf_week_pct": -0.3,
+                "perf_month_pct": 0.4,
+                "perf_quart_pct": 0.5,
+                "perf_year_pct": 1.6,
+            }
+        ]
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_finviz_forex_applies_limit(self, mock_get_forex):
+        from mtdata.core.finviz import finviz_forex
+
+        mock_get_forex.return_value = {
+            "success": True,
+            "market": "forex",
+            "pairs": [
+                {"Pair": "EUR/USD"},
+                {"Pair": "GBP/USD"},
+                {"Pair": "USD/JPY"},
+            ],
+        }
+
+        raw = getattr(finviz_forex, "__wrapped__", finviz_forex)
+        result = raw(limit=2)
+
+        assert result["count"] == 2
+        assert result["available_count"] == 3
+        assert result["omitted_item_count"] == 1
+        assert result["items"] == [
+            {
+                "symbol": "EURUSD",
+                "display_symbol": "EUR/USD",
+                "name": "Euro / US Dollar",
+            },
+            {
+                "symbol": "GBPUSD",
+                "display_symbol": "GBP/USD",
+                "name": "British Pound / US Dollar",
+            },
+        ]
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_finviz_forex_filters_symbol_aliases(self, mock_get_forex):
+        from mtdata.core.finviz import finviz_forex
+
+        mock_get_forex.return_value = {
+            "success": True,
+            "market": "forex",
+            "pairs": [
+                {"Pair": "EUR/USD", "Price": "1.10"},
+                {"Pair": "GBP/USD", "Price": "1.25"},
+                {"Pair": "USD/JPY", "Price": "156.20"},
+            ],
+        }
+
+        raw = getattr(finviz_forex, "__wrapped__", finviz_forex)
+        result = raw("GBPUSD", limit=20)
+
+        assert result["success"] is True
+        assert result["symbol"] == "GBPUSD"
+        assert result["count"] == 1
+        assert result["available_count"] == 1
+        assert result["items"] == [
+            {
+                "symbol": "GBPUSD",
+                "display_symbol": "GBP/USD",
+                "name": "British Pound / US Dollar",
+                "delayed_price": 1.25,
+                "price_currency": "USD",
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
+            }
+        ]
+
+        slash_result = raw("USD/JPY", limit=20)
+        assert slash_result["symbol"] == "USDJPY"
+        assert slash_result["items"][0]["symbol"] == "USDJPY"
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_finviz_forex_rejects_invalid_symbol_without_fetch(self, mock_get_forex):
+        from mtdata.core.finviz import finviz_forex
+
+        raw = getattr(finviz_forex, "__wrapped__", finviz_forex)
+        result = raw("BTCUSD")
+
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_forex_invalid_symbol"
+        mock_get_forex.assert_not_called()
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_finviz_forex_rejects_zero_limit(self, mock_get_forex):
+        from mtdata.core.finviz import finviz_forex
+
+        raw = getattr(finviz_forex, "__wrapped__", finviz_forex)
+        result = raw(limit=0)
+
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_forex_invalid_limit"
+        mock_get_forex.assert_not_called()
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_finviz_forex_filters_non_fiat_pairs(self, mock_get_forex):
+        from mtdata.core.finviz import finviz_forex
+
+        mock_get_forex.return_value = {
+            "success": True,
+            "market": "forex",
+            "pairs": [
+                {"Pair": "EUR/USD"},
+                {"Pair": "BTC/USD", "Name": None},
+                {"Pair": "USD/JPY"},
+            ],
+        }
+
+        raw = getattr(finviz_forex, "__wrapped__", finviz_forex)
+        result = raw(limit=10)
+
+        assert result["count"] == 2
+        assert result["available_count"] == 2
+        assert result["items"] == [
+            {
+                "symbol": "EURUSD",
+                "display_symbol": "EUR/USD",
+                "name": "Euro / US Dollar",
+            },
+            {
+                "symbol": "USDJPY",
+                "display_symbol": "USD/JPY",
+                "name": "US Dollar / Japanese Yen",
+            },
+        ]
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_finviz_market_tools_accept_shared_non_full_details(self, mock_get_forex):
+        from mtdata.core.finviz import finviz_forex
+
+        mock_get_forex.return_value = {
+            "success": True,
+            "market": "forex",
+            "pairs": [{"Pair": "EUR/USD"}],
+        }
+
+        raw = getattr(finviz_forex, "__wrapped__", finviz_forex)
+
+        assert raw(detail="standard")["detail"] == "compact"
+        assert raw(detail="summary")["detail"] == "compact"
+
+    @patch("mtdata.core.finviz.get_crypto_performance")
+    def test_finviz_crypto_uses_items_with_snake_case_rows(self, mock_get_crypto):
+        from mtdata.core.finviz import finviz_crypto
+
+        mock_get_crypto.return_value = {
+            "success": True,
+            "market": "crypto",
+            "count": 1,
+            "coins": [{"Ticker": "BTC", "Name": "Bitcoin", "Price": "90000", "Perf Day": "2.5%"}],
+        }
+
+        raw = getattr(finviz_crypto, "__wrapped__", finviz_crypto)
+        result = raw()
+
+        assert "coins" not in result
+        assert result["detail"] == "compact"
+        assert result["performance_format"] == "percentage_points"
+        assert result["data_limitations"] == {"performance_periods": ["day"]}
+        assert result["price_currency"] == "USD"
+        assert result["price_source"] == "finviz_delayed"
+        assert result["freshness"] == "finviz_delayed"
+        assert result["data_quality"] == "delayed_15_to_20_min"
+        assert result["data_delayed"] is True
+        assert result["delay_minutes_min"] == 15
+        assert result["delay_minutes_max"] == 20
+        assert result["items"] == [
+            {
+                "symbol": "BTC",
+                "name": "Bitcoin",
+                "price": 90000,
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
+                "perf_day_pct": 2.5,
+            }
+        ]
+
+    @patch("mtdata.core.finviz.get_crypto_performance")
+    def test_finviz_crypto_numeric_fraction_perf_pct_is_percentage_points(
+        self,
+        mock_get_crypto,
+    ):
+        from mtdata.core.finviz import finviz_crypto
+
+        mock_get_crypto.return_value = {
+            "success": True,
+            "market": "crypto",
+            "count": 1,
+            "coins": [
+                {
+                    "Ticker": "SOL",
+                    "Name": "Solana",
+                    "Price": "180",
+                    "Perf Day": 0.0091,
+                }
+            ],
+        }
+
+        raw = getattr(finviz_crypto, "__wrapped__", finviz_crypto)
+        result = raw()
+
+        assert result["items"][0]["perf_day_pct"] == 0.91
+
+    @patch("mtdata.core.finviz.get_crypto_performance")
+    def test_finviz_crypto_compact_maps_wtd_to_week_when_week_missing(self, mock_get_crypto):
+        from mtdata.core.finviz import finviz_crypto
+
+        mock_get_crypto.return_value = {
+            "success": True,
+            "market": "crypto",
+            "count": 1,
+            "coins": [
+                {
+                    "Ticker": "BTC",
+                    "Name": "Bitcoin",
+                    "Price": "90000",
+                    "Perf Day": "2.5%",
+                    "Perf WTD": "2.5%",
+                }
+            ],
+        }
+
+        raw = getattr(finviz_crypto, "__wrapped__", finviz_crypto)
+        result = raw()
+
+        assert result["items"] == [
+            {
+                "symbol": "BTC",
+                "name": "Bitcoin",
+                "price": 90000.0,
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
+                "perf_day_pct": 2.5,
+                "perf_week_pct": 2.5,
+                "perf_week_basis": "week_to_date",
+            }
+        ]
+        assert "perf_wtd_pct" not in result["items"][0]
+
+    @patch("mtdata.core.finviz.get_futures_performance")
+    def test_finviz_futures_uses_items_with_snake_case_rows(self, mock_get_futures):
+        from mtdata.core.finviz import finviz_futures
+
+        mock_get_futures.return_value = {
+            "success": True,
+            "market": "futures",
+            "count": 1,
+            "futures": [{"ticker": "NQ", "label": "Nasdaq 100", "perf": "0.8%"}],
+        }
+
+        raw = getattr(finviz_futures, "__wrapped__", finviz_futures)
+        result = raw()
+
+        assert "futures" not in result
+        assert result["detail"] == "compact"
+        assert result["data_limitations"] == {
+            "performance_periods": ["day"],
+            "price": "not_available_from_source",
+        }
+        assert result["price_source"] == "finviz_delayed"
+        assert result["freshness"] == "finviz_delayed"
+        assert result["data_quality"] == "delayed_15_to_20_min"
+        assert result["data_delayed"] is True
+        assert result["delay_minutes_min"] == 15
+        assert result["delay_minutes_max"] == 20
+        assert "delayed web data" in result["warnings"][0]
+        assert result["items"] == [
+            {
+                "symbol": "NQ",
+                "name": "Nasdaq 100",
+                "perf_day_pct": 0.8,
+            }
+        ]
+
+    @patch("mtdata.core.finviz.get_futures_performance")
+    def test_finviz_futures_numeric_perf_is_already_percentage_points(
+        self,
+        mock_get_futures,
+    ):
+        from mtdata.core.finviz import finviz_futures
+
+        mock_get_futures.return_value = {
+            "success": True,
+            "market": "futures",
+            "count": 1,
+            "futures": [{"ticker": "SB", "label": "Sugar", "perf": 0.93}],
+        }
+
+        raw = getattr(finviz_futures, "__wrapped__", finviz_futures)
+        result = raw()
+
+        assert result["items"][0]["perf_day_pct"] == 0.93
+
+    @patch("mtdata.core.finviz.get_futures_performance")
+    def test_finviz_market_tools_accept_full_detail(self, mock_get_futures):
+        from mtdata.core.finviz import finviz_futures
+
+        mock_get_futures.return_value = {
+            "success": True,
+            "market": "futures",
+            "count": 1,
+            "futures": [{"ticker": "NQ", "label": "Nasdaq 100", "perf": "0.8%"}],
+        }
+
+        raw = getattr(finviz_futures, "__wrapped__", finviz_futures)
+        result = raw(detail="full")
+
+        assert result["detail"] == "full"
+        assert result["data_fetched_at"].endswith("Z")
+        assert result["items"] == [{"symbol": "NQ", "name": "Nasdaq 100", "perf_pct": "0.8%"}]
+        assert result["meta"]["tool"] == "finviz_futures"
+        assert "request" not in result["meta"]
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_rejects_non_equity_symbols_upfront(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("BTCUSD")
+
+        mock_get_fundamentals.assert_not_called()
+        assert result["error"] == (
+            "BTCUSD is not a Finviz-supported equity ticker. "
+            "finviz_fundamentals only supports US equities."
+        )
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_unsupported_symbol"
+        assert result["operation"] == "finviz_fundamentals"
+        assert result["details"] == {
+            "symbol": "BTCUSD",
+            "tool": "finviz_fundamentals",
+        }
+        assert isinstance(result.get("request_id"), str)
+
+    def test_finviz_equity_symbol_normalization_strips_mt5_suffixes(self):
+        from mtdata.core.finviz import _normalize_equity_symbol
+
+        for raw_symbol, finviz_symbol in (
+            ("AAPL.NAS", "AAPL"),
+            ("MSFT.O", "MSFT"),
+            ("NVDA.TQ", "NVDA"),
+            ("AAPL.L", "AAPL"),
+        ):
+            symbol, error = _normalize_equity_symbol(
+                raw_symbol,
+                tool_name="finviz_fundamentals",
+            )
+            assert error is None
+            assert symbol == finviz_symbol
+
+        symbol, error = _normalize_equity_symbol(
+            "BRK.B",
+            tool_name="finviz_fundamentals",
+        )
+        assert error is None
+        assert symbol == "BRK.B"
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_strips_mt5_equity_suffix(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {"Company": "Apple Inc."},
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL.NAS")
+
+        mock_get_fundamentals.assert_called_once_with("AAPL")
+        assert result["symbol"] == "AAPL"
+
+    @patch("mtdata.core.finviz.get_stock_description")
+    def test_finviz_description_normalizes_equity_symbols(self, mock_get_description):
+        from mtdata.core.finviz import finviz_description
+
+        mock_get_description.return_value = {"success": True, "symbol": "AAPL"}
+        raw = getattr(finviz_description, "__wrapped__", finviz_description)
+        result = raw("aapl")
+
+        mock_get_description.assert_called_once_with("AAPL")
+        assert result["success"] is True
+
+    @patch("mtdata.core.finviz.get_stock_news")
+    def test_finviz_news_rejects_non_equity_symbols_upfront(self, mock_get_news):
+        from mtdata.core.finviz import finviz_news
+
+        raw = getattr(finviz_news, "__wrapped__", finviz_news)
+        result = raw("BTCUSD", limit=5, page=1)
+
+        mock_get_news.assert_not_called()
+        assert result["error"] == (
+            "BTCUSD is not a Finviz-supported equity ticker. "
+            "finviz_news only supports US equities."
+        )
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_unsupported_symbol"
+        assert result["operation"] == "finviz_news"
+        assert result["details"] == {"symbol": "BTCUSD", "tool": "finviz_news"}
+        assert isinstance(result.get("request_id"), str)
+
+    @patch("mtdata.core.finviz.get_stock_news")
+    def test_finviz_news_rejects_zero_limit(self, mock_get_news):
+        from mtdata.core.finviz import finviz_news
+
+        raw = getattr(finviz_news, "__wrapped__", finviz_news)
+        result = raw("AAPL", limit=0)
+
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_news_invalid_limit"
+        mock_get_news.assert_not_called()
+
+    @patch("mtdata.core.finviz.get_stock_news")
+    def test_finviz_news_compact_keeps_url_and_provenance(self, mock_get_news):
+        from mtdata.core.finviz import finviz_news
+
+        mock_get_news.return_value = {
+            "success": True,
+            "news": [
+                {
+                    "Title": "Market update",
+                    "Source": "Example",
+                    "Date": "2026-06-13 12:00",
+                    "Link": "https://example.com/story",
+                }
+            ],
+        }
+        raw = getattr(finviz_news, "__wrapped__", finviz_news)
+
+        result = raw("AAPL", limit=1, detail="compact")
+
+        assert result["provider"] == "finviz"
+        assert result["delivery"] == "aggregated_web_feed"
+        assert result["is_realtime"] is False
+        assert "does not guarantee real-time" in result["freshness_note"]
+        assert result["items"][0]["url"] == "https://example.com/story"
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_requires_symbol(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("")
+
+        mock_get_fundamentals.assert_not_called()
+        assert result["success"] is False
+        assert result["error"] == "finviz_fundamentals requires a symbol."
+        assert result["error_code"] == "finviz_symbol_required"
+        assert result["operation"] == "finviz_fundamentals"
+        assert result["details"] == {"tool": "finviz_fundamentals"}
+        assert isinstance(result.get("request_id"), str)
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    @patch("mtdata.core.finviz._normalize_equity_symbol", return_value=(None, None))
+    def test_finviz_fundamentals_handles_degenerate_symbol_normalization(
+        self,
+        mock_normalize,
+        mock_get_fundamentals,
+    ):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL")
+
+        mock_normalize.assert_called_once_with(
+            "AAPL",
+            tool_name="finviz_fundamentals",
+        )
+        mock_get_fundamentals.assert_not_called()
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_symbol_invalid"
+        assert result["operation"] == "finviz_fundamentals"
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_defaults_to_compact_summary(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "Company": "Apple Inc",
+                "Sector": "Technology",
+                "P/E": "34.29",
+                "EPS (ttm)": "7.90",
+                "Market Cap": "3979.47B",
+                "Price": "270.00",
+                "Change": "1.2%",
+                "52W High": "288.62 -2.94%",
+                "RSI (14)": "62.1",
+                "Insider Own": "0.1%",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("aapl")
+
+        mock_get_fundamentals.assert_called_once_with("AAPL")
+        assert result["detail"] == "compact"
+        assert result["category"] == "summary"
+        assert result["currency"] == "USD"
+        assert result["price_currency"] == "USD"
+        assert result["price_source"] == "finviz_delayed"
+        assert result["freshness"] == "finviz_delayed"
+        assert "freshness_basis" not in result
+        assert result["data_fetched_at"].endswith("Z")
+        assert result["fundamentals"]["price_source"] == "finviz_delayed"
+        assert result["fundamentals"]["data_delayed"] is True
+        assert result["fundamentals"]["delay_minutes_min"] == 15
+        assert result["fundamentals"]["delay_minutes_max"] == 20
+        assert result["fundamentals"]["pe_ratio"] == 34.29
+        assert result["fundamentals"]["market_cap"] == 3_979_470_000_000
+        assert result["fundamentals"]["market_cap_formatted"] == "3.98T"
+        assert result["fundamentals"]["eps_ttm"] == 7.9
+        assert result["fundamentals"]["change_pct"] == 1.2
+        assert result["fundamentals"]["high_52w_price"] == 288.62
+        assert result["fundamentals"]["high_52w_distance_pct"] == -2.94
+        assert "high_52w" not in result["fundamentals"]
+        assert result["fundamentals"]["rsi_14"] == 62.1
+        assert "insider_own" not in result["fundamentals"]
+
+        overview = raw("AAPL", category="overview")
+        assert overview["category"] == "summary"
+        assert overview["category_requested"] == "overview"
+        assert "fields_returned" not in result
+        assert "available_field_count" not in result
+        assert "omitted_field_count" not in result
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_full_omits_opaque_freshness_basis(
+        self,
+        mock_get_fundamentals,
+    ):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {"Price": "270.00"},
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL", detail="full")
+
+        assert result["price_source"] == "finviz_delayed"
+        assert result["price_currency"] == "USD"
+        assert result["freshness"] == "finviz_delayed"
+        assert result["fundamentals"]["price_source"] == "finviz_delayed"
+        assert result["fundamentals"]["data_delayed"] is True
+        assert "freshness_basis" not in result
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_flags_stale_52w_high(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "Company": "Apple Inc",
+                "Market Cap": "3979.47B",
+                "Price": "308.82",
+                "52W High": "305.50 1.07%",
+                "52W Low": "193.50 59.60%",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL")
+
+        fundamentals = result["fundamentals"]
+        assert result["trust"] == "degraded"
+        assert fundamentals["new_52w_high"] is False
+        assert fundamentals["new_52w_high_unconfirmed"] is True
+        assert "high_52w_distance_pct_recomputed" not in fundamentals
+        assert "upstream 52-week data may be delayed" in fundamentals["data_quality_warnings"][0]
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_filters_category_and_fields(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "Market Cap": "3979.47B",
+                "P/E": "34.29",
+                "P/S": "8.1",
+                "EPS (ttm)": "7.90",
+                "RSI (14)": "62.1",
+                "SMA20": "4.54%",
+                "SMA50": "12.98%",
+                "SMA200": "18.15%",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        valuation = raw("AAPL", category="valuation")
+        technical = raw("AAPL", category="technical")
+        financial = raw("AAPL", category="financial")
+        custom = raw("AAPL", fields="P/E,RSI (14),SMA20,Missing")
+        custom_normalized = raw(
+            "AAPL",
+            fields="pe_ratio,market_cap,eps_ttm,sma20_distance_pct",
+        )
+
+        assert valuation["category"] == "valuation"
+        assert valuation["fundamentals"] == {
+            "market_cap": 3_979_470_000_000,
+            "market_cap_formatted": "3.98T",
+            "pe_ratio": 34.29,
+            "price_to_sales": 8.1,
+            "eps_ttm": 7.9,
+        }
+        assert custom["category"] == "custom"
+        assert custom["fundamentals"] == {
+            "pe_ratio": 34.29,
+            "rsi_14": 62.1,
+            "sma20_distance_pct": 4.54,
+        }
+        assert custom["missing_fields"] == ["Missing"]
+        assert custom_normalized["fundamentals"] == {
+            "pe_ratio": 34.29,
+            "market_cap": 3_979_470_000_000,
+            "market_cap_formatted": "3.98T",
+            "eps_ttm": 7.9,
+            "sma20_distance_pct": 4.54,
+        }
+        assert "missing_fields" not in custom_normalized
+        assert technical["category"] == "technical"
+        assert technical["fundamentals"] == {
+            "rsi_14": 62.1,
+            "sma20_distance_pct": 4.54,
+            "sma50_distance_pct": 12.98,
+            "sma200_distance_pct": 18.15,
+        }
+        assert financial["success"] is False
+        assert financial["error_code"] == "finviz_fundamentals_invalid_category"
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_full_omits_redundant_field_echo(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "Company": "Apple Inc",
+                "Sector": "Technology",
+                "P/E": "34.29",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL", detail="full")
+
+        assert "fields_returned" not in result
+        assert result["available_field_count"] == 3
+        assert result["omitted_field_count"] == 0
+        assert "omitted_fields" not in result
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_full_filtered_omits_field_name_list(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "Price": "270.00",
+                "Change": "1.2%",
+                "Market Cap": "3979.47B",
+                "EPS (ttm)": "7.90",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL", detail="full", fields="price,change")
+
+        assert result["fundamentals"] == {
+            "price": 270.0,
+            "change_pct": 1.2,
+            "price_source": "finviz_delayed",
+            "data_delayed": True,
+            "delay_minutes_min": 15,
+            "delay_minutes_max": 20,
+        }
+        assert result["available_field_count"] == 4
+        assert result["omitted_field_count"] == 2
+        assert "omitted_fields" not in result
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_splits_compound_fields(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "52W High": "300.92 -0.90%",
+                "52W Low": "193.46 54.15%",
+                "EPS past 3/5Y": "6.89% 17.91%",
+                "Sales past 3/5Y": "1.81% 8.71%",
+                "Dividend Gr. 3/5Y": "4.26% 4.98%",
+                "Volatility W": "1.72%",
+                "Volatility M": "2.09%",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL", detail="full")
+
+        fundamentals = result["fundamentals"]
+        assert fundamentals["high_52w_price"] == 300.92
+        assert fundamentals["high_52w_distance_pct"] == -0.9
+        assert fundamentals["low_52w_price"] == 193.46
+        assert fundamentals["low_52w_distance_pct"] == 54.15
+        assert fundamentals["eps_past_3y_cagr_pct"] == 6.89
+        assert fundamentals["eps_past_5y_cagr_pct"] == 17.91
+        assert fundamentals["sales_past_3y_cagr_pct"] == 1.81
+        assert fundamentals["sales_past_5y_cagr_pct"] == 8.71
+        assert fundamentals["dividend_growth_3y_cagr_pct"] == 4.26
+        assert fundamentals["dividend_growth_5y_cagr_pct"] == 4.98
+        assert fundamentals["volatility_w_pct"] == 1.72
+        assert fundamentals["volatility_m_pct"] == 2.09
+        assert result["omitted_field_count"] == 0
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_expands_cryptic_metric_keys(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "ROA": "29.5%",
+                "ROE": "156.0%",
+                "Curr R": "0.87",
+                "Quick R": "0.83",
+                "LT Debt/Eq": "1.26",
+                "Shs Outstand": "14.70B",
+                "Shs Float": "14.66B",
+                "Book/sh": "6.00",
+                "Perf Week": "1.71%",
+                "Volume": "47.38M",
+                "Avg Volume": "43.78M",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL", detail="full")
+
+        fundamentals = result["fundamentals"]
+        assert fundamentals["return_on_assets"] == 29.5
+        assert fundamentals["return_on_equity"] == 156.0
+        assert fundamentals["current_ratio"] == 0.87
+        assert fundamentals["quick_ratio"] == 0.83
+        assert fundamentals["long_term_debt_to_equity"] == 1.26
+        assert fundamentals["shares_outstanding"] == 14_700_000_000.0
+        assert fundamentals["shares_outstanding_formatted"] == "14.7B"
+        assert fundamentals["shares_float"] == 14_660_000_000.0
+        assert fundamentals["shares_float_formatted"] == "14.66B"
+        assert fundamentals["book_value_per_share"] == 6.0
+        assert fundamentals["performance_week"] == 1.71
+        assert fundamentals["volume"] == 47_380_000
+        assert fundamentals["volume_formatted"] == "47.38M"
+        assert fundamentals["avg_volume"] == 43_780_000
+        assert fundamentals["avg_volume_formatted"] == "43.78M"
+        assert "roa" not in fundamentals
+        assert "curr_r" not in fundamentals
+
+    @patch("mtdata.core.finviz.get_stock_fundamentals")
+    def test_finviz_fundamentals_normalizes_mixed_numeric_formats(self, mock_get_fundamentals):
+        from mtdata.core.finviz import finviz_fundamentals
+
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {
+                "Enterprise Value": "4599.54B",
+                "Income": "122.58B",
+                "Sales": "451.44B",
+                "EPS this Y": "17.26%",
+                "EPS next Y": "9.62",
+            },
+        }
+
+        raw = getattr(finviz_fundamentals, "__wrapped__", finviz_fundamentals)
+        result = raw("AAPL", detail="full")
+
+        fundamentals = result["fundamentals"]
+        assert fundamentals["enterprise_value"] == 4_599_540_000_000
+        assert fundamentals["enterprise_value_formatted"] == "4.6T"
+        assert fundamentals["income"] == 122_580_000_000
+        assert fundamentals["income_formatted"] == "122.58B"
+        assert fundamentals["sales"] == 451_440_000_000
+        assert fundamentals["sales_formatted"] == "451.44B"
+        assert fundamentals["eps_this_y"] == 17.26
+        assert fundamentals["eps_next_y"] == 9.62
+
+    @patch("mtdata.core.finviz.get_stock_insider_trades")
+    def test_finviz_insider_defaults_to_compact_detail(self, mock_get_trades):
+        from mtdata.core.finviz import finviz_insider
+
+        mock_get_trades.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "total": 4,
+            "insider_trades": [
+                {
+                    "Owner": f"Owner {i}",
+                    "Transaction": "Buy" if i == 0 else "Sale",
+                    "Cost": 411.34,
+                    "Shares": 10,
+                }
+                for i in range(4)
+            ],
+        }
+
+        raw = getattr(finviz_insider, "__wrapped__", finviz_insider)
+        result = raw("AAPL")
+
+        assert result["detail"] == "compact"
+        assert result["count"] == 3
+        assert result["items"][0]["price_per_share"] == 411.34
+        assert "cost" not in result["items"][0]
+        assert result["omitted_item_count"] == 1
+        assert result["summary"]["buy_transactions"] == 1
+
+    @patch("mtdata.core.finviz.get_stock_insider_trades")
+    def test_finviz_insider_none_detail_uses_compact(self, mock_get_trades):
+        from mtdata.core.finviz import finviz_insider
+
+        mock_get_trades.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "total": 4,
+            "insider_trades": [
+                {"Owner": f"Owner {i}", "Transaction": "Sale", "Shares": 10}
+                for i in range(4)
+            ],
+        }
+
+        raw = getattr(finviz_insider, "__wrapped__", finviz_insider)
+        result = raw("AAPL", detail=None)
+
+        assert result["detail"] == "compact"
+        assert result["count"] == 3
+        assert result["omitted_item_count"] == 1
+
+    @patch("mtdata.core.finviz.get_stock_ratings")
+    def test_finviz_ratings_structures_price_targets(self, mock_get_ratings):
+        from mtdata.core.finviz import finviz_ratings
+
+        mock_get_ratings.return_value = {
+            "success": True,
+            "symbol": "TSLA",
+            "ratings": [
+                {
+                    "Date": "2026-04-30",
+                    "Status": "Reiterated",
+                    "Firm": "Wells Fargo",
+                    "Rating": "Overweight",
+                    "Price": "$615 \u2192 $625",
+                }
+            ],
+        }
+
+        raw = getattr(finviz_ratings, "__wrapped__", finviz_ratings)
+        result = raw("TSLA")
+
+        row = result["ratings"][0]
+        assert row["price_target_previous"] == 615.0
+        assert row["price_target_new"] == 625.0
+        assert row["price_target_change_pct"] == 1.63
+        assert "price" not in row
+        assert "price_target_display" not in row
+
+        full = raw("TSLA", detail="full")
+        full_row = full["ratings"][0]
+        assert full_row["price"] == "$615 -> $625"
+        assert full_row["price_target_display"] == "$615 -> $625"
+
+    @patch("mtdata.core.finviz.get_stock_ratings")
+    def test_finviz_ratings_cleans_mojibake_price_target_arrow(self, mock_get_ratings):
+        from mtdata.core.finviz import finviz_ratings
+
+        mock_get_ratings.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "ratings": [
+                {
+                    "Date": "2026-05-26",
+                    "Status": "Reiterated",
+                    "Firm": "BofA Securities",
+                    "Rating": "Buy",
+                    "Price": "$330 \u00d4\u00e5\u00c6 $380",
+                }
+            ],
+        }
+
+        raw = getattr(finviz_ratings, "__wrapped__", finviz_ratings)
+        result = raw("AAPL", detail="full")
+
+        row = result["ratings"][0]
+        assert row["price"] == "$330 -> $380"
+        assert row["price_target_display"] == "$330 -> $380"
+        assert row["price_target_previous"] == 330.0
+        assert row["price_target_new"] == 380.0
+
+    @patch("mtdata.core.finviz.get_stock_ratings")
+    def test_finviz_ratings_none_detail_uses_compact(self, mock_get_ratings):
+        from mtdata.core.finviz import finviz_ratings
+
+        mock_get_ratings.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "ratings": [
+                {"Date": "2026-04-30", "Firm": "Firm A", "Rating": "Buy"},
+                {"Date": "2026-04-29", "Firm": "Firm B", "Rating": "Hold"},
+            ],
+        }
+
+        raw = getattr(finviz_ratings, "__wrapped__", finviz_ratings)
+        result = raw("AAPL", detail=None)
+
+        assert result["detail"] == "compact"
+        assert result["count"] == 2
+        assert result["available_count"] == 2
+        assert "meta" not in result
+
+    @patch("mtdata.core.finviz.get_stock_peers")
+    def test_finviz_peers_empty_detail_uses_compact(self, mock_get_peers):
+        from mtdata.core.finviz import finviz_peers
+
+        mock_get_peers.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "peers": ["MSFT", "GOOGL", "META"],
+        }
+
+        raw = getattr(finviz_peers, "__wrapped__", finviz_peers)
+        result = raw("AAPL", detail="")
+
+        assert result["detail"] == "compact"
+        assert result["count"] == 3
+        assert result["available_count"] == 3
+        assert "meta" not in result
+
+    @patch("mtdata.core.finviz.get_insider_activity")
+    def test_finviz_insider_activity_rejects_invalid_detail(self, mock_get_activity):
+        from mtdata.core.finviz import finviz_insider_activity
+
+        raw = getattr(finviz_insider_activity, "__wrapped__", finviz_insider_activity)
+        result = raw(detail="banana")
+
+        assert result["success"] is False
+        assert "compact, standard, summary, full" in result["error"]
+        assert result["error_code"] == "finviz_insider_activity_invalid_detail"
+        mock_get_activity.assert_not_called()
+
+    @patch("mtdata.core.finviz.get_earnings_calendar")
+    def test_finviz_earnings_expands_cryptic_metric_keys(self, mock_get_earnings):
+        from mtdata.core.finviz import finviz_earnings
+
+        mock_get_earnings.return_value = {
+            "success": True,
+            "period": "This Week",
+            "earnings": [
+                {
+                    "Ticker": "APLM",
+                    "ROA": "-1.365",
+                    "ROE": "-3.8",
+                    "ROIC": None,
+                    "Curr R": "0.97",
+                    "Debt/Eq": None,
+                    "Gross M": None,
+                    "Oper M": "-3.04",
+                    "Profit M": "-3.67",
+                },
+            ],
+            "count": 1,
+            "total": 1,
+            "page": 1,
+            "pages": 1,
+        }
+
+        raw = getattr(finviz_earnings, "__wrapped__", finviz_earnings)
+        result = raw(detail="full")
+
+        item = result["items"][0]
+        assert item["symbol"] == "APLM"
+        assert item["return_on_assets"] == "-1.365"
+        assert item["return_on_equity"] == "-3.8"
+        assert item["return_on_invested_capital"] is None
+        assert item["current_ratio"] == "0.97"
+        assert item["debt_to_equity"] is None
+        assert item["gross_margin"] is None
+        assert item["operating_margin"] == "-3.04"
+        assert item["profit_margin"] == "-3.67"
+        assert "curr_r" not in item
+
+    @patch("mtdata.core.finviz.get_earnings_calendar")
+    def test_finviz_earnings_compact_uses_calendar_focused_rows(self, mock_get_earnings):
+        from mtdata.core.finviz import finviz_earnings
+
+        mock_get_earnings.return_value = {
+            "success": True,
+            "period": "This Week",
+            "earnings": [
+                {
+                    "Ticker": "APLM",
+                    "Market Cap": 14170000,
+                    "ROA": "-1.365",
+                    "ROE": "-3.8",
+                    "Curr R": "0.97",
+                    "Earnings": "Apr 27/b",
+                    "Price": "12.85",
+                    "Change": "-0.0258",
+                    "Volume": "6593",
+                },
+            ],
+            "count": 1,
+            "total": 12,
+            "page": 1,
+            "pages": 2,
+        }
+
+        raw = getattr(finviz_earnings, "__wrapped__", finviz_earnings)
+        result = raw()
+
+        mock_get_earnings.assert_called_once_with(period="This Week", limit=10, page=1)
+        assert result["detail"] == "compact"
+        assert result["omitted_item_count"] == 11
+        assert result["items"] == [
+            {
+                "symbol": "APLM",
+                "earnings_date": "2026-04-27",
+                "earnings": "Apr 27/b",
+                "earnings_timing": "before_market",
+                "market_cap": "14.17M",
+                "price": "12.85",
+                "change_pct": -2.58,
+                "volume": "6593",
+            }
+        ]
+
+    @patch("mtdata.core.finviz.get_earnings_calendar")
+    def test_finviz_earnings_rejects_invalid_detail(self, mock_get_earnings):
+        from mtdata.core.finviz import finviz_earnings
+
+        raw = getattr(finviz_earnings, "__wrapped__", finviz_earnings)
+        result = raw(detail="banana")
+
+        assert result["success"] is False
+        assert "compact, standard, summary, full" in result["error"]
+        assert result["error_code"] == "finviz_earnings_invalid_detail"
+        mock_get_earnings.assert_not_called()
+
+    @patch('mtdata.services.finviz.api.get_stock_fundamentals')
+    def test_finviz_fundamentals_tool(self, mock_get_fundamentals):
+        """Test finviz_fundamentals tool."""
+        # Import the service function directly to test logic without MCP server init
+        
+        mock_get_fundamentals.return_value = {
+            "success": True,
+            "symbol": "AAPL",
+            "fundamentals": {"P/E": "28.5"},
+        }
+        
+        # Call the mocked function
+        result = mock_get_fundamentals("AAPL")
+        
+        mock_get_fundamentals.assert_called_once_with("AAPL")
+        assert result["success"] is True
+
+    @patch('mtdata.services.finviz.api.screen_stocks')
+    def test_finviz_screen_tool_with_filters(self, mock_screen):
+        """Test finviz_screen tool with JSON filters."""
+        import json
+        
+        mock_screen.return_value = {"success": True, "count": 5, "stocks": []}
+        
+        # Simulate what finviz_screen does: parse JSON and call service
+        filters_str = '{"Exchange": "NASDAQ"}'
+        filters_dict = json.loads(filters_str)
+        result = mock_screen(filters=filters_dict, order=None, limit=10, view="overview")
+        
+        mock_screen.assert_called_once_with(
+            filters={"Exchange": "NASDAQ"},
+            order=None,
+            limit=10,
+            view="overview"
+        )
+        assert result["success"] is True
+
+    def test_finviz_screen_tool_invalid_json(self):
+        """Test finviz_screen tool with invalid JSON."""
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(filters="not valid json")
+
+        assert "error" in result
+        # Verify improved error message
+        assert "Invalid filters format" in result["error"]
+        assert "JSON object" in result["error"]
+        assert "filter names as keys" in result["error"]
+        assert "Sector" in result["error"]  # Should include example
+        assert "Finviz screener shorthand tokens" in result["error"]
+        assert "'not valid json'" in result["error"]
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_screen_filters_invalid"
+        assert result["operation"] == "finviz_screen"
+        assert result["details"]["received_type"] == "str"
+        assert isinstance(result["details"].get("valid_filter_examples"), list)
+        assert result["related_tools"] == ["finviz_filters_list"]
+        assert "finviz_filters_list" in result["remediation"]
+        assert isinstance(result.get("request_id"), str)
+
+    def test_finviz_screen_tool_rejects_non_object_json_filters(self):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(filters='["NASDAQ"]')
+
+        assert result["error"].startswith("Invalid filters format.")
+        assert "Got: '[\"NASDAQ\"]'" in result["error"]
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_screen_filters_invalid"
+        assert result["details"]["received_type"] == "str"
+        assert isinstance(result["details"].get("valid_filter_examples"), list)
+
+    def test_finviz_screen_invalid_shorthand_identifies_bad_token(self):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        token_map = {"cap_largeover": ("Market Cap.", "+Large (over $10bln)")}
+        with (
+            patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct),
+            patch(
+                "mtdata.core.finviz._finviz_screen_shorthand_token_map",
+                return_value=token_map,
+            ),
+        ):
+            result = finviz_screen.__wrapped__(filters="cap_largeover,sec_stock")
+
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_screen_filters_invalid"
+        assert "Unrecognized Finviz shorthand token(s): sec_stock" in result["error"]
+        assert result["details"]["invalid_tokens"] == ["sec_stock"]
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_accepts_dict_filters(self, mock_screen):
+        """Test finviz_screen tool accepts dict filters directly."""
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {
+            "success": True,
+            "count": 5,
+            "stocks": [
+                {
+                    "Ticker": "AAPL",
+                    "Company": "Apple Inc.",
+                    "Sector": "Technology",
+                    "Industry": "Consumer Electronics",
+                    "Country": "USA",
+                    "Market Cap": "3.0T",
+                    "Price": 298.21,
+                    "Change": 0.0087,
+                    "Volume": 123456,
+                    "P/E": "28.5",
+                }
+            ],
+        }
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters={"Exchange": "NASDAQ", "Sector": "Technology"},
+                limit=10
+            )
+
+        mock_screen.assert_called_once_with(
+            filters={"Exchange": "NASDAQ", "Sector": "Technology"},
+            order=None,
+            limit=10,
+            page=1,
+            view="overview"
+        )
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert "available_count" not in result
+        assert result["detail"] == "compact"
+        assert "stocks" not in result
+        assert result["items"] == [
+            {
+                "symbol": "AAPL",
+                "price": 298.21,
+                "change_pct": 0.87,
+                "volume": 123456,
+                "pe_ratio": "28.5",
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
+            }
+        ]
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_compact_uses_selected_view_fields(self, mock_screen):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {
+            "success": True,
+            "count": 1,
+            "stocks": [
+                {
+                    "Ticker": "AAPL",
+                    "Price": 298.21,
+                    "Change": 0.0087,
+                    "Volume": 123456,
+                    "P/E": "28.5",
+                    "RSI (14)": "45.1",
+                    "SMA20": "2.0%",
+                    "SMA50": "-1.2%",
+                    "ATR (14)": "3.4",
+                    "Beta": "1.2",
+                }
+            ],
+        }
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters={"Exchange": "NASDAQ"},
+                view="technical",
+            )
+
+        mock_screen.assert_called_once_with(
+            filters={"Exchange": "NASDAQ"},
+            order=None,
+            limit=20,
+            page=1,
+            view="technical",
+        )
+        assert result["detail"] == "compact"
+        assert result["price_currency"] == "USD"
+        assert result["price_source"] == "finviz_delayed"
+        assert result["freshness"] == "finviz_delayed"
+        assert result["items"] == [
+            {
+                "symbol": "AAPL",
+                "price": 298.21,
+                "change_pct": 0.87,
+                "volume": 123456,
+                "rsi_14": 45.1,
+                "sma20_distance_pct": 2.0,
+                "sma50_distance_pct": -1.2,
+                "atr_14": "3.4",
+                "beta": "1.2",
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
+            }
+        ]
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_compact_uses_valuation_fields(self, mock_screen):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {
+            "success": True,
+            "count": 1,
+            "stocks": [
+                {
+                    "Ticker": "AAPL",
+                    "Price": 298.21,
+                    "Market Cap": "3.0T",
+                    "P/E": "28.5",
+                    "Forward P/E": "26.1",
+                    "PEG": "2.3",
+                    "P/S": "8.1",
+                    "P/B": "36.2",
+                    "RSI (14)": "45.1",
+                }
+            ],
+        }
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters={"Exchange": "NASDAQ"},
+                view="valuation",
+            )
+
+        assert result["items"] == [
+            {
+                "symbol": "AAPL",
+                "price": 298.21,
+                "market_cap": "3.0T",
+                "pe_ratio": "28.5",
+                "forward_pe": "26.1",
+                "peg": "2.3",
+                "price_to_sales": "8.1",
+                "price_to_book": "36.2",
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
+            }
+        ]
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_defaults_to_20_rows(self, mock_screen):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {"success": True, "count": 0, "stocks": []}
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(filters={"Exchange": "NASDAQ"})
+
+        mock_screen.assert_called_once_with(
+            filters={"Exchange": "NASDAQ"},
+            order=None,
+            limit=20,
+            page=1,
+            view="overview",
+        )
+        assert result["detail"] == "compact"
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_accepts_json_string_filters(self, mock_screen):
+        """Test finviz_screen tool still accepts JSON string filters."""
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {"success": True, "count": 3, "stocks": []}
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters='{"Exchange": "NASDAQ"}',
+                limit=5
+            )
+
+        mock_screen.assert_called_once_with(
+            filters={"Exchange": "NASDAQ"},
+            order=None,
+            limit=5,
+            page=1,
+            view="overview"
+        )
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert "available_count" not in result
+        assert result["items"] == []
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_accepts_colon_filter_string(self, mock_screen):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {"success": True, "count": 1, "stocks": []}
+        with (
+            patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct),
+            patch(
+                "mtdata.core.finviz._parse_finviz_screen_key_value_filters",
+                return_value={"Market Cap.": "Large ($10bln to $200bln)"},
+            ) as mock_parse,
+        ):
+            result = finviz_screen.__wrapped__(filters="marketcap:large", limit=5)
+
+        mock_parse.assert_called_once_with("marketcap:large")
+        mock_screen.assert_called_once_with(
+            filters={"Market Cap.": "Large ($10bln to $200bln)"},
+            order=None,
+            limit=5,
+            page=1,
+            view="overview",
+        )
+        assert result["success"] is True
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_supports_full_detail_meta_and_omitted_count(self, mock_screen):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {
+            "success": True,
+            "stocks": [
+                {"Ticker": "AAPL", "Market Cap": "3.0T"},
+                {"Ticker": "MSFT", "Market Cap": "2.8T"},
+            ],
+        }
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters={"Exchange": "NASDAQ"},
+                limit=1,
+                detail="full",
+            )
+
+        assert result["items"] == [{"symbol": "AAPL", "market_cap": "3.0T"}]
+        assert "available_count" not in result
+        assert result["omitted_item_count"] == 1
+        assert result["detail"] == "full"
+        assert result["meta"]["tool"] == "finviz_screen"
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_accepts_finviz_shorthand_filters(self, mock_screen):
+        """Test finviz_screen accepts native Finviz screener shorthand filters."""
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {"success": True, "count": 2, "stocks": []}
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters="cap_largeover,exch_nyse",
+                limit=5,
+            )
+
+        mock_screen.assert_called_once_with(
+            filters={
+                "Market Cap.": "+Large (over $10bln)",
+                "Exchange": "NYSE",
+            },
+            order=None,
+            limit=5,
+            page=1,
+            view="overview",
+        )
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert "available_count" not in result
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_accepts_key_value_filters(self, mock_screen):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {"success": True, "count": 2, "stocks": []}
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters="country=USA,marketcap=+mega",
+                limit=5,
+            )
+
+        mock_screen.assert_called_once_with(
+            filters={
+                "Country": "USA",
+                "Market Cap.": "Mega ($200bln and more)",
+            },
+            order=None,
+            limit=5,
+            page=1,
+            view="overview",
+        )
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert "available_count" not in result
+
+    @patch('mtdata.core.finviz.screen_stocks')
+    def test_finviz_screen_tool_accepts_operator_key_value_filters(self, mock_screen):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        mock_screen.return_value = {"success": True, "count": 2, "stocks": []}
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters="pe_under=15,beta_under=1",
+                limit=5,
+            )
+
+        mock_screen.assert_called_once_with(
+            filters={
+                "P/E": "Under 15",
+                "Beta": "Under 1",
+            },
+            order=None,
+            limit=5,
+            page=1,
+            view="overview",
+        )
+        assert result["success"] is True
+
+    def test_finviz_screen_unsupported_key_value_filter_explains_discrete_filters(self):
+        from mtdata.core.finviz import finviz_screen
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        with patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct):
+            result = finviz_screen.__wrapped__(
+                filters="sharpe_above=2,beta_under=1",
+                limit=5,
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "finviz_screen_filters_invalid"
+        assert "Unsupported Finviz key=value filter or option" in result["error"]
+        assert "beta_under=1" in result["error"]
+        assert result["details"]["invalid_tokens"] == [
+            "sharpe_above=2",
+            "beta_under=1",
+        ]
+
+    def test_finviz_calendar_uses_start_end_dates(self):
+        from mtdata.core.finviz import finviz_calendar
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        with (
+            patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct),
+            patch("mtdata.core.finviz.get_economic_calendar", return_value={"success": True}) as mock_calendar,
+        ):
+            result = finviz_calendar.__wrapped__(start="2026-01-05", end="2026-01-12")
+
+        assert result["success"] is True
+        mock_calendar.assert_called_once_with(
+            impact=None,
+            limit=20,
+            page=1,
+            date_from="2026-01-05",
+            date_to="2026-01-12",
+        )
+
+    def test_finviz_calendar_compact_replaces_opaque_symbol_with_country(self):
+        from mtdata.core.finviz import finviz_calendar
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        service_result = {
+            "success": True,
+            "items": [
+                {
+                    "ticker": "UNITEDSTANONFAR",
+                    "event": "Nonfarm Payrolls",
+                    "category": "Employment",
+                    "date": "2026-01-04T08:30:00",
+                    "importance": 3,
+                }
+            ],
+        }
+        with (
+            patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct),
+            patch(
+                "mtdata.core.finviz.get_economic_calendar",
+                return_value=service_result,
+            ),
+        ):
+            result = finviz_calendar.__wrapped__()
+
+        assert result["items"] == [
+            {
+                "country": "United States",
+                "country_code": "US",
+                "event": "Nonfarm Payrolls",
+                "category": "Employment",
+                "date": "2026-01-04T13:30:00Z",
+                "local_time": "2026-01-04T08:30:00-05:00",
+                "local_timezone": "America/New_York",
+                "impact": "high",
+            }
+        ]
+        assert result["timezone"] == "UTC"
+        assert "symbol" not in result["items"][0]
+
+    def test_finviz_dividend_calendar_labels_amounts_and_yield_units(self):
+        from mtdata.core.finviz import finviz_calendar
+
+        def _run_direct(_logger, operation, func, **fields):
+            return func()
+
+        service_result = {
+            "success": True,
+            "items": [
+                {
+                    "ticker": "ADP",
+                    "ordinary": 1.7,
+                    "special": 0.1,
+                    "yield": 2.878,
+                    "exdate": "2026-06-12",
+                }
+            ],
+        }
+        with (
+            patch("mtdata.core.finviz.run_logged_operation", side_effect=_run_direct),
+            patch(
+                "mtdata.core.finviz.get_dividends_calendar_api",
+                return_value=service_result,
+            ),
+        ):
+            result = finviz_calendar.__wrapped__(calendar="dividends")
+
+        assert result["items"][0]["ordinary_amount"] == 1.7
+        assert result["items"][0]["special_amount"] == 0.1
+        assert result["items"][0]["yield_pct"] == 2.878
+        assert "yield" not in result["items"][0]
+        assert result["currency_basis"] == "listing_currency"
+        assert result["units"]["yield_pct"] == "percentage_points (1.0 = 1%)"
+
+    def test_finviz_calendar_rejects_removed_date_aliases(self):
+        from mtdata.core.finviz import finviz_calendar
+
+        try:
+            finviz_calendar.__wrapped__(start="2026-01-05", date_from="2026-01-06")
+        except TypeError as exc:
+            assert "date_from" in str(exc)
+        else:
+            raise AssertionError("date_from should not be accepted")

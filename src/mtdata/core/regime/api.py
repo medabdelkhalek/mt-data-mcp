@@ -1,0 +1,3751 @@
+"""Regime detection implementation."""
+
+import logging
+import math
+import time
+import warnings
+from collections import Counter
+from typing import Any, Dict, List, Literal, Optional
+
+import numpy as np
+
+from ...forecast.common import fetch_history as _fetch_history
+from ...forecast.common import log_returns_from_prices as _log_returns_from_prices
+from ...shared.schema import DenoiseSpec, DetailLiteral, TimeframeLiteral
+from ...utils.denoise import _resolve_denoise_base_col
+from ...utils.mt5 import MT5ConnectionError, ensure_mt5_connection_or_raise
+from ...utils.regime_heuristics import infer_market_regime
+from ...utils.time import _format_time_minimal
+from .. import features as _features_module
+from .._mcp_instance import mcp
+from ..execution_logging import (
+    infer_result_success,
+    log_operation_finish,
+    log_operation_start,
+)
+from ..features import extract_rolling_features
+from ..mt5_gateway import create_mt5_gateway, mt5_connection_error
+from ..output_contract import normalize_output_detail, normalize_output_verbosity_detail
+from ..tool_calling import call_tool_sync_structured
+from .methods.bocpd import (
+    _auto_calibrate_bocpd_params,
+    _bocpd_reliability_score,
+    _default_bocpd_cp_threshold,
+    _default_bocpd_hazard_lambda,
+    _filter_bocpd_change_points,
+    _walkforward_quantile_threshold_calibration,
+)
+from .methods.hmm import _hmm_reliability_from_gamma
+from .methods.ms_ar import _ms_ar_reliability_from_smoothed
+from .payload import (
+    _consolidate_payload,
+    _summary_only_payload,
+)
+
+# Import from package submodules directly to avoid circular imports
+from .smoothing import (
+    _canonicalize_regime_labels,
+    _confirm_state_changes_causally,
+    _count_state_transitions,
+    _hard_state_probability_matrix,
+    _normalize_state_probability_matrix,
+    _state_runs,
+)
+
+logger = logging.getLogger(__name__)
+
+_PELT_DIRECTION_T_STAT_THRESHOLD = 1.96
+
+
+def _pelt_return_direction(
+    segment: np.ndarray,
+    mean_value: float,
+) -> tuple[str, Optional[float], bool]:
+    values = np.asarray(segment, dtype=float)
+    if values.size < 2:
+        return "neutral", None, False
+    sample_std = float(np.std(values, ddof=1))
+    if not np.isfinite(sample_std) or sample_std <= 1e-12:
+        significant = bool(abs(float(mean_value)) > 1e-12)
+        direction = (
+            "positive" if mean_value > 0 else "negative" if mean_value < 0 else "neutral"
+        )
+        return (direction if significant else "neutral"), None, significant
+    mean_t_stat = float(mean_value) / (sample_std / np.sqrt(float(values.size)))
+    significant = bool(abs(mean_t_stat) >= _PELT_DIRECTION_T_STAT_THRESHOLD)
+    if not significant:
+        return "neutral", mean_t_stat, False
+    return ("positive" if mean_value > 0 else "negative"), mean_t_stat, True
+
+
+def _regime_connection_error() -> Optional[Dict[str, Any]]:
+    return mt5_connection_error(
+        create_mt5_gateway(ensure_connection_impl=ensure_mt5_connection_or_raise),
+    )
+
+
+def _coerce_param(
+    params: Dict[str, Any],
+    key: str,
+    *,
+    default: Any,
+    cast: Any,
+    error: Optional[str] = None,
+) -> tuple[Any, Optional[str]]:
+    raw = params.get(key, default)
+    if raw is None:
+        return default, None
+    try:
+        return cast(raw), None
+    except Exception:
+        if error is not None:
+            return None, error
+        return default, None
+
+
+def _summary_window_size(lookback: int, size: int) -> int:
+    try:
+        lookback_i = int(lookback)
+    except Exception:
+        lookback_i = int(size)
+    return min(max(lookback_i, 0), int(size))
+
+
+def _history_fetch_limit(limit: Optional[int], lookback: int) -> int:
+    if limit is not None and int(limit) >= 0:
+        return int(max(int(limit), 50))
+    return int(max(int(lookback), 50)) + 20
+
+
+_DIRECTION_SIGNALS = frozenset({"bullish", "bearish", "neutral"})
+_VOLATILITY_SIGNALS = frozenset(
+    {"very_low_vol", "low_vol", "moderate_vol", "high_vol", "very_high_vol"}
+)
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(out):
+        return None
+    return out
+
+
+def _finite_raw_kurtosis(values: np.ndarray) -> float:
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return 3.0
+    scale = float(np.max(np.abs(array)))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        return 3.0
+    scaled = array / scale
+    std = float(np.std(scaled))
+    if not np.isfinite(std) or std <= 1e-9:
+        return 3.0
+    with np.errstate(over="ignore", invalid="ignore"):
+        standardized = (scaled - float(np.mean(scaled))) / std
+        kurtosis = float(np.mean(standardized**4))
+    return kurtosis if np.isfinite(kurtosis) else 3.0
+
+
+def _garch_tier_thresholds(
+    conditional_volatility: np.ndarray,
+    n_states: int,
+    explicit_threshold: Optional[float],
+) -> Tuple[List[float], str]:
+    """Return cut points for GARCH conditional-volatility tiers."""
+    if explicit_threshold is not None and int(n_states) == 2:
+        return [float(explicit_threshold)], "explicit_absolute"
+    percentiles = np.linspace(0, 100, int(n_states) + 1)[1:-1]
+    thresholds = [
+        float(np.percentile(conditional_volatility, percentile))
+        for percentile in percentiles
+    ]
+    return thresholds, "full_window_percentiles"
+
+
+def _lookup_regime_info_entry(regime_info: Any, regime_id: Any) -> Dict[str, Any]:
+    if not isinstance(regime_info, dict):
+        return {}
+
+    candidates: List[Any] = []
+    if regime_id is not None:
+        candidates.append(regime_id)
+        try:
+            candidates.append(int(regime_id))
+        except (TypeError, ValueError):
+            pass
+        candidates.append(str(regime_id))
+
+    for candidate in candidates:
+        details = regime_info.get(candidate)
+        if isinstance(details, dict):
+            return details
+    return {}
+
+
+def _normalize_direction_signal(
+    label: Any,
+    *,
+    mean_return: Any = None,
+) -> Optional[str]:
+    text = str(label or "").strip().lower()
+    if "bullish" in text or "positive" in text:
+        return "bullish"
+    if "bearish" in text or "negative" in text:
+        return "bearish"
+    if "neutral" in text:
+        return "neutral"
+
+    mean_value = _coerce_optional_float(mean_return)
+    if mean_value is None:
+        return None
+    if abs(mean_value) < 1e-4:
+        return "neutral"
+    return "bullish" if mean_value > 0 else "bearish"
+
+
+def _normalize_volatility_signal(
+    label: Any,
+    *,
+    volatility: Any = None,
+) -> Optional[str]:
+    text = str(label or "").strip().lower()
+    if "very_high_vol" in text or "extreme_vol" in text:
+        return "very_high_vol"
+    if "moderate_vol" in text or "mod_vol" in text:
+        return "moderate_vol"
+    if "very_low_vol" in text:
+        return "very_low_vol"
+    if "quiet" in text:
+        return "low_vol"
+    if "high_vol" in text or "volatile" in text:
+        return "high_vol"
+    if "low_vol" in text or "stable" in text:
+        return "low_vol"
+
+    # Raw per-bar volatility has no symbol/timeframe-independent semantic
+    # threshold. Callers should supply a run-relative label when available.
+    return None
+
+
+def _normalize_regime_method_name(method: Any) -> str:
+    text = str(method or "").strip().lower()
+    return text
+
+
+def _reliability_label(confidence: Any) -> str:
+    value = _coerce_optional_float(confidence)
+    if value is None:
+        return "unknown"
+    if value >= 0.8:
+        return "high"
+    if value >= 0.6:
+        return "medium"
+    if value >= 0.4:
+        return "low"
+    return "very_low"
+
+
+def _common_reliability(
+    reliability: Optional[Dict[str, Any]],
+    *,
+    source: str,
+    confidence: Any = None,
+) -> Dict[str, Any]:
+    out = dict(reliability or {})
+    if "confidence" not in out:
+        out["confidence"] = round(float(_coerce_optional_float(confidence) or 0.0), 4)
+    out.setdefault("reliability_label", _reliability_label(out.get("confidence")))
+    confidence_value = _coerce_optional_float(out.get("confidence"))
+    if confidence_value is not None and confidence_value < 0.55:
+        out.setdefault(
+            "confidence_note",
+            "Low-confidence regime classification; use a wider lookback, compare methods, or treat the current regime as tentative.",
+        )
+    out.setdefault("source", source)
+    return out
+
+
+def _append_warnings(payload: Dict[str, Any], warnings_to_add: List[str]) -> None:
+    if not warnings_to_add:
+        return
+    existing = payload.get("warnings")
+    warnings_list = list(existing) if isinstance(existing, list) else []
+    for warning_text in warnings_to_add:
+        if warning_text not in warnings_list:
+            warnings_list.append(warning_text)
+    payload["warnings"] = warnings_list
+
+
+# Bars required before BOCPD under-segmentation checks kick in. Below this
+# window length a single-segment result is unremarkable and not worth warning
+# about; above it, the absence of any change point becomes suspicious.
+_BOCPD_UNDERSEG_MIN_BARS = 100
+# Single-bar absolute return (in std units) above which we flag a possible
+# missed change point even when BOCPD posterior never crossed cp_threshold.
+_BOCPD_UNDERSEG_PEAK_Z = 3.5
+
+
+def _peak_abs_return(series: np.ndarray) -> float:
+    arr = np.asarray(series, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0
+    std = float(np.std(arr))
+    if not np.isfinite(std) or std <= 1e-12:
+        return 0.0
+    return float(np.max(np.abs(arr)) / std)
+
+
+def _bocpd_under_segmentation_warnings(
+    *,
+    total_bars: int,
+    change_point_count: int,
+    reliability: Any,
+    peak_abs_return: float,
+) -> List[str]:
+    """Surface likely BOCPD under-segmentation.
+
+    BOCPD's Gaussian conjugate priors can absorb a violent but short-lived
+    move as a fat-tail outlier inside a single regime, so a flash crash that
+    PELT, MS-AR, and clustering all flag is silently missed. Surface a
+    warning when the model returns zero change points over a long window,
+    especially when reliability confidence is low or when the window contains
+    a multi-sigma single-bar move that other methods would have caught.
+    """
+    if total_bars < _BOCPD_UNDERSEG_MIN_BARS:
+        return []
+    if change_point_count > 0:
+        return []
+
+    warnings: List[str] = []
+    confidence_value: Optional[float] = None
+    if isinstance(reliability, dict):
+        raw_conf = reliability.get("confidence")
+        try:
+            if raw_conf is not None:
+                confidence_value = float(raw_conf)
+        except (TypeError, ValueError):
+            confidence_value = None
+    if confidence_value is not None and confidence_value < 0.5:
+        warnings.append(
+            "BOCPD reported no change points over a long window with low "
+            "reliability confidence; possible under-segmentation. Compare "
+            "with PELT or ms_ar for cross-validation."
+        )
+    if peak_abs_return >= _BOCPD_UNDERSEG_PEAK_Z:
+        warnings.append(
+            f"Window contains a {peak_abs_return:.1f}σ single-bar move but "
+            "BOCPD reported no change points; the move may have been absorbed "
+            "as a fat-tail outlier. Try a lower cp_threshold or hazard_lambda."
+        )
+    return warnings
+
+
+def _resolve_state_count_param(
+    params: Dict[str, Any],
+    *,
+    default: int,
+    method: str,
+    canonical: str = "n_states",
+) -> tuple[Optional[int], Optional[str], str, List[str]]:
+    raw_value = params.get(canonical)
+    if raw_value is None:
+        raw_value = default
+    try:
+        value = int(raw_value)
+    except Exception:
+        return None, f"{canonical} must be an integer >= 2 for {method}.", canonical, []
+    return value, None, canonical, []
+
+
+def _method_parameter_warnings(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    threshold: Optional[float],
+    requested_lookback: int,
+    requested_min_regime_bars: int,
+    include_series: bool,
+    max_regimes: int,
+    output: str,
+    lookback_mapped_to_window: bool = False,
+) -> List[str]:
+    warnings_out: List[str] = []
+    if method != "bocpd" and (threshold is not None or "threshold" in params):
+        warnings_out.append(
+            "threshold only applies to BOCPD change-point detection and is ignored "
+            f"for method='{method}'."
+        )
+    if method == "rule_based":
+        if (
+            requested_lookback >= 0
+            and "window_bars" in params
+            and not bool(lookback_mapped_to_window)
+        ):
+            warnings_out.append(
+                "lookback was ignored for rule_based because params.window_bars was "
+                "also provided; remove params.window_bars to use lookback as the "
+                "rule-based analysis window."
+            )
+        elif "lookback" in params:
+            warnings_out.append(
+                "params.lookback is ignored for rule_based; use the top-level "
+                "lookback argument or params.window_bars."
+            )
+        if requested_min_regime_bars >= 0 or "min_regime_bars" in params:
+            warnings_out.append(
+                "min_regime_bars is not used by rule_based because it emits one "
+                "current-window regime."
+            )
+        if max_regimes != 10:
+            warnings_out.append(
+                "max_regimes has no effect for rule_based because it emits one "
+                "current-window regime."
+            )
+        if include_series and output != "full":
+            warnings_out.append(
+                "include_series is only emitted for rule_based when detail='full'."
+            )
+    return warnings_out
+
+
+def _smoothing_warnings(method: str, smoothing_meta: Dict[str, Any]) -> List[str]:
+    if bool(smoothing_meta.get("min_regime_bars_satisfied", True)):
+        return []
+    return [
+        "min_regime_bars could not be fully satisfied for "
+        f"method='{method}' with the available decoded state sequence; "
+        f"{int(smoothing_meta.get('remaining_short_runs', 0))} short run(s) remain."
+    ]
+
+
+def _summarize_rule_based_current_regime(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    current_regime = result.get("current_regime")
+    if not isinstance(current_regime, dict):
+        return None
+    regime = result.get("regime")
+    if not isinstance(regime, dict):
+        regime = current_regime
+    entry = {
+        key: regime.get(key)
+        for key in (
+            "state",
+            "direction",
+            "trend_strength",
+            "efficiency_ratio",
+            "window_bars",
+            "window_move_pct",
+            "signal_source",
+        )
+        if regime.get(key) is not None
+    }
+    for key in ("regime_id", "label", "since", "bars"):
+        value = current_regime.get(key)
+        if value is not None:
+            entry[key] = value
+    regime_confidence = current_regime.get("regime_confidence")
+    if regime_confidence is not None:
+        entry["regime_confidence"] = regime_confidence
+    return entry or None
+
+
+def _summarize_bocpd_current_regime(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    current_regime = result.get("current_regime")
+    if not isinstance(current_regime, dict) or not current_regime:
+        regimes = result.get("regimes")
+        if isinstance(regimes, list) and regimes and isinstance(regimes[-1], dict):
+            last = regimes[-1]
+            current_regime = {
+                "since": last.get("start"),
+                "bars_since_change": last.get("bars"),
+            }
+        else:
+            return None
+
+    entry = {
+        key: current_regime.get(key)
+        for key in (
+            "status",
+            "since",
+            "bars_since_change",
+            "transition_risk",
+            "latest_transition_probability",
+        )
+        if current_regime.get(key) is not None
+    }
+
+    transition_summary = result.get("transition_summary")
+    if not isinstance(transition_summary, dict):
+        transition_summary = result.get("summary")
+    if isinstance(transition_summary, dict):
+        recent_change_points_count = transition_summary.get(
+            "recent_change_points_count",
+            transition_summary.get("change_points_count"),
+        )
+        if recent_change_points_count is not None:
+            entry["recent_change_points_count"] = recent_change_points_count
+        for key in ("recent_transition_activity", "calibration_status"):
+            value = transition_summary.get(key)
+            if value is not None:
+                entry[key] = value
+
+    regime_context = result.get("regime_context")
+    if isinstance(regime_context, dict):
+        for key in ("bias", "return_pct", "volatility_pct"):
+            value = regime_context.get(key)
+            if value is not None:
+                entry[key] = value
+
+    return entry or None
+
+
+def _summarize_current_regime_for_comparison(
+    method: str,
+    result: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(result, dict):
+        return None
+
+    if method == "bocpd":
+        return _summarize_bocpd_current_regime(result)
+
+    if method == "rule_based":
+        return _summarize_rule_based_current_regime(result)
+
+    current = result.get("current_regime")
+    if not isinstance(current, dict) or not current:
+        regimes = result.get("regimes")
+        if isinstance(regimes, list) and regimes and isinstance(regimes[-1], dict):
+            last = regimes[-1]
+            current = {
+                "regime_id": last.get("regime"),
+                "label": last.get("label"),
+                "regime_confidence": last.get("regime_confidence"),
+                "since": last.get("start"),
+                "bars": last.get("bars"),
+            }
+        else:
+            return None
+
+    regime_id = current.get("regime_id")
+    regime_stats = _lookup_regime_info_entry(result.get("regime_info"), regime_id)
+    label = current.get("label")
+    if label is None and regime_stats:
+        label = regime_stats.get("label")
+
+    entry: Dict[str, Any] = {
+        key: current.get(key)
+        for key in ("regime_id", "since", "bars")
+        if current.get(key) is not None
+    }
+    if label is not None:
+        entry["label"] = label
+
+    regime_confidence = current.get("regime_confidence")
+    if regime_confidence is not None:
+        entry["regime_confidence"] = regime_confidence
+
+    direction = None
+    if method in {"hmm", "ms_ar", "ensemble"}:
+        direction = _normalize_direction_signal(
+            label,
+            mean_return=regime_stats.get("mean_return"),
+        )
+    elif method in {"clustering", "pelt"}:
+        direction = _normalize_direction_signal(label)
+    if direction is not None:
+        entry["direction"] = direction
+
+    volatility = None
+    if method in {"hmm", "ms_ar", "garch", "ensemble", "wavelet", "pelt"}:
+        volatility = _normalize_volatility_signal(
+            label,
+            volatility=regime_stats.get("volatility"),
+        )
+    if volatility is not None:
+        entry["volatility"] = volatility
+
+    for key in ("mean_return_pct", "volatility_pct"):
+        value = regime_stats.get(key)
+        if value is not None:
+            entry[key] = value
+
+    if method == "bocpd":
+        summary = result.get("summary")
+        if isinstance(summary, dict):
+            for key in ("last_cp_prob", "change_points_count"):
+                value = summary.get(key)
+                if value is not None:
+                    entry[key] = value
+
+    return entry or None
+
+
+def _build_semantic_agreement(current_regimes: Dict[str, Any]) -> Dict[str, Any]:
+    agreement: Dict[str, Any] = {"basis": "semantic_signals"}
+
+    direction_votes = {
+        method: entry["direction"]
+        for method, entry in current_regimes.items()
+        if isinstance(entry, dict) and entry.get("direction") in _DIRECTION_SIGNALS
+    }
+    volatility_votes = {
+        method: entry["volatility"]
+        for method, entry in current_regimes.items()
+        if isinstance(entry, dict) and entry.get("volatility") in _VOLATILITY_SIGNALS
+    }
+
+    def _consensus(votes: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        if len(votes) < 2:
+            return None
+        counts = Counter(votes.values())
+        majority, count = counts.most_common(1)[0]
+        return {
+            "majority": majority,
+            "agreement_pct": round(count / len(votes) * 100.0, 2),
+            "methods_considered": list(votes.keys()),
+        }
+
+    direction_consensus = _consensus(direction_votes)
+    if direction_consensus is not None:
+        agreement["direction"] = direction_consensus
+
+    volatility_consensus = _consensus(volatility_votes)
+    if volatility_consensus is not None:
+        agreement["volatility"] = volatility_consensus
+
+    return agreement
+
+
+def _build_all_method_comparison(results_by_method: Dict[str, Any]) -> Dict[str, Any]:
+    current_regimes: Dict[str, Any] = {}
+    for method, result in results_by_method.items():
+        current_regimes[method] = _summarize_current_regime_for_comparison(
+            method,
+            result,
+        )
+
+    return {
+        "methods_run": list(results_by_method.keys()),
+        "current_regimes": current_regimes,
+        "agreement": _build_semantic_agreement(current_regimes),
+    }
+
+
+def _resolve_bocpd_priors(
+    params: Dict[str, Any],
+    series: np.ndarray,
+) -> Dict[str, float]:
+    """Extract BOCPD prior hyper-parameters from *params* dict.
+
+    If a prior param (mu0, kappa0, alpha0, beta0) is explicitly provided,
+    use it.  Otherwise fall back to data-driven defaults derived from the
+    series statistics, which are more appropriate than the hard-coded
+    ``bocpd_gaussian`` defaults (mu0=0, kappa0=1, alpha0=1, beta0=1)
+    when the data mean / variance is far from those assumptions.
+    """
+    x = np.asarray(series, dtype=float)
+    x = x[np.isfinite(x)]
+
+    # Data-driven defaults
+    if x.size >= 10:
+        mu_data = float(np.mean(x))
+        var_data = float(np.var(x, ddof=0))
+        var_safe = max(var_data, 1e-16)
+        dd_mu0 = mu_data
+        dd_kappa0 = 1.0
+        dd_alpha0 = max(1.0, x.size / 20.0)
+        dd_beta0 = max(1e-8, var_safe * dd_alpha0)
+    else:
+        dd_mu0, dd_kappa0, dd_alpha0, dd_beta0 = 0.0, 1.0, 1.0, 1.0
+
+    mode = str(params.get("prior_mode", "data_driven") or "data_driven").strip().lower()
+    if mode == "fixed":
+        dd_mu0, dd_kappa0, dd_alpha0, dd_beta0 = 0.0, 1.0, 1.0, 1.0
+
+    mu0, _ = _coerce_param(params, "mu0", default=dd_mu0, cast=float)
+    kappa0, _ = _coerce_param(params, "kappa0", default=dd_kappa0, cast=float)
+    alpha0, _ = _coerce_param(params, "alpha0", default=dd_alpha0, cast=float)
+    beta0, _ = _coerce_param(params, "beta0", default=dd_beta0, cast=float)
+
+    return {
+        "mu0": float(mu0),
+        "kappa0": max(1e-8, float(kappa0)),
+        "alpha0": max(0.5, float(alpha0)),
+        "beta0": max(1e-12, float(beta0)),
+    }
+
+
+def _apply_bocpd_output_mode(
+    payload: Dict[str, Any],
+    *,
+    output: str,
+    lookback: int,
+    cp_prob: np.ndarray,
+    change_points: List[Dict[str, Any]],
+    raw_cp_idx: List[int],
+    reliability: Dict[str, Any],
+    expected_fa_rate: float,
+    calibration_age_bars: int,
+    tuning_hint: Optional[str],
+) -> Dict[str, Any]:
+    n = _summary_window_size(lookback, len(cp_prob))
+    tail = (
+        np.asarray(cp_prob[-n:], dtype=float)
+        if n > 0
+        else np.asarray(cp_prob, dtype=float)
+    )
+    recent_floor = len(cp_prob) - n
+    recent_cps = [cp for cp in change_points if cp.get("idx", 0) >= recent_floor]
+    summary = {
+        "lookback": int(n),
+        "last_cp_prob": float(cp_prob[-1]) if len(cp_prob) else float("nan"),
+        "max_cp_prob": float(np.nanmax(tail)) if tail.size else float("nan"),
+        "mean_cp_prob": float(np.nanmean(tail)) if tail.size else float("nan"),
+        "change_points_count": int(len(recent_cps)),
+        "raw_change_points_count": int(
+            sum(1 for idx in raw_cp_idx if int(idx) >= recent_floor)
+        ),
+        "filtered_change_points_count": int(
+            max(
+                0,
+                sum(1 for idx in raw_cp_idx if int(idx) >= recent_floor)
+                - int(len(recent_cps)),
+            )
+        ),
+        "recent_change_points": recent_cps[-5:],
+        "confidence": float(reliability.get("confidence", 0.0)),
+        "expected_false_alarm_rate": float(
+            reliability.get("expected_false_alarm_rate", expected_fa_rate)
+        ),
+        "calibration_age_bars": int(
+            reliability.get("calibration_age_bars", calibration_age_bars)
+        ),
+    }
+    if tuning_hint is not None:
+        summary["tuning_hint"] = tuning_hint
+    payload["summary"] = summary
+    if output == "summary":
+        return _summary_only_payload(payload)
+    return payload
+
+
+def _apply_state_output_mode(
+    payload: Dict[str, Any],
+    *,
+    output: str,
+    lookback: int,
+    summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Apply output mode filtering.
+
+    - 'summary': Return stats only, no regimes
+    - 'compact': Trading-focused (regimes, current_regime, regime_info, reliability)
+    - 'full': Research-focused (adds raw series, params, technical details)
+    """
+    payload["summary"] = summary
+    if output == "summary":
+        return _summary_only_payload(payload)
+    # Note: Raw series (times, state, state_probabilities) are now handled
+    # in _consolidate_payload based on output_mode
+    return payload
+
+
+# Timeframe-based default parameters for regime detection
+_TIMEFRAME_DEFAULTS: Dict[str, Dict[str, int]] = {
+    # Intraday high-frequency
+    "M1": {"lookback": 3000, "min_regime_bars": 30},  # ~2 days, 30 min regimes
+    "M5": {"lookback": 2000, "min_regime_bars": 12},  # ~7 days, 1 hour regimes
+    "M15": {"lookback": 1000, "min_regime_bars": 8},  # ~10 days, 2 hour regimes
+    "M30": {"lookback": 800, "min_regime_bars": 6},  # ~16 days, 3 hour regimes
+    # Standard intraday/swing
+    "H1": {"lookback": 500, "min_regime_bars": 4},  # ~21 days, 4 hour regimes
+    "H2": {"lookback": 400, "min_regime_bars": 3},  # ~33 days, 6 hour regimes
+    "H4": {"lookback": 300, "min_regime_bars": 3},  # ~50 days, 12 hour regimes
+    "H6": {"lookback": 250, "min_regime_bars": 2},  # ~62 days, 12 hour regimes
+    "H8": {"lookback": 200, "min_regime_bars": 2},  # ~66 days, 16 hour regimes
+    "H12": {"lookback": 150, "min_regime_bars": 2},  # ~75 days, 24 hour regimes
+    # Daily and higher
+    "D1": {"lookback": 200, "min_regime_bars": 2},  # ~200 days, 2 day regimes
+    "W1": {"lookback": 100, "min_regime_bars": 2},  # ~100 weeks, 2 week regimes
+    "MN1": {"lookback": 48, "min_regime_bars": 2},  # ~48 months, 2 month regimes
+}
+_RULE_BASED_RECOMMENDED_WINDOW_BARS = 160
+
+
+_REGIME_METHOD_RUNTIME_GUIDANCE: Dict[str, Dict[str, str]] = {
+    "rule_based": {
+        "speed_tier": "fast",
+        "use_case": "quick trend/ranging/transition snapshot",
+        "cost_notes": "deterministic indicator-style calculations",
+    },
+    "bocpd": {
+        "speed_tier": "medium",
+        "use_case": "change-point and transition timing",
+        "cost_notes": "calibration and run-length filtering cost grows with history",
+    },
+    "pelt": {
+        "speed_tier": "fast",
+        "use_case": "offline structural-break segmentation",
+        "cost_notes": "ruptures PELT with pruning; cost depends on model and history length",
+    },
+    "hmm": {
+        "speed_tier": "medium",
+        "use_case": "probabilistic return/price state segmentation",
+        "cost_notes": "Gaussian HMM fit with forward filtering",
+    },
+    "gmm": {
+        "speed_tier": "medium",
+        "use_case": "independent Gaussian mixture segmentation",
+        "cost_notes": "i.i.d. mixture fit without Markov transitions",
+    },
+    "clustering": {
+        "speed_tier": "medium",
+        "use_case": "rolling feature cluster regimes",
+        "cost_notes": "feature extraction and clustering can be slow on large windows",
+    },
+    "garch": {
+        "speed_tier": "medium",
+        "use_case": "GARCH conditional-volatility tier classification",
+        "cost_notes": "optimization fit; convergence varies by symbol/history",
+    },
+    "wavelet": {
+        "speed_tier": "medium",
+        "use_case": "multi-resolution energy regimes",
+        "cost_notes": "depends on PyWavelets and decomposition level",
+    },
+    "ms_ar": {
+        "speed_tier": "slow",
+        "use_case": "Markov-switching autoregressive regimes",
+        "cost_notes": "statsmodels maximum-likelihood fit can be long-running",
+    },
+    "ensemble": {
+        "speed_tier": "slow",
+        "use_case": "consensus across selected regime methods",
+        "cost_notes": "runs multiple sub-methods",
+    },
+    "all": {
+        "speed_tier": "slow",
+        "use_case": "cross-method comparison and diagnostics",
+        "cost_notes": "runs every method plus ensemble; use faster methods for low-latency checks",
+    },
+}
+
+
+def _regime_runtime_guidance(methods: List[str]) -> Dict[str, Dict[str, str]]:
+    return {
+        method: dict(_REGIME_METHOD_RUNTIME_GUIDANCE[method])
+        for method in methods
+        if method in _REGIME_METHOD_RUNTIME_GUIDANCE
+    }
+
+
+def _suggest_faster_regime_methods(methods: List[str]) -> List[str]:
+    suggestions: List[str] = []
+    for candidate in ("rule_based", "bocpd", "hmm"):
+        if candidate not in methods and candidate not in suggestions:
+            suggestions.append(candidate)
+    for method in methods:
+        guidance = _REGIME_METHOD_RUNTIME_GUIDANCE.get(method, {})
+        if guidance.get("speed_tier") == "slow":
+            continue
+        if method not in suggestions:
+            suggestions.append(method)
+    return suggestions[:3]
+
+
+def _attach_regime_usage_notice(result: Dict[str, Any]) -> None:
+    if not isinstance(result, dict) or result.get("error"):
+        return
+    result.setdefault("is_signal", False)
+    result.setdefault("usage", "information_only")
+    result.setdefault(
+        "calibration",
+        {
+            "confidence": "model or heuristic assignment score, not historical hit rate",
+            "note": (
+                "Regime labels describe observed state. Validate with backtests "
+                "before using direction/confidence as a trading signal."
+            ),
+        },
+    )
+
+
+def _get_timeframe_defaults(timeframe: str) -> Dict[str, int]:
+    """Get sensible defaults for regime detection based on timeframe.
+
+    Higher frequency timeframes need more bars for meaningful analysis
+    and higher min_regime_bars to avoid micro-noise.
+    """
+    tf = str(timeframe).strip().upper()
+    return _TIMEFRAME_DEFAULTS.get(tf, {"lookback": 300, "min_regime_bars": 5})
+
+
+@mcp.tool()
+def regime_detect(  # noqa: C901
+    symbol: str,
+    timeframe: TimeframeLiteral = "H1",
+    limit: Optional[int] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    method: Literal[
+        "bocpd",
+        "pelt",
+        "hmm",
+        "gmm",
+        "ms_ar",
+        "clustering",
+        "garch",
+        "rule_based",
+        "wavelet",
+        "ensemble",
+        "all",
+    ] = "rule_based",  # type: ignore
+    target: Literal["return", "price"] = "return",  # type: ignore
+    params: Optional[Dict[str, Any]] = None,
+    denoise: Optional[DenoiseSpec] = None,
+    threshold: Optional[float] = None,
+    detail: DetailLiteral = "compact",
+    lookback: int = -1,  # -1 means use timeframe-based default
+    include_series: bool = False,
+    min_regime_bars: int = -1,  # -1 means use timeframe-based default
+    max_regimes: int = 10,  # Maximum regimes to show in compact mode
+) -> Dict[str, Any]:
+    """Detect regimes and/or change-points over a bounded history window.
+
+    - limit: Optional bars to fetch/analyze. If omitted, the fetch window tracks
+      the effective lookback plus warmup bars.
+    - start/end: Optional UTC-compatible analysis window. If provided, `limit`
+      caps bars analysed after the window is fetched; omitted limit uses the
+      effective lookback cap.
+    - method: Default is 'rule_based' (fast trend/ranging/transition classification).
+      Other options: 'bocpd' (Bayesian online change-point; Gaussian), 'pelt' (offline penalized change-point segmentation), 'hmm' (Gaussian hidden Markov model), 'gmm' (i.i.d. Gaussian mixture),
+      'ms_ar' (Markov-switching AR), 'clustering' (rolling-feature clustering via tsfresh + KMeans/Spectral),
+      'garch' (GARCH conditional-volatility tiers),
+      'wavelet' (multi-resolution wavelet energy regime detection via PyWavelets),
+      'ensemble' (consensus across multiple methods), 'all' (runs all methods for comparison, may be slow).
+    - params (clustering): optional `algorithm` = 'kmeans' (default) | 'spectral' (sklearn SpectralClustering).
+      Optional `affinity` for spectral (default 'nearest_neighbors').
+    - params (wavelet): optional `wavelet` (default 'db4'), `level` (auto), `n_states` (default 3),
+      `energy_window` (default 30 bars).
+    - params (ensemble): optional `methods` list (default ['hmm', 'clustering', 'wavelet']),
+      `voting` = 'soft' (probability averaging, default) | 'hard' (majority vote).
+    - params (bocpd): optional `hazard_mode` = auto_default|auto_calibrated (defaults to auto_calibrated).
+      Explicit `hazard_lambda` / `cp_threshold` always take precedence over auto selection.
+      The top-level `threshold` defaults to None for automatic calibration;
+      any numeric value, including 0.5, is a fixed cutoff.
+      Optional robustness params:
+        `cp_threshold_calibration_mode` (default `walkforward_quantile`),
+        `threshold_target_false_alarm_rate`,
+        `cp_confirm_bars` (default `1`, live-oriented),
+        `min_cp_distance_bars`, `cp_edge_multiplier`.
+    - include_series: If True, include raw time series data (probs, states) in output. Default False.
+    - lookback: Number of recent bars to include in summary/compact detail. Default -1 uses timeframe-based defaults:
+        M1: 3000, M5: 2000, M15: 1000, M30: 800, H1: 500, H2: 400, H4: 300, H6-H12: 200-150, D1: 200, W1: 100, MN1: 48
+    - min_regime_bars: Confirm a new state only after it persists for this many
+        consecutive bars. Confirmation is causal and never rewrites earlier labels.
+        Default -1 uses timeframe-based defaults: M1: 30, M5: 12, M15-M30: 6-8, H1-H4: 3-4, D1+: 2
+    - max_regimes: Maximum number of regime windows to show in compact mode (default 10).
+        Most recent regimes are shown. Full mode shows all available windows.
+    - extras:
+        Compact output is the public default. Use extras such as `metadata`
+        for richer consolidated output. Raw `series` is included only if
+        include_series=True.
+
+    Output Structure (state-based methods: hmm, ms_ar, clustering, garch, wavelet, ensemble):
+        - success: bool - Whether detection succeeded
+        - symbol: str - Symbol analyzed
+        - timeframe: str - Timeframe used
+        - method: str - Method used
+        - target: str - 'return' or 'price'
+        - regimes: List[Dict] - Regime segments with start, end, bars, regime ID, label, regime_confidence
+        - regime_info: Dict - Descriptive info for each regime (label, mean_return, volatility, etc.)
+        - summary: Dict - Quick stats including last_state, state_shares, transitions, smoothing status
+        - state_probabilities: List[List[float]] - Probability of each regime at each bar (full output only)
+        - reliability: Dict - Confidence score and source (method-dependent)
+        - params_used: Dict - Parameters actually used
+        - warnings: List[str] - Any warnings (optional)
+
+    Method-Specific Notes:
+        - 'bocpd': Returns transition-oriented compact/full output:
+          `current_regime`, `transition_summary`, `regime_context`, and `regimes`.
+          These describe whether a new change point has been confirmed, how long the
+          current segment has persisted, and derived bias/volatility context from the
+          target series. Raw `cp_prob` and `change_points` remain available in `series`
+          when include_series=True. Reliability is based on calibration quality.
+          Best for detecting transition timing.
+        - 'hmm', 'ms_ar', 'clustering': Return 'state' array and 'state_probabilities'.
+          Labels like 'positive_low_vol' describe regime characteristics (return + volatility).
+          Reliability based on model fit or cluster separation.
+        - 'garch': Fits GARCH(1,1), then classifies its conditional-volatility
+          path into relative full-window percentile tiers (or an explicit
+          absolute threshold for two states). This is not a switching-GARCH model.
+          n_states is AUTO-DETECTED by default from realized-vol percentile spread
+          (vol_ratio_90_10) plus return kurtosis (see docs/forecast/REGIMES.md):
+            wider 90/10 vol spread and/or heavy tails → more states (up to 4)
+            tighter spreads → 2 states (low/high)
+          Explicit n_states parameter overrides auto-detection.
+          Uses percentile-based classification with volatility characteristics reported in output.
+        - 'rule_based': Returns `current_regime` and a single-item `regimes` list with
+          state (trending/ranging/transition), direction (bullish/bearish/neutral),
+          trend_strength, and efficiency_ratio.
+          Trend metrics use the recent price window so direction/window_move_pct stay coherent
+          even when target='return'. Best for quick trend classification.
+        - 'wavelet': Returns 'regime_params' with 'energy_profiles' showing frequency distribution.
+          Best for detecting regimes at different time scales.
+        - 'ensemble': Consensus across multiple methods with heuristic n_states selection.
+          Default voters are HMM, clustering, and wavelet. Only state methods
+          whose IDs are canonicalized by return are accepted; change-point,
+          rule-based, and GARCH volatility-tier methods cannot vote.
+          When omitted, n_states is selected by return-distribution kurtosis:
+            kurtosis > 6.0 → 6 states
+            kurtosis > 4.5 → 5 states
+            kurtosis > 3.5 → 4 states
+            kurtosis ≤ 3.5 → 3 states
+          Labels are derived from observed return sign and volatility tiers so they stay aligned
+          with regime statistics. 'ensemble_info' shows voting method and mean_agreement.
+          Explicit n_states overrides auto-detection.
+        - 'all': Returns a cross-method 'comparison' dict with semantic agreement metrics.
+          Compact output keeps the comparison view concise; `extras='metadata'`
+          includes richer per-method outputs.
+          Best for method comparison.
+    """
+    requested_method = str(method).strip().lower()
+    method = _normalize_regime_method_name(requested_method)
+    started_at = time.perf_counter()
+    global_warnings: List[str] = []
+    analysis_window_meta: Dict[str, Any] = {}
+    log_operation_start(
+        logger,
+        operation="regime_detect",
+        symbol=symbol,
+        timeframe=timeframe,
+        method=requested_method,
+        target=target,
+        detail=detail,
+        limit=limit,
+        start=start,
+        end=end,
+    )
+
+    def _finish(result: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(result, dict) and "error" not in result:
+            if requested_method != method:
+                result.setdefault("requested_method", requested_method)
+                result.setdefault("method_effective", method)
+                result.setdefault(
+                    "method_note",
+                    f"Requested method '{requested_method}' is handled by the '{method}' implementation.",
+                )
+            _append_warnings(result, global_warnings)
+            if analysis_window_meta:
+                result.setdefault("analysis_window", dict(analysis_window_meta))
+            result.setdefault("timezone", "UTC")
+            _attach_regime_usage_notice(result)
+        log_operation_finish(
+            logger,
+            operation="regime_detect",
+            started_at=started_at,
+            success=infer_result_success(result),
+            symbol=symbol,
+            timeframe=timeframe,
+            method=requested_method,
+            target=target,
+            detail=detail,
+            limit=limit,
+            start=start,
+            end=end,
+        )
+        return result
+
+    output = normalize_output_detail(detail)
+    verbosity_output = normalize_output_verbosity_detail(detail)
+    connection_error = _regime_connection_error()
+    if connection_error is not None:
+        return _finish(connection_error)
+    try:
+        p = dict(params or {})
+        requested_lookback = lookback
+        requested_min_regime_bars = min_regime_bars
+
+        # Apply timeframe-based defaults if not explicitly provided
+        tf_defaults = _get_timeframe_defaults(timeframe)
+        effective_lookback = lookback if lookback >= 0 else tf_defaults["lookback"]
+        effective_min_regime_bars = (
+            min_regime_bars if min_regime_bars >= 0 else tf_defaults["min_regime_bars"]
+        )
+        lookback_mapped_to_window = (
+            method == "rule_based" and requested_lookback >= 0 and "window_bars" not in p
+        )
+        if lookback_mapped_to_window:
+            p["window_bars"] = int(effective_lookback)
+
+        min_regime_bars_val, min_regime_bars_error = _coerce_param(
+            p,
+            "min_regime_bars",
+            default=effective_min_regime_bars,
+            cast=int,
+            error="min_regime_bars must be an integer >= 1.",
+        )
+        if min_regime_bars_error is not None:
+            return _finish({"error": min_regime_bars_error})
+        if min_regime_bars_val < 1:
+            return _finish({"error": "min_regime_bars must be >= 1."})
+
+        # Override lookback with effective value (will be used throughout function)
+        lookback = p.get("lookback", effective_lookback)
+        global_warnings = _method_parameter_warnings(
+            method,
+            p,
+            threshold=threshold,
+            requested_lookback=int(requested_lookback),
+            requested_min_regime_bars=int(requested_min_regime_bars),
+            include_series=bool(include_series),
+            max_regimes=int(max_regimes),
+            output=output,
+            lookback_mapped_to_window=lookback_mapped_to_window,
+        )
+
+        rule_based_config: Optional[Dict[str, Any]] = None
+        fetch_limit = _history_fetch_limit(limit, lookback)
+        if method == "rule_based":
+            efficiency_threshold, efficiency_error = _coerce_param(
+                p,
+                "efficiency_threshold",
+                default=0.35,
+                cast=float,
+                error="params.efficiency_threshold must be a positive number.",
+            )
+            if efficiency_error is not None:
+                return _finish({"error": efficiency_error})
+            if not np.isfinite(float(efficiency_threshold)) or float(efficiency_threshold) <= 0.0:
+                return _finish({"error": "params.efficiency_threshold must be > 0."})
+
+            trend_strength_threshold, trend_strength_error = _coerce_param(
+                p,
+                "trend_strength_threshold",
+                default=1.25,
+                cast=float,
+                error="params.trend_strength_threshold must be a positive number.",
+            )
+            if trend_strength_error is not None:
+                return _finish({"error": trend_strength_error})
+            if (
+                not np.isfinite(float(trend_strength_threshold))
+                or float(trend_strength_threshold) <= 0.0
+            ):
+                return _finish({"error": "params.trend_strength_threshold must be > 0."})
+
+            requested_window_bars, window_error = _coerce_param(
+                p,
+                "window_bars",
+                default=160,
+                cast=int,
+                error="params.window_bars must be an integer >= 20.",
+            )
+            if window_error is not None:
+                return _finish({"error": window_error})
+            if int(requested_window_bars) < 20:
+                return _finish({"error": "params.window_bars must be >= 20."})
+
+            rule_based_config = {
+                "efficiency_threshold": float(efficiency_threshold),
+                "trend_strength_threshold": float(trend_strength_threshold),
+                "window_bars": int(requested_window_bars),
+            }
+            fetch_limit = int(max(fetch_limit, int(requested_window_bars)))
+
+        history_kwargs: Dict[str, Any] = {"as_of": None}
+        if start or end:
+            history_kwargs.update({"start": start, "end": end})
+        df = _fetch_history(symbol, timeframe, fetch_limit, **history_kwargs)
+        fetched_range_bars = len(df)
+        if (start or end) and len(df) > fetch_limit:
+            df = df.iloc[-fetch_limit:].reset_index(drop=True)
+        if start or end:
+            analysis_window_meta.update(
+                {
+                    "range_bars_fetched": int(fetched_range_bars),
+                    "bars_analyzed": int(len(df)),
+                    "truncated": bool(fetched_range_bars > len(df)),
+                    "limit_applied": int(fetch_limit),
+                }
+            )
+            if len(df) and "time" in df:
+                analysis_window_meta["effective_start"] = _format_time_minimal(
+                    float(df["time"].iloc[0])
+                )
+                analysis_window_meta["effective_end"] = _format_time_minimal(
+                    float(df["time"].iloc[-1])
+                )
+        if len(df) < 10:
+            return _finish({"error": "Insufficient history"})
+        base_col = _resolve_denoise_base_col(
+            df, denoise, base_col="close", default_when="pre_ti"
+        )
+        y = df[base_col].astype(float).to_numpy()
+        times = df["time"].astype(float).to_numpy()
+        price_mask = np.isfinite(y)
+        price_series = y[price_mask]
+        price_times = times[price_mask]
+        try:
+            return_series = _log_returns_from_prices(y)
+        except ValueError as exc:
+            return _finish({"error": str(exc)})
+        calibration_returns = return_series
+        calibration_returns = calibration_returns[np.isfinite(calibration_returns)]
+        if target == "return":
+            x_raw = return_series
+            return_mask = np.isfinite(x_raw)
+            x = x_raw[return_mask]
+            t = times[1:][return_mask]
+        else:
+            x = price_series
+            t = times[price_mask]
+
+        if x.size < 2:
+            return _finish({"error": "Insufficient finite observations after filter"})
+
+        # format times
+        t_fmt = [_format_time_minimal(tt) for tt in t]
+
+        if method == "bocpd":
+            from ...utils.bocpd import bocpd_gaussian
+
+            hazard_mode = (
+                str(p.get("hazard_mode", "auto_calibrated") or "auto_calibrated")
+                .strip()
+                .lower()
+            )
+            if hazard_mode in {"auto", "calibrated"}:
+                hazard_mode = "auto_calibrated"
+            if hazard_mode not in {"auto_default", "auto_calibrated"}:
+                hazard_mode = "auto_calibrated"
+
+            hazard_src = "params"
+            threshold_src = "arg"
+            calibration_info: Optional[Dict[str, Any]] = None
+            threshold_calibration_info: Optional[Dict[str, Any]] = None
+
+            auto_hazard = _default_bocpd_hazard_lambda(symbol, timeframe)
+            auto_threshold = _default_bocpd_cp_threshold(symbol, timeframe)
+            if hazard_mode == "auto_calibrated":
+                auto_hazard, auto_threshold, calibration_info = (
+                    _auto_calibrate_bocpd_params(
+                        returns=calibration_returns, symbol=symbol, timeframe=timeframe
+                    )
+                )
+
+            if "hazard_lambda" in p and p.get("hazard_lambda") is not None:
+                raw_hazard = p.get("hazard_lambda")
+                try:
+                    hazard_f = float(raw_hazard)
+                except (TypeError, ValueError):
+                    return _finish(
+                        {
+                            "error": (
+                                f"params.hazard_lambda must be a positive integer "
+                                f"(got {raw_hazard!r})."
+                            )
+                        }
+                    )
+                if not math.isfinite(hazard_f) or hazard_f != int(hazard_f) or int(hazard_f) < 1:
+                    return _finish(
+                        {
+                            "error": (
+                                "params.hazard_lambda must be a positive integer "
+                                f"(got {raw_hazard!r})."
+                            )
+                        }
+                    )
+                hazard_lambda = int(hazard_f)
+            else:
+                hazard_lambda = int(auto_hazard)
+                hazard_src = (
+                    "auto_calibrated"
+                    if hazard_mode == "auto_calibrated"
+                    else "auto_default"
+                )
+            if "cp_threshold" in p and p.get("cp_threshold") is not None:
+                threshold_used = float(p.get("cp_threshold"))
+                threshold_src = "params.cp_threshold"
+            elif "threshold" in p and p.get("threshold") is not None:
+                threshold_used = float(p.get("threshold"))
+                threshold_src = "params.threshold"
+            elif threshold is None:
+                threshold_used = float(auto_threshold)
+                threshold_src = (
+                    "auto_calibrated"
+                    if hazard_mode == "auto_calibrated"
+                    else "auto_default"
+                )
+            else:
+                threshold_used = float(threshold)
+                threshold_src = "arg"
+            max_rl, _ = _coerce_param(
+                p,
+                "max_run_length",
+                default=min(1000, x.size),
+                cast=int,
+            )
+            threshold_cal_mode = (
+                str(
+                    p.get("cp_threshold_calibration_mode", "walkforward_quantile")
+                    or "walkforward_quantile"
+                )
+                .strip()
+                .lower()
+            )
+            if threshold_cal_mode in {"auto", "walkforward", "quantile"}:
+                threshold_cal_mode = "walkforward_quantile"
+            if (
+                threshold_src in {"auto_calibrated", "auto_default"}
+                and threshold_cal_mode == "walkforward_quantile"
+            ):
+                target_fa, _ = _coerce_param(
+                    p,
+                    "threshold_target_false_alarm_rate",
+                    default=0.02,
+                    cast=float,
+                )
+                cal_window, _ = _coerce_param(
+                    p,
+                    "threshold_calibration_window",
+                    default=None,
+                    cast=int,
+                )
+                cal_step, _ = _coerce_param(
+                    p,
+                    "threshold_calibration_step",
+                    default=None,
+                    cast=int,
+                )
+                cal_max_windows, _ = _coerce_param(
+                    p,
+                    "threshold_calibration_max_windows",
+                    default=6,
+                    cast=int,
+                )
+                cal_boot, _ = _coerce_param(
+                    p,
+                    "threshold_calibration_bootstraps",
+                    default=2,
+                    cast=int,
+                )
+                threshold_used, threshold_calibration_info = (
+                    _walkforward_quantile_threshold_calibration(
+                        series=x,
+                        hazard_lambda=hazard_lambda,
+                        base_threshold=threshold_used,
+                        target_false_alarm_rate=target_fa,
+                        window=cal_window,
+                        step=cal_step,
+                        max_windows=cal_max_windows,
+                        bootstrap_runs=cal_boot,
+                    )
+                )
+            bocpd_priors = _resolve_bocpd_priors(p, x)
+            res = bocpd_gaussian(
+                x,
+                hazard_lambda=hazard_lambda,
+                max_run_length=max_rl,
+                mu0=bocpd_priors["mu0"],
+                kappa0=bocpd_priors["kappa0"],
+                alpha0=bocpd_priors["alpha0"],
+                beta0=bocpd_priors["beta0"],
+            )
+            cp_prob = np.asarray(
+                res.get("cp_prob", np.zeros_like(x, dtype=float)), dtype=float
+            )
+            raw_cp_idx = [
+                int(i)
+                for i, v in enumerate(cp_prob.tolist())
+                if np.isfinite(v) and float(v) >= float(threshold_used)
+            ]
+            cp_confirm_bars, _ = _coerce_param(
+                p,
+                "cp_confirm_bars",
+                default=1,
+                cast=int,
+            )
+            cp_confirm_relaxed_mult, _ = _coerce_param(
+                p,
+                "cp_confirm_relaxed_mult",
+                default=0.90,
+                cast=float,
+            )
+            if "cp_edge_multiplier" in p and p.get("cp_edge_multiplier") is not None:
+                cp_edge_multiplier, _ = _coerce_param(
+                    p,
+                    "cp_edge_multiplier",
+                    default=1.08,
+                    cast=float,
+                )
+            else:
+                # When threshold is already calibrated via walk-forward null quantiles,
+                # avoid double-tightening the edge gate.
+                if (
+                    threshold_src in {"auto_calibrated", "auto_default"}
+                    and isinstance(threshold_calibration_info, dict)
+                    and bool(threshold_calibration_info.get("calibrated", False))
+                ):
+                    cp_edge_multiplier = 1.0
+                else:
+                    cp_edge_multiplier = 1.08
+            min_cp_distance_bars, _ = _coerce_param(
+                p,
+                "min_cp_distance_bars",
+                default=max(2, min_regime_bars_val),
+                cast=int,
+            )
+            cp_idx, cp_filter_meta = _filter_bocpd_change_points(
+                cp_prob=cp_prob,
+                threshold=float(threshold_used),
+                min_distance_bars=int(max(1, min_cp_distance_bars)),
+                min_regime_bars=int(max(1, min_regime_bars_val)),
+                confirm_bars=int(max(1, cp_confirm_bars)),
+                confirm_relaxed_mult=float(cp_confirm_relaxed_mult),
+                edge_multiplier=float(cp_edge_multiplier),
+            )
+            cps = [
+                {"idx": i, "time": t_fmt[i], "prob": float(cp_prob[i])} for i in cp_idx
+            ]
+            tuning_hint: Optional[str] = None
+            if len(cps) == 0:
+                if (
+                    len(raw_cp_idx) > 0
+                    and int(cp_filter_meta.get("filtered_count", 0)) > 0
+                ):
+                    tuning_hint = (
+                        "Change-point candidates were filtered by robustness guards "
+                        "(confirmation/cooldown/edge checks). Tune cp_confirm_bars, "
+                        "min_cp_distance_bars, or cp_edge_multiplier if needed."
+                    )
+                else:
+                    tuning_hint = (
+                        "No change points detected. Try lowering threshold or reducing "
+                        f"hazard_lambda (currently {hazard_lambda}); active threshold={threshold_used:.2f}."
+                    )
+            if isinstance(threshold_calibration_info, dict):
+                expected_fa_rate = float(
+                    threshold_calibration_info.get("target_false_alarm_rate", 0.02)
+                )
+                calibration_age_bars = int(
+                    threshold_calibration_info.get(
+                        "points",
+                        calibration_info.get("points", 0)
+                        if isinstance(calibration_info, dict)
+                        else 0,
+                    )
+                )
+                threshold_calibrated = bool(
+                    threshold_calibration_info.get("calibrated", False)
+                )
+            else:
+                expected_fa_rate = 0.02
+                calibration_age_bars = int(
+                    calibration_info.get("points", 0)
+                    if isinstance(calibration_info, dict)
+                    else 0
+                )
+                threshold_calibrated = False
+            reliability = _bocpd_reliability_score(
+                cp_prob=cp_prob,
+                cp_indices=cp_idx,
+                threshold=float(threshold_used),
+                lookback=int(lookback),
+                min_regime_bars=int(max(1, min_regime_bars_val)),
+                expected_false_alarm_rate=float(expected_fa_rate),
+                calibration_age_bars=int(calibration_age_bars),
+                threshold_calibrated=bool(threshold_calibrated),
+            )
+            reliability = _common_reliability(
+                reliability,
+                source="bocpd_calibration",
+            )
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "times": t_fmt,
+                "cp_prob": [
+                    float(v) for v in np.asarray(cp_prob, dtype=float).tolist()
+                ],
+                "change_points": cps,
+                "_series_values": [
+                    float(v) for v in np.asarray(x, dtype=float).tolist()
+                ],
+                "threshold": float(threshold_used),
+                "reliability": reliability,
+                "params_used": {
+                    "hazard_lambda": hazard_lambda,
+                    "hazard_lambda_source": hazard_src,
+                    "cp_threshold": float(threshold_used),
+                    "cp_threshold_source": threshold_src,
+                    "hazard_mode": hazard_mode,
+                    "max_run_length": max_rl,
+                    "cp_filter": cp_filter_meta,
+                    "priors": bocpd_priors,
+                },
+            }
+            if isinstance(calibration_info, dict):
+                payload["params_used"]["auto_calibration"] = calibration_info
+            if isinstance(threshold_calibration_info, dict):
+                payload["params_used"]["cp_threshold_calibration"] = (
+                    threshold_calibration_info
+                )
+            if tuning_hint is not None:
+                payload["tuning_hint"] = tuning_hint
+            _append_warnings(
+                payload,
+                _bocpd_under_segmentation_warnings(
+                    total_bars=int(x.size),
+                    change_point_count=len(raw_cp_idx),
+                    reliability=payload.get("reliability"),
+                    peak_abs_return=_peak_abs_return(x),
+                ),
+            )
+            if output in ("summary", "compact"):
+                payload = _apply_bocpd_output_mode(
+                    payload,
+                    output=output,
+                    lookback=lookback,
+                    cp_prob=cp_prob,
+                    change_points=cps,
+                    raw_cp_idx=raw_cp_idx,
+                    reliability=reliability,
+                    expected_fa_rate=expected_fa_rate,
+                    calibration_age_bars=calibration_age_bars,
+                    tuning_hint=tuning_hint,
+                )
+                if output == "summary":
+                    return _finish(payload)
+
+            return _finish(
+                _consolidate_payload(
+                    payload,
+                    method,
+                    output,
+                    include_series=include_series,
+                    max_regimes=max_regimes,
+                )
+            )
+
+        elif method == "pelt":
+            try:
+                import ruptures as rpt
+            except ImportError:
+                return _finish(
+                    {
+                        "error": "ruptures is required for PELT regime detection.",
+                        "error_code": "dependency_missing",
+                        "details": {"method": "pelt", "requires": ["ruptures"]},
+                    }
+                )
+
+            model = str(p.get("model", "l2") or "l2").strip().lower()
+            if model not in {"l1", "l2", "rbf", "normal", "ar"}:
+                return _finish(
+                    {"error": "params.model must be one of: l1, l2, rbf, normal, ar."}
+                )
+            min_size, min_size_error = _coerce_param(
+                p,
+                "min_size",
+                default=max(2, int(min_regime_bars_val)),
+                cast=int,
+                error="params.min_size must be an integer >= 2.",
+            )
+            if min_size_error is not None or int(min_size) < 2:
+                return _finish({"error": min_size_error or "params.min_size must be >= 2."})
+            jump, jump_error = _coerce_param(
+                p,
+                "jump",
+                default=1,
+                cast=int,
+                error="params.jump must be an integer >= 1.",
+            )
+            if jump_error is not None or int(jump) < 1:
+                return _finish({"error": jump_error or "params.jump must be >= 1."})
+            penalty_raw = p.get("penalty")
+            if penalty_raw is None or str(penalty_raw).strip().lower() == "auto":
+                variance = float(np.var(x, ddof=0))
+                penalty = max(1e-12, 3.0 * np.log(max(int(x.size), 2)) * variance)
+                penalty_source = "bic_like_auto"
+            else:
+                try:
+                    penalty = float(penalty_raw)
+                except Exception:
+                    return _finish({"error": "params.penalty must be a positive number."})
+                penalty_source = "params"
+            if not np.isfinite(penalty) or penalty <= 0.0:
+                return _finish({"error": "params.penalty must be a positive finite number."})
+
+            signal = np.asarray(x, dtype=float).reshape(-1, 1)
+            try:
+                breakpoints = rpt.Pelt(
+                    model=model,
+                    min_size=int(min_size),
+                    jump=int(jump),
+                ).fit(signal).predict(pen=float(penalty))
+            except Exception as exc:
+                return _finish({"error": f"PELT regime detection failed: {exc}"})
+
+            segment_ends = [int(value) for value in breakpoints if int(value) > 0]
+            if not segment_ends or segment_ends[-1] != int(x.size):
+                segment_ends.append(int(x.size))
+            regimes: List[Dict[str, Any]] = []
+            change_points: List[Dict[str, Any]] = []
+            start_idx = 0
+            global_volatility = max(float(np.std(x, ddof=0)), 1e-12)
+            for regime_id, end_idx in enumerate(segment_ends):
+                if end_idx <= start_idx:
+                    continue
+                segment = np.asarray(x[start_idx:end_idx], dtype=float)
+                mean_value = float(np.mean(segment))
+                volatility = float(np.std(segment, ddof=0))
+                if target == "return":
+                    direction, mean_t_stat, direction_significant = (
+                        _pelt_return_direction(segment, mean_value)
+                    )
+                    vol_label = "high_vol" if volatility > global_volatility else "low_vol"
+                    label = f"{direction}_{vol_label}"
+                else:
+                    direction = "rising" if segment[-1] > segment[0] else "falling" if segment[-1] < segment[0] else "flat"
+                    label = direction
+                row = {
+                    "regime": int(regime_id),
+                    "label": label,
+                    "start": t_fmt[start_idx],
+                    "end": t_fmt[end_idx - 1],
+                    "bars": int(end_idx - start_idx),
+                    "mean": round(mean_value, 8),
+                    "volatility": round(volatility, 8),
+                }
+                if target == "return":
+                    row["mean_t_stat"] = (
+                        round(float(mean_t_stat), 4)
+                        if mean_t_stat is not None and np.isfinite(mean_t_stat)
+                        else None
+                    )
+                    row["direction_significant"] = bool(direction_significant)
+                regimes.append(row)
+                if start_idx > 0:
+                    change_points.append(
+                        {"idx": int(start_idx), "time": t_fmt[start_idx]}
+                    )
+                start_idx = end_idx
+
+            if not regimes:
+                return _finish({"error": "PELT produced no valid regime segments."})
+            latest = regimes[-1]
+            mean_contrast = float(np.std([float(row["mean"]) for row in regimes], ddof=0))
+            confidence = min(1.0, mean_contrast / global_volatility) if global_volatility > 0 else 0.0
+            current_regime = {
+                "regime_id": latest["regime"],
+                "label": latest["label"],
+                "since": latest["start"],
+                "bars": latest["bars"],
+                "regime_confidence": round(float(confidence), 4),
+            }
+            payload: Dict[str, Any] = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": "pelt",
+                "target": target,
+                "current_regime": current_regime,
+                "regimes": regimes[-int(max_regimes) :] if output != "full" else regimes,
+                "change_points": change_points,
+                "summary": {
+                    "segments": int(len(regimes)),
+                    "change_points_count": int(len(change_points)),
+                    "current_segment_bars": int(latest["bars"]),
+                },
+                "reliability": _common_reliability(
+                    None,
+                    source="pelt_segment_separation",
+                    confidence=confidence,
+                ),
+                "params_used": {
+                    "model": model,
+                    "penalty": round(float(penalty), 10),
+                    "penalty_source": penalty_source,
+                    "min_size": int(min_size),
+                    "jump": int(jump),
+                    "direction_t_stat_threshold": _PELT_DIRECTION_T_STAT_THRESHOLD,
+                },
+            }
+            if include_series and output == "full":
+                payload["series"] = {
+                    "times": t_fmt,
+                    "values": [float(value) for value in x.tolist()],
+                }
+            return _finish(payload)
+
+        elif method == "ms_ar":
+            try:
+                from statsmodels.tsa.regime_switching.markov_regression import (
+                    MarkovRegression,  # type: ignore
+                )
+            except ImportError:
+                return _finish(
+                    {
+                        "error": "statsmodels MarkovRegression not available. Install statsmodels.",
+                        "error_code": "dependency_missing",
+                        "details": {"method": "ms_ar", "requires": ["statsmodels"]},
+                    }
+                )
+            n_states_msar, n_states_error, n_states_source, state_count_warnings = (
+                _resolve_state_count_param(
+                    p,
+                    default=2,
+                    method="ms_ar",
+                )
+            )
+            if n_states_error is not None:
+                return _finish({"error": n_states_error})
+            if n_states_msar is None or n_states_msar < 2:
+                return _finish({"error": "n_states must be >= 2 for ms_ar."})
+            # Default AR(1) so MS-AR is an actual switching autoregression, not intercept-only.
+            order, _ = _coerce_param(p, "order", default=1, cast=int)
+            try:
+                mod = MarkovRegression(
+                    endog=x,
+                    k_regimes=max(2, n_states_msar),
+                    trend="c",
+                    order=max(0, order),
+                    switching_variance=True,
+                )
+                maxiter, _ = _coerce_param(p, "maxiter", default=100, cast=int)
+                res = mod.fit(disp=False, maxiter=maxiter)
+                inference = str(p.get("inference", "filtered")).strip().lower()
+                if inference not in {"filtered", "smoothed"}:
+                    return _finish({"error": "params.inference must be 'filtered' or 'smoothed'."})
+                marginal = (
+                    res.filtered_marginal_probabilities
+                    if inference == "filtered"
+                    else res.smoothed_marginal_probabilities
+                )
+                if hasattr(marginal, "values"):
+                    marginal = marginal.values
+                probs = np.asarray(marginal, dtype=float)
+                raw_state = np.argmax(probs, axis=1)
+                state, smoothing_meta = _confirm_state_changes_causally(
+                    np.asarray(raw_state, dtype=int), min_regime_bars_val
+                )
+                state, probs, canon_meta = _canonicalize_regime_labels(
+                    state,
+                    probs,
+                    x,
+                )
+                smoothing_meta["relabeled"] = canon_meta.get("relabeled", False)
+                mle_retvals = getattr(res, "mle_retvals", None)
+                converged = None
+                if isinstance(mle_retvals, dict):
+                    converged = mle_retvals.get("converged")
+                elif mle_retvals is not None and hasattr(mle_retvals, "get"):
+                    try:
+                        converged = mle_retvals.get("converged")
+                    except Exception:
+                        converged = getattr(mle_retvals, "converged", None)
+            except Exception as ex:
+                return _finish({"error": f"MS-AR fitting error: {ex}"})
+
+            # Build regime parameters (mean/vol per regime) for states that
+            # actually have observations after smoothing/canonicalization.
+            # Iterating range(n_states_msar) produced phantom entries (0.0
+            # mean / 0.0 vol) for states that smoothing had eliminated,
+            # which then leaked into payload labels and downstream scoring.
+            unique_canonical_states = sorted(int(s) for s in np.unique(state).tolist())
+            msar_regime_params = {"mean_return": [], "volatility": []}
+            for s in unique_canonical_states:
+                mask = state == s
+                if mask.any():
+                    msar_regime_params["mean_return"].append(float(np.mean(x[mask])))
+                    msar_regime_params["volatility"].append(float(np.std(x[mask])))
+                else:
+                    msar_regime_params["mean_return"].append(0.0)
+                    msar_regime_params["volatility"].append(0.0)
+
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "times": t_fmt,
+                "state": [int(s) for s in state.tolist()],
+                "state_probabilities": [
+                    [float(v) for v in row] for row in probs.tolist()
+                ],
+                "regime_params": msar_regime_params,
+                "params_used": {
+                    "n_states": int(n_states_msar),
+                    "state_count_param": n_states_source,
+                    "order": order,
+                    "inference": inference,
+                    "model_fit_scope": "full_window",
+                    "state_postprocess": "causal_confirmation",
+                    "min_regime_bars": int(min_regime_bars_val),
+                    "relabeled": bool(canon_meta.get("relabeled", False)),
+                    "smoothing_applied": bool(
+                        smoothing_meta.get("smoothing_applied", False)
+                    ),
+                    "transitions_before": int(
+                        smoothing_meta.get("transitions_before", 0)
+                    ),
+                    "transitions_after": int(
+                        smoothing_meta.get("transitions_after", 0)
+                    ),
+                },
+            }
+            if canon_meta.get("mapping"):
+                payload["params_used"]["label_mapping"] = canon_meta["mapping"]
+            _append_warnings(payload, state_count_warnings)
+            _append_warnings(payload, _smoothing_warnings(method, smoothing_meta))
+            if converged is not None:
+                payload["params_used"]["converged"] = bool(converged)
+                if not bool(converged):
+                    _append_warnings(
+                        payload,
+                        [
+                            "MS-AR model did not converge; regime probabilities may be unreliable."
+                        ],
+                    )
+            # Add reliability info
+            reliability = _ms_ar_reliability_from_smoothed(
+                smoothed_probs=probs,
+                params_used=payload["params_used"],
+            )
+            payload["reliability"] = _common_reliability(
+                reliability,
+                source=f"ms_ar_{inference}_probabilities",
+            )
+
+            if output in ("summary", "compact"):
+                n = _summary_window_size(lookback, len(state))
+                st_tail = state[-n:] if n > 0 else state
+                last_s = int(state[-1]) if len(state) else None
+                unique, counts = np.unique(st_tail, return_counts=True)
+                shares = {
+                    int(k): float(c) / float(len(st_tail) or 1)
+                    for k, c in zip(unique, counts)
+                }
+                summary = {
+                    "lookback": int(n),
+                    "last_state": last_s,
+                    "state_shares": shares,
+                    "transitions_before": int(
+                        smoothing_meta.get("transitions_before", 0)
+                    ),
+                    "transitions_after": int(
+                        smoothing_meta.get("transitions_after", 0)
+                    ),
+                    "smoothing_applied": bool(
+                        smoothing_meta.get("smoothing_applied", False)
+                    ),
+                }
+                payload = _apply_state_output_mode(
+                    payload,
+                    output=output,
+                    lookback=lookback,
+                    summary=summary,
+                )
+                if output == "summary":
+                    return _finish(payload)
+
+            return _finish(
+                _consolidate_payload(
+                    payload,
+                    method,
+                    output,
+                    include_series=include_series,
+                    max_regimes=max_regimes,
+                )
+            )
+
+        elif method in {"hmm", "gmm"}:
+            n_states, n_states_error, n_states_source, state_count_warnings = (
+                _resolve_state_count_param(
+                    p,
+                    default=2,
+                    method=method,
+                )
+            )
+            if n_states_error is not None:
+                return _finish({"error": n_states_error})
+            if n_states is None or n_states < 2:
+                return _finish({"error": f"n_states must be >= 2 for {method}."})
+            inference = str(p.get("inference", "filtered")).strip().lower()
+            if inference not in {"filtered", "smoothed"}:
+                return _finish({"error": "params.inference must be 'filtered' or 'smoothed'."})
+            hmm_fit: Dict[str, Any] = {}
+            if method == "hmm":
+                try:
+                    from ...forecast.monte_carlo import fit_gaussian_hmm_1d
+                except Exception as ex:
+                    return _finish({"error": f"Gaussian HMM import error: {ex}"})
+                fit_gaussian_hmm_1d = globals().get(
+                    "fit_gaussian_hmm_1d", fit_gaussian_hmm_1d
+                )
+                try:
+                    hmm_fit = fit_gaussian_hmm_1d(
+                        x,
+                        n_states=n_states,
+                        max_iter=int(p.get("maxiter", 80)),
+                        tol=float(p.get("tol", 1e-6)),
+                        seed=int(p.get("seed", 42)),
+                    )
+                except ImportError:
+                    return _finish({
+                        "error": "hmmlearn GaussianHMM is unavailable.",
+                        "error_code": "dependency_missing",
+                        "details": {"method": "hmm", "requires": ["hmmlearn"]},
+                    })
+                mu = np.asarray(hmm_fit["mu"], dtype=float)
+                sigma = np.asarray(hmm_fit["sigma"], dtype=float)
+                w = np.asarray(hmm_fit["state_occupancy"], dtype=float)
+                gamma = np.asarray(
+                    hmm_fit[f"{inference}_probabilities"], dtype=float
+                )
+            else:
+                try:
+                    from ...forecast.monte_carlo import fit_gaussian_mixture_1d
+                except Exception as ex:
+                    return _finish({"error": f"Gaussian mixture import error: {ex}"})
+                fit_gaussian_mixture_1d = globals().get(
+                    "fit_gaussian_mixture_1d", fit_gaussian_mixture_1d
+                )
+                w, mu, sigma, gamma, _ = fit_gaussian_mixture_1d(
+                    x, n_states=n_states
+                )
+                if "inference" in p:
+                    state_count_warnings.append(
+                        "params.inference does not apply to gmm responsibilities."
+                    )
+            gamma_matrix = _normalize_state_probability_matrix(
+                gamma,
+                rows=x.size,
+                requested_states=len(mu),
+            )
+            raw_state = (
+                np.argmax(gamma_matrix, axis=1)
+                if gamma_matrix.size
+                else np.zeros(x.size, dtype=int)
+            )
+            state, smoothing_meta = _confirm_state_changes_causally(
+                np.asarray(raw_state, dtype=int), min_regime_bars_val
+            )
+            state, gamma_for_payload, canon_meta = _canonicalize_regime_labels(
+                state,
+                gamma_matrix,
+                x,
+            )
+            smoothing_meta["relabeled"] = canon_meta.get("relabeled", False)
+            if not isinstance(gamma_for_payload, np.ndarray):
+                gamma_for_payload = gamma_matrix
+            label_mapping = {
+                int(old): int(new)
+                for old, new in canon_meta.get("mapping", {}).items()
+            }
+            if label_mapping:
+                native_order = sorted(
+                    range(len(mu)),
+                    key=lambda old: label_mapping.get(old, len(label_mapping) + old),
+                )
+                mu = mu[native_order]
+                sigma = sigma[native_order]
+                w = w[native_order]
+            regime_params: Dict[str, Any] = {
+                "mu": [float(v) for v in mu.tolist()],
+                "sigma": [float(v) for v in sigma.tolist()],
+            }
+            if method == "hmm":
+                transition_matrix = np.asarray(hmm_fit["trans"], dtype=float)
+                initial_probabilities = np.asarray(hmm_fit["start_prob"], dtype=float)
+                if label_mapping:
+                    transition_matrix = transition_matrix[np.ix_(native_order, native_order)]
+                    initial_probabilities = initial_probabilities[native_order]
+                regime_params.update({
+                    "transition_matrix": [
+                        [float(v) for v in row]
+                        for row in transition_matrix.tolist()
+                    ],
+                    "initial_probabilities": [
+                        float(v) for v in initial_probabilities.tolist()
+                    ],
+                    "state_occupancy": [float(v) for v in w.tolist()],
+                })
+            else:
+                regime_params["weights"] = [float(v) for v in w.tolist()]
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "times": t_fmt,
+                "state": [int(s) for s in state.tolist()],
+                "state_probabilities": [
+                    [float(v) for v in row] for row in gamma_for_payload.tolist()
+                ],
+                "regime_params": regime_params,
+                "params_used": {
+                    "n_states": int(n_states),
+                    "fitted_n_states": int(len(mu)),
+                    "state_count_param": n_states_source,
+                    "inference": inference if method == "hmm" else "component_responsibility",
+                    "model_fit_scope": "full_window",
+                    "state_postprocess": "causal_confirmation",
+                    "min_regime_bars": int(min_regime_bars_val),
+                    "relabeled": bool(canon_meta.get("relabeled", False)),
+                    "regime_params_order": "canonical",
+                    "smoothing_applied": bool(
+                        smoothing_meta.get("smoothing_applied", False)
+                    ),
+                    "transitions_before": int(
+                        smoothing_meta.get("transitions_before", 0)
+                    ),
+                    "transitions_after": int(
+                        smoothing_meta.get("transitions_after", 0)
+                    ),
+                },
+            }
+            if method == "hmm":
+                payload["params_used"].update({
+                    "converged": bool(hmm_fit.get("converged", False)),
+                    "log_likelihood": float(hmm_fit.get("log_likelihood", 0.0)),
+                })
+            if canon_meta.get("mapping"):
+                payload["params_used"]["label_mapping"] = canon_meta["mapping"]
+            _append_warnings(payload, state_count_warnings)
+            _append_warnings(payload, _smoothing_warnings(method, smoothing_meta))
+            if method == "hmm" and len(mu) < n_states:
+                _append_warnings(
+                    payload,
+                    [
+                        "HMM state collapse: requested "
+                        f"{int(n_states)} states but fitted {int(len(mu))}; "
+                        "regime output uses the reduced-state model."
+                    ],
+                )
+            # Add reliability info
+            reliability = _hmm_reliability_from_gamma(gamma_for_payload)
+            payload["reliability"] = _common_reliability(
+                reliability,
+                source=(
+                    f"hmm_{inference}_probabilities"
+                    if method == "hmm"
+                    else "gmm_component_responsibilities"
+                ),
+            )
+
+            if output in ("summary", "compact"):
+                n = _summary_window_size(lookback, len(state))
+                st_tail = state[-n:] if n > 0 else state
+                last_s = int(state[-1]) if len(state) else None
+                unique, counts = np.unique(st_tail, return_counts=True)
+                shares = {
+                    int(k): float(c) / float(len(st_tail) or 1)
+                    for k, c in zip(unique, counts)
+                }
+                order = np.argsort(sigma)
+                ranks = {int(s): int(r) for r, s in enumerate(order)}
+                summary = {
+                    "lookback": int(n),
+                    "last_state": last_s,
+                    "state_shares": shares,
+                    "state_sigma": {int(i): float(sigma[i]) for i in range(len(sigma))},
+                    "state_order_by_sigma": ranks,
+                    "transitions_before": int(
+                        smoothing_meta.get("transitions_before", 0)
+                    ),
+                    "transitions_after": int(
+                        smoothing_meta.get("transitions_after", 0)
+                    ),
+                    "smoothing_applied": bool(
+                        smoothing_meta.get("smoothing_applied", False)
+                    ),
+                }
+                payload = _apply_state_output_mode(
+                    payload,
+                    output=output,
+                    lookback=lookback,
+                    summary=summary,
+                )
+                if output == "summary":
+                    return _finish(payload)
+
+            return _finish(
+                _consolidate_payload(
+                    payload,
+                    method,
+                    output,
+                    include_series=include_series,
+                    max_regimes=max_regimes,
+                )
+            )
+
+        elif method == "clustering":
+            try:
+                standard_scaler_cls = globals().get("StandardScaler")
+                kmeans_cls = globals().get("KMeans")
+                pca_cls = globals().get("PCA")
+                if standard_scaler_cls is None:
+                    from sklearn.preprocessing import (
+                        StandardScaler as standard_scaler_cls,
+                    )
+                if kmeans_cls is None:
+                    from sklearn.cluster import KMeans as kmeans_cls
+                if pca_cls is None:
+                    from sklearn.decomposition import PCA as pca_cls
+                algorithm = str(p.get("algorithm", "kmeans")).strip().lower()
+                spectral_cls = None
+                if algorithm == "spectral":
+                    _sc = globals().get("SpectralClustering")
+                    if _sc is None:
+                        from sklearn.cluster import (
+                            SpectralClustering as _sc,
+                        )
+                    spectral_cls = _sc
+            except ImportError as ex:
+                return _finish({"error": f"Clustering dependencies missing: {ex}"})
+            window_size, _ = _coerce_param(p, "window_size", default=20, cast=int)
+            n_states_cluster, n_states_error, n_states_source, state_count_warnings = (
+                _resolve_state_count_param(
+                    p,
+                    default=3,
+                    method="clustering",
+                )
+            )
+            if n_states_error is not None:
+                return _finish({"error": n_states_error})
+            if n_states_cluster is None or n_states_cluster < 2:
+                return _finish({"error": "n_states must be >= 2 for clustering."})
+            use_pca = bool(p.get("use_pca", True))
+            n_components, _ = _coerce_param(p, "n_components", default=3, cast=int)
+            clustering_warnings: List[str] = []
+            if target == "price":
+                clustering_warnings.append(
+                    "Clustering on price features may produce level-dependent regimes. Consider target='return'."
+                )
+
+            # Extract features (use 'return' or 'price'? 'return' is stationary, usually better)
+            # x is already computed based on target input
+            extract_rolling_features_impl = globals().get(
+                "extract_rolling_features", extract_rolling_features
+            )
+            if extract_rolling_features_impl is extract_rolling_features:
+                extract_rolling_features_impl = (
+                    _features_module.extract_rolling_features
+                )
+            features_df = extract_rolling_features_impl(x, window_size=window_size)
+
+            # Align features with time
+            # valid_indices are where features are not NaN
+            valid_mask = ~features_df.isna().any(axis=1)
+            X_valid = features_df.loc[valid_mask]
+
+            if X_valid.empty:
+                return _finish(
+                    {
+                        "error": "Not enough data for feature extraction (check window_size)"
+                    }
+                )
+
+            # Normalize
+            scaler = standard_scaler_cls()
+            X_scaled = scaler.fit_transform(X_valid)
+
+            # PCA
+            if use_pca and X_scaled.shape[1] > n_components:
+                pca = pca_cls(n_components=min(n_components, X_scaled.shape[1]))
+                X_final = pca.fit_transform(X_scaled)
+            else:
+                X_final = X_scaled
+
+            # Cluster
+            n_samples = X_final.shape[0]
+            if n_samples < n_states_cluster:
+                return _finish(
+                    {
+                        "error": f"Not enough samples ({n_samples}) for {n_states_cluster} clusters"
+                    }
+                )
+
+            if algorithm == "spectral" and spectral_cls is not None:
+                affinity = str(p.get("affinity", "nearest_neighbors")).strip().lower()
+                sc_kwargs: Dict[str, Any] = {
+                    "n_clusters": n_states_cluster,
+                    "affinity": affinity,
+                    "random_state": 42,
+                    "assign_labels": "kmeans",
+                    "n_init": 1,
+                }
+                if affinity == "nearest_neighbors":
+                    sc_kwargs["n_neighbors"] = min(
+                        max(5, n_samples // 10), n_samples - 1
+                    )
+                sc = spectral_cls(**sc_kwargs)
+                labels = sc.fit_predict(X_final)
+            else:
+                # KMeans — seed centroids from evenly-spaced rows so KMeans++
+                # init is skipped.  KMeans++ triggers joblib CPU-topology probing
+                # which blocks indefinitely in asyncio.to_thread workers on Windows.
+                idx = np.round(np.linspace(0, n_samples - 1, n_states_cluster)).astype(int)
+                kmeans = kmeans_cls(
+                    n_clusters=n_states_cluster,
+                    random_state=42,
+                    n_init=1,
+                    init=X_final[idx],
+                )
+                labels = kmeans.fit_predict(X_final)
+
+            # Smooth short runs and canonicalize on valid slice only
+            labels, smoothing_meta = _confirm_state_changes_causally(
+                np.asarray(labels, dtype=int), min_regime_bars_val
+            )
+            valid_probs = _hard_state_probability_matrix(
+                labels, n_states_cluster
+            )
+            labels, valid_probs, canon_meta = _canonicalize_regime_labels(
+                labels,
+                valid_probs,
+                x[valid_mask],
+            )
+            smoothing_meta["relabeled"] = canon_meta.get("relabeled", False)
+
+            # Map back to full length (-1 for undefined leading window)
+            full_states = np.full(len(x), -1, dtype=int)
+            full_states[valid_mask] = labels
+
+            full_probs = np.zeros((len(x), n_states_cluster))
+            full_probs[valid_mask] = valid_probs
+
+            # Build regime parameters from data
+            clustering_regime_params = {"mean_return": [], "volatility": []}
+            for s in range(n_states_cluster):
+                mask = full_states == s
+                if mask.any():
+                    clustering_regime_params["mean_return"].append(
+                        float(np.mean(x[mask]))
+                    )
+                    clustering_regime_params["volatility"].append(
+                        float(np.std(x[mask]))
+                    )
+                else:
+                    clustering_regime_params["mean_return"].append(0.0)
+                    clustering_regime_params["volatility"].append(0.0)
+
+            # Reconstruct payload
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "times": t_fmt,
+                "state": [int(s) for s in full_states.tolist()],
+                "state_probabilities": [
+                    [float(v) for v in row] for row in full_probs.tolist()
+                ],
+                "regime_params": clustering_regime_params,
+                "params_used": {
+                    "n_states": int(n_states_cluster),
+                    "state_count_param": n_states_source,
+                    "algorithm": algorithm,
+                    "window_size": window_size,
+                    "use_pca": use_pca,
+                    "n_components": n_components,
+                    "min_regime_bars": int(min_regime_bars_val),
+                    "smoothing_applied": smoothing_meta.get("smoothing_applied", False),
+                    "transitions_before": int(
+                        smoothing_meta.get("transitions_before", 0)
+                    ),
+                    "transitions_after": int(
+                        smoothing_meta.get("transitions_after", 0)
+                    ),
+                    "model_fit_scope": "full_window",
+                    "label_scope": "retrospective_canonical",
+                },
+            }
+            if clustering_warnings:
+                payload["warnings"] = clustering_warnings
+            _append_warnings(payload, state_count_warnings)
+            _append_warnings(payload, _smoothing_warnings(method, smoothing_meta))
+
+            # Summary stats
+            if output in ("summary", "compact"):
+                n_summary = _summary_window_size(lookback, len(full_states))
+                st_tail = full_states[-n_summary:] if n_summary > 0 else full_states
+                # Filter out -1
+                st_tail_valid = st_tail[st_tail != -1]
+
+                unique, counts = np.unique(st_tail_valid, return_counts=True)
+                shares = {
+                    int(k): float(c) / float(len(st_tail_valid) or 1)
+                    for k, c in zip(unique, counts)
+                }
+
+                summary = {
+                    "lookback": int(n_summary),
+                    "last_state": int(full_states[-1]) if len(full_states) else None,
+                    "state_shares": shares,
+                    "transitions_before": int(
+                        smoothing_meta.get("transitions_before", 0)
+                    ),
+                    "transitions_after": int(
+                        smoothing_meta.get("transitions_after", 0)
+                    ),
+                    "smoothing_applied": bool(
+                        smoothing_meta.get("smoothing_applied", False)
+                    ),
+                }
+                payload = _apply_state_output_mode(
+                    payload,
+                    output=output,
+                    lookback=lookback,
+                    summary=summary,
+                )
+                if output == "summary":
+                    return _finish(payload)
+
+            # Add reliability based on cluster separation
+            # Compute variance ratio: between-cluster variance / total variance
+            total_var = float(np.var(x)) if len(x) > 1 else 0.0
+            if total_var > 1e-9:
+                between_var = 0.0
+                overall_mean = float(np.mean(x))
+                for s in range(n_states_cluster):
+                    mask = full_states == s
+                    if mask.any():
+                        cluster_mean = float(np.mean(x[mask]))
+                        cluster_size = int(mask.sum())
+                        between_var += cluster_size * (cluster_mean - overall_mean) ** 2
+                between_var /= len(x)
+                variance_ratio = between_var / total_var
+                reliability_score = min(
+                    1.0, variance_ratio * 2
+                )  # Scale for interpretability
+            else:
+                variance_ratio = 0.0
+                reliability_score = 0.0
+
+            payload["reliability"] = {
+                "confidence": round(reliability_score, 4),
+                "variance_ratio": round(variance_ratio, 4),
+                "source": "cluster_separation",
+            }
+            payload["reliability"] = _common_reliability(
+                payload["reliability"],
+                source="cluster_separation",
+            )
+
+            return _finish(
+                _consolidate_payload(
+                    payload,
+                    method,
+                    output,
+                    include_series=include_series,
+                    max_regimes=max_regimes,
+                )
+            )
+
+        elif method == "garch":
+            # GARCH-based volatility regime detection
+            garch_warnings: List[str] = []
+            if target != "return":
+                return _finish(
+                    {
+                        "error": "GARCH regime detection requires target='return'; price levels are non-stationary for this volatility model.",
+                        "error_code": "invalid_target",
+                        "details": {"method": "garch", "target": target},
+                    }
+                )
+            try:
+                from arch import arch_model
+            except ImportError:
+                return _finish(
+                    {
+                        "error": "arch package required for GARCH regime detection. Install: pip install arch"
+                    }
+                )
+
+            # Auto-detect optimal n_states if not explicitly provided
+            # Based on volatility distribution characteristics
+            n_states_input = p.get("n_states")
+            state_count_warnings: List[str] = []
+
+            if n_states_input is None:
+                # Calculate rolling realized volatility for better characterization
+                # Use 20-bar rolling window to capture volatility clustering
+                window = min(20, len(x) // 4)
+                if window < 5:
+                    window = 5
+
+                # Rolling standard deviation of returns
+                rolling_vol = np.array(
+                    [np.std(x[max(0, i - window) : i + 1]) for i in range(len(x))]
+                )
+                rolling_vol = rolling_vol[np.isfinite(rolling_vol) & (rolling_vol > 0)]
+
+                if len(rolling_vol) > 10:
+                    # Use ratio of 90th to 10th percentile to measure volatility range
+                    vol_p90 = np.percentile(rolling_vol, 90)
+                    vol_p10 = np.percentile(rolling_vol, 10)
+                    vol_ratio = vol_p90 / vol_p10 if vol_p10 > 1e-9 else 1.0
+
+                    # Also calculate kurtosis of returns (fat tails indicator)
+                    returns_kurt = _finite_raw_kurtosis(x)
+
+                    # Infer optimal states based on vol_ratio and kurtosis
+                    # High vol_ratio (10+) or high kurtosis (>6) suggests need for more states
+                    if vol_ratio > 10.0 or returns_kurt > 6.0:
+                        n_states_auto = (
+                            4  # Very volatile - need very_low/low/high/very_high
+                        )
+                    elif vol_ratio > 5.0 or returns_kurt > 4.0:
+                        n_states_auto = 3  # Moderately volatile - low/moderate/high
+                    else:
+                        n_states_auto = 2  # Stable - binary classification sufficient
+
+                    auto_detect_metrics = {
+                        "vol_ratio_90_10": round(vol_ratio, 2),
+                        "returns_kurtosis": round(returns_kurt, 2),
+                    }
+                else:
+                    # Insufficient data, default to 3 states
+                    n_states_auto = 3
+                    auto_detect_metrics = {}
+
+                n_states_garch = n_states_auto
+                garch_auto_n_states = True
+            else:
+                try:
+                    n_states_garch = int(n_states_input)
+                except Exception:
+                    return _finish({"error": "n_states must be an integer >= 2 for garch."})
+                garch_auto_n_states = False
+            garch_p, _ = _coerce_param(p, "p_order", default=1, cast=int)
+            garch_q, _ = _coerce_param(p, "q_order", default=1, cast=int)
+            vol_threshold, _ = _coerce_param(
+                p, "vol_threshold", default=None, cast=float
+            )
+
+            if n_states_garch < 2:
+                return _finish({"error": "n_states must be >= 2 for garch method."})
+
+            # Fit GARCH model
+            try:
+                # Scale returns for numerical stability
+                scale = 100.0
+                x_scaled = x * scale
+
+                am = arch_model(
+                    x_scaled,
+                    vol="GARCH",
+                    p=max(1, garch_p),
+                    q=max(1, garch_q),
+                    dist="normal",
+                    mean="Constant",
+                )
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    res = am.fit(disp="off", show_warning=False)
+
+                # Extract conditional volatility
+                conditional_vol = res.conditional_volatility / scale  # Unscale
+
+                # Create regime states based on volatility levels
+                # Strategy: sort volatilities and assign regimes based on percentiles
+                # State 0 = lowest vol, State N-1 = highest vol
+                valid_vol = conditional_vol[np.isfinite(conditional_vol)]
+
+                if len(valid_vol) < n_states_garch * 10:
+                    return _finish(
+                        {
+                            "error": f"Insufficient data for GARCH regime detection (need {n_states_garch * 10}+ bars)"
+                        }
+                    )
+
+                # Determine volatility thresholds
+                thresholds, threshold_scope = _garch_tier_thresholds(
+                    valid_vol,
+                    n_states_garch,
+                    vol_threshold,
+                )
+
+                # Assign states based on volatility levels
+                state = np.zeros(len(conditional_vol), dtype=int)
+                for i, thresh in enumerate(thresholds):
+                    state[conditional_vol > thresh] = i + 1
+
+                # Handle non-finite values
+                state[~np.isfinite(conditional_vol)] = -1
+
+                # Causally confirm changes, then align the hard-assignment
+                # probabilities with the emitted state path.
+                state, smoothing_meta = _confirm_state_changes_causally(
+                    np.asarray(state, dtype=int), min_regime_bars_val
+                )
+                probs = _hard_state_probability_matrix(state, n_states_garch)
+
+                # Build regime parameters
+                regime_params = {"volatility": [], "mean_return": []}
+                for s in range(n_states_garch):
+                    mask = state == s
+                    if mask.any():
+                        regime_params["volatility"].append(
+                            float(np.mean(conditional_vol[mask]))
+                        )
+                        regime_params["mean_return"].append(
+                            float(np.mean(x[mask])) if mask.sum() > 0 else 0.0
+                        )
+                    else:
+                        regime_params["volatility"].append(0.0)
+                        regime_params["mean_return"].append(0.0)
+
+                # Build payload
+                # Check if n_states seems appropriate for this asset
+                garch_warnings = []
+                vol_std = float(np.std(valid_vol))
+                vol_mean = float(np.mean(valid_vol))
+                cv = (
+                    vol_std / vol_mean if vol_mean > 1e-9 else 0
+                )  # Coefficient of variation
+
+                # Heuristic: High CV (>1.0) suggests volatile asset needing more states
+                if cv > 1.0 and n_states_garch < 3:
+                    garch_warnings.append(
+                        f"High volatility variation detected (CV={cv:.2f}). "
+                        f"Consider n_states=3 or 4 for better regime separation."
+                    )
+
+                # Build volatility characteristics for transparency
+                vol_characteristics = {
+                    "cv": round(cv, 4),
+                    "mean": round(float(np.mean(valid_vol)), 6),
+                    "std": round(float(np.std(valid_vol)), 6),
+                    "percentile_33": round(float(np.percentile(valid_vol, 33)), 6),
+                    "percentile_66": round(float(np.percentile(valid_vol, 66)), 6),
+                }
+
+                # Add auto-detection metrics if applicable
+                if garch_auto_n_states and auto_detect_metrics:
+                    vol_characteristics["auto_detection"] = auto_detect_metrics
+
+                payload = {
+                    "success": True,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "method": method,
+                    "target": target,
+                    "times": t_fmt,
+                    "state": [int(s) for s in state.tolist()],
+                    "state_probabilities": [
+                        [float(v) for v in row] for row in probs.tolist()
+                    ],
+                    "conditional_volatility": [
+                        float(v) for v in conditional_vol.tolist()
+                    ],
+                    "regime_params": regime_params,
+                    "params_used": {
+                        "n_states": int(n_states_garch),
+                        "n_states_auto": bool(garch_auto_n_states),
+                        "p_order": int(garch_p),
+                        "q_order": int(garch_q),
+                        "min_regime_bars": int(min_regime_bars_val),
+                        "smoothing_applied": bool(
+                            smoothing_meta.get("smoothing_applied", False)
+                        ),
+                        "transitions_before": int(
+                            smoothing_meta.get("transitions_before", 0)
+                        ),
+                        "transitions_after": int(
+                            smoothing_meta.get("transitions_after", 0)
+                        ),
+                        "classification": "conditional_volatility_tiers",
+                        "threshold_scope": threshold_scope,
+                        "volatility_thresholds": [float(v) for v in thresholds],
+                        "model_fit_scope": "full_window",
+                    },
+                    "volatility_characteristics": vol_characteristics,
+                }
+                if garch_warnings:
+                    payload["warnings"] = garch_warnings
+                _append_warnings(payload, state_count_warnings)
+                _append_warnings(payload, _smoothing_warnings(method, smoothing_meta))
+
+                # Model fit is reported separately; it is not a confidence
+                # score for the derived percentile-tier classification.
+                if hasattr(res, "aic") and hasattr(res, "bic"):
+                    payload["model_fit"] = {
+                        "aic": float(res.aic),
+                        "bic": float(res.bic),
+                        "loglikelihood": float(res.loglikelihood)
+                        if hasattr(res, "loglikelihood")
+                        else None,
+                    }
+
+                # Add summary for compact/summary output
+                if output in ("summary", "compact"):
+                    n = _summary_window_size(lookback, len(state))
+                    st_tail = state[-n:] if n > 0 else state
+                    vol_tail = conditional_vol[-n:] if n > 0 else conditional_vol
+                    last_s = int(state[-1]) if len(state) else None
+
+                    unique, counts = np.unique(
+                        st_tail[st_tail >= 0], return_counts=True
+                    )
+                    shares = {
+                        int(k): float(c) / float(len(st_tail[st_tail >= 0]) or 1)
+                        for k, c in zip(unique, counts)
+                    }
+
+                    summary = {
+                        "lookback": int(n),
+                        "last_state": last_s,
+                        "state_shares": shares,
+                        "current_conditional_vol": float(conditional_vol[-1])
+                        if len(conditional_vol)
+                        else None,
+                        "avg_conditional_vol": float(np.mean(vol_tail))
+                        if len(vol_tail)
+                        else None,
+                        "transitions_before": int(
+                            smoothing_meta.get("transitions_before", 0)
+                        ),
+                        "transitions_after": int(
+                            smoothing_meta.get("transitions_after", 0)
+                        ),
+                        "smoothing_applied": bool(
+                            smoothing_meta.get("smoothing_applied", False)
+                        ),
+                    }
+                    payload = _apply_state_output_mode(
+                        payload,
+                        output=output,
+                        lookback=lookback,
+                        summary=summary,
+                    )
+                    if output == "summary":
+                        return _finish(payload)
+
+                return _finish(
+                    _consolidate_payload(
+                        payload,
+                        method,
+                        output,
+                        include_series=include_series,
+                        max_regimes=max_regimes,
+                    )
+                )
+
+            except Exception as ex:
+                return _finish({"error": f"GARCH regime detection failed: {str(ex)}"})
+
+        elif method == "rule_based":
+            # Rule-based trend/ranging/transition detection
+            if rule_based_config is None:
+                return _finish({"error": "Internal error resolving rule_based parameters."})
+
+            efficiency_threshold = float(rule_based_config["efficiency_threshold"])
+            trend_strength_threshold = float(rule_based_config["trend_strength_threshold"])
+            requested_window_bars = int(rule_based_config["window_bars"])
+
+            # Ensure window isn't too large
+            window_bars = min(requested_window_bars, len(price_series))
+            if window_bars < requested_window_bars:
+                global_warnings.append(
+                    "params.window_bars exceeded available finite price bars; "
+                    f"requested {requested_window_bars}, using {int(window_bars)}."
+                )
+
+            if window_bars < 20:
+                return _finish(
+                    {
+                        "error": f"Insufficient data for rule-based regime (need 20+ bars, got {window_bars})"
+                    }
+                )
+
+            regime_metrics = infer_market_regime(
+                price_series,
+                window_bars=window_bars,
+                efficiency_threshold=efficiency_threshold,
+                trend_strength_threshold=trend_strength_threshold,
+            )
+            if regime_metrics is None:
+                return _finish({"error": "Insufficient finite price data for rule-based regime."})
+            regime_state = str(regime_metrics["state"])
+            direction = str(regime_metrics["direction"])
+            trend_strength = float(regime_metrics["trend_strength"])
+            efficiency_ratio = float(regime_metrics["efficiency_ratio"])
+            window_move_pct_raw = float(regime_metrics["window_move_pct"])
+            ranging_efficiency_threshold = max(0.1, 0.55 * efficiency_threshold)
+
+            direction_bias = {
+                "bullish": "upward",
+                "bearish": "downward",
+                "neutral": "neutral",
+            }.get(direction, "neutral")
+            if regime_state == "ranging":
+                interpretation = (
+                    f"Price is ranging with a {direction_bias} net move over "
+                    f"{int(window_bars)} bars; direction is a window bias, not a trend classification."
+                )
+            elif regime_state == "transition":
+                interpretation = (
+                    f"Price is in transition with a {direction_bias} net move over "
+                    f"{int(window_bars)} bars."
+                )
+            else:
+                interpretation = (
+                    f"Price is trending {direction_bias} over {int(window_bars)} bars."
+                )
+
+            state_note = None
+            if (
+                regime_state == "ranging"
+                and trend_strength >= trend_strength_threshold
+            ):
+                state_note = (
+                    "trend_strength exceeds threshold, but efficiency_ratio indicates "
+                    "a choppy path; state uses both metrics."
+                )
+
+            # Build payload - single regime for the window
+            trend_strength_out = round(trend_strength, 4)
+            efficiency_ratio_out = round(efficiency_ratio, 4)
+            window_move_pct = round(window_move_pct_raw, 4)
+            window_quality: Optional[Dict[str, Any]] = None
+            if int(window_bars) < _RULE_BASED_RECOMMENDED_WINDOW_BARS:
+                window_quality = {
+                    "status": "limited_history",
+                    "lookback_too_short": True,
+                    "recommended_min_bars": _RULE_BASED_RECOMMENDED_WINDOW_BARS,
+                    "window_bars": int(window_bars),
+                }
+            regime_info = {
+                "state": regime_state,
+                "direction": direction,
+                "state_label_native": regime_state,
+                "state_label_canonical": regime_state,
+                "direction_basis": "net_window_move",
+                "interpretation": interpretation,
+                "trend_strength": trend_strength_out,
+                "efficiency_ratio": efficiency_ratio_out,
+                "window_bars": int(window_bars),
+                "window_move_pct": window_move_pct,
+                "signal_source": "price",
+            }
+            if state_note:
+                regime_info["note"] = state_note
+            confidence = 0.0
+            try:
+                if regime_state == "trending":
+                    confidence = (
+                        min(1.0, efficiency_ratio / max(float(efficiency_threshold), 1e-9))
+                        + min(
+                            1.0,
+                            trend_strength / max(float(trend_strength_threshold), 1e-9),
+                        )
+                    ) / 2.0
+                elif regime_state == "ranging":
+                    confidence = (
+                        max(0.0, ranging_efficiency_threshold - efficiency_ratio)
+                        / max(float(ranging_efficiency_threshold), 1e-9)
+                    )
+                else:
+                    transition_span = max(
+                        float(efficiency_threshold - ranging_efficiency_threshold),
+                        1e-9,
+                    )
+                    distance_from_boundary = min(
+                        max(0.0, efficiency_ratio - ranging_efficiency_threshold),
+                        max(0.0, efficiency_threshold - efficiency_ratio),
+                    )
+                    confidence = min(1.0, (distance_from_boundary / transition_span) * 2.0)
+                confidence = min(1.0, max(0.0, float(confidence)))
+            except Exception:
+                confidence = 0.0
+            regime_confidence = round(float(confidence), 4)
+            regime_id_by_state = {"ranging": 0, "trending": 1, "transition": 2}
+            regime_id = regime_id_by_state.get(regime_state, 2)
+            rule_t_fmt = [_format_time_minimal(tt) for tt in price_times]
+            regime_since = (
+                rule_t_fmt[-int(window_bars)]
+                if len(rule_t_fmt) >= int(window_bars)
+                else rule_t_fmt[0]
+            )
+            regime_end = rule_t_fmt[-1]
+            current_regime = {
+                "regime_id": int(regime_id),
+                "label": regime_state,
+                "regime_confidence": regime_confidence,
+                "since": regime_since,
+                "bars": int(window_bars),
+                "direction": direction,
+                "state_label_native": regime_state,
+                "state_label_canonical": regime_state,
+                "headline": f"regime={regime_state}; window_bias={direction}",
+            }
+            if regime_state != "trending":
+                current_regime["window_bias"] = direction
+            regime_payload = dict(regime_info)
+
+            reliability = _common_reliability(
+                {
+                    "confidence": regime_confidence,
+                    "trend_strength": trend_strength_out,
+                    "efficiency_ratio": efficiency_ratio_out,
+                },
+                source="rule_based_trend_efficiency",
+            )
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "regime": regime_payload,
+                "current_regime": current_regime,
+                "regimes": [
+                    {
+                        "start": regime_since,
+                        "end": regime_end,
+                        "bars": int(window_bars),
+                        "regime": int(regime_id),
+                        "label": regime_state,
+                        "regime_confidence": regime_confidence,
+                        "direction": direction,
+                    }
+                ],
+                "regime_info": {
+                    int(regime_id): {
+                        "label": regime_state,
+                        "direction": direction,
+                        "trend_strength": trend_strength_out,
+                        "efficiency_ratio": efficiency_ratio_out,
+                        "window_move_pct": window_move_pct,
+                    }
+                },
+                "reliability": reliability,
+                "total_regimes": 1,
+                "params_used": {
+                    "efficiency_threshold": float(efficiency_threshold),
+                    "trend_strength_threshold": float(trend_strength_threshold),
+                    "window_bars": int(window_bars),
+                    "signal_source": "price",
+                },
+            }
+            if window_quality:
+                payload["data_quality"] = window_quality
+                current_regime["window_quality"] = window_quality["status"]
+            if output == "summary":
+                payload["summary"] = {
+                    "lookback": int(window_bars),
+                    "last_state": int(regime_id),
+                    "label": regime_state,
+                    "direction": direction,
+                    "window_bias": direction if regime_state != "trending" else None,
+                    "headline": f"regime={regime_state}; window_bias={direction}",
+                    "regime_confidence": regime_confidence,
+                }
+                payload["summary"] = {
+                    key: value
+                    for key, value in payload["summary"].items()
+                    if value is not None
+                }
+                if regime_state != "trending" or state_note:
+                    payload["summary"]["direction_basis"] = "net_window_move"
+                    payload["summary"]["interpretation"] = interpretation
+                if state_note:
+                    payload["summary"]["note"] = state_note
+                return _finish(_summary_only_payload(payload))
+            if output == "full" and include_series:
+                payload["series"] = {
+                    "times": rule_t_fmt[-int(window_bars) :],
+                    "state": [int(regime_id)] * int(window_bars),
+                }
+            if output == "compact":
+                compact_current_regime = dict(current_regime)
+                for key in (
+                    "state_label_native",
+                    "state_label_canonical",
+                    "headline",
+                ):
+                    compact_current_regime.pop(key, None)
+                compact_current_regime.update(
+                    {
+                        "trend_strength": trend_strength_out,
+                        "efficiency_ratio": efficiency_ratio_out,
+                        "window_move_pct": window_move_pct,
+                    }
+                )
+                if regime_state != "trending" or state_note:
+                    compact_current_regime["direction_basis"] = "net_window_move"
+                    compact_current_regime["interpretation"] = interpretation
+                if regime_state != "trending":
+                    compact_current_regime["direction_role"] = "window_bias_not_trend"
+                if state_note:
+                    compact_current_regime["note"] = state_note
+                payload = {
+                    "success": True,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "method": method,
+                    "target": target,
+                    "signal_status": (
+                        "information_only" if regime_state == "trending" else "not_actionable"
+                    ),
+                    "current_regime": compact_current_regime,
+                }
+                if window_quality:
+                    payload["data_quality"] = window_quality
+
+            return _finish(payload)
+
+        elif method == "wavelet":
+            # Multi-resolution wavelet energy regime detection.
+            # Decomposes the series via DWT, computes rolling energy at each
+            # decomposition level, then clusters the energy feature vectors
+            # to identify regimes that differ in frequency content.
+            try:
+                import pywt as _pywt
+            except ImportError:
+                return _finish(
+                    {
+                        "error": "PyWavelets required for wavelet regime detection. "
+                        "Install: pip install PyWavelets"
+                    }
+                )
+
+            wavelet_name = str(p.get("wavelet", "db4")).strip()
+            n_states_wv, n_states_error, n_states_source, state_count_warnings = (
+                _resolve_state_count_param(
+                    p,
+                    default=3,
+                    method="wavelet",
+                )
+            )
+            if n_states_error is not None:
+                return _finish({"error": n_states_error})
+            if n_states_wv is None:
+                n_states_wv = 3
+            energy_window, _ = _coerce_param(p, "energy_window", default=30, cast=int)
+
+            if n_states_wv < 2:
+                return _finish({"error": "n_states must be >= 2 for wavelet method."})
+            if energy_window < 1:
+                return _finish(
+                    {"error": "params.energy_window must be a positive integer."}
+                )
+            if len(x) < energy_window + 10:
+                return _finish(
+                    {
+                        "error": f"Insufficient data for wavelet regime detection "
+                        f"(need {energy_window + 10}+ bars, got {len(x)})"
+                    }
+                )
+
+            # Determine decomposition level
+            try:
+                w = _pywt.Wavelet(wavelet_name)
+            except Exception:
+                return _finish({"error": f"Unknown wavelet: {wavelet_name}"})
+            max_level = _pywt.dwt_max_level(len(x), w.dec_len)
+            user_level = p.get("level")
+            if user_level is not None:
+                level = max(1, min(int(user_level), max_level))
+            else:
+                level = max(1, min(4, max_level))
+
+            # DWT decomposition
+            coeffs = _pywt.wavedec(x, wavelet_name, mode="periodization", level=level)
+            # coeffs[0] = approx (low-freq trend), coeffs[1..level] = details (high→low freq)
+
+            # Reconstruct each detail band at full length
+            bands: List[np.ndarray] = []
+            for i in range(1, len(coeffs)):
+                # Zero out all coefficients except band i
+                zeroed = [np.zeros_like(c) for c in coeffs]
+                zeroed[i] = coeffs[i]
+                band = _pywt.waverec(zeroed, wavelet_name, mode="periodization")
+                bands.append(np.asarray(band[: len(x)], dtype=float))
+
+            if not bands:
+                return _finish(
+                    {"error": "Wavelet decomposition produced no detail bands."}
+                )
+
+            # Compute rolling energy (variance) for each band
+            n_bars = len(x)
+            n_bands = len(bands)
+            energy_matrix = np.zeros((n_bars, n_bands))
+            for bi, band in enumerate(bands):
+                sq = band**2
+                # Cumulative sum for fast rolling mean
+                cs = np.concatenate([[0.0], np.cumsum(sq)])
+                for t in range(n_bars):
+                    lo = max(0, t - energy_window + 1)
+                    hi = t + 1
+                    energy_matrix[t, bi] = (cs[hi] - cs[lo]) / max(1, hi - lo)
+
+            # Normalize energy rows to proportions (energy distribution across scales)
+            row_sums = energy_matrix.sum(axis=1, keepdims=True)
+            row_sums = np.where(row_sums < 1e-16, 1.0, row_sums)
+            energy_props = energy_matrix / row_sums
+
+            # Cluster energy profiles into regimes using KMeans
+            # (sklearn is already available from clustering branch pattern)
+            try:
+                from sklearn.cluster import KMeans as _WvKMeans
+                from sklearn.preprocessing import StandardScaler as _WvScaler
+            except ImportError:
+                return _finish(
+                    {"error": "sklearn required for wavelet regime clustering."}
+                )
+
+            # Skip leading bars where energy window isn't fully populated
+            valid_start = min(energy_window, n_bars - 1)
+            E_valid = energy_props[valid_start:]
+            if len(E_valid) < n_states_wv:
+                return _finish(
+                    {
+                        "error": f"Not enough valid bars ({len(E_valid)}) for "
+                        f"{n_states_wv} wavelet regimes."
+                    }
+                )
+
+            scaler = _WvScaler()
+            E_scaled = scaler.fit_transform(E_valid)
+
+            n_valid = E_scaled.shape[0]
+            idx = np.round(np.linspace(0, n_valid - 1, n_states_wv)).astype(int)
+            km = _WvKMeans(
+                n_clusters=n_states_wv,
+                random_state=42,
+                n_init=1,
+                init=E_scaled[idx],
+            )
+            labels = km.fit_predict(E_scaled)
+
+            # Build probability matrix from cluster distances
+            distances = km.transform(E_scaled)  # (n_valid, n_states_wv)
+            inv_dist = 1.0 / (distances + 1e-8)
+            probs_valid = inv_dist / inv_dist.sum(axis=1, keepdims=True)
+
+            # Smooth and canonicalize
+            labels, smoothing_meta = _confirm_state_changes_causally(
+                np.asarray(labels, dtype=int), min_regime_bars_val
+            )
+            labels, probs_valid, canon_meta = _canonicalize_regime_labels(
+                labels,
+                probs_valid,
+                x[valid_start:],
+            )
+            smoothing_meta["relabeled"] = canon_meta.get("relabeled", False)
+
+            # Map back to full length
+            full_states = np.full(n_bars, -1, dtype=int)
+            full_states[valid_start:] = labels
+            full_probs = np.zeros((n_bars, n_states_wv))
+            full_probs[valid_start:] = probs_valid
+
+            # Compute per-regime energy profiles for interpretability
+            regime_energy_profiles: Dict[str, Any] = {}
+            wavelet_regime_params: Dict[str, Any] = {
+                "mean_return": [],
+                "volatility": [],
+                "energy_profiles": regime_energy_profiles,
+                "n_bands": n_bands,
+                "band_labels": [f"D{i}" for i in range(1, n_bands + 1)],
+            }
+            x_valid = x[valid_start:]
+            for s in range(n_states_wv):
+                mask = labels == s
+                if mask.any():
+                    wavelet_regime_params["mean_return"].append(
+                        float(np.mean(x_valid[mask]))
+                    )
+                    wavelet_regime_params["volatility"].append(
+                        float(np.std(x_valid[mask]))
+                    )
+                    profile = energy_props[valid_start:][mask].mean(axis=0)
+                    regime_energy_profiles[str(s)] = {
+                        f"band_{bi}_energy": round(float(v), 6)
+                        for bi, v in enumerate(profile)
+                    }
+                else:
+                    wavelet_regime_params["mean_return"].append(0.0)
+                    wavelet_regime_params["volatility"].append(0.0)
+
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "times": t_fmt,
+                "state": [int(s) for s in full_states.tolist()],
+                "state_probabilities": [
+                    [float(v) for v in row] for row in full_probs.tolist()
+                ],
+                "regime_params": wavelet_regime_params,
+                "params_used": {
+                    "wavelet": wavelet_name,
+                    "level": level,
+                    "n_states": n_states_wv,
+                    "state_count_param": n_states_source,
+                    "energy_window": energy_window,
+                    "energy_window_mode": "trailing",
+                    "model_fit_scope": "full_window",
+                    "min_regime_bars": int(min_regime_bars_val),
+                    "smoothing_applied": smoothing_meta.get("smoothing_applied", False),
+                },
+            }
+            _append_warnings(payload, state_count_warnings)
+            _append_warnings(payload, _smoothing_warnings(method, smoothing_meta))
+            max_state_prob = np.max(probs_valid, axis=1) if probs_valid.size else np.array([])
+            payload["reliability"] = _common_reliability(
+                {
+                    "confidence": round(float(np.mean(max_state_prob)), 4)
+                    if max_state_prob.size
+                    else 0.0,
+                    "mean_state_probability": round(float(np.mean(max_state_prob)), 4)
+                    if max_state_prob.size
+                    else 0.0,
+                },
+                source="wavelet_cluster_distance",
+            )
+
+            if output in ("summary", "compact"):
+                n_summary = _summary_window_size(lookback, len(full_states))
+                st_tail = full_states[-n_summary:] if n_summary > 0 else full_states
+                st_tail_valid = st_tail[st_tail != -1]
+                unique, counts = np.unique(st_tail_valid, return_counts=True)
+                shares = {
+                    int(k): float(c) / float(len(st_tail_valid) or 1)
+                    for k, c in zip(unique, counts)
+                }
+                summary = {
+                    "lookback": int(n_summary),
+                    "last_state": int(full_states[-1]) if len(full_states) else None,
+                    "state_shares": shares,
+                }
+                payload = _apply_state_output_mode(
+                    payload,
+                    output=output,
+                    lookback=lookback,
+                    summary=summary,
+                )
+                if output == "summary":
+                    return _finish(payload)
+
+            return _finish(
+                _consolidate_payload(
+                    payload,
+                    method,
+                    output,
+                    include_series=include_series,
+                    max_regimes=max_regimes,
+                )
+            )
+
+        elif method == "ensemble":
+            # Consensus regime detection: run multiple fast methods and
+            # aggregate their state_probabilities via soft or hard voting.
+            state_methods = {"hmm", "gmm", "ms_ar", "clustering", "wavelet"}
+            default_sub = ["hmm", "clustering", "wavelet"]
+            sub_methods_raw = p.get("methods", default_sub)
+            if isinstance(sub_methods_raw, str):
+                sub_methods_raw = [m.strip() for m in sub_methods_raw.split(",")]
+            sub_methods: List[str] = []
+            unsupported_methods: List[str] = []
+            for candidate in sub_methods_raw:
+                normalized = _normalize_regime_method_name(candidate)
+                if normalized not in state_methods:
+                    if normalized not in unsupported_methods:
+                        unsupported_methods.append(normalized)
+                    continue
+                if normalized not in sub_methods:
+                    sub_methods.append(normalized)
+            if unsupported_methods:
+                return _finish(
+                    {
+                        "error": (
+                            "Ensemble methods must be return-canonicalized state "
+                            "classifiers. Supported methods: clustering, gmm, hmm, "
+                            "ms_ar, wavelet. Unsupported: "
+                            + ", ".join(unsupported_methods)
+                            + "."
+                        ),
+                        "error_code": "invalid_ensemble_methods",
+                    }
+                )
+            if not sub_methods:
+                return _finish({"error": "No valid sub-methods for ensemble."})
+
+            voting = str(p.get("voting", "soft")).strip().lower()
+
+            # Use the documented kurtosis heuristic when n_states is omitted.
+            # This controls output granularity; it is not statistical model selection.
+            n_states_input = p.get("n_states")
+            state_count_warnings: List[str] = []
+            n_states_source = "n_states"
+            if n_states_input is None:
+                # Analyze return distribution characteristics
+                returns_kurt = _finite_raw_kurtosis(x)
+
+                # High kurtosis (>5) suggests fat tails needing more granular regimes
+                if returns_kurt > 6.0:
+                    n_states_auto = 6  # Very granular: strong_bearish to strong_bullish
+                elif returns_kurt > 4.5:
+                    n_states_auto = 5  # Rich detail with neutral center
+                elif returns_kurt > 3.5:
+                    n_states_auto = 4  # Standard: bearish_low/high + bullish_low/high
+                else:
+                    n_states_auto = 3  # Simple: bearish/neutral/bullish
+
+                n_states_ens = n_states_auto
+                ens_auto_n_states = True
+                n_states_source = "return_kurtosis_heuristic"
+                ens_auto_metrics = {
+                    "method": "return_kurtosis_thresholds",
+                    "returns_kurtosis": round(returns_kurt, 2),
+                }
+                state_count_warnings.append(
+                    "Ensemble n_states was selected by a return-kurtosis heuristic, "
+                    "not statistical model selection. Set params.n_states explicitly "
+                    "and validate it through backtesting when state count matters."
+                )
+            else:
+                try:
+                    n_states_ens = int(n_states_input)
+                except Exception:
+                    return _finish(
+                        {"error": "n_states must be an integer >= 2 for ensemble."}
+                    )
+                ens_auto_n_states = False
+                ens_auto_metrics = {}
+
+            if n_states_ens < 2:
+                return _finish({"error": "n_states must be >= 2 for ensemble."})
+
+            # Run each sub-method with include_series so we get raw state data
+            sub_results: List[Dict[str, Any]] = []
+            sub_errors: List[str] = []
+            for sm in sub_methods:
+                sub_params = dict(p)
+                sub_params.pop("methods", None)
+                sub_params.pop("voting", None)
+                sub_params.setdefault("n_states", n_states_ens)
+                try:
+                    sr = call_tool_sync_structured(
+                        regime_detect,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        limit=limit,
+                        method=sm,  # type: ignore[arg-type]
+                        target=target,
+                        params=sub_params,
+                        denoise=denoise,
+                        threshold=threshold,
+                        detail="full",
+                        lookback=lookback,
+                        include_series=True,
+                        min_regime_bars=min_regime_bars,
+                        raw_tool_output=True,
+                    )
+                except Exception as exc:
+                    sub_errors.append(f"{sm}: {exc}")
+                    continue
+                if isinstance(sr, dict) and sr.get("error"):
+                    sub_errors.append(f"{sm}: {sr['error']}")
+                    continue
+                sub_results.append({"method": sm, "result": sr})
+
+            if not sub_results:
+                return _finish(
+                    {
+                        "error": f"All ensemble sub-methods failed: {'; '.join(sub_errors)}"
+                    }
+                )
+
+            # Extract return-canonicalized state arrays from sub-results.
+            state_arrays: List[np.ndarray] = []
+            prob_arrays: List[np.ndarray] = []  # (n_bars, n_states) per method
+            prob_valid_masks: List[np.ndarray] = []
+            method_names: List[str] = []
+            ref_len = len(t_fmt)
+
+            for sr_info in sub_results:
+                sm_name = sr_info["method"]
+                sr = sr_info["result"]
+                series = sr.get("series", {})
+
+                raw_state = series.get("state", sr.get("state", []))
+                raw_probs = series.get(
+                    "state_probabilities", sr.get("state_probabilities", [])
+                )
+                if raw_state is None or len(raw_state) != ref_len:
+                    continue
+
+                st = np.asarray(raw_state, dtype=int)
+                if raw_probs is not None and len(raw_probs) == ref_len:
+                    pr = np.asarray(raw_probs, dtype=float)
+                    if pr.ndim != 2:
+                        pr = np.zeros((ref_len, n_states_ens))
+                    else:
+                        pr = np.nan_to_num(pr, nan=0.0, posinf=0.0, neginf=0.0)
+                        # Pad or trim columns to n_states_ens
+                        if pr.shape[1] < n_states_ens:
+                            pr = np.pad(
+                                pr,
+                                ((0, 0), (0, n_states_ens - pr.shape[1])),
+                            )
+                        elif pr.shape[1] > n_states_ens:
+                            pr = pr[:, :n_states_ens]
+                    row_sums = np.sum(pr, axis=1, keepdims=True)
+                    positive_rows = np.isfinite(row_sums[:, 0]) & (row_sums[:, 0] > 0)
+                    if np.any(positive_rows):
+                        pr[positive_rows] = pr[positive_rows] / row_sums[positive_rows]
+                    valid_mask = (st >= 0) & (st < n_states_ens) & positive_rows
+                    pr[~valid_mask] = 0.0
+                else:
+                    # Hard assignment fallback
+                    pr = np.zeros((ref_len, n_states_ens))
+                    valid_mask = (st >= 0) & (st < n_states_ens)
+                    for i, s in enumerate(st):
+                        if bool(valid_mask[i]):
+                            pr[i, s] = 1.0
+
+                if not np.any(valid_mask):
+                    continue
+                state_arrays.append(st)
+                prob_arrays.append(pr)
+                prob_valid_masks.append(valid_mask)
+                method_names.append(sm_name)
+
+            if not prob_arrays:
+                return _finish({"error": "No sub-methods produced usable state data."})
+
+            # Aggregate
+            if voting == "hard":
+                # Majority vote over methods that have a valid state for the bar.
+                ensemble_state = np.full(ref_len, -1, dtype=int)
+                ensemble_probs = np.zeros((ref_len, n_states_ens))
+                for t_idx in range(ref_len):
+                    votes = [
+                        int(state_arr[t_idx])
+                        for state_arr, valid_mask in zip(
+                            state_arrays, prob_valid_masks
+                        )
+                        if bool(valid_mask[t_idx])
+                        and 0 <= int(state_arr[t_idx]) < n_states_ens
+                    ]
+                    if not votes:
+                        continue
+                    counts = Counter(votes)
+                    majority, _count = counts.most_common(1)[0]
+                    ensemble_state[t_idx] = int(majority)
+                    for state_id, count in counts.items():
+                        ensemble_probs[t_idx, int(state_id)] = float(count) / float(
+                            len(votes)
+                        )
+            else:
+                # Soft voting: average probabilities across valid methods per bar.
+                ensemble_probs = np.zeros((ref_len, n_states_ens))
+                valid_counts = np.zeros(ref_len, dtype=float)
+                for pr, valid_mask in zip(prob_arrays, prob_valid_masks):
+                    rows = valid_mask & (np.sum(pr, axis=1) > 0)
+                    if not np.any(rows):
+                        continue
+                    ensemble_probs[rows] += pr[rows]
+                    valid_counts[rows] += 1.0
+                valid_rows = valid_counts > 0
+                if np.any(valid_rows):
+                    ensemble_probs[valid_rows] = (
+                        ensemble_probs[valid_rows] / valid_counts[valid_rows, None]
+                    )
+                ensemble_state = np.full(ref_len, -1, dtype=int)
+                ensemble_state[valid_rows] = np.argmax(
+                    ensemble_probs[valid_rows],
+                    axis=1,
+                ).astype(int)
+
+            # Smooth and canonicalize
+            valid_ensemble_mask = (ensemble_state >= 0) & (
+                np.sum(ensemble_probs, axis=1) > 0
+            )
+            if not np.any(valid_ensemble_mask):
+                return _finish({"error": "No valid ensemble state rows after voting."})
+
+            valid_state, smoothing_meta = _confirm_state_changes_causally(
+                ensemble_state[valid_ensemble_mask], min_regime_bars_val
+            )
+            valid_probs = ensemble_probs[valid_ensemble_mask]
+            valid_state, valid_probs, canon_meta = _canonicalize_regime_labels(
+                valid_state,
+                valid_probs,
+                x[valid_ensemble_mask],
+            )
+            ensemble_state = np.full(ref_len, -1, dtype=int)
+            ensemble_probs = np.zeros((ref_len, n_states_ens))
+            ensemble_state[valid_ensemble_mask] = valid_state
+            ensemble_probs[valid_ensemble_mask] = valid_probs
+            smoothing_meta["relabeled"] = canon_meta.get("relabeled", False)
+
+            # Agreement score: fraction of methods that agree per bar
+            agreement = np.zeros(ref_len)
+            for t_idx in range(ref_len):
+                votes = [
+                    int(state_arr[t_idx])
+                    for state_arr, valid_mask in zip(state_arrays, prob_valid_masks)
+                    if bool(valid_mask[t_idx])
+                    and 0 <= int(state_arr[t_idx]) < n_states_ens
+                ]
+                if votes:
+                    most_common = max(set(votes), key=votes.count)
+                    agreement[t_idx] = votes.count(most_common) / len(votes)
+
+            # Compute regime parameters (mean, vol) for each ensemble state
+            mean_agreement = round(
+                float(np.mean(agreement[valid_ensemble_mask])),
+                4,
+            )
+            ensemble_regime_params = {
+                "mean_return": [],
+                "volatility": [],
+            }
+            for s in range(n_states_ens):
+                mask = ensemble_state == s
+                if mask.any():
+                    ensemble_regime_params["mean_return"].append(
+                        float(np.mean(x[mask]))
+                    )
+                    ensemble_regime_params["volatility"].append(float(np.std(x[mask])))
+                else:
+                    ensemble_regime_params["mean_return"].append(0.0)
+                    ensemble_regime_params["volatility"].append(0.0)
+
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "times": t_fmt,
+                "state": [int(s) for s in ensemble_state.tolist()],
+                "state_probabilities": [
+                    [float(v) for v in row] for row in ensemble_probs.tolist()
+                ],
+                "regime_params": ensemble_regime_params,
+                "ensemble_info": {
+                    "sub_methods": method_names,
+                    "voting": voting,
+                    "mean_agreement": mean_agreement,
+                },
+                "params_used": {
+                    "methods": method_names,
+                    "voting": voting,
+                    "n_states": n_states_ens,
+                    "state_count_param": n_states_source,
+                    "n_states_auto": bool(ens_auto_n_states),
+                    "n_methods_succeeded": len(method_names),
+                    "min_regime_bars": int(min_regime_bars_val),
+                    "smoothing_applied": smoothing_meta.get("smoothing_applied", False),
+                },
+            }
+            if ens_auto_metrics:
+                payload["params_used"]["state_count_heuristic"] = ens_auto_metrics
+                payload["auto_detection"] = ens_auto_metrics
+            if sub_errors:
+                payload["warnings"] = [f"Sub-method errors: {'; '.join(sub_errors)}"]
+            _append_warnings(payload, state_count_warnings)
+            _append_warnings(payload, _smoothing_warnings(method, smoothing_meta))
+            payload["reliability"] = _common_reliability(
+                {
+                    "confidence": mean_agreement,
+                    "methods_considered": method_names,
+                },
+                source="ensemble_agreement",
+            )
+
+            if output in ("summary", "compact"):
+                n_summary = _summary_window_size(lookback, len(ensemble_state))
+                st_tail = (
+                    ensemble_state[-n_summary:] if n_summary > 0 else ensemble_state
+                )
+                st_tail_valid = st_tail[st_tail >= 0]
+                unique, counts = np.unique(st_tail_valid, return_counts=True)
+                shares = {
+                    int(k): float(c) / float(len(st_tail_valid) or 1)
+                    for k, c in zip(unique, counts)
+                }
+                summary = {
+                    "lookback": int(n_summary),
+                    "last_state": int(ensemble_state[-1])
+                    if len(ensemble_state)
+                    else None,
+                    "state_shares": shares,
+                    "mean_agreement": mean_agreement,
+                }
+                payload = _apply_state_output_mode(
+                    payload,
+                    output=output,
+                    lookback=lookback,
+                    summary=summary,
+                )
+                if output == "summary":
+                    return _finish(payload)
+
+            return _finish(
+                _consolidate_payload(
+                    payload,
+                    method,
+                    output,
+                    include_series=include_series,
+                    max_regimes=max_regimes,
+                )
+            )
+
+        elif method == "all":
+            # Run all methods and return individual results for comparison
+            detail_value = output
+            sub_detail = "full" if verbosity_output == "full" else "compact"
+            include_series_for_subcalls = bool(include_series) and sub_detail == "full"
+            all_methods = [
+                "bocpd",
+                "pelt",
+                "hmm",
+                "ms_ar",
+                "clustering",
+                "garch",
+                "wavelet",
+                "rule_based",
+            ]
+            results_by_method: Dict[str, Any] = {}
+            all_errors: List[str] = []
+            method_durations_ms: Dict[str, float] = {}
+            method_errors: Dict[str, str] = {}
+
+            for m in all_methods:
+                method_started_at = time.perf_counter()
+                try:
+                    sub_params = dict(p)
+                    # Only set default n_states for methods that don't auto-detect
+                    # GARCH auto-detects optimal n_states, don't force a default
+                    if m in ("hmm", "ms_ar", "clustering"):
+                        sub_params.setdefault("n_states", 2)
+                    # GARCH: if n_states not explicitly set, leave it out for auto-detection
+                    sr = call_tool_sync_structured(
+                        regime_detect,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        limit=limit,
+                        method=m,  # type: ignore[arg-type]
+                        target=target,
+                        params=sub_params,
+                        denoise=denoise,
+                        threshold=threshold,
+                        detail=sub_detail,  # type: ignore[arg-type]
+                        lookback=lookback,
+                        include_series=include_series_for_subcalls,
+                        min_regime_bars=min_regime_bars,
+                        raw_tool_output=True,
+                    )
+                    if isinstance(sr, dict) and not sr.get("error"):
+                        # Strip redundant fields that are already at top level
+                        # (symbol, timeframe, method, target, success)
+                        cleaned_result = {
+                            k: v
+                            for k, v in sr.items()
+                            if k
+                            not in (
+                                "symbol",
+                                "timeframe",
+                                "method",
+                                "target",
+                                "success",
+                            )
+                        }
+                        results_by_method[m] = cleaned_result
+                    else:
+                        error_text = (
+                            str(sr.get("error", "unknown error"))
+                            if isinstance(sr, dict)
+                            else "unknown error"
+                        )
+                        method_errors[m] = error_text
+                        all_errors.append(f"{m}: {error_text}")
+                except Exception as exc:
+                    method_errors[m] = str(exc)
+                    all_errors.append(f"{m}: {exc}")
+                finally:
+                    method_durations_ms[m] = round(
+                        (time.perf_counter() - method_started_at) * 1000.0,
+                        3,
+                    )
+
+            if not results_by_method:
+                return _finish(
+                    {
+                        "error": f"All methods failed: {'; '.join(all_errors)}",
+                        "error_code": "regime_methods_failed",
+                        "runtime": {
+                            "completed_methods": [],
+                            "failed_methods": list(method_errors.keys()),
+                            "method_errors": method_errors,
+                            "method_durations_ms": method_durations_ms,
+                            "partial_results": False,
+                            "suggested_faster_methods": _suggest_faster_regime_methods(
+                                all_methods
+                            ),
+                            "method_guidance": _regime_runtime_guidance(
+                                ["all", *all_methods]
+                            ),
+                        },
+                    }
+                )
+
+            # Also run ensemble to provide consensus view
+            try:
+                ensemble_started_at = time.perf_counter()
+                ens_params = dict(p)
+                ens_params["methods"] = list(
+                    results_by_method.keys()
+                )  # Use methods that succeeded
+                ensemble_result = call_tool_sync_structured(
+                    regime_detect,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                    method="ensemble",
+                    target=target,
+                    params=ens_params,
+                    denoise=denoise,
+                    threshold=threshold,
+                    detail=sub_detail,  # type: ignore[arg-type]
+                    lookback=lookback,
+                    include_series=include_series_for_subcalls,
+                    min_regime_bars=min_regime_bars,
+                    raw_tool_output=True,
+                )
+                if isinstance(ensemble_result, dict) and not ensemble_result.get(
+                    "error"
+                ):
+                    # Strip redundant fields
+                    results_by_method["ensemble"] = {
+                        k: v
+                        for k, v in ensemble_result.items()
+                        if k
+                        not in ("symbol", "timeframe", "method", "target", "success")
+                    }
+                    method_durations_ms["ensemble"] = round(
+                        (time.perf_counter() - ensemble_started_at) * 1000.0,
+                        3,
+                    )
+                else:
+                    error_text = (
+                        str(ensemble_result.get("error", "unknown error"))
+                        if isinstance(ensemble_result, dict)
+                        else "unknown error"
+                    )
+                    method_errors["ensemble"] = error_text
+                    method_durations_ms["ensemble"] = round(
+                        (time.perf_counter() - ensemble_started_at) * 1000.0,
+                        3,
+                    )
+            except Exception as exc:
+                # Ensemble is optional, don't fail if it errors
+                method_errors["ensemble"] = str(exc)
+                method_durations_ms["ensemble"] = round(
+                    (time.perf_counter() - ensemble_started_at) * 1000.0,
+                    3,
+                )
+
+            comparison = _build_all_method_comparison(results_by_method)
+            comparison["methods_failed"] = [e.split(":")[0] for e in all_errors]
+            individual_methods_succeeded = [
+                method_name
+                for method_name in all_methods
+                if method_name in results_by_method
+            ]
+            ensemble_aggregated = "ensemble" in results_by_method
+
+            summary_payload: Optional[Dict[str, Any]] = None
+            if detail_value in {"summary", "compact"}:
+                summary_payload = {
+                    "methods_attempted": int(len(all_methods)),
+                    "methods_succeeded": int(len(individual_methods_succeeded)),
+                    "methods_failed": int(len(all_errors)),
+                }
+                if ensemble_aggregated:
+                    summary_payload["ensemble_aggregated"] = True
+                agreement_summary = comparison.get("agreement")
+                if isinstance(agreement_summary, dict):
+                    summary_payload["agreement"] = agreement_summary
+                # Summary/compact modes drop per-method regimes and diagnostics.
+                compact_comparison = {
+                    "methods_run": comparison.get("methods_run"),
+                    "methods_failed": comparison.get("methods_failed"),
+                }
+                if detail_value == "compact":
+                    compact_comparison["agreement"] = comparison.get("agreement")
+                comparison = compact_comparison
+            runtime_payload: Dict[str, Any] = {
+                "completed_methods": list(individual_methods_succeeded),
+                "failed_methods": list(method_errors.keys()),
+                "partial_results": bool(method_errors),
+            }
+            if ensemble_aggregated:
+                runtime_payload["ensemble_aggregated"] = True
+            if method_errors:
+                runtime_payload["method_errors"] = method_errors
+            if detail_value == "full":
+                runtime_payload["method_durations_ms"] = method_durations_ms
+                runtime_payload["suggested_faster_methods"] = (
+                    _suggest_faster_regime_methods(all_methods)
+                )
+                runtime_payload["method_guidance"] = _regime_runtime_guidance(
+                    ["all", *all_methods, "ensemble"]
+                )
+
+            payload = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": method,
+                "target": target,
+                "detail": detail_value,
+                "comparison": comparison,
+                "runtime": runtime_payload,
+            }
+            if detail_value == "full":
+                payload["params_used"] = {
+                    "methods_attempted": all_methods,
+                    "methods_succeeded": list(individual_methods_succeeded),
+                    "methods_failed": [e.split(":")[0] for e in all_errors],
+                }
+                if ensemble_aggregated:
+                    payload["params_used"]["ensemble_aggregated"] = True
+            if summary_payload is not None:
+                payload["summary"] = summary_payload
+            if detail_value == "full":
+                payload["results"] = results_by_method
+            if all_errors:
+                payload["warnings"] = [f"Method errors: {'; '.join(all_errors)}"]
+
+            return _finish(payload)
+
+    except Exception as e:
+        return _finish({"error": f"Error detecting regimes: {str(e)}"})

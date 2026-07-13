@@ -20,7 +20,7 @@ Identifies specific visual patterns that traders use for entry/exit signals.
 Single or multi-bar patterns with historical significance.
 
 ```bash
-python cli.py patterns_detect EURUSD --timeframe H1 --mode candlestick --limit 200
+mtdata-cli patterns_detect EURUSD --timeframe H1 --mode candlestick --limit 200
 ```
 
 **Output:**
@@ -34,7 +34,7 @@ data[29]{time,pattern}:
 
 **Filter to robust patterns only:**
 ```bash
-python cli.py patterns_detect EURUSD --mode candlestick --robust-only true
+mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true
 ```
 
 **Common patterns detected:**
@@ -52,7 +52,7 @@ python cli.py patterns_detect EURUSD --mode candlestick --robust-only true
 Larger geometric patterns formed over multiple bars.
 
 ```bash
-python cli.py patterns_detect EURUSD --timeframe H1 --mode classic --limit 500
+mtdata-cli patterns_detect EURUSD --timeframe H1 --mode classic --limit 500
 ```
 
 **Patterns detected:**
@@ -65,27 +65,107 @@ python cli.py patterns_detect EURUSD --timeframe H1 --mode classic --limit 500
 | **Wedge** | Rising or falling wedge |
 | **Rectangle** | Horizontal consolidation |
 
+### Harmonic Patterns
+
+Fibonacci-ratio patterns built from alternating pivot legs.
+
+The harmonic detector reports completed XABCD/ABCD structures rather than
+forming candidates. These completions are the primary harmonic findings and
+are therefore returned even when the shared `--include-completed` flag is
+false. That flag continues to control historical visibility for lifecycle-aware
+classic, Elliott, and fractal modes.
+
+```bash
+mtdata-cli patterns_detect EURUSD --timeframe H1 --mode harmonic --limit 500
+```
+
+**Patterns detected:**
+| Pattern | Description |
+|---------|-------------|
+| **ABCD** | Four-point measured-move completion |
+| **Gartley** | XABCD retracement pattern with 0.786 XA completion |
+| **Bat / Alternate Bat** | XABCD patterns with deeper D-point completion |
+| **Butterfly** | XABCD extension beyond X |
+| **Crab / Deep Crab** | Extended XABCD completion patterns |
+| **Shark, Cypher, 5-0** | Additional Fibonacci-ratio reversal structures |
+
+**Useful harmonic config:**
+```bash
+mtdata-cli patterns_detect EURUSD --timeframe H1 --mode harmonic \
+  --config "pattern_types=gartley,bat,crab ratio_tolerance=0.06 min_confidence=0.45"
+```
+
+**Common output fields:**
+| Field | Meaning |
+|-------|---------|
+| `entry_price` | D-point completion price |
+| `target_price`, `target_price_1`, `target_price_2` | CD retracement targets |
+| `invalidation_price` | Pattern invalidation level with configured buffer |
+| `price_levels` | Entry, targets, invalidation, and PRZ levels |
+| `details.ratios` | Measured Fibonacci ratios for the candidate |
+
+### Fractal Patterns
+
+Bill Williams-style bullish and bearish fractal levels with confirmation and breakout context.
+
+```bash
+mtdata-cli patterns_detect EURUSD --timeframe H1 --mode fractal --limit 300
+```
+
+**Useful fractal config:**
+```bash
+mtdata-cli patterns_detect EURUSD --timeframe H1 --mode fractal \
+  --config "left_bars=2 right_bars=2 breakout_basis=high_low"
+```
+
+**Common output fields:**
+| Field | Meaning |
+|-------|---------|
+| `level_price` | Confirmed fractal high/low level |
+| `status` | Level lifecycle: `active` or `broken` (not pattern completion) |
+| `level_state` | `active` when unbroken, `broken` after price breaches the level |
+| `confirmation_date` | When the fractal became knowable after the right-side bars closed |
+| `breakout_direction` | Direction of the later level break (`bullish` or `bearish`) |
+| `breakout_date` | When the breakout occurred, if any |
+
+Active levels are informational support/resistance context and have neutral
+signal bias. A broken level takes the breakout direction as its bias. By
+default, active levels are returned and historical broken levels are hidden;
+use `--include-completed true` to include broken levels as well.
+
 ### Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--mode` | `candlestick` | Pattern type: candlestick, classic, elliott |
-| `--limit` | 500 | Bars to analyze |
-| `--robust-only` | false | Only return high-confidence patterns |
+| `--mode` | `candlestick` | Pattern type: all, candlestick, classic, harmonic, fractal, elliott |
+| `--limit` | 150 | Bars to analyze |
+| `--robust-only` | false | Only return high-confidence candlestick patterns. Pass `true` to filter to the robust subset. |
 | `--whitelist` | — | Comma-separated list of specific patterns |
-| `--min-strength` | — | Minimum pattern strength score |
+| `--min-strength` | 0.70 | Minimum semantic candlestick conviction score (0.0-1.0) |
+| `--config` | — | Detector-specific overrides. Fractals support `left_bars`, `right_bars`, `breakout_basis`, `min_prominence_pct`, and `confidence_prominence_cap_pct`. Harmonics support `pattern_types`, `ratio_tolerance`, `min_confidence`, and pivot controls. |
+
+Pattern names listed in this guide describe detector coverage, not a promise
+that every pattern is returned at the default threshold. `robust_only=true`
+further restricts candlesticks to the robust subset; lower-strength and
+deprioritized formations such as many dojis may be absent by default.
 
 ### Filtering Patterns
 
+Classic detector config values `max_pattern_age_bars` and
+`max_pattern_span_bars` bound all detector results, including completed
+patterns. `--include-completed true` adds completed structures that remain
+inside those detection bounds; it does not request an unbounded historical
+scan.
+
 **By name:**
 ```bash
-python cli.py patterns_detect EURUSD --mode candlestick \
+mtdata-cli patterns_detect EURUSD --mode candlestick \
   --whitelist "ENGULFING,HAMMER,DOJI"
 ```
 
 **By confidence:**
 ```bash
-python cli.py patterns_detect EURUSD --mode candlestick --robust-only true
+mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true
 ```
 
 ---
@@ -106,8 +186,8 @@ Finds historical windows that "look like" the current market and uses them to pr
 ### Basic Usage
 
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model analog --model-params "window_size=64 top_k=20"
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method analog --params "window_size=64 top_k=20"
 ```
 
 ### Parameters
@@ -132,18 +212,25 @@ python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
 
 ### Distance Metrics
 
+The `metric` parameter controls the initial candidate search (must be fast — Euclidean-family):
+
 | Metric | Description |
 |--------|-------------|
-| `euclidean` | Standard L2 distance (fast) |
-| `cosine` | Cosine similarity (shape-focused) |
-| `dtw` | Dynamic Time Warping (handles warping) |
+| `euclidean` | Standard L2 distance (default, fastest) |
+
+The `refine_metric` parameter re-ranks candidates using a slower, more precise metric:
+
+| Refine Metric | Description |
+|---------------|-------------|
+| `dtw` | Dynamic Time Warping (handles time warping) |
 | `softdtw` | Differentiable DTW |
 | `ncc` | Normalized cross-correlation |
+| `affine` | Affine-invariant distance |
 
 **Example with refinement:**
 ```bash
-python cli.py forecast_generate EURUSD --horizon 12 \
-  --model analog --model-params "window_size=64 metric=euclidean refine_metric=dtw"
+mtdata-cli forecast_generate EURUSD --horizon 12 \
+  --method analog --params "window_size=64 metric=euclidean refine_metric=dtw"
 ```
 
 This first finds candidates with fast Euclidean distance, then refines ranking using DTW.
@@ -153,7 +240,7 @@ This first finds candidates with fast Euclidean distance, then refines ranking u
 | Engine | Description |
 |--------|-------------|
 | `ckdtree` | Scipy KD-tree (default, fast) |
-| `hnsw` | Approximate nearest neighbor (scalable) |
+| `hnsw` | Approximate nearest neighbor (scalable, optional `hnswlib` backend; not part of the default Python 3.14 environment, but available through the opt-in native/source-build path in [../SETUP.md](../SETUP.md)) |
 | `matrix_profile` | STUMPY-based (specialized for time series) |
 | `mass` | Mueen's MASS algorithm |
 
@@ -167,7 +254,7 @@ Use pattern detection as a confirmation signal:
 
 ```bash
 # Check for reversal patterns at support
-python cli.py patterns_detect EURUSD --mode candlestick --robust-only true
+mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true
 
 # If bullish pattern detected at support level → consider long entry
 ```
@@ -178,8 +265,8 @@ Use analog forecasts to set price targets:
 
 ```bash
 # Find similar historical patterns
-python cli.py forecast_generate EURUSD --model analog \
-  --model-params "window_size=64 top_k=20" --format json
+mtdata-cli forecast_generate EURUSD --method analog \
+  --params "window_size=64 top_k=20" --json
 
 # Use forecast percentiles for TP levels
 ```
@@ -188,11 +275,11 @@ python cli.py forecast_generate EURUSD --model analog \
 
 ```bash
 # Get patterns and indicators together
-python cli.py data_fetch_candles EURUSD --limit 200 \
+mtdata-cli data_fetch_candles EURUSD --limit 200 \
   --indicators "ema(20),rsi(14)"
 
 # Then check patterns
-python cli.py patterns_detect EURUSD --mode candlestick --robust-only true
+mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true
 
 # Look for pattern + indicator confluence
 ```
@@ -236,11 +323,13 @@ data[5]{time,pattern}:
 
 | Task | Command |
 |------|---------|
-| Candlestick patterns | `python cli.py patterns_detect EURUSD --mode candlestick` |
-| Robust patterns only | `python cli.py patterns_detect EURUSD --mode candlestick --robust-only true` |
-| Chart patterns | `python cli.py patterns_detect EURUSD --mode classic` |
-| Analog forecast | `python cli.py forecast_generate EURUSD --model analog --model-params "window_size=64 top_k=20"` |
-| Analog with DTW | `python cli.py forecast_generate EURUSD --model analog --model-params "refine_metric=dtw"` |
+| Candlestick patterns | `mtdata-cli patterns_detect EURUSD --mode candlestick` |
+| Robust patterns only | `mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true` |
+| Chart patterns | `mtdata-cli patterns_detect EURUSD --mode classic` |
+| Harmonic patterns | `mtdata-cli patterns_detect EURUSD --mode harmonic` |
+| Fractal levels and breakouts | `mtdata-cli patterns_detect EURUSD --mode fractal` |
+| Analog forecast | `mtdata-cli forecast_generate EURUSD --method analog --params "window_size=64 top_k=20"` |
+| Analog with DTW | `mtdata-cli forecast_generate EURUSD --method analog --params "refine_metric=dtw"` |
 
 ---
 
@@ -249,3 +338,4 @@ data[5]{time,pattern}:
 - [../FORECAST.md](../FORECAST.md) — Price forecasting overview
 - [../TECHNICAL_INDICATORS.md](../TECHNICAL_INDICATORS.md) — Technical indicators
 - [../GLOSSARY.md](../GLOSSARY.md) — Term definitions
+

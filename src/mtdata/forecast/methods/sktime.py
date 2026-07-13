@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+import logging
 import warnings
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 
-from ..interface import ForecastMethod, ForecastResult
-from ..registry import ForecastRegistry
+from ..common import build_ci_diagnostics as _build_ci_diagnostics
+from ..interface import CancelToken, ForecastMethod, ForecastResult, ProgressReporter, TrainResult
+from ..forecast_registry import ForecastRegistry
 
 try:
     import importlib.util as _importlib_util
@@ -15,6 +18,7 @@ except Exception:
     _HAS_SKTIME = False
 
 _SKTIME_IMPORT_ERROR = "sktime is not installed; install it to enable sktime-based forecast methods."
+logger = logging.getLogger(__name__)
 
 class SktimeMethod(ForecastMethod):
     """Base class for Sktime methods."""
@@ -34,7 +38,118 @@ class SktimeMethod(ForecastMethod):
     def _get_estimator(self, seasonality: int, params: Dict[str, Any]):
         raise NotImplementedError
 
-    def forecast(
+    # ------------------------------------------------------------------
+    # Train / predict lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_training(self) -> bool:
+        return True
+
+    @property
+    def training_category(self):
+        return "fast"
+
+    @property
+    def train_supports_cancel(self) -> bool:
+        return True
+
+    @property
+    def train_supports_progress(self) -> bool:
+        return True
+
+    def train(
+        self,
+        series: pd.Series,
+        horizon: int,
+        seasonality: int,
+        params: Dict[str, Any],
+        *,
+        progress_callback=None,
+        cancel_token: Optional[CancelToken] = None,
+        exog=None,
+        **kwargs,
+    ) -> TrainResult:
+        if not _HAS_SKTIME:
+            raise RuntimeError(_SKTIME_IMPORT_ERROR)
+        reporter = ProgressReporter(progress_callback, total_steps=3)
+        reporter.stage(0, "Preparing sktime training data", force=True)
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+
+        y = series.copy()
+        if not isinstance(y.index, pd.RangeIndex) and getattr(y.index, "freq", None) is None:
+            try:
+                y.index.freq = pd.infer_freq(y.index)
+            except Exception:
+                pass
+        if not isinstance(y.index, pd.RangeIndex) and getattr(y.index, "freq", None) is None:
+            y = y.reset_index(drop=True)
+
+        estimator = self._get_estimator(seasonality, params)
+        reporter.stage(1, "Fitting sktime estimator", force=True)
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+
+        X = exog if exog is not None else params.get('exog_used')
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X, index=y.index)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if X is not None:
+                estimator.fit(y, X=X)
+            else:
+                estimator.fit(y)
+
+        artifact_bytes = self.serialize_artifact(estimator)
+        reporter.stage(3, "Training complete", force=True)
+        return TrainResult(
+            artifact_bytes=artifact_bytes,
+            params_used={"seasonality": seasonality, **params},
+        )
+
+    def predict_with_model(
+        self,
+        model,
+        series: pd.Series,
+        horizon: int,
+        seasonality: int,
+        params: Dict[str, Any],
+        *,
+        exog_future=None,
+        **kwargs,
+    ) -> ForecastResult:
+        if not _HAS_SKTIME:
+            raise RuntimeError(_SKTIME_IMPORT_ERROR)
+
+        estimator = model  # deserialized sktime estimator
+        fh = np.arange(1, horizon + 1)
+
+        X_future = kwargs.get('exog_future')
+        if X_future is None:
+            X_future = exog_future if exog_future is not None else params.get('exog_future')
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if X_future is not None:
+                y_pred = estimator.predict(fh=fh, X=X_future)
+            else:
+                y_pred = estimator.predict(fh=fh)
+
+        if isinstance(y_pred, pd.Series):
+            f_vals = y_pred.values
+        elif isinstance(y_pred, pd.DataFrame):
+            f_vals = y_pred.iloc[:, 0].values
+        else:
+            f_vals = np.array(y_pred)
+
+        return ForecastResult(
+            forecast=f_vals,
+            params_used={"seasonality": seasonality, **params},
+        )
+
+    def forecast(  # noqa: C901
         self, 
         series: pd.Series, 
         horizon: int, 
@@ -133,12 +248,15 @@ class SktimeMethod(ForecastMethod):
                 
             # CI extraction
             ci_values = None
+            metadata: Dict[str, Any] = {}
             ci_alpha = kwargs.get('ci_alpha', params.get('ci_alpha'))
             if ci_alpha is not None:
+                ci_alpha_value: Optional[float] = None
                 try:
                     # sktime predict_interval returns DataFrame with MultiIndex columns (coverage, lower/upper)
                     # coverage is 1 - alpha? No, coverage is e.g. 0.9 for alpha 0.1
-                    coverage = 1.0 - float(ci_alpha)
+                    ci_alpha_value = float(ci_alpha)
+                    coverage = 1.0 - ci_alpha_value
                     intervals = estimator.predict_interval(fh=fh, X=X_future, coverage=coverage)
                     # intervals columns: (var_name, coverage, 'lower'/'upper')
                     # We assume univariate
@@ -152,28 +270,71 @@ class SktimeMethod(ForecastMethod):
                     # Let's try to find them dynamically
                     lo_vals = None
                     hi_vals = None
+                    interval_columns = [str(col) for col in cols]
                     
                     for col in cols:
                         # col is a tuple
-                        if len(col) >= 3:
-                            cov = col[1]
+                        if isinstance(col, tuple) and len(col) >= 3:
+                            try:
+                                cov = float(col[1])
+                            except (TypeError, ValueError):
+                                continue
                             direction = col[2]
-                            if abs(cov - coverage) < 1e-6:
+                            if np.isclose(cov, coverage, atol=1e-3, rtol=0.0):
                                 if direction == 'lower':
                                     lo_vals = intervals[col].values
                                 elif direction == 'upper':
                                     hi_vals = intervals[col].values
                     
                     if lo_vals is not None and hi_vals is not None:
-                         ci_values = (lo_vals.astype(float), hi_vals.astype(float))
-                         
-                except Exception:
-                    pass
+                        ci_values = (lo_vals.astype(float), hi_vals.astype(float))
+                        metadata = _build_ci_diagnostics(
+                            provider=self.name,
+                            requested=True,
+                            available=True,
+                            status="available",
+                            alpha=ci_alpha_value,
+                            coverage=coverage,
+                        )
+                    else:
+                        warning_text = (
+                            f"Sktime {self.name} did not return matching interval columns for coverage "
+                            f"{coverage:g}; returning point forecast only."
+                        )
+                        logger.warning("%s Columns=%s", warning_text, interval_columns)
+                        metadata = _build_ci_diagnostics(
+                            provider=self.name,
+                            requested=True,
+                            available=False,
+                            status="unavailable",
+                            alpha=ci_alpha_value,
+                            coverage=coverage,
+                            warning=warning_text,
+                            interval_columns=interval_columns,
+                        )
+
+                except Exception as ex:
+                    warning_text = (
+                        f"Sktime {self.name} confidence interval extraction failed: {ex}. "
+                        "Returning point forecast only."
+                    )
+                    logger.warning("%s", warning_text)
+                    metadata = _build_ci_diagnostics(
+                        provider=self.name,
+                        requested=True,
+                        available=False,
+                        status="error",
+                        alpha=ci_alpha_value,
+                        warning=warning_text,
+                        error=str(ex),
+                        error_type=type(ex).__name__,
+                    )
 
             return ForecastResult(
                 forecast=f_vals,
                 ci_values=ci_values,
-                params_used={"seasonality": seasonality, **params}
+                params_used={"seasonality": seasonality, **params},
+                metadata=metadata or None,
             )
             
         except Exception as ex:
@@ -182,6 +343,10 @@ class SktimeMethod(ForecastMethod):
 @ForecastRegistry.register("sktime")
 class GenericSktimeMethod(SktimeMethod):
     """Generic wrapper for any Sktime estimator."""
+
+    CAPABILITY_EXECUTION_LIBRARY = "sktime"
+    CAPABILITY_SELECTOR_KEY = "estimator"
+    CAPABILITY_SELECTOR_MODE = "dotted_path"
 
     PARAMS: List[Dict[str, Any]] = [
         {"name": "estimator", "type": "str", "description": "Fully qualified class path."},
@@ -205,7 +370,14 @@ class GenericSktimeMethod(SktimeMethod):
         try:
             module_path, class_name = estimator_path.rsplit('.', 1)
             import importlib
-            module = importlib.import_module(module_path)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=DeprecationWarning)
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*swigvarlink.*",
+                    category=DeprecationWarning,
+                )
+                module = importlib.import_module(module_path)
             estimator_cls = getattr(module, class_name)
         except (ValueError, ImportError, AttributeError) as e:
              raise ValueError(f"Could not import sktime estimator '{estimator_path}': {e}")
@@ -231,6 +403,9 @@ class GenericSktimeMethod(SktimeMethod):
 class SktThetaMethod(GenericSktimeMethod):
     """Alias for `sktime` using `sktime.forecasting.theta.ThetaForecaster`."""
 
+    CAPABILITY_SELECTOR_VALUE = "sktime.forecasting.theta.ThetaForecaster"
+    CAPABILITY_ALIASES = ("ThetaForecaster", "theta")
+
     @property
     def name(self) -> str:
         return "skt_theta"
@@ -244,6 +419,9 @@ class SktThetaMethod(GenericSktimeMethod):
 @ForecastRegistry.register("skt_naive")
 class SktNaiveMethod(GenericSktimeMethod):
     """Alias for `sktime` using `sktime.forecasting.naive.NaiveForecaster`."""
+
+    CAPABILITY_SELECTOR_VALUE = "sktime.forecasting.naive.NaiveForecaster"
+    CAPABILITY_ALIASES = ("NaiveForecaster", "naive")
 
     @property
     def name(self) -> str:
@@ -259,6 +437,9 @@ class SktNaiveMethod(GenericSktimeMethod):
 @ForecastRegistry.register("skt_autoets")
 class SktAutoETSMethod(GenericSktimeMethod):
     """Alias for `sktime` using `sktime.forecasting.ets.AutoETS`."""
+
+    CAPABILITY_SELECTOR_VALUE = "sktime.forecasting.ets.AutoETS"
+    CAPABILITY_ALIASES = ("AutoETS", "autoets")
 
     @property
     def name(self) -> str:

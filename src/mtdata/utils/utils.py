@@ -1,26 +1,43 @@
-from datetime import datetime, timezone
 import math
-from typing import Any, Dict, List, Optional, Tuple, Set
+from datetime import datetime, timedelta, timezone
 from numbers import Number
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import pandas as pd
 import dateparser
+import numpy as np
+import pandas as pd
 
-from .constants import (
-    PRECISION_ABS_TOL,
-    PRECISION_MAX_DECIMALS,
-    PRECISION_MAX_LOSS_PCT,
-    PRECISION_REL_TOL,
-    TIME_DISPLAY_FORMAT,
+from .formatting import (
+    format_float,
 )
 from .formatting import (
     format_number,
-    optimal_decimals as _optimal_decimals_shared,
-    format_float as _format_float_shared,
 )
+from .formatting import optimal_decimals
+from .coercion import safe_float as _safe_float  # noqa: F401  # re-exported for callers
 
 
-def _coerce_scalar(s: str):
+def _positive_float_attr(obj: Any, *names: str) -> Optional[float]:
+    """Return the first finite, strictly-positive float among *names* on *obj*.
+
+    Tries each attribute name in order, accepting only real numeric values
+    (``int``/``float``, excluding ``bool``) and skipping non-numeric,
+    non-finite, and non-positive values.  Returns ``None`` when no attribute
+    yields a positive float.
+    """
+    if obj is None:
+        return None
+    for name in names:
+        value = getattr(obj, name, None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric > 0.0:
+            return numeric
+    return None
+
+
+def coerce_scalar(s: str):
     """Try to coerce a scalar string to int or float; otherwise return original string."""
     try:
         if s is None:
@@ -110,80 +127,6 @@ def _table_from_rows(headers: List[str], rows: List[List[Any]]) -> Dict[str, Any
         "success": True,
         "count": len(items),
     }
-
-def _format_time_minimal(epoch_seconds: float) -> str:
-    """Format epoch seconds into a normalized UTC datetime string.
-
-    Normalized format everywhere: YYYY-MM-DD HH:MM
-    """
-    dt = datetime.utcfromtimestamp(epoch_seconds)
-    return dt.strftime(TIME_DISPLAY_FORMAT)
-
-def _format_time_minimal_local(epoch_seconds: float) -> str:
-    """Format epoch seconds into a normalized local/client datetime string.
-
-    Normalized format everywhere: YYYY-MM-DD HH:MM (local/client tz)
-    Falls back to UTC if tz resolution fails.
-    """
-    from ..core.config import mt5_config
-    try:
-        tz = mt5_config.get_client_tz()
-        if tz is not None:
-            dt = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).astimezone(tz)
-        else:
-            dt = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).astimezone()
-        return dt.strftime(TIME_DISPLAY_FORMAT)
-    except Exception:
-        return _format_time_minimal(epoch_seconds)
-
-def _use_client_tz(_: object = None) -> bool:
-    """Return True when a client timezone is configured."""
-    from ..core.config import mt5_config
-    try:
-        return mt5_config.get_client_tz() is not None
-    except Exception:
-        return False
-
-def _resolve_client_tz(_: object = None):
-    """Return the configured client timezone, if any."""
-    from ..core.config import mt5_config
-    try:
-        return mt5_config.get_client_tz()
-    except Exception:
-        return None
-
-def _time_format_from_epochs(epochs: List[float]) -> str:
-    """Return the normalized display format regardless of epoch contents."""
-    return TIME_DISPLAY_FORMAT
-
-def _maybe_strip_year(fmt: str, epochs: List[float]) -> str:
-    """No-op when normalization is requested; keep full year for consistency."""
-    return fmt
-
-def _style_time_format(fmt: str) -> str:
-    """No special styling; keep normalized spacing."""
-    try:
-        if 'T' in fmt:
-            return fmt.replace('T', ' ')
-    except Exception:
-        pass
-    return fmt
-
-def _optimal_decimals(
-    values: List[float],
-    rel_tol: float = PRECISION_REL_TOL,
-    abs_tol: float = PRECISION_ABS_TOL,
-    max_decimals: int = PRECISION_MAX_DECIMALS,
-    max_loss_pct: float = PRECISION_MAX_LOSS_PCT,
-) -> int:
-    return _optimal_decimals_shared(
-        values,
-        rel_tol=rel_tol,
-        abs_tol=abs_tol,
-        max_decimals=max_decimals,
-        max_loss_pct=max_loss_pct,
-    )
-
 
 def parse_kv_or_json(obj: Any) -> Dict[str, Any]:
     """Parse params/features provided as dict, JSON string, or k=v pairs into a dict.
@@ -280,13 +223,12 @@ def parse_kv_or_json(obj: Any) -> Dict[str, Any]:
     return {}
 
 
-def _format_float(v: float, d: int) -> str:
-    return _format_float_shared(v, d)
-
-
-
-
-def _format_numeric_rows_from_df(df: pd.DataFrame, headers: List[str]) -> List[List[str]]:
+def _format_numeric_rows_from_df(
+    df: pd.DataFrame,
+    headers: List[str],
+    *,
+    stringify: bool = True,
+) -> List[List[Any]]:
     # Precompute per-column decimals to trim numeric noise without losing precision.
     col_decimals: Dict[str, int] = {}
     for col in headers:
@@ -302,33 +244,40 @@ def _format_numeric_rows_from_df(df: pd.DataFrame, headers: List[str]) -> List[L
         except Exception:
             values = []
         if values:
-            col_decimals[col] = _optimal_decimals(values)
+            col_decimals[col] = optimal_decimals(values)
 
-    out_rows: List[List[str]] = []
-    for _, row in df[headers].iterrows():
-        out_row: List[str] = []
-        for col in headers:
-            val = row[col]
+    out_rows: List[List[Any]] = []
+    for row_values in df[headers].itertuples(index=False, name=None):
+        out_row: List[Any] = []
+        for col, val in zip(headers, row_values):
             if col == 'time':
-                out_row.append(str(val))
+                out_row.append(str(val) if stringify else val)
             elif val is None or isinstance(val, bool):
-                out_row.append(format_number(val))
+                out_row.append(format_number(val) if stringify else val)
             elif isinstance(val, Number):
                 try:
                     num = float(val)
                 except Exception:
-                    out_row.append(str(val))
+                    out_row.append(str(val) if stringify else val)
                     continue
                 if not math.isfinite(num):
-                    out_row.append(format_number(num))
+                    out_row.append(format_number(num) if stringify else num)
                     continue
-                decimals = col_decimals.get(col)
-                if decimals is None:
-                    out_row.append(format_number(num))
+                if not stringify:
+                    if isinstance(val, int) and not isinstance(val, bool):
+                        out_row.append(int(val))
+                    elif float(num).is_integer() and not isinstance(val, float):
+                        out_row.append(int(num))
+                    else:
+                        out_row.append(num)
                 else:
-                    out_row.append(_format_float(num, decimals))
+                    decimals = col_decimals.get(col)
+                    if decimals is None:
+                        out_row.append(format_number(num))
+                    else:
+                        out_row.append(format_float(num, decimals))
             else:
-                out_row.append(str(val))
+                out_row.append(str(val) if stringify else val)
         out_rows.append(out_row)
     return out_rows
 
@@ -349,8 +298,6 @@ def to_float_np(
 
     Notes: When both drop_na and finite_only are False, the original length is preserved.
     """
-    import numpy as np  # local import
-
     try:
         # Normalize to pandas Series for robust conversion
         if hasattr(values, "to_numpy") and hasattr(values, "dtype"):
@@ -400,7 +347,6 @@ def align_finite(*arrays: Any) -> Tuple["np.ndarray", ...]:
 
     Returns a tuple of filtered arrays, all of equal length.
     """
-    import numpy as np
     conv = [to_float_np(a) for a in arrays]
     if not conv:
         return tuple()
@@ -414,6 +360,24 @@ def _parse_start_datetime(value: str) -> Optional[datetime]:
     """Parse a date/time string via dateparser into UTC-naive datetime."""
     if not value:
         return None
+    parts = str(value).strip().lower().split()
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    if len(parts) == 2 and parts[0] in {"last", "next"} and parts[1] in weekdays:
+        today = datetime.now(timezone.utc).date()
+        target_weekday = weekdays[parts[1]]
+        if parts[0] == "next":
+            days = (target_weekday - today.weekday()) % 7 or 7
+        else:
+            days = -((today.weekday() - target_weekday) % 7 or 7)
+        return datetime.combine(today + timedelta(days=days), datetime.min.time())
     dt = dateparser.parse(
         value,
         settings={

@@ -1,6 +1,7 @@
 from typing import Any, Dict, Optional
-from ..schema import DenoiseSpec
-from .basic import template_basic, _get_raw_result
+
+from ...shared.schema import DenoiseSpec
+from .basic import _first_volatility_value, _get_raw_result, template_basic
 
 
 def template_advanced(
@@ -12,6 +13,8 @@ def template_advanced(
     # Ensure a timeframe for subcalls
     p = dict(params or {})
     tf = str(p.get('timeframe', 'H1'))
+    start = p.get('start')
+    end = p.get('end')
     p['timeframe'] = tf
     
     base = template_basic(symbol, horizon, denoise, p)
@@ -31,13 +34,17 @@ def template_advanced(
         symbol=symbol,
         timeframe=tf,
         limit=int(p.get('regime_limit', 1500)),
-        method='bocpd', threshold=float(p.get('cp_threshold', 0.6)), output='summary', lookback=int(p.get('regime_lookback', 300))
+        start=start,
+        end=end,
+        method='bocpd', threshold=float(p.get('cp_threshold', 0.6)), detail='summary', lookback=int(p.get('regime_lookback', 300))
     )
     hmm = _get_raw_result(regime_detect,
         symbol=symbol,
         timeframe=tf,
         limit=int(p.get('regime_limit', 1500)),
-        method='hmm', params={'n_states': int(p.get('hmm_states', 3))}, output='compact', lookback=int(p.get('regime_lookback', 300))
+        start=start,
+        end=end,
+        method='hmm', params={'n_states': int(p.get('hmm_states', 3))}, detail='compact', lookback=int(p.get('regime_lookback', 300))
     )
     base.setdefault('sections', {})['regime'] = {
         'bocpd': bocpd if 'error' in bocpd else {'summary': bocpd.get('summary')},
@@ -46,13 +53,28 @@ def template_advanced(
 
     # HAR-RV volatility summary
     from ..forecast import forecast_volatility_estimate
-    har = _get_raw_result(forecast_volatility_estimate, symbol=symbol, timeframe=tf, horizon=int(horizon), method='har_rv', params={'rv_timeframe': 'M5', 'days': 150, 'window_w': 5, 'window_m': 22})
+    har = _get_raw_result(
+        forecast_volatility_estimate,
+        symbol=symbol,
+        timeframe=tf,
+        horizon=int(horizon),
+        method='har_rv',
+        start=start,
+        end=end,
+        params={'rv_timeframe': 'M5', 'days': 150, 'window_w': 5, 'window_m': 22},
+    )
     if 'error' in har:
         base['sections']['volatility_har_rv'] = {'error': har['error']}
     else:
         base['sections']['volatility_har_rv'] = {
-            'sigma_bar_return': har.get('sigma_bar_return'),
-            'horizon_sigma_return': har.get('horizon_sigma_return'),
+            'volatility_per_bar': _first_volatility_value(
+                har,
+                ('volatility_per_bar', 'sigma_bar_price'),
+            ),
+            'volatility_horizon': _first_volatility_value(
+                har,
+                ('volatility_horizon', 'horizon_sigma_price'),
+            ),
         }
 
     # Conformal intervals around chosen method
@@ -69,7 +91,7 @@ def template_advanced(
             horizon=int(horizon),
             steps=int(p.get('conformal_steps', 25)),
             spacing=int(p.get('conformal_spacing', 10)),
-            alpha=float(p.get('conformal_alpha', 0.1)),
+            ci_alpha=float(p.get('conformal_alpha', 0.1)),
         )
         if 'error' in conf:
             base['sections']['forecast_conformal'] = {'error': conf['error'], 'method': best_method}
@@ -79,7 +101,7 @@ def template_advanced(
                 'lower_price': conf.get('lower_price'),
                 'upper_price': conf.get('upper_price'),
                 'per_step_q': conf.get('conformal', {}).get('per_step_q'),
-                'alpha': conf.get('ci_alpha'),
+                'ci_alpha': conf.get('ci_alpha'),
             }
 
     return base

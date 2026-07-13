@@ -10,43 +10,36 @@ authors = [
     {name = "Emerson Gomes", email = "emerson.gomes@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
-    "MetaTrader5>=5.0.5430",
-    "mcp>=1.24.0",
-    "fastmcp>=2.14.0",
+    "MetaTrader5>=5.0.5735",
+    "mcp>=1.27.2",
+    "fastmcp>=3.3.1",
     "typing-extensions>=4.15.0",
-    "python-dotenv>=1.2.1",
-    "dateparser>=1.2.2",
-    "pandas>=2.3.3",
-    "numpy>=2.0.0,<2.2.0",
-    "pandas-ta-classic==0.3.59",
-    "TA-Lib>=0.6.5",
-    "scipy>=1.15.3,<1.16.0",
-    "scikit-learn>=1.7.2",
-    "scikit-image>=0.24.0",
-    "tsdownsample>=0.1.4.1",
-    "rdp>=0.8",
-    "ruptures>=1.1.9",
-    "statsmodels>=0.14.5",
-    "statsforecast>=2.0.2",
-    "sktime>=0.40.1",
-    "mlforecast>=1.0.2",
-    "lightgbm>=4.6.0",
-    "torch>=2.3.0",
-    "chronos-forecasting>=2.0.0",
-    "timesfm @ git+https://github.com/google-research/timesfm.git@6bd8044275f8b76cdc9554f2fecccac5f31a156c",
-    "tslearn>=0.7.0",
-    "h5py>=3.15.1",
-    "gluonts[torch]>=0.16.2",
-    "hnswlib>=0.8.0",
-    "stumpy>=1.13.0",
-    "precise-patterns @ git+https://github.com/BennyThadikaran/precise-patterns.git@e92e10cbb1b6e414c89ad287be32ddae4214b353",
-    "matplotlib>=3.10.8",
-    "fastapi>=0.124.4",
-    "uvicorn[standard]>=0.38.0",
-    "tsfresh>=0.20.3",
-    "finvizfinance>=0.15.0",
+    "python-dotenv>=1.2.2",
+    "PyYAML>=6.0.3",
+    "dateparser>=1.4.0",
+    "pytz>=2026.2",
+    "tzlocal>=5.3.1",
+    "pandas>=2.3.3,<3",
+    "numpy>=2.3.5,<2.4",
+    "pandas-ta-classic>=0.6.20",
+    "TA-Lib>=0.6.8",
+    "holidays>=0.97",
+    "scipy>=1.17.1",
+    "scikit-learn>=1.7.2,<1.8",
+    "hmmlearn>=0.3.3",
+    "scikit-image>=0.26.0",
+    "PyWavelets>=1.9.0",
+    "EMD-signal>=1.9.0",
+    "vmdpy>=0.2",
+    "ruptures>=1.0.6,<1.1.0",
+    "statsmodels>=0.14.6",
+    "tslearn>=0.8.1",
+    "h5py>=3.16.0",
+    "stumpy>=1.14.1",
+    "matplotlib>=3.10.9",
+    "finvizfinance>=1.3.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -54,22 +47,139 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["mtdata*"]
 
+[project.optional-dependencies]
+forecast-classical = [
+    "arch>=8.0.0",
+    "optuna>=4.8.0",
+    "QuantLib>=1.42.1",
+    "statsforecast>=1.7.6",
+    "sktime>=0.40.1",
+    "mlforecast>=1.0.31",
+    "lightgbm>=4.6.0",
+    "coreforecast>=0.0.17",
+    "fugue>=0.9.7",
+    "numba>=0.65.1",
+    "tsfresh>=0.21.1",
+]
+forecast-foundation = [
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "pillow>=12.2.0",
+    "accelerate>=1.13.0",
+    "chronos-forecasting>=2.2.2",
+    "transformers>=4.57.6,<5",
+    "huggingface-hub>=0.36.2,<1",
+]
+forecast-timesfm = [
+    "torch>=2.11.0",
+    "timesfm @ git+https://github.com/google-research/timesfm.git@6bd8044275f8b76cdc9554f2fecccac5f31a156c",
+]
+patterns-ext = [
+    # stock-pattern has no setup.py/pyproject.toml; manual install required (see docs/SETUP.md)
+]
+web = [
+    "fastapi>=0.136.3",
+    "uvicorn[standard]>=0.48.0",
+]
+news-embeddings = [
+    "sentence-transformers>=5.5.1,<6",
+    "huggingface-hub>=0.36.2,<1",
+]
+news-ycnbc = [
+    "ycnbc @ git+https://github.com/codestorm-official/ycnbc.git@d5e50293be499b617edaa10a03467b4184193a4e",
+]
+all = [
+    "arch>=8.0.0",
+    "hmmlearn>=0.3.3",
+    "optuna>=4.8.0",
+    "QuantLib>=1.42.1",
+    "statsforecast>=1.7.6",
+    "sktime>=0.40.1",
+    "mlforecast>=1.0.31",
+    "lightgbm>=4.6.0",
+    "coreforecast>=0.0.17",
+    "fugue>=0.9.7",
+    "numba>=0.65.1",
+    "tsfresh>=0.21.1",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "pillow>=12.2.0",
+    "accelerate>=1.13.0",
+    "chronos-forecasting>=2.2.2",
+    "transformers>=4.57.6,<5",
+    "huggingface-hub>=0.36.2,<1",
+    "tsdownsample>=0.1.5",
+    "fastapi>=0.136.3",
+    "uvicorn[standard]>=0.48.0",
+    "sentence-transformers>=5.5.1,<6",
+]
+all-git = [
+    "arch>=8.0.0",
+    "hmmlearn>=0.3.3",
+    "optuna>=4.8.0",
+    "QuantLib>=1.42.1",
+    "statsforecast>=1.7.6",
+    "sktime>=0.40.1",
+    "mlforecast>=1.0.31",
+    "lightgbm>=4.6.0",
+    "coreforecast>=0.0.17",
+    "fugue>=0.9.7",
+    "numba>=0.65.1",
+    "tsfresh>=0.21.1",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "pillow>=12.2.0",
+    "accelerate>=1.13.0",
+    "chronos-forecasting>=2.2.2",
+    "transformers>=4.57.6,<5",
+    "huggingface-hub>=0.36.2,<1",
+    "timesfm @ git+https://github.com/google-research/timesfm.git@6bd8044275f8b76cdc9554f2fecccac5f31a156c",
+    "tsdownsample>=0.1.5",
+    "fastapi>=0.136.3",
+    "uvicorn[standard]>=0.48.0",
+    "sentence-transformers>=5.5.1,<6",
+    "ycnbc @ git+https://github.com/codestorm-official/ycnbc.git@d5e50293be499b617edaa10a03467b4184193a4e",
+]
+
 [project.scripts]
 mtdata-sse = "mtdata.core.server:main_sse"
 mtdata-stdio = "mtdata.core.server:main_stdio"
+mtdata-streamable-http = "mtdata.core.server:main_streamable_http"
 mtdata-webapi = "mtdata.core.web_api:main_webapi"
 mtdata-cli = "mtdata.core.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/emerzon/mt-data-mcp"
 Repository = "https://github.com/emerzon/mt-data-mcp"
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "C901"]
+ignore = ["E402", "E501", "E701", "E702", "E741", "B904", "B905"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["E731", "F401", "F841", "B007", "B017", "B023", "B028"]
+"src/mtdata/**/__init__.py" = ["F401"]
+"src/mtdata/core/regime/api.py" = ["F401"]
+"src/mtdata/core/report/utils.py" = ["F401"]
+"src/mtdata/core/web_api.py" = ["B008"]
+"src/mtdata/core/server.py" = ["F401"]
+"src/mtdata/core/schema_attach.py" = ["B023"]
+"src/mtdata/utils/indicators.py" = ["B023"]
+"src/mtdata/services/data_service.py" = ["F401"]
+"src/mtdata/forecast/barriers_shared.py" = ["F401"]
+"src/mtdata/forecast/forecast.py" = ["F401"]
+"src/mtdata/patterns/classic.py" = ["F401"]
+"src/mtdata/shared/constants.py" = ["F401"]

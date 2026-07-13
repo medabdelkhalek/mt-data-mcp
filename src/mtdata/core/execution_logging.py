@@ -1,0 +1,183 @@
+"""Shared execution-path logging helpers."""
+
+from __future__ import annotations
+
+import logging
+import time
+from contextvars import ContextVar
+from typing import Any, Callable, Optional, TypeVar
+
+ResultT = TypeVar("ResultT")
+
+_ACTIVE_OPERATIONS: ContextVar[tuple[str, ...]] = ContextVar(
+    "mtdata_active_operations",
+    default=(),
+)
+
+
+def infer_result_success(result: Any) -> bool:
+    try:
+        from ..shared.result import Err, Ok
+    except Exception:  # pragma: no cover - package always ships shared.result
+        Ok = ()  # type: ignore[assignment,misc]
+        Err = ()  # type: ignore[assignment,misc]
+    if isinstance(result, Ok):
+        return True
+    if isinstance(result, Err):
+        return False
+
+    if isinstance(result, dict):
+        error_text = result.get("error")
+        if isinstance(error_text, str) and error_text.strip():
+            return False
+        if error_text not in (None, False):
+            return False
+        success = result.get("success")
+        if isinstance(success, bool):
+            return success
+        return True
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict):
+                error_text = item.get("error")
+                if isinstance(error_text, str) and error_text.strip():
+                    return False
+                if error_text not in (None, False):
+                    return False
+        return True
+    return result is not None
+
+
+def log_operation_start(logger: logging.Logger, *, operation: str, **fields: Any) -> None:
+    parent_operation = _push_operation(operation)
+    if parent_operation == str(operation):
+        return
+    logger.debug("event=start operation=%s %s", operation, _format_fields(fields))
+
+
+def log_operation_finish(
+    logger: logging.Logger,
+    *,
+    operation: str,
+    started_at: float,
+    success: bool,
+    **fields: Any,
+) -> None:
+    parent_operation = _pop_operation(operation)
+    if parent_operation == str(operation):
+        return
+    logger.debug(
+        "event=finish operation=%s success=%s duration_ms=%.3f %s",
+        operation,
+        bool(success),
+        _elapsed_ms(started_at),
+        _format_fields(fields),
+    )
+
+
+def log_operation_exception(
+    logger: logging.Logger,
+    *,
+    operation: str,
+    started_at: float,
+    exc: BaseException,
+    **fields: Any,
+) -> None:
+    parent_operation = _pop_operation(operation)
+    if parent_operation == str(operation):
+        return
+    logger.exception(
+        "event=error operation=%s duration_ms=%.3f %s error=%s",
+        operation,
+        _elapsed_ms(started_at),
+        _format_fields(fields),
+        exc,
+    )
+
+
+def run_logged_operation(
+    logger: logging.Logger,
+    *,
+    operation: str,
+    func: Callable[[], ResultT],
+    success_eval: Optional[Callable[[ResultT], bool]] = None,
+    **fields: Any,
+) -> ResultT:
+    started_at = time.perf_counter()
+    log_operation_start(logger, operation=operation, **fields)
+    try:
+        result = func()
+    except Exception as exc:
+        log_operation_exception(
+            logger,
+            operation=operation,
+            started_at=started_at,
+            exc=exc,
+            **fields,
+        )
+        raise
+    else:
+        success_value = infer_result_success(result) if success_eval is None else bool(success_eval(result))
+        log_operation_finish(
+            logger,
+            operation=operation,
+            started_at=started_at,
+            success=success_value,
+            **fields,
+        )
+        return result
+    finally:
+        if not _ACTIVE_OPERATIONS.get():
+            _run_post_operation_cleanup(logger, operation=operation)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - float(started_at)) * 1000.0, 3)
+
+
+def _push_operation(operation: str) -> Optional[str]:
+    stack = _ACTIVE_OPERATIONS.get()
+    parent = stack[-1] if stack else None
+    _ACTIVE_OPERATIONS.set(stack + (str(operation),))
+    return parent
+
+
+def _pop_operation(operation: str) -> Optional[str]:
+    stack = _ACTIVE_OPERATIONS.get()
+    op_name = str(operation)
+    if not stack:
+        return None
+    if stack[-1] == op_name:
+        parent = stack[-2] if len(stack) > 1 else None
+        _ACTIVE_OPERATIONS.set(stack[:-1])
+        return parent
+    for idx in range(len(stack) - 1, -1, -1):
+        if stack[idx] == op_name:
+            parent = stack[idx - 1] if idx > 0 else None
+            _ACTIVE_OPERATIONS.set(stack[:idx] + stack[idx + 1 :])
+            return parent
+    return None
+
+
+def _run_post_operation_cleanup(logger: logging.Logger, *, operation: str) -> None:
+    try:
+        from ..forecast.gpu_runtime import cleanup_forecast_gpu_runtime
+
+        cleanup_forecast_gpu_runtime(clear_model_cache=True)
+    except Exception as exc:
+        logger.debug("post-operation cleanup failed for %s: %s", operation, exc)
+
+
+def _format_fields(fields: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            parts.append(f"{key}={text}")
+            continue
+        parts.append(f"{key}={value}")
+    return " ".join(parts)

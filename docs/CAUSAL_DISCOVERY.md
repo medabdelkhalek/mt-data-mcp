@@ -2,6 +2,8 @@
 
 The `causal_discover_signals` tool performs **pairwise Granger-style causal discovery** between symbols using recent MT5 close prices. It is intended for exploratory analysis (feature discovery / watchlist relationships), not “true causality”.
 
+If you want **co-movement**, use `correlation_matrix`. For a direct two-symbol lead/lag estimate, use `cross_correlation`. For candidate **mean-reverting / spread** relationships, use `cointegration_test`.
+
 **Related:**
 - [CLI.md](CLI.md) — Command usage and output formats
 - [SETUP.md](SETUP.md) — MT5 connection and dependencies
@@ -12,24 +14,114 @@ The `causal_discover_signals` tool performs **pairwise Granger-style causal disc
 ## Quick Start
 
 ```bash
+# Compare symbols by correlation strength
+mtdata-cli correlation_matrix "EURUSD,GBPUSD,USDJPY" --timeframe H1 \
+  --window-bars 500 --method pearson --transform log_return --json
+
+# Use an explicit MT5 group path for easier basket selection
+mtdata-cli correlation_matrix --group "Forex\\Majors" --timeframe H1 \
+  --window-bars 500 --limit 120 --method pearson --transform log_return --json
+
+# Test an MT5 group for candidate cointegrated pairs
+mtdata-cli cointegration_test --group "Forex\\Majors" --timeframe H1 \
+  --window-bars 400 --transform log_level --significance 0.05 --json
+
+# Estimate whether the first symbol leads the second
+mtdata-cli cross_correlation "EURUSD,GBPUSD" --timeframe H1 \
+  --max-lag 20 --transform log_return --json
+
+# Test a multivariate basket with Johansen trace and maximum-eigenvalue tests
+mtdata-cli cointegration_test "EURUSD,GBPUSD,EURGBP" --timeframe H1 \
+  --method johansen --k-ar-diff 1 --transform log_level --json
+
 # Provide an explicit list of symbols
-python cli.py causal_discover_signals "EURUSD,GBPUSD,USDJPY" --timeframe H1 \
-  --limit 800 --max-lag 5 --transform log_return --significance 0.05
+mtdata-cli causal_discover_signals "EURUSD,GBPUSD,USDJPY" --timeframe H1 \
+  --window-bars 800 --max-lag 5 --transform log_return --significance 0.05
 
 # Provide a single symbol to auto-expand its visible MT5 group (e.g., Forex\Majors)
-python cli.py causal_discover_signals EURUSD --timeframe H1 --limit 800
+mtdata-cli causal_discover_signals EURUSD --timeframe H1 --window-bars 800
 ```
 
 ---
 
 ## What It Does
 
+### `correlation_matrix`
+
+For each unordered pair of symbols `(A, B)`, the tool:
+1. Fetches recent close-price histories
+2. Applies a transform (by default `log_return`)
+3. Computes pairwise correlations on overlapping transformed samples
+4. Returns canonical ranked pair rows plus optional matrix/highlight views
+
+It accepts either:
+
+- an explicit `symbols` list (or compatibility alias `symbol`), or
+- a `group` path that matches the MT5 symbol groups exposed by `symbols_list --list-mode groups`
+
+`items` is the canonical compact payload. Each row includes the correlation,
+sample count, and pairwise period window; `context` records the timeframe,
+`window_bars`, transform, and `min_overlap` used. A requested `limit` records
+the output page size, not the analysis sample size. Use `extras=metadata` when you also
+need derived convenience views such as `matrix`; omit `extras` to keep only the
+ranked pair rows plus summary highlights.
+
+### `cointegration_test`
+
+For each unordered pair of symbols `(A, B)`, the tool:
+1. Fetches recent price histories
+2. Applies a level-style transform (`log_level` by default)
+3. Runs one Engle-Granger test with the first symbol in stable input/group
+   order as the dependent series
+4. Reports that orientation's p-value, hedge ratio, spread diagnostics, and
+   `orientation_policy="left_dependent"`
+
+Engle-Granger is orientation-sensitive. The tool deliberately avoids selecting
+the lower p-value after testing both directions because that would cherry-pick
+the test result. For a two-symbol request, reverse the input order and run the
+tool again when the opposite economic orientation is relevant.
+
+With `method=engle_granger`, it evaluates unordered pairs. With
+`method=johansen`, it evaluates the aligned basket jointly and returns
+trace/max-eigenvalue rank estimates plus cointegrating vectors. Johansen's
+critical-value tables support `significance` values of `0.01`, `0.05`, and
+`0.1` only; other values return an `invalid_input` error. Engle-Granger accepts
+any significance value strictly between zero and one.
+
+It accepts either:
+
+- an explicit `symbols` list (or compatibility alias `symbol`), or
+- a `group` path that matches the MT5 symbol groups exposed by `symbols_list --list-mode groups`
+
+### `cross_correlation`
+
+This tool requires exactly two symbols and evaluates lags from `-max_lag`
+through `+max_lag`. A positive best lag means the first symbol leads the second;
+a negative lag means the second leads the first. The result includes a
+moving-block bootstrap confidence interval for the best-lag correlation.
+Because the best lag is selected by maximum absolute correlation, the interval
+uses a Bonferroni-adjusted per-lag confidence level to provide 95% family-wise
+coverage across all evaluated lags. `best.significant` is true only when that
+adjusted interval excludes zero; the context reports the number of lag tests
+and both confidence levels.
+
+### `causal_discover_signals`
+
 For each ordered pair of symbols `(cause → effect)`, the tool:
-1. Fetches and aligns overlapping close-price histories
+1. Aligns each pair on that pair's overlapping close-price history
 2. Applies a transform (by default `log_return`) to improve stationarity
 3. Optionally z-scores the series (`normalize=true`)
 4. Runs Granger causality tests for lags `1..max_lag`
-5. Reports the **best (lowest p-value) lag** per pair using `ssr_ftest`
+5. Selects the **best (lowest raw p-value) lag** per pair using `ssr_ftest`
+6. Applies Bonferroni correction first across the tested lags, then across all
+   successfully tested directed pairs
+
+The primary `p_value` and `significant` fields use this global family-wise
+correction. `p_value_raw` is the selected lag's unadjusted value, and
+`p_value_lag_adjusted` is corrected only for the lag search. The correction
+becomes stricter as the basket grows; use full detail to inspect non-significant
+exploratory candidates rather than interpreting an empty compact result as
+proof that no predictive relationships exist.
 
 ---
 
@@ -39,10 +131,12 @@ For each ordered pair of symbols `(cause → effect)`, the tool:
 |----------|---------|-------------|
 | `symbols` | (required) | Comma-separated MT5 symbols. If you pass **one** symbol, mtdata expands to other visible symbols in the same MT5 group. |
 | `timeframe` | `H1` | Bar timeframe (`M15`, `H1`, etc.). |
-| `limit` | `500` | Bars per symbol to analyze (after alignment). |
+| `window_bars` | `500` | Maximum overlapping transformed samples analyzed per pair. |
+| `limit` | all rows | Optional maximum number of ranked result rows returned. |
+| `offset` | `0` | Number of ranked result rows to skip before applying `limit`. |
 | `max_lag` | `5` | Maximum lag to test (≥ 1). |
-| `significance` | `0.05` | Alpha threshold for reporting “causal” links. |
-| `transform` | `log_return` | One of: `log_return`, `pct`, `diff`, `level`. |
+| `significance` | `0.05` | Family-wise alpha threshold after Bonferroni correction across tested lags and directed pairs. |
+| `transform` | `log_return` | One of: `log_return`, `log_level`, `pct`, `diff`, `level`. |
 | `normalize` | `true` | Z-score each series before testing. |
 
 ---
@@ -55,15 +149,21 @@ The tool returns a plain-text table:
 Effect <- Cause | Lag | p-value | Samples | Conclusion
 ```
 
-- **Conclusion** is `causal` when `p-value < significance`, otherwise `no-link`.
+- **Conclusion** is `causal` when the globally Bonferroni-adjusted `p-value < significance`, otherwise `no-link`.
 - **Lag** is the best-performing lag for the pair under the selected test statistic.
 
-Tip: `--format json` wraps the text as `{"text": "..."}`.
+Tip: `--json` returns the structured payload instead of default TOON text.
 
 ---
 
 ## Interpretation and Caveats
 
+- `correlation_matrix`, `cointegration_test`, `causal_discover_signals`, and `market_scan` all accept `symbols` for explicit multi-symbol calls.
+- `group` remains mutually exclusive with explicit symbol selectors.
+
+- Use **`correlation_matrix`** when you want a fast view of which symbols move together or in opposite directions.
+- Use **`cointegration_test`** when you want candidate pairs or baskets whose price levels may share a stable long-run relationship.
+- Use **`causal_discover_signals`** when you specifically want to test whether lagged values of one symbol add predictive information for another.
 - Granger causality is a **predictive** notion: “past values of A help predict B” under the model assumptions.
 - Results are **pairwise** (not a full causal graph) and can be confounded by common drivers (USD strength, risk-on/off, sessions).
 - Use transforms (returns/diffs) and sufficient history; non-stationary levels can produce misleading links.
@@ -73,5 +173,14 @@ Tip: `--format json` wraps the text as `{"text": "..."}`.
 
 ## Dependencies
 
-`causal_discover_signals` requires `statsmodels`. If it is not installed, the tool returns a readable error message.
+`causal_discover_signals` and `cointegration_test` require `statsmodels`. If it is not installed, the tools return a readable error message.
+
+---
+
+## See Also
+
+- [FORECAST.md](FORECAST.md) — Forecasting methods overview
+- [TECHNICAL_INDICATORS.md](TECHNICAL_INDICATORS.md) — Indicator reference
+- [GLOSSARY.md](GLOSSARY.md) — Term definitions
+
 

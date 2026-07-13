@@ -16,14 +16,14 @@ Simplification is different from denoising:
 
 ```bash
 # Candles: default simplification (targets ~10% of --limit)
-python cli.py data_fetch_candles EURUSD --timeframe M1 --limit 5000 --simplify
+mtdata-cli data_fetch_candles EURUSD --timeframe M1 --limit 5000 --simplify
 
 # Candles: choose an algorithm + target points
-python cli.py data_fetch_candles EURUSD --timeframe M1 --limit 5000 \
+mtdata-cli data_fetch_candles EURUSD --timeframe M1 --limit 5000 \
   --simplify lttb --simplify-params "points=500"
 
 # Ticks: simplify only applies when returning raw rows
-python cli.py data_fetch_ticks EURUSD --output rows --limit 20000 \
+mtdata-cli data_fetch_ticks EURUSD --limit 20000 \
   --simplify rdp --simplify-params "points=2000"
 ```
 
@@ -64,13 +64,14 @@ Notes:
 
 ### LTTB (`method=lttb`)
 **Largest-Triangle-Three-Buckets** downsampling preserves visual shape well for plotting.
+mtdata uses `tsdownsample` when available and falls back to the built-in Python implementation otherwise. The full Python 3.14 package-index install path includes `tsdownsample>=0.1.5`; lean installs can add it directly with `pip install "tsdownsample>=0.1.5"`.
 
 Recommended parameters:
 - `points` (or `ratio`)
 
 Example:
 ```bash
-python cli.py data_fetch_candles EURUSD --limit 10000 --simplify lttb \
+mtdata-cli data_fetch_candles EURUSD --limit 10000 --simplify lttb \
   --simplify-params "points=800"
 ```
 
@@ -82,11 +83,11 @@ python cli.py data_fetch_candles EURUSD --limit 10000 --simplify lttb \
 Examples:
 ```bash
 # Direct tolerance
-python cli.py data_fetch_candles EURUSD --limit 5000 --simplify rdp \
+mtdata-cli data_fetch_candles EURUSD --limit 5000 --simplify rdp \
   --simplify-params "epsilon=0.0005"
 
 # Auto-tune epsilon to target points
-python cli.py data_fetch_candles EURUSD --limit 5000 --simplify rdp \
+mtdata-cli data_fetch_candles EURUSD --limit 5000 --simplify rdp \
   --simplify-params "points=500"
 ```
 
@@ -98,7 +99,7 @@ python cli.py data_fetch_candles EURUSD --limit 5000 --simplify rdp \
 
 Example:
 ```bash
-python cli.py data_fetch_candles EURUSD --limit 5000 --simplify pla \
+mtdata-cli data_fetch_candles EURUSD --limit 5000 --simplify pla \
   --simplify-params "segments=200"
 ```
 
@@ -110,7 +111,7 @@ python cli.py data_fetch_candles EURUSD --limit 5000 --simplify pla \
 
 Example:
 ```bash
-python cli.py data_fetch_candles EURUSD --limit 5000 --simplify apca \
+mtdata-cli data_fetch_candles EURUSD --limit 5000 --simplify apca \
   --simplify-params "points=600"
 ```
 
@@ -121,3 +122,10 @@ python cli.py data_fetch_candles EURUSD --limit 5000 --simplify apca \
 - Simplification is meant for **visualization and UI performance**. For quantitative analysis (e.g., volatility estimation, backtests), use full-resolution data.
 - In `mode=select`, mtdata returns existing rows; this can miss intra-bar extremes if you simplify OHLC data aggressively.
 
+---
+
+## See Also
+
+- [DENOISING.md](DENOISING.md) — Signal denoising (complementary technique)
+- [TECHNICAL_INDICATORS.md](TECHNICAL_INDICATORS.md) — Indicator reference
+- [CLI.md](CLI.md) — Full command reference

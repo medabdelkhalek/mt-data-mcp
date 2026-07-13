@@ -13,12 +13,12 @@ Detailed reference for the `forecast_generate` command, which produces price for
 ## Basic Usage
 
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --model theta
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta
 ```
 
 **Output:**
 ```
-forecast[12]{time,forecast}:
+forecast[12]{time,value}:
     "2026-01-01 18:00",1.17569
     "2026-01-01 19:00",1.17570
     ...
@@ -33,12 +33,12 @@ forecast[12]{time,forecast}:
 |-----------|-------------|
 | `symbol` | Trading symbol (positional argument) |
 
-### Model Selection
+### Method Selection
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--library` | `native` | Model library: native, statsforecast, sktime, mlforecast, pretrained |
-| `--model` | `theta` | Model name within the library |
-| `--model-params` | — | Model-specific parameters (JSON or `key=value`) |
+| `--library` | `native` | Method library: native, statsforecast, sktime, mlforecast, pretrained |
+| `--method` | `theta` | Method name within the library |
+| `--params` | — | Method-specific parameters (JSON or `key=value`) |
 
 ### Window
 | Parameter | Default | Description |
@@ -74,18 +74,18 @@ forecast[12]{time,forecast}:
 
 - `price` (default): forecasts the future **close price** (output includes `forecast_price`).
 - `return`: forecasts **log returns** (`ln(close_t / close_{t-1})`). Output includes `forecast_return` and a reconstructed `forecast_price` path when possible.
-- `volatility`: routes to the volatility forecasters (same family as `forecast_volatility_estimate`). When using `--quantity volatility`, set `--model` to a volatility method (e.g., `ewma`, `garch`).
+- `volatility`: routes to the volatility forecasters (same family as `forecast_volatility_estimate`). When using `--quantity volatility`, set `--method` to a volatility method (e.g., `ewma`, `garch`).
 
 Examples:
 ```bash
 # Price forecast (default)
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --quantity price
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --quantity price
 
 # Return forecast (log returns) + reconstructed price path
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --quantity return
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --quantity return
 
 # Volatility forecast (recommended alternative: use forecast_volatility_estimate)
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --quantity volatility --model ewma
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --quantity volatility --method ewma
 ```
 
 ---
@@ -101,7 +101,7 @@ Supported dimred methods in the forecasting pipeline:
 
 Examples:
 ```bash
-python cli.py forecast_generate EURUSD --horizon 12 --model mlf_lightgbm \
+mtdata-cli forecast_generate EURUSD --horizon 12 --method mlf_lightgbm \
   --features '{"include":["close","volume"]}' \
   --dimred-method pca --dimred-params "n_components=5"
 ```
@@ -117,15 +117,15 @@ Tip: the Web UI exposes a broader method list via `GET /api/dimred/methods` (for
 Built-in implementations with minimal dependencies.
 
 ```bash
-python cli.py forecast_generate EURUSD --library native --model theta
-python cli.py forecast_generate EURUSD --library native --model arima
-python cli.py forecast_generate EURUSD --library native --model mc_gbm
-python cli.py forecast_generate EURUSD --library native --model analog
+mtdata-cli forecast_generate EURUSD --library native --method theta
+mtdata-cli forecast_generate EURUSD --library native --method arima
+mtdata-cli forecast_generate EURUSD --library native --method mc_gbm
+mtdata-cli forecast_generate EURUSD --library native --method analog
 ```
 
 **Available models:**
 ```bash
-python cli.py forecast_list_library_models native
+mtdata-cli forecast_list_library_models native
 ```
 
 ### StatsForecast (`--library statsforecast`)
@@ -133,8 +133,8 @@ python cli.py forecast_list_library_models native
 Fast statistical models from Nixtla.
 
 ```bash
-python cli.py forecast_generate EURUSD --library statsforecast --model AutoARIMA
-python cli.py forecast_generate EURUSD --library statsforecast --model AutoETS
+mtdata-cli forecast_generate EURUSD --library statsforecast --method AutoARIMA
+mtdata-cli forecast_generate EURUSD --library statsforecast --method AutoETS
 ```
 
 **Requires:** `pip install statsforecast`
@@ -145,35 +145,35 @@ python cli.py forecast_generate EURUSD --library statsforecast --model AutoETS
 
 Foundation models pre-trained on large time series datasets.
 
+On the supported Python 3.14 install path:
+- `chronos2` and `chronos_bolt` are part of the package-index install path
+- `timesfm` remains a Git-backed extra
+
 ```bash
-python cli.py forecast_generate EURUSD --library pretrained --model chronos2    
-python cli.py forecast_generate EURUSD --library pretrained --model chronos_bolt
-python cli.py forecast_generate EURUSD --library pretrained --model timesfm
-python cli.py forecast_generate EURUSD --library pretrained --model lag_llama \
-  --model-params '{"ckpt_path":"C:/path/to/lag-llama.ckpt"}'
+mtdata-cli forecast_generate EURUSD --library pretrained --method chronos2    
+mtdata-cli forecast_generate EURUSD --library pretrained --method chronos_bolt
+mtdata-cli forecast_generate EURUSD --library pretrained --method timesfm
 ```
 
-Tip: `python cli.py forecast_list_library_models pretrained` shows requirements for your current environment.
+Tip: `mtdata-cli forecast_list_library_models pretrained` shows requirements for your current environment.
 
 **Dependencies (by model):**
 - `chronos2` / `chronos_bolt`: `chronos-forecasting`, `torch`
-- `timesfm`: `timesfm`, `torch` (TimesFM is installed from Git in `requirements.txt`)
-- `lag_llama`: `lag-llama`, `gluonts[torch]`, `torch` (may not be installable on all Python versions due to upstream pins)
+- `timesfm`: `timesfm`, `torch` (install with `pip install -e .[forecast-timesfm]`)
 
 **Parameters:**
 - Common: `context_length`, `quantiles`
 - Chronos: `model_name`, `device_map`
 - TimesFM: `device`, `model_class`
-- Lag-Llama: `ckpt_path` (or `hf_repo`/`hf_filename` for auto-download), `num_samples`, `device`, `freq`
 
 ### sktime (`--library sktime`)
 
 Scikit-learn style time series forecasters.
 
 ```bash
-python cli.py forecast_generate EURUSD --library sktime --model ThetaForecaster
-python cli.py forecast_generate EURUSD --library sktime --model NaiveForecaster \
-  --model-params "strategy=last sp=24"
+mtdata-cli forecast_generate EURUSD --library sktime --method ThetaForecaster
+mtdata-cli forecast_generate EURUSD --library sktime --method NaiveForecaster \
+  --params "strategy=last sp=24"
 ```
 
 **Requires:** `pip install sktime`
@@ -183,7 +183,7 @@ python cli.py forecast_generate EURUSD --library sktime --model NaiveForecaster 
 Machine learning models with lag features.
 
 ```bash
-python cli.py forecast_generate EURUSD --library mlforecast --model LGBMRegressor
+mtdata-cli forecast_generate EURUSD --library mlforecast --method LGBMRegressor
 ```
 
 **Requires:** `pip install mlforecast lightgbm`
@@ -224,7 +224,6 @@ python cli.py forecast_generate EURUSD --library mlforecast --model LGBMRegresso
 | `chronos2` | Amazon Chronos-II | `context_length=512` |
 | `chronos_bolt` | Fast Chronos variant | `context_length=256` |
 | `timesfm` | TimesFM (foundation model adapter) | `context_length=512` |
-| `lag_llama` | Lag-Llama via GluonTS | `context_length=32 num_samples=100` |
 
 ---
 
@@ -232,42 +231,42 @@ python cli.py forecast_generate EURUSD --library mlforecast --model LGBMRegresso
 
 ### Basic Forecast
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --model theta
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta
 ```
 
 ### With Confidence Intervals
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model arima --ci-alpha 0.1 --format json
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method arima --ci-alpha 0.1 --json
 ```
 
 ### Monte Carlo Simulation
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model mc_gbm --model-params "n_sims=3000 seed=7"
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method mc_gbm --params "n_sims=3000 seed=7"
 ```
 
 ### Foundation Model
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 24 \
-  --library pretrained --model chronos2 --model-params "context_length=512"
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 24 \
+  --library pretrained --method chronos2 --params "context_length=512"
 ```
 
 ### Analog Forecasting
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model analog --model-params "window_size=64 search_depth=5000 top_k=20"
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method analog --params "window_size=64 search_depth=5000 top_k=20"
 ```
 
 ### With Denoising
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model theta --denoise ema
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method theta --denoise ema
 ```
 
 ### Ensemble
 
-`ensemble` combines multiple base methods. Common `--model-params` keys:
+`ensemble` combines multiple base methods. Common `--params` keys:
 - `methods` (list): component methods to run
 - `mode` (str): `average`, `bma`, or `stacking`
 - `weights` (list): manual weights (only used when `mode=average`)
@@ -276,12 +275,12 @@ python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
 - `expose_components` (bool): include component forecasts in the JSON output
 
 ```bash
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model ensemble --model-params '{"methods":["theta","naive","arima"],"mode":"average"}'
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method ensemble --params '{"methods":["theta","naive","arima"],"mode":"average"}'
 
 # Bayesian model averaging (weights inferred from walk-forward CV)
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --model ensemble --model-params '{"methods":["theta","naive","fourier_ols"],"mode":"bma","cv_points":12}'
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
+  --method ensemble --params '{"methods":["theta","naive","fourier_ols"],"mode":"bma","cv_points":12}'
 ```
 
 ---
@@ -290,8 +289,9 @@ python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
 
 | Field | Description |
 |-------|-------------|
-| `forecast` | Array of predicted values |
-| `time` | Timestamps for each forecast point |
+| `forecast` | Compact rows for forecast points; each row uses `time` and `value` |
+| `forecast_price` | Predicted price values |
+| `forecast_return` | Predicted return values when `quantity=return` |
 | `lower` | Lower confidence bound (if `--ci-alpha`) |
 | `upper` | Upper confidence bound (if `--ci-alpha`) |
 | `trend` | Detected trend direction (if available) |
@@ -304,12 +304,12 @@ python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 \
 
 | Task | Command |
 |------|---------|
-| List methods | `python cli.py forecast_list_methods` |
-| List library models | `python cli.py forecast_list_library_models native` |
-| Basic forecast | `python cli.py forecast_generate EURUSD --model theta --horizon 12` |
-| With CI | `python cli.py forecast_generate EURUSD --model theta --ci-alpha 0.1` |
-| Foundation model | `python cli.py forecast_generate EURUSD --library pretrained --model chronos2` |
-| JSON output | `python cli.py forecast_generate EURUSD --model theta --format json` |
+| List methods | `mtdata-cli forecast_list_methods` |
+| List library models | `mtdata-cli forecast_list_library_models native` |
+| Basic forecast | `mtdata-cli forecast_generate EURUSD --method theta --horizon 12` |
+| With CI | `mtdata-cli forecast_generate EURUSD --method theta --ci-alpha 0.1` |
+| Foundation method | `mtdata-cli forecast_generate EURUSD --library pretrained --method chronos2` |
+| JSON output | `mtdata-cli forecast_generate EURUSD --method theta --json` |
 
 ---
 

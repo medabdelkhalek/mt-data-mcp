@@ -2,43 +2,71 @@
 Forecast engine core logic and orchestration.
 """
 
-from typing import Any, Dict, Optional, List, Literal, Tuple
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-import math
 
-from mtdata.core.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
-from mtdata.utils.mt5 import get_symbol_info_cached
-from mtdata.utils.utils import (
+from ..bootstrap.settings import mt5_config
+from ..shared.constants import SANITY_BARS_TOLERANCE, TIMEFRAME_MAP, TIMEFRAME_SECONDS
+from ..shared.schema import DenoiseSpec, ForecastMethodLiteral, TimeframeLiteral
+from ..shared.validators import (
+    invalid_timeframe_error,
+    unsupported_timeframe_seconds_error,
+)
+from ..utils.denoise import (
+    _apply_denoise,
+    _consume_denoise_warnings,
+)
+from ..utils.denoise import (
+    normalize_denoise_spec as _normalize_denoise_spec,
+)
+from ..utils.freshness import closed_session_context
+from ..utils.mt5 import get_cached_mt5_time_alignment, get_symbol_info_cached
+from ..utils.time import (
     _format_time_minimal,
     _format_time_minimal_local,
+    _resolve_client_tz,
     _use_client_tz,
+)
+from ..utils.utils import (
     parse_kv_or_json as _parse_kv_or_json,
 )
-from mtdata.utils.indicators import _parse_ti_specs as _parse_ti_specs_util, _apply_ta_indicators as _apply_ta_indicators_util
-from mtdata.utils.denoise import _apply_denoise, normalize_denoise_spec as _normalize_denoise_spec
-from mtdata.forecast.common import (
-    fetch_history as _fetch_history,
-    default_seasonality as _default_seasonality_period,
-    next_times_from_last as _next_times_from_last,
+from . import forecast_preprocessing as _forecast_preprocessing
+from .common import _normalize_weights as _normalize_weights_impl
+from .common import (
+    default_seasonality,
+    is_standard_weekend_closed_epoch,
+    next_times_from_last,
+    uses_standard_weekend_projection,
 )
-from mtdata.forecast.target_builder import build_target_series
-from mtdata.forecast.registry import ForecastRegistry
-# Import all method modules to ensure registration
-import mtdata.forecast.methods.classical
-import mtdata.forecast.methods.ets_arima
-import mtdata.forecast.methods.statsforecast
-import mtdata.forecast.methods.mlforecast
-import mtdata.forecast.methods.pretrained
-import mtdata.forecast.methods.neural
-import mtdata.forecast.methods.sktime
-import mtdata.forecast.methods.gluonts_extra
-import mtdata.forecast.methods.analog
-import mtdata.forecast.methods.monte_carlo  # noqa: F401 (method registration side effects)
-import MetaTrader5 as mt5
+from .common import (
+    fetch_history as _fetch_history,
+)
+from .ensemble_dispatch import (
+    build_dispatch_error as _build_ensemble_dispatch_error,
+)
+from .forecast_validation import format_invalid_method_error
+from .interface import ForecastCallContext
 
-# Backward-compatibility surface for tests/monkeypatching.
-_PATCHABLE_GLOBALS = (mt5,)
+if TYPE_CHECKING:
+    from .interface import ForecastMethod
+
+
+class _AsyncTrainingStarted(Exception):
+    """Raised by ``_run_registered_forecast_method`` when an async training
+    task is submitted instead of producing a synchronous forecast."""
+
+    def __init__(self, response: Dict[str, Any]) -> None:
+        self.response = response
+        super().__init__("async training started")
+
+
+from .forecast_registry import ForecastRegistry
+from .target_builder import build_target_series, resolve_alias_base
 
 _ENSEMBLE_BASE_METHODS = (
     'naive',
@@ -54,30 +82,89 @@ _ENSEMBLE_BASE_METHODS = (
     'sarima',
 )
 
+logger = logging.getLogger(__name__)
+_normalize_weights = _normalize_weights_impl
 
-def _normalize_weights(weights: Any, size: int) -> Optional[np.ndarray]:
-    if weights is None:
-        return None
-    vals: List[float] = []
-    if isinstance(weights, (list, tuple)):
-        vals = [float(v) for v in list(weights)[:size]]
-    elif isinstance(weights, str):
-        parts = [p.strip() for p in weights.split(',') if p.strip()]
-        vals = [float(p) for p in parts[:size]]
-    else:
-        return None
-    if len(vals) != size:
-        return None
-    arr = np.asarray(vals, dtype=float)
-    if not np.all(np.isfinite(arr)):
-        return None
-    arr = np.clip(arr, a_min=0.0, a_max=None)
-    total = float(np.sum(arr))
-    if total <= 0:
-        return None
-    return arr / total
+def _count_weekend_forecast_times(times: List[str]) -> int:
+    weekend_count = 0
+    for value in times:
+        try:
+            timestamp = pd.Timestamp(value)
+        except Exception:
+            continue
+        if timestamp.weekday() >= 5:
+            weekend_count += 1
+    return weekend_count
 
 
+def _forex_forecast_market_status(epoch: Any) -> str:
+    try:
+        float(epoch)
+    except Exception:
+        return "unknown"
+    return "closed_weekend" if is_standard_weekend_closed_epoch(epoch) else "open"
+
+
+def _forecast_calendar_gap_rows(
+    future_epochs: List[float],
+    tf_secs: int,
+    fmt_time: Any,
+) -> Tuple[List[Dict[str, Any]], int]:
+    try:
+        step = float(tf_secs)
+    except Exception:
+        return [], 0
+    if step <= 0:
+        return [], 0
+
+    gaps: List[Dict[str, Any]] = []
+    total_skipped = 0
+    for previous_epoch, current_epoch in zip(future_epochs, future_epochs[1:]):
+        delta = float(current_epoch) - float(previous_epoch)
+        if delta <= step * 1.5:
+            continue
+        skipped_bars = max(1, int(round(delta / step)) - 1)
+        total_skipped += skipped_bars
+        gaps.append(
+            {
+                "from": fmt_time(float(previous_epoch) + step),
+                "to": fmt_time(float(current_epoch) - step),
+                "skipped_bars": skipped_bars,
+                "reason": "weekend",
+            }
+        )
+    return gaps, total_skipped
+
+
+@dataclass(frozen=True)
+class TrainingExecutionContext:
+    method_l: str
+    data_scope: str
+    target_series: pd.Series
+    horizon: int
+    seasonality: int
+    method_params: Dict[str, Any]
+    timeframe: str
+    exog_used: Optional[np.ndarray]
+
+
+def _ensemble_dispatch_method_impl(
+    method_name: str,
+    series: pd.Series,
+    horizon: int,
+    seasonality: Optional[int],
+    params: Optional[Dict[str, Any]],
+) -> Tuple[Optional[np.ndarray], Optional[Dict[str, Any]]]:
+    """Run a supported ensemble base method with safe fallbacks."""
+
+    m = str(method_name).lower().strip()
+    method_params = dict(params or {})
+    try:
+        forecaster = ForecastRegistry.get(m)
+        res = forecaster.forecast(series, horizon, seasonality or 1, method_params)
+        return res.forecast, None
+    except Exception as ex:
+        return None, _build_ensemble_dispatch_error(m, ex)
 def _ensemble_dispatch_method(
     method_name: str,
     series: pd.Series,
@@ -85,19 +172,32 @@ def _ensemble_dispatch_method(
     seasonality: Optional[int],
     params: Optional[Dict[str, Any]],
 ) -> Optional[np.ndarray]:
-    """Run a supported ensemble base method with safe fallbacks."""
+    forecast, _ = _ensemble_dispatch_method_impl(
+        method_name,
+        series,
+        horizon,
+        seasonality,
+        params,
+    )
+    return forecast
 
-    m = str(method_name).lower().strip()
-    # Allow any registered method in ensemble if it supports what we need
-    # But for safety/speed, we might restrict to fast methods or check registry
-    
-    method_params = dict(params or {})
-    try:
-        forecaster = ForecastRegistry.get(m)
-        res = forecaster.forecast(series, horizon, seasonality or 1, method_params)
-        return res.forecast
-    except Exception:
-        return None
+
+
+
+def _ensemble_dispatch_with_error(
+    method_name: str,
+    series: pd.Series,
+    horizon: int,
+    seasonality: Optional[int],
+    params: Optional[Dict[str, Any]],
+) -> Tuple[Optional[np.ndarray], Optional[Dict[str, Any]]]:
+    return _ensemble_dispatch_method_impl(
+        method_name,
+        series,
+        horizon,
+        seasonality,
+        params,
+    )
 
 
 def _prepare_ensemble_cv(
@@ -108,77 +208,60 @@ def _prepare_ensemble_cv(
     params_map: Dict[str, Dict[str, Any]],
     cv_points: int,
     min_train: int,
+    failure_sink: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Collect walk-forward one-step predictions for ensemble weighting."""
+    """Collect walk-forward one-step predictions for ensemble weighting.
 
-    n = len(series)
-    if n <= max(min_train, horizon + 2):
-        return np.empty((0, len(methods))), np.empty((0,))
+    Delegates to the shared implementation in
+    ``methods.ensemble._prepare_ensemble_cv_default``.
+    """
+    from .methods.ensemble import _prepare_ensemble_cv_default
 
-    end = n - horizon
-    candidate_idx = list(range(max(min_train, 3), end))
-    if not candidate_idx:
-        return np.empty((0, len(methods))), np.empty((0,))
-    if cv_points and len(candidate_idx) > cv_points:
-        candidate_idx = candidate_idx[-cv_points:]
+    return _prepare_ensemble_cv_default(
+        series,
+        methods,
+        horizon,
+        seasonality,
+        params_map,
+        cv_points,
+        min_train,
+        dispatch_with_error=_ensemble_dispatch_with_error,
+        failure_sink=failure_sink,
+    )
 
-    rows: List[List[float]] = []
-    targets: List[float] = []
-    for idx in candidate_idx:
-        train = series.iloc[:idx]
-        if len(train) < min_train:
-            continue
-        row: List[float] = []
-        success = True
-        for m in methods:
-            fc = _ensemble_dispatch_method(m, train, horizon, seasonality, params_map.get(m, {}))
-            if fc is None or fc.size == 0 or not math.isfinite(float(fc[0])):
-                success = False
-                break
-            row.append(float(fc[0]))
-        if not success:
-            continue
-        rows.append(row)
-        targets.append(float(series.iloc[idx]))
-
-    if not rows:
-        return np.empty((0, len(methods))), np.empty((0,))
-
-    return np.asarray(rows, dtype=float), np.asarray(targets, dtype=float)
-
-
-# Local fallbacks for typing aliases used in signatures (avoid import cycle)
-try:
-    from ..core.server import ForecastMethodLiteral, TimeframeLiteral, DenoiseSpec  # type: ignore
-except Exception:  # runtime fallback
-    ForecastMethodLiteral = str
-    TimeframeLiteral = str
-    DenoiseSpec = Dict[str, Any]
 
 # Supported forecast methods - dynamically fetch from registry
 def _get_available_methods():
     return tuple(ForecastRegistry.get_all_method_names())
 
-_FORECAST_METHODS = _get_available_methods()
-
 
 
 def _calculate_lookback_bars(method_l: str, horizon: int, lookback: Optional[int],
-                             seasonality: int, timeframe: str) -> int:
+                             seasonality: int, timeframe: str,
+                             params: Optional[Dict[str, Any]] = None) -> int:
     """Calculate the number of bars needed for forecasting."""
+    if method_l == 'analog':
+        p = dict(params or {})
+        try:
+            window_size = int(p.get('window_size', 64))
+        except Exception:
+            window_size = 64
+        try:
+            search_depth = int(p.get('search_depth', 5000))
+        except Exception:
+            search_depth = 5000
+        search_depth = max(1, search_depth)
+        # Analog search needs enough history for:
+        # 1. `search_depth` disjoint candidate starts
+        # 2. each candidate's full window plus forecast future
+        # 3. the active query window at the end of the series
+        analog_history_bars = search_depth + (2 * window_size) + int(horizon) - 1
+        if lookback is not None and lookback > 0:
+            return max(int(lookback) + 2, analog_history_bars)
+        return max(100, analog_history_bars)
+
     if lookback is not None and lookback > 0:
         return int(lookback) + 2
-
-    if method_l == 'analog':
-        # Default search_depth=5000, window=64.
-        # But we don't have params here. Assume reasonable default.
-        # If the user provides params['search_depth'], we can't see it here easily without changing signature.
-        # So we return a large enough default for fetch. 
-        # Actually AnalogMethod re-fetches, so this 'need' is just for the 'target_series' passed to it,
-        # which it ignores (via Option A).
-        # EXCEPT: the engine checks len(df) < 3. 
-        # So we just need something small like 100 to pass checks.
-        return max(100, int(horizon) + 10)
 
     if method_l == 'seasonal_naive':
         return max(3 * seasonality, int(horizon) + seasonality + 2)
@@ -188,103 +271,770 @@ def _calculate_lookback_bars(method_l: str, horizon: int, lookback: Optional[int
         return max(100, int(horizon) + 10)
 
 
-def _prepare_base_data(df: pd.DataFrame, quantity: str, target: str) -> str:
-    """Prepare base data column for forecasting."""
-    base_col = 'close'
-
-    if quantity == 'return':
-        df['__log_return'] = np.log(df['close'] / df['close'].shift(1))
-        base_col = '__log_return'
-    elif quantity == 'volatility':
-        if target == 'price':
-            df['__log_return'] = np.log(df['close'] / df['close'].shift(1))
-            df['__squared_return'] = df['__log_return'] ** 2
-            base_col = '__squared_return'
-        else:  # return
-            df['__squared_return'] = df['__log_return'] ** 2
-            base_col = '__squared_return'
-
-    return base_col
-
-
-def _apply_features_and_target_spec(df: pd.DataFrame, features: Optional[Dict[str, Any]],
-                                   target_spec: Optional[Dict[str, Any]], base_col: str) -> str:
-    """Apply features and target specification to the dataframe."""
-    # Apply technical indicators if specified in features
-    if features and isinstance(features, dict):
-        ti_spec = features.get('ti')
-        if ti_spec:
-            ti_list = _parse_ti_specs_util(ti_spec)
-            if ti_list:
-                ti_cols = _apply_ta_indicators_util(df, ti_spec)
-                # Update base_col if TI column is specified as target
-                if target_spec and target_spec.get('column') in ti_cols:
-                    base_col = target_spec.get('column')
-
-    # Apply target column transformations
-    if target_spec:
-        target_col = target_spec.get('column', base_col)
-        transform = target_spec.get('transform')
-
-        if transform == 'log':
-            df[f'__target_{target_col}'] = np.log(df[target_col])
-            base_col = f'__target_{target_col}'
-        elif transform == 'diff':
-            df[f'__target_{target_col}'] = df[target_col].diff()
-            base_col = f'__target_{target_col}'
-        elif transform == 'pct':
-            df[f'__target_{target_col}'] = df[target_col].pct_change()
-            base_col = f'__target_{target_col}'
-        elif target_col != base_col:
-            base_col = target_col
-
-    return base_col
-
-
-def _apply_dimensionality_reduction(X: pd.DataFrame, dimred_method: Optional[str],
-                                   dimred_params: Optional[Dict[str, Any]]) -> pd.DataFrame:
-    """Apply dimensionality reduction to feature matrix."""
-    if not dimred_method or len(X.columns) <= 1:
-        return X
-
-    try:
-        from sklearn.decomposition import PCA
-        from sklearn.manifold import TSNE
-
-        params = dimred_params or {}
-
-        if dimred_method.lower() == 'pca':
-            n_components = params.get('n_components', min(5, X.shape[1]))
-            reducer = PCA(n_components=n_components)
-            X_reduced = reducer.fit_transform(X)
-            return pd.DataFrame(X_reduced, columns=[f'pca_{i}' for i in range(X_reduced.shape[1])])
-
-        elif dimred_method.lower() == 'tsne':
-            n_components = params.get('n_components', 2)
-            reducer = TSNE(n_components=n_components, random_state=42)
-            X_reduced = reducer.fit_transform(X)
-            return pd.DataFrame(X_reduced, columns=[f'tsne_{i}' for i in range(X_reduced.shape[1])])
-
-        elif dimred_method.lower() == 'selectkbest':
+def _resolve_history_context(
+    *,
+    symbol: str,
+    timeframe: TimeframeLiteral,
+    need: int,
+    as_of: Optional[str],
+    start: Optional[str],
+    end: Optional[str],
+    prefetched_df: Optional[pd.DataFrame],
+    prefetched_base_col: Optional[str],
+    prefetched_denoise_spec: Optional[Any],
+    denoise: Optional[DenoiseSpec],
+) -> Tuple[pd.DataFrame, str, Optional[Any]]:
+    """Return the source DataFrame, active base column, and denoise spec used."""
+    if prefetched_df is not None:
+        df = prefetched_df.copy()
+        base_col = prefetched_base_col or ('close_dn' if 'close_dn' in df.columns else 'close')
+        dn_spec_used = None
+        if prefetched_denoise_spec:
             try:
-                k = int(params.get('k', min(5, X.shape[1])))
-            except (TypeError, ValueError):
-                k = min(5, X.shape[1])
-            k = max(1, min(int(k), int(X.shape[1])))
-            X_num = X.apply(pd.to_numeric, errors='coerce')
-            variances = X_num.var(axis=0, skipna=True).astype(float)
-            variances = variances.fillna(float("-inf"))
-            selected_cols = variances.sort_values(ascending=False).index.tolist()[:k]
-            if not selected_cols:
-                selected_cols = list(X.columns[:k])
-            X_reduced = X_num[selected_cols].to_numpy()
-            return pd.DataFrame(X_reduced, columns=[f'select_{i}' for i in range(X_reduced.shape[1])])
+                dn_spec_used = _normalize_denoise_spec(prefetched_denoise_spec, default_when='pre_ti')
+            except Exception:
+                dn_spec_used = None
+        elif denoise:
+            try:
+                normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
+            except Exception:
+                normalized = None
+            added = _apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
+            dn_spec_used = normalized
+            if len(added) > 0 and base_col == 'close' and f"{base_col}_dn" in added:
+                base_col = f"{base_col}_dn"
+        return df, base_col, dn_spec_used
 
+    history_kwargs: Dict[str, Any] = {}
+    if start or end:
+        history_kwargs.update({"start": start, "end": end})
+    df = _fetch_history(symbol, timeframe, int(need), as_of, **history_kwargs)
+    if (start or end) and len(df) > int(need):
+        df = df.iloc[-int(need):].reset_index(drop=True)
+    if len(df) < 3:
+        raise ValueError("Not enough closed bars to compute forecast")
+
+    base_col = 'close'
+    dn_spec_used = None
+    if denoise:
+        try:
+            normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
+        except Exception:
+            normalized = None
+        added = _apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
+        dn_spec_used = normalized
+        if len(added) > 0 and f"{base_col}_dn" in added:
+            base_col = f"{base_col}_dn"
+    return df, base_col, dn_spec_used
+
+
+def _prepare_target_series_context(
+    *,
+    df: pd.DataFrame,
+    quantity_l: str,
+    base_col: str,
+    features: Optional[Dict[str, Any]],
+    target_spec: Optional[Dict[str, Any]],
+) -> Tuple[pd.Series, str, str, Dict[str, Any]]:
+    """Prepare the effective base column and target series consumed by forecasters."""
+    base_col_initial = base_col
+    base_col_prepared = _forecast_preprocessing._prepare_base_data(df, quantity_l, base_col)
+    base_col_prepared = _forecast_preprocessing._apply_features_and_target_spec(
+        df,
+        features,
+        target_spec,
+        base_col_prepared,
+        parse_kv_or_json=_parse_kv_or_json,
+    )
+
+    target_series = df[base_col_prepared].dropna()
+    target_info: Dict[str, Any] = {}
+    if target_spec:
+        y_arr, target_info = build_target_series(df, base_col_initial, target_spec, quantity=quantity_l)
+        target_series = pd.Series(y_arr, index=df.index)
+        base_col_final = target_info.get('base', base_col_initial)
+    else:
+        base_col_final = base_col_prepared
+        if quantity_l == 'return':
+            target_info = {'mode': 'return', 'base': base_col_initial, 'transform': 'log_return'}
+        else:
+            target_series = df[base_col_final]
+            target_info = {'mode': quantity_l, 'base': base_col_final, 'transform': 'none'}
+
+    target_series = target_series.dropna()
+    return target_series, base_col_initial, base_col_final, target_info
+
+
+def _reconstruct_prices_from_target(
+    forecast_values: np.ndarray,
+    price_history: Optional[np.ndarray],
+    target_info: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    history = np.asarray(price_history, dtype=float).reshape(-1) if price_history is not None else np.asarray([], dtype=float)
+    if history.size == 0:
+        return None
+
+    forecast_arr = np.asarray(forecast_values, dtype=float)
+    transform = str((target_info or {}).get("transform", "log_return")).strip().lower()
+    lag = 1
+    if "(k=" in transform:
+        try:
+            lag = max(1, int(transform.rsplit("(k=", 1)[1].rstrip(") ")))
+        except Exception:
+            lag = 1
+
+    if transform == "none":
+        return forecast_arr.astype(float, copy=True)
+    if transform == "log":
+        return np.exp(forecast_arr)
+    if history.size < lag or not np.all(np.isfinite(history[-lag:])):
+        return None
+
+    inverse_fn = _RECONSTRUCTION_MODES.get(
+        transform.split("(")[0] if "(" in transform else transform,
+    )
+    if inverse_fn is None:
+        logger.warning("Unknown transform %r – cannot reconstruct prices", transform)
+        return None
+
+    reconstructed: List[float] = []
+    anchors = history.astype(float).tolist()
+    for value in forecast_arr:
+        anchor = anchors[-lag]
+        fallback_anchor = anchor
+        if not np.isfinite(fallback_anchor):
+            fallback_anchor = next(
+                (candidate for candidate in reversed(anchors) if np.isfinite(candidate)),
+                float("nan"),
+            )
+        if not (np.isfinite(anchor) and np.isfinite(value)):
+            price = float("nan")
+        else:
+            price = inverse_fn(anchor, float(value))
+            if not np.isfinite(price):
+                price = float("nan")
+        anchors.append(price if np.isfinite(price) else fallback_anchor)
+        reconstructed.append(price)
+
+    return np.asarray(reconstructed, dtype=float)
+
+
+def _inverse_log_return(anchor: float, value: float) -> float:
+    """log_return: price = anchor * exp(value)"""
+    return anchor * float(np.exp(value))
+
+
+def _inverse_return(anchor: float, value: float) -> float:
+    """return / pct_change: price = anchor * (1 + value)"""
+    return anchor * (1.0 + value)
+
+
+def _inverse_pct(anchor: float, value: float) -> float:
+    """pct: price = anchor * (1 + value/100)"""
+    return anchor * (1.0 + value / 100.0)
+
+
+def _inverse_diff(anchor: float, value: float) -> float:
+    """diff: price = anchor + value"""
+    return anchor + value
+
+
+_RECONSTRUCTION_MODES = {
+    "log_return": _inverse_log_return,
+    "return": _inverse_return,
+    "pct_change": _inverse_return,
+    "pct": _inverse_pct,
+    "diff": _inverse_diff,
+}
+
+
+def _prepare_feature_context(
+    *,
+    df: pd.DataFrame,
+    features: Optional[Dict[str, Any]],
+    exog_used: Optional[np.ndarray],
+    exog_future: Optional[np.ndarray],
+    tf_secs: int,
+    horizon: int,
+    target_series: pd.Series,
+    dimred_method: Optional[str],
+    dimred_params: Optional[Dict[str, Any]],
+    symbol: Optional[str] = None,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]:
+    """Prepare training and future exogenous features if requested."""
+    X = exog_used
+    future_exog = exog_future
+    feat_info: Dict[str, Any] = {}
+    if X is None and features:
+        future_times = next_times_from_last(
+            float(df['time'].iloc[-1]),
+            int(tf_secs),
+            int(horizon),
+            skip_weekends=uses_standard_weekend_projection(symbol, int(tf_secs)),
+        )
+        try:
+            X, built_future_exog, feat_info = _forecast_preprocessing.prepare_features(
+                df,
+                features,
+                future_times,
+                horizon,
+                training_index=target_series.index,
+                dimred_method=dimred_method,
+                dimred_params=dimred_params,
+                parse_kv_or_json=_parse_kv_or_json,
+                reducer_factory=_forecast_preprocessing._create_dimred_reducer,
+            )
+        except Exception as exc:
+            logger.warning("Feature preparation failed; using univariate fallback: %s", exc)
+            X, built_future_exog, feat_info = None, None, {'error': f"feature_build_error: {str(exc)}"}
+        if future_exog is None:
+            future_exog = built_future_exog
+    return X, future_exog, feat_info
+
+
+def build_training_context(
+    symbol: str,
+    timeframe: TimeframeLiteral = "H1",
+    method: ForecastMethodLiteral = "theta",
+    horizon: int = 12,
+    lookback: Optional[int] = None,
+    as_of: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+    quantity: Literal["price", "return", "volatility"] = "price",
+    denoise: Optional[DenoiseSpec] = None,
+    features: Optional[Dict[str, Any]] = None,
+    dimred_method: Optional[str] = None,
+    dimred_params: Optional[Dict[str, Any]] = None,
+    target_spec: Optional[Dict[str, Any]] = None,
+    exog_used: Optional[np.ndarray] = None,
+    exog_future: Optional[np.ndarray] = None,
+    prefetched_df: Optional[pd.DataFrame] = None,
+    prefetched_base_col: Optional[str] = None,
+    prefetched_denoise_spec: Optional[Any] = None,
+) -> TrainingExecutionContext:
+    method_l = str(method).lower().strip()
+    quantity_l = str(quantity).lower().strip()
+    if timeframe not in TIMEFRAME_MAP:
+        raise ValueError(invalid_timeframe_error(timeframe, TIMEFRAME_MAP))
+    tf_secs = TIMEFRAME_SECONDS.get(timeframe)
+    if not tf_secs:
+        raise ValueError(unsupported_timeframe_seconds_error(timeframe))
+    available_methods = _get_available_methods()
+    if method_l not in available_methods:
+        raise ValueError(format_invalid_method_error(method, list(available_methods)))
+    if quantity_l == "volatility" or method_l.startswith("vol_"):
+        raise ValueError("Use forecast_volatility for volatility models")
+
+    p = _parse_kv_or_json(params)
+    seasonality = int(p.get("seasonality")) if p.get("seasonality") is not None else default_seasonality(timeframe)
+    need = _calculate_lookback_bars(method_l, int(horizon), lookback, seasonality, timeframe, params=p)
+    df, base_col, _ = _resolve_history_context(
+        symbol=symbol,
+        timeframe=timeframe,
+        need=need,
+        as_of=as_of,
+        start=start,
+        end=end,
+        prefetched_df=prefetched_df,
+        prefetched_base_col=prefetched_base_col,
+        prefetched_denoise_spec=prefetched_denoise_spec,
+        denoise=denoise,
+    )
+    if p.get("seasonality") is None and "time" in df.columns:
+        seasonality = default_seasonality(timeframe, df["time"])
+    target_series, _, base_col, _ = _prepare_target_series_context(
+        df=df,
+        quantity_l=quantity_l,
+        base_col=base_col,
+        features=features,
+        target_spec=target_spec,
+    )
+    if len(target_series) < 3:
+        raise ValueError(f"Not enough valid data points in column '{base_col}'")
+    X, _, feature_info = _prepare_feature_context(
+        df=df,
+        features=features,
+        exog_used=exog_used,
+        exog_future=exog_future,
+        tf_secs=int(tf_secs),
+        horizon=int(horizon),
+        target_series=target_series,
+        dimred_method=dimred_method,
+        dimred_params=dimred_params,
+        symbol=symbol,
+    )
+    if features and feature_info.get("error"):
+        raise ValueError(
+            "Requested features could not be prepared: "
+            f"{feature_info['error']}"
+        )
+    training_params = dict(p)
+    training_params["_training_context"] = _training_context_fingerprint(
+        df=df,
+        target_series=target_series,
+        base_col=base_col,
+        denoise=denoise,
+        features=features,
+        target_spec=target_spec,
+        exog=X,
+    )
+    return TrainingExecutionContext(
+        method_l=method_l,
+        data_scope=f"{symbol}_{timeframe}",
+        target_series=target_series,
+        horizon=int(horizon),
+        seasonality=int(seasonality),
+        method_params=training_params,
+        timeframe=str(timeframe),
+        exog_used=X,
+    )
+
+
+def _build_engine_diagnostics(
+    *,
+    df: pd.DataFrame,
+    need: int,
+    lookback: Optional[int],
+    seasonality: int,
+    quantity_l: str,
+    base_col: str,
+    target_series: pd.Series,
+) -> Dict[str, Any]:
+    history_start_epoch: Optional[float]
+    history_end_epoch: Optional[float]
+    try:
+        history_start_epoch = float(df['time'].iloc[0])
     except Exception:
-        # Fall back to original features if dimensionality reduction fails
-        pass
+        history_start_epoch = None
+    try:
+        history_end_epoch = float(df['time'].iloc[-1])
+    except Exception:
+        history_end_epoch = None
 
-    return X
+    fmt_time = _format_time_minimal_local if _use_client_tz() else _format_time_minimal
+    diagnostics: Dict[str, Any] = {
+        "lookback_bars_requested": int(lookback) if lookback is not None else None,
+        "lookback_bars_fetched": int(need),
+        "history_bars_used": int(len(df)),
+        "target_points_used": int(len(target_series)),
+        "seasonality_used": int(seasonality),
+        "quantity": quantity_l,
+        "base_col_used": str(base_col),
+    }
+    if history_start_epoch is not None:
+        diagnostics["history_start_epoch"] = history_start_epoch
+        diagnostics["history_start_time"] = fmt_time(history_start_epoch)
+    if history_end_epoch is not None:
+        diagnostics["history_end_epoch"] = history_end_epoch
+        diagnostics["history_end_time"] = fmt_time(history_end_epoch)
+    return diagnostics
+
+
+def _compute_model_key(
+    forecaster: "ForecastMethod",
+    method_l: str,
+    horizon: int,
+    seasonality: int,
+    params: Dict[str, Any],
+    timeframe: str,
+    has_exog: bool,
+) -> str:
+    """Compute a stable params_hash for the model store lookup."""
+    from .interface import ForecastMethod as _FM
+    fp = forecaster.training_fingerprint(
+        horizon=horizon,
+        seasonality=seasonality,
+        params=params,
+        timeframe=timeframe,
+        has_exog=has_exog,
+    )
+    return _FM.hash_fingerprint(fp)
+
+
+def _stable_training_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_training_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_training_value(item) for item in value]
+    return value
+
+
+def _training_context_fingerprint(
+    *,
+    df: pd.DataFrame,
+    target_series: pd.Series,
+    base_col: str,
+    denoise: Any,
+    features: Any,
+    target_spec: Any,
+    exog: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    return {
+        "target_points": int(len(target_series)),
+        "history_start_epoch": float(df["time"].iloc[0]),
+        "training_end_epoch": float(df["time"].iloc[-1]),
+        "base_col": str(base_col),
+        "denoise": _stable_training_value(denoise),
+        "features": _stable_training_value(features),
+        "target_spec": _stable_training_value(target_spec),
+        "exog_shape": list(exog.shape) if exog is not None else None,
+    }
+
+
+def _try_predict_with_stored_model(
+    forecaster: "ForecastMethod",
+    method_l: str,
+    data_scope: str,
+    params_hash: str,
+    target_series: pd.Series,
+    horizon: int,
+    seasonality: int,
+    method_params: Dict[str, Any],
+    future_exog: Optional[np.ndarray],
+    call_kwargs: Dict[str, Any],
+    current_anchor_epoch: Optional[float] = None,
+) -> Optional[Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]]:
+    """Attempt to load a trained model and predict. Returns None if no model found."""
+    try:
+        from .model_store import describe_store_metadata_compatibility
+        from .model_store import model_store as _store
+        handle = _store.find(method_l, data_scope, params_hash)
+        if handle is None:
+            return None
+        if current_anchor_epoch is not None:
+            training_context = handle.metadata.get("training_context")
+            if not isinstance(training_context, dict):
+                return None
+            trained_anchor = training_context.get("training_end_epoch")
+            try:
+                anchor_matches = abs(
+                    float(trained_anchor) - float(current_anchor_epoch)
+                ) < 1e-6
+            except (TypeError, ValueError):
+                anchor_matches = False
+            if not anchor_matches:
+                return None
+        raw = _store.load_bytes(handle.model_id)
+        if raw is None:
+            return None
+        artifact = forecaster.deserialize_artifact(raw)
+        res = forecaster.predict_with_model(
+            artifact,
+            target_series,
+            horizon,
+            seasonality,
+            method_params,
+            exog_future=future_exog,
+            **call_kwargs,
+        )
+        metadata = res.metadata or {}
+        metadata['params_used'] = res.params_used
+        model_info = {
+            'model_id': handle.model_id,
+            'trained_at': handle.created_at,
+            'data_scope': handle.data_scope,
+            'source': 'model_store',
+        }
+        try:
+            compatibility = describe_store_metadata_compatibility(handle.store_metadata)
+        except Exception as compat_exc:
+            logger.debug(
+                "Model store compatibility inspection failed for %s: %s",
+                handle.model_id,
+                compat_exc,
+            )
+        else:
+            if compatibility.get("status") == "warning":
+                model_info["compatibility"] = compatibility
+                warnings = metadata.get("warnings")
+                if not isinstance(warnings, list):
+                    warnings = []
+                for warning_text in compatibility.get("warnings") or []:
+                    warning_text = str(warning_text).strip()
+                    if warning_text and warning_text not in warnings:
+                        warnings.append(warning_text)
+                if warnings:
+                    metadata["warnings"] = warnings
+        metadata['model_info'] = model_info
+        return res.forecast, res.ci_values, metadata
+    except Exception as exc:
+        logger.debug("Model store predict failed for %s/%s: %s", method_l, data_scope, exc)
+        return None
+
+
+def _submit_async_training(
+    forecaster: "ForecastMethod",
+    method_l: str,
+    target_series: pd.Series,
+    horizon: int,
+    seasonality: int,
+    params: Dict[str, Any],
+    data_scope: str,
+    params_hash: str,
+    timeframe: str,
+    exog: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    """Submit a background training task. Returns an async response dict."""
+    from .task_manager import get_task_manager
+
+    tm = get_task_manager()
+    task_id, is_new = tm.submit(
+        method_name=method_l,
+        series=target_series,
+        horizon=horizon,
+        seasonality=seasonality,
+        params=params,
+        data_scope=data_scope,
+        params_hash=params_hash,
+        exog=exog,
+        timeframe=timeframe,
+    )
+
+    category = getattr(forecaster, "training_category", "unknown")
+    duration_hint = {
+        "heavy": "1-10 minutes (GPU training)",
+        "moderate": "10-60 seconds",
+        "fast": "1-10 seconds",
+    }.get(category, "varies")
+
+    return {
+        "status": "pending" if is_new else "running",
+        "task_id": task_id,
+        "method": method_l,
+        "data_scope": data_scope,
+        "estimated_duration": duration_hint,
+        "next_step": (
+            f"Poll forecast_task_status(task_id='{task_id}') for progress. "
+            f"Once complete, call forecast_generate again — the trained model will be used automatically."
+        ),
+    }
+
+
+def _run_registered_forecast_method(
+    *,
+    method_l: str,
+    method: ForecastMethodLiteral,
+    df: pd.DataFrame,
+    target_series: pd.Series,
+    horizon: int,
+    seasonality: int,
+    params: Dict[str, Any],
+    ci_alpha: Optional[float],
+    as_of: Optional[str],
+    quantity_l: str,
+    symbol: str,
+    timeframe: TimeframeLiteral,
+    base_col: str,
+    denoise_spec_used: Optional[Any],
+    X: Optional[np.ndarray],
+    future_exog: Optional[np.ndarray],
+    features: Optional[Dict[str, Any]] = None,
+    feature_info: Optional[Dict[str, Any]] = None,
+    target_spec: Optional[Dict[str, Any]] = None,
+    async_mode: bool = False,
+    model_id: Optional[str] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
+    forecaster = ForecastRegistry.get(method_l)
+    method_params = dict(params)
+    if ci_alpha is not None and 'ci_alpha' not in method_params:
+        method_params['ci_alpha'] = ci_alpha
+    requested_model_id = str(model_id or "").strip()
+    supports_training = bool(getattr(forecaster, 'supports_training', False))
+    if requested_model_id and not supports_training:
+        raise ValueError(
+            f"model_id '{requested_model_id}' was provided, but method "
+            f"'{method_l}' does not support stored model prediction. "
+            "Use forecast_models_list to inspect stored trainable models, or omit model_id."
+        )
+
+    call_kwargs: Dict[str, Any] = {
+        'ci_alpha': ci_alpha,
+        'as_of': as_of,
+        'quantity': quantity_l,
+        'timeframe': timeframe,
+    }
+    if X is not None:
+        call_kwargs['exog_used'] = X
+    call_context = ForecastCallContext(
+        method=method_l,
+        symbol=symbol,
+        timeframe=str(timeframe),
+        quantity=quantity_l,
+        horizon=int(horizon),
+        seasonality=int(seasonality),
+        base_col=str(base_col),
+        ci_alpha=ci_alpha,
+        as_of=as_of,
+        denoise_spec_used=denoise_spec_used,
+        history_df=df,
+        target_series=target_series,
+        exog_used=X,
+        future_exog=future_exog,
+        features=dict(features) if isinstance(features, dict) else None,
+        feature_info=dict(feature_info) if isinstance(feature_info, dict) else None,
+    )
+    prepare_call = getattr(forecaster, "prepare_forecast_call", None)
+    if callable(prepare_call):
+        method_params, call_kwargs = prepare_call(
+            method_params,
+            call_kwargs,
+            call_context,
+        )
+
+    # --- Model store fast path ---
+    if supports_training:
+        data_scope = f"{symbol}_{timeframe}"
+        has_exog = X is not None
+        training_params = dict(method_params)
+        training_params["quantity"] = quantity_l
+        training_params["_training_context"] = _training_context_fingerprint(
+            df=df,
+            target_series=target_series,
+            base_col=base_col,
+            denoise=denoise_spec_used,
+            features=features,
+            target_spec=target_spec,
+            exog=X,
+        )
+        params_hash = requested_model_id or _compute_model_key(
+            forecaster, method_l, horizon, seasonality,
+            training_params, str(timeframe), has_exog,
+        )
+
+        stored_result = _try_predict_with_stored_model(
+            forecaster, method_l, data_scope, params_hash,
+            target_series, horizon, seasonality,
+            method_params, future_exog, call_kwargs,
+            float(df["time"].iloc[-1]),
+        )
+        if stored_result is not None:
+            return stored_result
+        if requested_model_id:
+            raise ValueError(
+                f"Model with ID or params_hash '{requested_model_id}' was not found "
+                "in the model store or could not be loaded. Use forecast_models_list "
+                "to see available models, or omit model_id for an on-the-fly forecast."
+            )
+
+        # No stored model — async route for any trainable method when requested
+        if async_mode:
+            # Pass training_params (includes quantity) so TaskManager's recomputed
+            # hash matches the model-store key used above.
+            async_resp = _submit_async_training(
+                forecaster, method_l, target_series,
+                horizon, seasonality, training_params,
+                data_scope, params_hash, str(timeframe), X,
+            )
+            raise _AsyncTrainingStarted(async_resp)
+
+    # --- Default synchronous path (backward compatible) ---
+    res = forecaster.forecast(
+        target_series,
+        horizon,
+        seasonality,
+        method_params,
+        exog_future=future_exog,
+        **call_kwargs,
+    )
+    metadata = res.metadata or {}
+    metadata['params_used'] = res.params_used
+    return res.forecast, res.ci_values, metadata
+
+
+def _merge_engine_diagnostics(metadata: Dict[str, Any], diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        metadata = {}
+    existing_diagnostics = metadata.get("diagnostics")
+    if not isinstance(existing_diagnostics, dict):
+        existing_diagnostics = {}
+    merged_diagnostics = dict(existing_diagnostics)
+    for key, value in diagnostics.items():
+        if key not in merged_diagnostics:
+            merged_diagnostics[key] = value
+    metadata["diagnostics"] = merged_diagnostics
+    return metadata
+
+
+def _forecast_timezone_label(*, use_client_tz: bool, client_tz: Any) -> str:
+    if not use_client_tz:
+        return "UTC"
+    if client_tz is None:
+        return "local"
+    return (
+        getattr(client_tz, "key", None)
+        or getattr(client_tz, "zone", None)
+        or str(client_tz)
+    )
+
+
+def _format_age_seconds(seconds: Any) -> Optional[str]:
+    try:
+        value = max(0, int(round(float(seconds))))
+    except Exception:
+        return None
+    days, remainder = divmod(value, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _last_price_freshness_fields(
+    *,
+    last_epoch: float,
+    tf_secs: int,
+    now_epoch: Optional[float] = None,
+    symbol: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        last_value = float(last_epoch)
+        step_seconds = max(1, int(tf_secs))
+    except Exception:
+        return {}
+    if now_epoch is None:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+    try:
+        age_seconds = max(0.0, float(now_epoch) - last_value)
+    except Exception:
+        return {}
+    stale_after = int(step_seconds * max(1, int(SANITY_BARS_TOLERANCE)))
+    rounded_age = int(round(age_seconds))
+    out: Dict[str, Any] = {
+        "last_price_age_seconds": rounded_age,
+        "last_price_stale": age_seconds > float(stale_after),
+        "freshness_basis": "bar_policy",
+        "stale_after_seconds": stale_after,
+    }
+    age_text = _format_age_seconds(rounded_age)
+    if age_text:
+        out["last_price_age"] = age_text
+    closed_session = closed_session_context(
+        symbol,
+        now_epoch=now_epoch,
+        item="forecast anchor",
+        data_age_seconds=age_seconds,
+    )
+    if closed_session:
+        out.update(closed_session)
+    out["usable_for_live_trading"] = not out["last_price_stale"] and not bool(closed_session)
+    if out["last_price_stale"]:
+        out["stale_warning"] = (
+            "Last forecast anchor is older than the bar freshness policy; "
+            "market may be closed or broker data may be stale."
+        )
+    return out
 
 
 def _format_forecast_output(
@@ -303,27 +1053,93 @@ def _format_forecast_output(
     digits: Optional[int] = None,
     forecast_return_values: Optional[np.ndarray] = None,
     reconstructed_prices: Optional[np.ndarray] = None,
+    reconstructed_price_ci: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    symbol: Optional[str] = None,
+    timeframe: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Format forecast output with proper structure."""
     # Generate future time indices
-    future_epochs = _next_times_from_last(last_epoch, tf_secs, horizon)
-
-    # Time formatting
-    _use_ctz = _use_client_tz()
-    if _use_ctz:
-        future_times = [_format_time_minimal_local(e) for e in future_epochs]
-    else:
-        future_times = [_format_time_minimal(e) for e in future_epochs]
+    future_epochs = next_times_from_last(
+        last_epoch,
+        tf_secs,
+        horizon,
+        skip_weekends=uses_standard_weekend_projection(symbol, tf_secs),
+    )
+    use_client_tz = _use_client_tz()
+    client_tz = _resolve_client_tz() if use_client_tz else None
+    fmt_time = _format_time_minimal_local if use_client_tz else _format_time_minimal
+    timezone_label = _forecast_timezone_label(
+        use_client_tz=use_client_tz,
+        client_tz=client_tz,
+    )
+    forecast_times = [fmt_time(float(epoch)) for epoch in future_epochs]
+    last_observation_time = fmt_time(float(last_epoch))
+    calendar_gaps, skipped_bars = _forecast_calendar_gap_rows(
+        future_epochs,
+        tf_secs,
+        fmt_time,
+    )
+    price_anchor_series = df["close"] if "close" in df.columns else df[base_col]
+    price_anchor_numeric = pd.to_numeric(price_anchor_series, errors="coerce")
+    finite_price_anchors = price_anchor_numeric[np.isfinite(price_anchor_numeric)]
+    last_price = (
+        float(finite_price_anchors.iloc[-1])
+        if len(finite_price_anchors) > 0
+        else None
+    )
 
     # Build base result
+    forecast_start_epoch = float(future_epochs[0]) if future_epochs else None
+    forecast_start_gap_bars = (
+        float(forecast_start_epoch - float(last_epoch)) / float(tf_secs)
+        if forecast_start_epoch is not None and tf_secs
+        else None
+    )
     result: Dict[str, Any] = {
         "success": True,
         "method": method,
         "horizon": horizon,
         "base_col": base_col,
-        "forecast_time": future_times,
+        "last_observation_epoch": float(last_epoch),
+        "last_observation_time": last_observation_time,
+        "timezone": timezone_label,
+        "forecast_from": {
+            "time": last_observation_time,
+            "anchor": "last_observation",
+        },
+        "forecast_start_epoch": forecast_start_epoch,
+        "forecast_start_time": forecast_times[0] if forecast_times else None,
+        "forecast_start_gap_bars": forecast_start_gap_bars,
+        "forecast_start_gap_note": (
+            "Bars from the last closed observation to the first forecast; "
+            "1.0 means the next timeframe bar."
+        ),
+        "forecast_anchor": "next_timeframe_bar_after_last_observation",
+        "forecast_step_seconds": int(tf_secs),
         "forecast_epoch": future_epochs,
+        "forecast_time": forecast_times,
+        "last_price": last_price,
+        "last_price_source": "candle_close" if last_price is not None else None,
+        "calendar_treatment": (
+            "forex_weekend_skipped"
+            if uses_standard_weekend_projection(symbol, tf_secs)
+            else "continuous_no_weekend_skip"
+        ),
     }
+    if calendar_gaps:
+        result["forecast_calendar_gaps"] = calendar_gaps
+        result["horizon_note"] = (
+            f"{horizon} trading bars forecast; {skipped_bars} "
+            f"{str(timeframe or '').upper() or 'timeframe'} bars skipped (weekend)."
+        )
+    elif not uses_standard_weekend_projection(symbol, tf_secs):
+        weekend_bars = _count_weekend_forecast_times(forecast_times)
+        if weekend_bars:
+            result.setdefault("warnings", []).append(
+                f"{weekend_bars} of {horizon} forecast timestamps fall on a weekend; "
+                "weekends are not skipped for this symbol (continuous calendar). "
+                "Confirm the instrument trades during those periods."
+            )
 
     # Choose which arrays to expose
     if quantity == 'return':
@@ -332,16 +1148,28 @@ def _format_forecast_output(
         result["forecast_return"] = [float(v) for v in forecast_return_values]
         if reconstructed_prices is not None:
             result["forecast_price"] = [float(v) for v in reconstructed_prices]
+    elif reconstructed_prices is not None:
+        result["forecast_price"] = [float(v) for v in reconstructed_prices]
     else:
         result["forecast_price"] = [float(v) for v in forecast_values]
     
     if digits is not None:
         result["digits"] = int(digits)
 
-    # Add confidence intervals if available
-    if ci_alpha is not None and ci_values is not None:
-        result["ci_alpha"] = float(ci_alpha)
-        if len(ci_values) == 2:  # [lower, upper]
+    # Add confidence intervals if available. If they are requested but missing,
+    # surface an explicit warning to avoid misleading point-only interpretation.
+    if ci_alpha is not None:
+        ci_alpha_value: Optional[float] = None
+        try:
+            ci_alpha_value = float(ci_alpha)
+        except Exception:
+            ci_alpha_value = None
+        if ci_alpha_value is not None:
+            result["ci_alpha"] = ci_alpha_value
+
+        if ci_values is not None and len(ci_values) == 2:  # [lower, upper]
+            result["ci_status"] = "available"
+            result["ci_available"] = True
             lower_vals = [float(v) for v in ci_values[0]]
             upper_vals = [float(v) for v in ci_values[1]]
             if quantity == 'return':
@@ -351,12 +1179,38 @@ def _format_forecast_output(
                 result["lower"] = lower_vals
                 result["upper"] = upper_vals
             else:
-                result["lower_price"] = lower_vals
-                result["upper_price"] = upper_vals
+                if reconstructed_price_ci is not None:
+                    result["lower_price"] = [
+                        float(v) for v in reconstructed_price_ci[0]
+                    ]
+                    result["upper_price"] = [
+                        float(v) for v in reconstructed_price_ci[1]
+                    ]
+                else:
+                    result["lower_price"] = lower_vals
+                    result["upper_price"] = upper_vals
+        else:
+            if ci_alpha_value is not None:
+                warning_text = (
+                    f"ci_alpha={ci_alpha_value:g} was requested but confidence intervals "
+                    f"are unavailable for method '{method}'; returning a point forecast only. "
+                    "Use forecast_conformal_intervals for residual-quantile uncertainty bands."
+                )
+            else:
+                warning_text = (
+                    f"Point forecast only for method '{method}'; confidence intervals are unavailable. "
+                    "Use forecast_conformal_intervals for residual-quantile uncertainty bands."
+                )
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            warnings.append(warning_text)
+            result["warnings"] = warnings
+            result["ci_status"] = "unavailable"
+            result["ci_available"] = False
 
     # Add metadata
     result.update({
-        "last_epoch": float(last_epoch),
         "quantity": quantity,
         "denoise_applied": denoise_used,
     })
@@ -364,20 +1218,44 @@ def _format_forecast_output(
     if metadata:
         result.update(metadata)
 
+    if (
+        uses_standard_weekend_projection(symbol, tf_secs)
+        and forecast_times
+    ):
+        market_status = [_forex_forecast_market_status(epoch) for epoch in future_epochs]
+        weekend_count = sum(1 for status in market_status if status == "closed_weekend")
+        if weekend_count:
+            result["forecast_market_status"] = market_status
+            result["open_market_forecast_bars"] = int(len(forecast_times) - weekend_count)
+            result["closed_market_forecast_bars"] = weekend_count
+            note = (
+                f"{weekend_count} of {len(forecast_times)} forecast bars fall on "
+                "Saturday/Sunday for a forex symbol; treat those timestamps as "
+                "closed-market placeholders."
+            )
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = [] if warnings in (None, "", [], {}) else [warnings]
+            if note not in warnings:
+                warnings.append(note)
+            result["warnings"] = warnings
+            result["market_hours_note"] = note
+
     return result
 
 
-def forecast_engine(
+def forecast_engine(  # noqa: C901
     symbol: str,
     timeframe: TimeframeLiteral = "H1",
     method: ForecastMethodLiteral = "theta",
     horizon: int = 12,
     lookback: Optional[int] = None,
     as_of: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     ci_alpha: Optional[float] = 0.05,
     quantity: Literal['price','return','volatility'] = 'price',
-    target: Literal['price','return'] = 'price',
     denoise: Optional[DenoiseSpec] = None,
     features: Optional[Dict[str, Any]] = None,
     dimred_method: Optional[str] = None,
@@ -388,6 +1266,8 @@ def forecast_engine(
     prefetched_df: Optional[pd.DataFrame] = None,
     prefetched_base_col: Optional[str] = None,
     prefetched_denoise_spec: Optional[Any] = None,
+    async_mode: bool = False,
+    model_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Core forecast engine implementation.
 
@@ -408,10 +1288,10 @@ def forecast_engine(
         
         # Validation
         if timeframe not in TIMEFRAME_MAP:
-            return {"error": f"Invalid timeframe: {timeframe}. Valid options: {list(TIMEFRAME_MAP.keys())}"}
+            return {"error": invalid_timeframe_error(timeframe, TIMEFRAME_MAP)}
         tf_secs = TIMEFRAME_SECONDS.get(timeframe)
         if not tf_secs:
-            return {"error": f"Unsupported timeframe seconds for {timeframe}"}
+            return {"error": unsupported_timeframe_seconds_error(timeframe)}
 
         method_l = str(method).lower().strip()
         quantity_l = str(quantity).lower().strip()
@@ -419,7 +1299,7 @@ def forecast_engine(
         # Refresh available methods
         available_methods = _get_available_methods()
         if method_l not in available_methods:
-            return {"error": f"Invalid method: {method}. Valid options: {list(available_methods)}"}
+            return {"error": format_invalid_method_error(method, list(available_methods))}
 
         # Volatility models have a dedicated endpoint
         if quantity_l == 'volatility' or method_l.startswith('vol_'):
@@ -427,92 +1307,127 @@ def forecast_engine(
 
         # Parse method params
         p = _parse_kv_or_json(params)
-        seasonality = int(p.get('seasonality')) if p.get('seasonality') is not None else _default_seasonality_period(timeframe)
+        seasonality = int(p.get('seasonality')) if p.get('seasonality') is not None else default_seasonality(timeframe)
 
         if method_l == 'seasonal_naive' and (not seasonality or seasonality <= 0):
             return {"error": "seasonal_naive requires a positive 'seasonality' in params or auto period"}
 
         # Calculate lookback bars
-        need = _calculate_lookback_bars(method_l, horizon, lookback, seasonality, timeframe)
+        need = _calculate_lookback_bars(method_l, horizon, lookback, seasonality, timeframe, params=p)
 
         # Fetch data (or reuse prefetched) and optional denoise
-        if prefetched_df is not None:
-            df = prefetched_df
-            base_col = prefetched_base_col or ('close_dn' if 'close_dn' in df.columns else 'close')
-            dn_spec_used = prefetched_denoise_spec
-        else:
-            try:
-                df = _fetch_history(symbol, timeframe, int(need), as_of)
-            except Exception as ex:
-                return {"error": str(ex)}
-            if len(df) < 3:
-                return {"error": "Not enough closed bars to compute forecast"}
-
-            # Apply denoising
-            base_col = 'close'
-            dn_spec_used = None
-            if denoise:
-                try:
-                    _dn = _normalize_denoise_spec(denoise, default_when='pre_ti')
-                except Exception:
-                    _dn = None
-                added = _apply_denoise(df, _dn, default_when='pre_ti') if _dn else []
-                dn_spec_used = _dn
-                if len(added) > 0 and f"{base_col}_dn" in added:
-                    base_col = f"{base_col}_dn"
-
-        # Track last close for potential price reconstruction
         try:
-            last_close = float(df['close'].iloc[-1])
-        except Exception:
-            last_close = float('nan')
-
-        # Prepare base data
-        base_col_initial = base_col
-        base_col_prepared = _prepare_base_data(df, quantity_l, target)
-
-        # Apply features and target specification
-        base_col_prepared = _apply_features_and_target_spec(df, features, target_spec, base_col_prepared)
+            df, base_col, dn_spec_used = _resolve_history_context(
+                symbol=symbol,
+                timeframe=timeframe,
+                need=need,
+                as_of=as_of,
+                start=start,
+                end=end,
+                prefetched_df=prefetched_df,
+                prefetched_base_col=prefetched_base_col,
+                prefetched_denoise_spec=prefetched_denoise_spec,
+                denoise=denoise,
+            )
+        except ValueError as ex:
+            return {"error": str(ex)}
+        except Exception as ex:
+            return {"error": str(ex)}
+        if p.get("seasonality") is None and "time" in df.columns:
+            seasonality = default_seasonality(timeframe, df["time"])
+        denoise_warnings = _consume_denoise_warnings(df)
 
         # Prepare target series, honoring target_spec if provided
-        target_series = df[base_col_prepared].dropna()
-        target_info: Dict[str, Any] = {}
-        if target_spec:
-            try:
-                y_arr, target_info = build_target_series(df, base_col_initial, target_spec, legacy_target=str(target))
-                target_series = pd.Series(y_arr, index=df.index)
-                base_col = target_info.get('base', base_col_initial)
-            except Exception as ex:
-                return {"error": f"Invalid target_spec: {ex}"}
-        else:
-            base_col = base_col_prepared
-            if quantity_l == 'return' or str(target).lower() == 'return':
-                target_series = df[base_col].dropna()
-            else:
-                target_series = df[base_col]
+        try:
+            target_series, base_col_initial, base_col, target_info = _prepare_target_series_context(
+                df=df,
+                quantity_l=quantity_l,
+                base_col=base_col,
+                features=features,
+                target_spec=target_spec,
+            )
+        except Exception as ex:
+            return {"error": f"Invalid target_spec: {ex}"}
 
-        target_series = target_series.dropna()
         if len(target_series) < 3:
             return {"error": f"Not enough valid data points in column '{base_col}'"}
 
-        # Prepare feature matrix if applicable (only if exog_used not provided)
-        X = exog_used
-        if X is None and isinstance(features, dict) and features.get('exog'):
-            exog_cols = features['exog']
-            if isinstance(exog_cols, str):
-                exog_cols = [c.strip() for c in exog_cols.split(',')]
+        price_anchor_base = str((target_info or {}).get("base") or base_col)
+        if quantity_l == "return" and str(base_col).startswith("__"):
+            price_anchor_base = base_col_initial
+        if price_anchor_base in df.columns:
+            price_anchor_history = df[price_anchor_base].astype(float).to_numpy()
+        else:
+            alias_inputs = {
+                name: df[name].to_numpy()
+                for name in ("open", "high", "low", "close")
+                if name in df.columns
+            }
+            price_anchor_history = resolve_alias_base(alias_inputs, price_anchor_base)
 
-            # Filter to available columns
-            available_exog = [col for col in exog_cols if col in df.columns and col != base_col]
-            if available_exog:
-                X_df = df[available_exog].loc[target_series.index]
-                # Apply dimensionality reduction if specified
-                X_df = _apply_dimensionality_reduction(X_df, dimred_method, dimred_params)
-                X = X_df.values
+        # Prepare feature matrices if applicable (only if exog_used not provided).
+        X, future_exog, feature_info = _prepare_feature_context(
+            df=df,
+            features=features,
+            exog_used=exog_used,
+            exog_future=exog_future,
+            tf_secs=tf_secs,
+            horizon=horizon,
+            target_series=target_series,
+            dimred_method=dimred_method,
+            dimred_params=dimred_params,
+            symbol=symbol,
+        )
+        if features and feature_info.get("error"):
+            return {
+                "error": (
+                    "Requested features could not be prepared: "
+                    f"{feature_info['error']}"
+                ),
+                "error_code": "feature_build_error",
+            }
 
         # Get last timestamp and values
         last_epoch = float(df['time'].iloc[-1])
-        
+
+        # Core run diagnostics to make model context explicit for users.
+        engine_diagnostics = _build_engine_diagnostics(
+            df=df,
+            need=need,
+            lookback=lookback,
+            seasonality=seasonality,
+            quantity_l=quantity_l,
+            base_col=base_col,
+            target_series=target_series,
+        )
+        if feature_info:
+            engine_diagnostics["feature_preparation"] = feature_info
+        broker_time_check_result: Optional[Dict[str, Any]] = None
+        broker_time_check_enabled = bool(getattr(mt5_config, "broker_time_check_enabled", False))
+        broker_time_check_ttl_seconds = int(getattr(mt5_config, "broker_time_check_ttl_seconds", 60))
+        if (
+            broker_time_check_enabled
+            and prefetched_df is None
+            and as_of is None
+            and start is None
+            and end is None
+        ):
+            try:
+                broker_time_check_result = get_cached_mt5_time_alignment(
+                    symbol=symbol,
+                    probe_timeframe='M1',
+                    ttl_seconds=broker_time_check_ttl_seconds,
+                )
+            except Exception as exc:
+                broker_time_check_result = {
+                    "symbol": str(symbol),
+                    "probe_timeframe": "M1",
+                    "status": "unavailable",
+                    "reason": "inspection_failed",
+                    "error": str(exc),
+                }
+            engine_diagnostics["broker_time_check"] = broker_time_check_result
+
         # Get symbol info for digits
         digits = None
         try:
@@ -525,165 +1440,79 @@ def forecast_engine(
         # Call engine
         metadata: Dict[str, Any] = {}
         try:
+            forecast_values, ci_values, metadata = _run_registered_forecast_method(
+                method_l=method_l,
+                method=method,
+                df=df,
+                target_series=target_series,
+                horizon=horizon,
+                seasonality=seasonality,
+                params=p,
+                ci_alpha=ci_alpha,
+                as_of=as_of,
+                quantity_l=quantity_l,
+                symbol=symbol,
+                timeframe=timeframe,
+                base_col=base_col,
+                denoise_spec_used=dn_spec_used,
+                X=X,
+                future_exog=future_exog,
+                features=features,
+                feature_info=feature_info,
+                target_spec=target_spec,
+                async_mode=async_mode,
+                model_id=model_id,
+            )
+        except _AsyncTrainingStarted as at:
+            return at.response
+        except ValueError as e:
             if method_l == 'ensemble':
-                ensemble_meta = {}
-                base_methods_in = p.get('methods')
-                if isinstance(base_methods_in, str):
-                    base_methods = [m.strip().lower() for m in base_methods_in.split(',') if m.strip()]
-                elif isinstance(base_methods_in, (list, tuple)):
-                    base_methods = [str(m).lower().strip() for m in base_methods_in if str(m).strip()]
-                else:
-                    base_methods = ['naive', 'theta', 'fourier_ols']
-                
-                # Filter to available methods
-                avail = _get_available_methods()
-                base_methods = [m for m in base_methods if m in avail and m != 'ensemble']
-                
-                seen: set[str] = set()
-                base_methods = [m for m in base_methods if not (m in seen or seen.add(m))]
-                if not base_methods:
-                    base_methods = ['naive', 'theta']
-                
-                params_in = p.get('method_params') if isinstance(p.get('method_params'), dict) else {}
-                params_map = {str(k).lower(): (v if isinstance(v, dict) else {}) for k, v in params_in.items()}
-                mode = str(p.get('mode', 'average')).lower()
-                cv_points = int(p.get('cv_points', max(6, len(base_methods) * 2)))
-                min_train = int(p.get('min_train_size', max(30, horizon * 3)))
-                expose_components = bool(p.get('expose_components', True))
-                weights_vec = _normalize_weights(p.get('weights'), len(base_methods))
-                ensemble_meta = {
-                    'mode_requested': mode,
-                    'methods': list(base_methods),
-                    'cv_points_requested': cv_points,
-                }
-                effective_mode = mode
-                rmse = None
-                ensemble_intercept = 0.0
-                coeffs = None
-                cv_rows = 0
-                if mode in ('bma', 'stacking'):
-                    X_cv, y_cv = _prepare_ensemble_cv(target_series, base_methods, horizon, seasonality, params_map, cv_points, min_train)
-                    cv_rows = int(len(y_cv))
-                    if X_cv.shape[0] >= max(3, len(base_methods)):
-                        if mode == 'bma':
-                            errors = X_cv - y_cv[:, None]
-                            rmse = np.sqrt(np.mean(np.square(errors), axis=0))
-                            min_rmse = float(np.min(rmse))
-                            weights_vec = np.exp(-0.5 * (rmse - min_rmse) / (min_rmse + 1e-12))
-                            total = float(np.sum(weights_vec))
-                            if total > 0:
-                                weights_vec = weights_vec / total
-                            else:
-                                weights_vec = None
-                        else:
-                            X_aug = np.column_stack([np.ones(X_cv.shape[0]), X_cv])
-                            beta, *_ = np.linalg.lstsq(X_aug, y_cv, rcond=None)
-                            ensemble_intercept = float(beta[0])
-                            coeffs = beta[1:]
-                            effective_mode = 'stacking'
-                    else:
-                        effective_mode = 'average'
-                component_methods: List[str] = []
-                component_forecasts: List[np.ndarray] = []
-                for m in base_methods:
-                    fc = _ensemble_dispatch_method(m, target_series, horizon, seasonality, params_map.get(m, {}))
-                    if fc is None or fc.size == 0:
-                        continue
-                    component_methods.append(m)
-                    component_forecasts.append(fc)
-                if not component_forecasts:
-                    return {'error': 'Ensemble failed: no component forecasts'}
-                if len(component_methods) != len(base_methods):
-                    keep_idx = [base_methods.index(m) for m in component_methods]
-                    if effective_mode == 'stacking' and coeffs is not None:
-                        coeffs = coeffs[keep_idx]
-                    elif weights_vec is not None:
-                        weights_vec = weights_vec[keep_idx]
-                    base_methods = component_methods
-                if effective_mode != 'stacking':
-                    total = float(np.sum(weights_vec)) if weights_vec is not None else 0.0
-                    if weights_vec is None or total <= 0:
-                        weights_vec = np.full(len(base_methods), 1.0 / len(base_methods))
-                    else:
-                        weights_vec = weights_vec / total
-                    combined = np.zeros_like(component_forecasts[0], dtype=float)
-                    for w, fc in zip(weights_vec, component_forecasts):
-                        combined = combined + float(w) * fc
-                else:
-                    if coeffs is None or coeffs.size != len(base_methods):
-                        coeffs = np.full(len(base_methods), 1.0 / len(base_methods))
-                        ensemble_intercept = 0.0
-                    combined = np.full_like(component_forecasts[0], ensemble_intercept, dtype=float)
-                    for w, fc in zip(coeffs, component_forecasts):
-                        combined = combined + float(w) * fc
-                    weights_vec = coeffs
-                forecast_values = combined
-                ensemble_meta.update({
-                    'mode_used': effective_mode,
-                    'methods': list(base_methods),
-                    'cv_points_used': cv_rows,
-                    'weights': [float(w) for w in (weights_vec.tolist() if isinstance(weights_vec, np.ndarray) else weights_vec)],
-                })
-                metadata = ensemble_meta
-                if rmse is not None:
-                    ensemble_meta['cv_rmse'] = [float(v) for v in rmse.tolist()]
-                if effective_mode == 'stacking':
-                    ensemble_meta['intercept'] = float(ensemble_intercept)
-                if expose_components:
-                    ensemble_meta['components'] = {m: [float(v) for v in fc.tolist()] for m, fc in zip(base_methods, component_forecasts)}
-            
-            else:
-                # Use Registry for all other methods
-                forecaster = ForecastRegistry.get(method_l)
-                
-                # Prepare exog variables if supported and available
-                # Note: X is the feature matrix for the training period. 
-                # For future exog, we would need to generate/fetch it. 
-                # Currently the engine doesn't support generating future exog automatically 
-                # unless provided in params or features.
-                # But some methods (like ML) might use X (training exog) during training.
-                
-                # Call forecast
-                method_params = dict(p)
-                if ci_alpha is not None and 'ci_alpha' not in method_params:
-                    method_params['ci_alpha'] = ci_alpha
-                call_kwargs: Dict[str, Any] = {
-                    'ci_alpha': ci_alpha,
-                    'as_of': as_of,
-                    'quantity': quantity_l,
-                    'target': target,
-                }
-                if X is not None:
-                    call_kwargs['exog_used'] = X
-
-                res = forecaster.forecast(
-                    target_series,
-                    horizon,
-                    seasonality,
-                    method_params,
-                    exog_future=exog_future,
-                    **call_kwargs,
-                )
-                forecast_values = res.forecast
-                ci_values = res.ci_values
-                metadata = res.metadata or {}
-                
-                # Add params used to metadata
-                metadata['params_used'] = res.params_used
-
+                return {"error": str(e)}
+            return {"error": f"Forecast method '{method}' failed: {str(e)}"}
         except Exception as e:
             return {"error": f"Forecast method '{method}' failed: {str(e)}"}
 
         if forecast_values is None:
             return {"error": f"Method '{method}' returned no forecast values"}
 
+        metadata = _merge_engine_diagnostics(metadata, engine_diagnostics)
+
         # Prepare output arrays
         forecast_return_vals = None
         reconstructed_prices = None
+        reconstructed_price_ci = None
+        target_transform = str(target_info.get("transform") or "none").strip().lower()
+        needs_price_reconstruction = (
+            quantity_l == "return" or target_transform != "none"
+        )
         if quantity_l == 'return':
             forecast_return_vals = np.asarray(forecast_values, dtype=float)
-            if np.isfinite(last_close):
-                reconstructed_prices = last_close * np.exp(np.cumsum(forecast_return_vals))
+        if needs_price_reconstruction:
+            reconstructed_prices = _reconstruct_prices_from_target(
+                np.asarray(forecast_values, dtype=float),
+                price_anchor_history,
+                target_info,
+            )
+            if reconstructed_prices is None:
+                return {
+                    "error": (
+                        "Unable to reconstruct price-scale forecast from target "
+                        f"transform '{target_transform}'."
+                    )
+                }
+            if ci_values is not None and len(ci_values) == 2:
+                lower_prices = _reconstruct_prices_from_target(
+                    np.asarray(ci_values[0], dtype=float),
+                    price_anchor_history,
+                    target_info,
+                )
+                upper_prices = _reconstruct_prices_from_target(
+                    np.asarray(ci_values[1], dtype=float),
+                    price_anchor_history,
+                    target_info,
+                )
+                if lower_prices is not None and upper_prices is not None:
+                    reconstructed_price_ci = (lower_prices, upper_prices)
 
         # Format and return output
         denoise_used = dn_spec_used is not None
@@ -703,9 +1532,48 @@ def forecast_engine(
             digits=digits,
             forecast_return_values=forecast_return_vals,
             reconstructed_prices=reconstructed_prices,
+            reconstructed_price_ci=reconstructed_price_ci,
+            symbol=symbol,
+            timeframe=timeframe,
         )
-        if method_l == 'ensemble' and ensemble_meta:
-            result['ensemble'] = ensemble_meta
+        if broker_time_check_result and broker_time_check_result.get("status") == "misaligned":
+            warning_text = str(broker_time_check_result.get("warning") or "").strip()
+            if warning_text:
+                warnings = result.get("warnings")
+                if not isinstance(warnings, list):
+                    warnings = []
+                if warning_text not in warnings:
+                    warnings.append(warning_text)
+                if warnings:
+                    result["warnings"] = warnings
+        if denoise_warnings:
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            for warning_text in denoise_warnings:
+                if warning_text not in warnings:
+                    warnings.append(warning_text)
+            if warnings:
+                result["warnings"] = warnings
+        if as_of is None and start is None and end is None:
+            result.update(
+                _last_price_freshness_fields(
+                    last_epoch=last_epoch,
+                    tf_secs=int(tf_secs),
+                    symbol=symbol,
+                )
+            )
+        if method_l == 'ensemble' and metadata:
+            generic_metadata_keys = {"params_used", "diagnostics", "model_info", "warnings"}
+            ensemble_metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key not in generic_metadata_keys
+            }
+            for key in ensemble_metadata:
+                result.pop(key, None)
+            if ensemble_metadata:
+                result["ensemble"] = ensemble_metadata
         return result
 
     except Exception as e:

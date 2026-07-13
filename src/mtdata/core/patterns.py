@@ -1,55 +1,121 @@
-from datetime import datetime
-from typing import Any, Dict, Optional, List, Tuple, Literal
-import importlib
 import copy
-import pandas as pd
+import logging
 import warnings
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
 
-from .schema import TimeframeLiteral
-from .constants import TIMEFRAME_MAP
-from ..utils.mt5 import _mt5_copy_rates_from
-from ..utils.utils import _format_time_minimal, to_float_np as __to_float_np
-from ..patterns.candlestick import detect_candlestick_patterns as _detect_candlestick_patterns
-from ..patterns.classic import detect_classic_patterns as _detect_classic_patterns, ClassicDetectorConfig as _ClassicCfg
-from ..patterns.eliott import detect_elliott_waves as _detect_elliott_waves, ElliottWaveConfig as _ElliottCfg
-from .server import mcp, _auto_connect_wrapper
-from ..utils.denoise import _apply_denoise as _apply_denoise_util, normalize_denoise_spec as _normalize_denoise_spec
-import MetaTrader5 as mt5
+from ..patterns.candlestick import (
+    detect_candlestick_patterns as _detect_candlestick_patterns,
+)
+from ..patterns.classic import ClassicDetectorConfig as _ClassicCfg
+from ..patterns.classic import detect_classic_patterns as _detect_classic_patterns
+from ..patterns.classic_impl.config import (
+    fatal_classic_detector_config_errors as _fatal_classic_detector_config_errors,
+)
+from ..patterns.common import data_quality_warnings, should_drop_last_live_bar
+from ..patterns.elliott import ElliottWaveConfig as _ElliottCfg
+from ..patterns.elliott import detect_elliott_waves as _detect_elliott_waves
+from ..patterns.fractal import FractalDetectorConfig as _FractalCfg
+from ..patterns.fractal import detect_fractal_patterns as _detect_fractal_patterns
+from ..patterns.fractal import (
+    validate_fractal_detector_config as _validate_fractal_detector_config,
+)
+from ..patterns.harmonic import HarmonicDetectorConfig as _HarmonicCfg
+from ..patterns.harmonic import detect_harmonic_patterns as _detect_harmonic_patterns
+from ..patterns.harmonic import (
+    validate_harmonic_detector_config as _validate_harmonic_detector_config,
+)
+from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
+from ..shared.validators import invalid_timeframe_error
+from ..utils.coercion import UNPARSED_BOOL, parse_bool_like
+from ..utils.denoise import _apply_denoise as _apply_denoise_util
+from ..utils.denoise import normalize_denoise_spec as _normalize_denoise_spec
+from ..utils.mt5 import (
+    _mt5_copy_rates_from,
+    _mt5_copy_rates_range,
+    ensure_mt5_connection_or_raise,
+    mt5,
+)
+from ..utils.ohlcv import validate_and_clean_ohlcv_frame
+from ..utils.time import _format_time_minimal
+from ..utils.utils import _parse_start_datetime
+from ..utils.utils import to_float_np as __to_float_np
+from ..utils.volume_profile import annotate_level_confluence
+from ._mcp_instance import mcp
+from .execution_logging import run_logged_operation
+from .mt5_gateway import create_mt5_gateway, mt5_connection_error
+from .patterns_requests import PatternsDetailLiteral, PatternsDetectRequest
+from .patterns_support import (
+    _STOCK_PATTERN_UTILS_CACHE,  # noqa: F401
+    _build_stock_pattern_frame,
+    _compact_patterns_payload,
+    _count_patterns_with_status,
+    _dedupe_repeated_regime_context,
+    _elliott_completed_preview,
+    _elliott_hidden_completed_note,
+    _empty_patterns_note,
+    _enrich_classic_patterns,
+    _enrich_elliott_patterns,
+    _estimate_classic_bars_to_completion,
+    _filter_non_actionable_elliott_warnings,
+    _format_pattern_dates,
+    _index_pos_for_timestamp,
+    _infer_stock_pattern_confidence,
+    _interval_overlap_ratio,  # noqa: F401
+    _load_stock_pattern_utils,
+    _map_stock_pattern_name,
+    _merge_classic_ensemble,
+    _normalize_engine_name,
+    _parse_engine_list,
+    _parse_native_scale_factors,
+    _resolve_engine_weights,
+    _round_value,
+    _summarize_engine_findings,
+    _summarize_pattern_bias,
+    _timestamp_to_label,
+    _to_float_safe,  # noqa: F401
+    _to_jsonable,
+    _visible_pattern_rows,
+)
+from .patterns_use_cases import PatternsDetectDeps, run_patterns_detect
+from .volume_profile import compute_volume_profile_payload
 
-_CLASSIC_ENGINE_ORDER = ("native", "stock_pattern", "precise_patterns")
-_STOCK_PATTERN_CODE_TO_NAME = {
-    "TRNG": "Triangle",
-    "DTOP": "Double Top",
-    "DBOT": "Double Bottom",
-    "HNSD": "Head and Shoulders",
-    "HNSU": "Inverse Head and Shoulders",
-    "UPTL": "Ascending Trend Line",
-    "DNTL": "Descending Trend Line",
-    "FLAGU": "Bull Flag",
-    "FLAGD": "Bear Flag",
-    "VCPU": "Bull VCP",
-    "VCPD": "Bear VCP",
-    "ABCDU": "Bull AB=CD",
-    "ABCDD": "Bear AB=CD",
-    "BATU": "Bull Bat",
-    "BATD": "Bear Bat",
-    "GARTU": "Bull Gartley",
-    "GARTD": "Bear Gartley",
-    "CRABU": "Bull Crab",
-    "CRABD": "Bear Crab",
-    "BFLYU": "Bull Butterfly",
-    "BFLYD": "Bear Butterfly",
-}
-_STOCK_PATTERN_UTILS_CACHE: Dict[str, Any] = {}
+logger = logging.getLogger(__name__)
+
+_CLASSIC_ENGINE_ORDER = ("native", "stock_pattern")
+_DEFAULT_ELLIOTT_SCAN_TIMEFRAMES = ("H1", "H4", "D1")
+ClassicEngineRunner = Callable[
+    [str, pd.DataFrame, _ClassicCfg, Optional[Dict[str, Any]]],
+    Tuple[List[Dict[str, Any]], Optional[str]],
+]
+_CLASSIC_ENGINE_REGISTRY: Dict[str, ClassicEngineRunner] = {}
 
 
-def _round_value(x: Any) -> Any:
-    """Round numeric values to 8 decimal places."""
-    try:
-        return float(np.round(float(x), 8))
-    except Exception:
-        return x
+def _patterns_connection_error() -> Optional[Dict[str, Any]]:
+    return mt5_connection_error(
+        create_mt5_gateway(
+            adapter=mt5,
+            ensure_connection_impl=ensure_mt5_connection_or_raise,
+        )
+    )
+
+
+def _should_drop_last_pattern_bar(
+    df: pd.DataFrame,
+    timeframe: str,
+    *,
+    now_utc: Optional[datetime] = None,
+    current_time_epoch: Optional[float] = None,
+) -> bool:
+    return should_drop_last_live_bar(
+        df,
+        timeframe,
+        now_utc=now_utc,
+        current_time_epoch=current_time_epoch,
+    )
 
 
 def _fetch_pattern_data(
@@ -57,28 +123,61 @@ def _fetch_pattern_data(
     timeframe: str,
     limit: int,
     denoise: Optional[Dict[str, Any]] = None,
+    gateway: Any = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    fetch_floor_bars: Optional[int] = None,
 ) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     """Fetch and prepare OHLCV data for pattern detection.
     
     Returns (df, error_dict) where error_dict is None on success.
     """
     if timeframe not in TIMEFRAME_MAP:
-        return None, {"error": f"Invalid timeframe: {timeframe}. Valid options: {list(TIMEFRAME_MAP.keys())}"}
-    
+        return None, {"error": invalid_timeframe_error(timeframe, TIMEFRAME_MAP)}
+
+    mt5_gateway = gateway or create_mt5_gateway(
+        adapter=mt5,
+        ensure_connection_impl=ensure_mt5_connection_or_raise,
+    )
     mt5_tf = TIMEFRAME_MAP[timeframe]
-    _info = mt5.symbol_info(symbol)
+    _info = mt5_gateway.symbol_info(symbol)
+    if _info is None:
+        return None, {"error": f"Symbol '{symbol}' not found or is not available in MT5."}
     _was_visible = bool(_info.visible) if _info is not None else None
     try:
         if _was_visible is False:
-            mt5.symbol_select(symbol, True)
+            if not mt5_gateway.symbol_select(symbol, True):
+                return None, {"error": f"Symbol '{symbol}' is not visible and could not be selected in MT5."}
+    except Exception as exc:
+        return None, {"error": f"Failed to enable symbol '{symbol}' in MT5: {exc}"}
+    
+    utc_now = datetime.now(timezone.utc)
+    start_dt = _parse_start_datetime(start) if start else None
+    if start and start_dt is None:
+        return None, {"error": "Invalid start time."}
+    end_dt = _parse_start_datetime(end) if end else None
+    if end and end_dt is None:
+        return None, {"error": "Invalid end time."}
+    if start_dt is not None and end_dt is None:
+        end_dt = utc_now.replace(tzinfo=None)
+    if start_dt is not None and end_dt is not None and start_dt > end_dt:
+        return None, {"error": "start must be before or equal to end."}
+    default_fetch_floor = 5 if (start_dt is not None or end_dt is not None) else 100
+    try:
+        configured_fetch_floor = int(fetch_floor_bars) if fetch_floor_bars is not None else default_fetch_floor
     except Exception:
-        pass
+        configured_fetch_floor = default_fetch_floor
+    count = max(max(1, configured_fetch_floor), int(limit) + 2)
+
+    if start_dt is not None:
+        rates = _mt5_copy_rates_range(symbol, mt5_tf, start_dt, end_dt)
+    elif end_dt is not None:
+        rates = _mt5_copy_rates_from(symbol, mt5_tf, end_dt, count)
+    else:
+        rates = _mt5_copy_rates_from(symbol, mt5_tf, utc_now, count)
     
-    utc_now = datetime.utcnow()
-    count = max(400, int(limit) + 2)
-    rates = _mt5_copy_rates_from(symbol, mt5_tf, utc_now, count)
-    
-    if rates is None or len(rates) < 100:
+    minimum_bars = 5 if (start_dt is not None or end_dt is not None) else 100
+    if rates is None or len(rates) < minimum_bars:
         return None, {"error": f"Failed to fetch sufficient bars for {symbol}"}
     
     df = pd.DataFrame(rates)
@@ -86,10 +185,27 @@ def _fetch_pattern_data(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             df['volume'] = df['tick_volume']
-    
-    # Drop the last (potentially incomplete) bar
-    if len(df) >= 2:
-        df = df.iloc[:-1]
+
+    warnings_out: List[str] = []
+    try:
+        df, quality_warnings = validate_and_clean_ohlcv_frame(df, epoch_col="time")
+    except ValueError as exc:
+        return None, {"error": str(exc)}
+    if len(df) == 0:
+        return None, {"error": f"No valid bars available for {symbol}"}
+    warnings_out.extend(quality_warnings)
+
+    # Drop the last bar only when it is still open or cannot be validated.
+    from ..services.data_service import _resolve_live_bar_reference_epoch
+
+    live_bar_reference_epoch = _resolve_live_bar_reference_epoch(symbol, timeframe)
+    if end_dt is None and _should_drop_last_pattern_bar(
+        df,
+        timeframe,
+        now_utc=utc_now,
+        current_time_epoch=live_bar_reference_epoch,
+    ):
+        df = df.iloc[:-1].copy()
     
     # Apply denoising if requested
     if denoise:
@@ -97,14 +213,142 @@ def _fetch_pattern_data(
             dn = _normalize_denoise_spec(denoise, default_when='pre_ti')
             if dn:
                 _apply_denoise_util(df, dn, default_when='pre_ti')
-        except Exception:
-            pass
+        except Exception as exc:
+            warning = f"Denoise failed for pattern detection on {symbol} {timeframe}; raw prices were used."
+            logger.warning(warning, exc_info=True)
+            warnings_out.append(f"{warning} {exc}")
     
     # Trim to requested limit
     if len(df) > int(limit):
         df = df.iloc[-int(limit):].copy()
+
+    # Freshness warning: flag when the most recent bar is unusually old.
+    # Uses a generous threshold (7 days) to tolerate weekend/holiday closures.
+    tf_secs = float(TIMEFRAME_SECONDS.get(timeframe, 0) or 0)
+    if tf_secs > 0 and len(df) > 0:
+        try:
+            last_epoch = float(df["time"].iloc[-1])
+            staleness = utc_now.timestamp() - last_epoch
+            if staleness > 7 * 86400:
+                warnings_out.append(
+                    f"Data may be stale for {symbol} {timeframe}: "
+                    f"latest bar is {staleness / 86400:.1f} days old."
+                )
+        except Exception:
+            pass
+
+    warnings_out.extend(
+        data_quality_warnings(
+            df,
+            symbol=symbol,
+            timeframe_seconds=float(TIMEFRAME_SECONDS.get(timeframe, 0) or 0),
+        )
+    )
+    if warnings_out:
+        df.attrs["warnings"] = list(warnings_out)
     
     return df, None
+
+
+def _elliott_timeframe_suggestion(timeframe: Optional[str]) -> str:
+    tf = str(timeframe or "").upper()
+    suggestion_map: Dict[str, List[str]] = {
+        "M1": ["H1", "H4"],
+        "M5": ["H1", "H4"],
+        "M15": ["H1", "H4"],
+        "M30": ["H4", "D1"],
+        "H1": ["H4", "D1"],
+        "H4": ["D1", "W1"],
+        "D1": ["H4", "W1"],
+        "W1": ["D1", "MN1"],
+        "MN1": ["W1", "D1"],
+    }
+    raw_suggestions = suggestion_map.get(tf, ["H4", "D1"])
+    suggestions = [s for s in raw_suggestions if s != tf]
+    if not suggestions:
+        suggestions = ["H4"] if tf != "H4" else ["D1"]
+    if len(suggestions) == 1:
+        return f"Try --timeframe {suggestions[0]} or increase --limit."
+    return f"Try --timeframe {suggestions[0]} or --timeframe {suggestions[1]}."
+
+
+def _resolve_elliott_scan_timeframes(cfg: _ElliottCfg) -> List[str]:
+    raw_scan = getattr(cfg, "scan_timeframes", None)
+    requested: List[str] = []
+    if isinstance(raw_scan, str):
+        requested = [part.strip().upper() for part in raw_scan.replace(";", ",").split(",") if part.strip()]
+    elif isinstance(raw_scan, (list, tuple, set)):
+        requested = [str(part).strip().upper() for part in raw_scan if str(part).strip()]
+
+    if not requested:
+        requested = [tf for tf in _DEFAULT_ELLIOTT_SCAN_TIMEFRAMES if tf in TIMEFRAME_MAP]
+    if not requested:
+        requested = [str(tf).strip().upper() for tf in TIMEFRAME_MAP.keys()]
+
+    try:
+        max_scan = int(getattr(cfg, "max_scan_timeframes", 3))
+    except Exception:
+        max_scan = 3
+    if max_scan <= 0:
+        max_scan = max(1, len(TIMEFRAME_MAP))
+
+    out: List[str] = []
+    seen = set()
+    for timeframe in requested:
+        if timeframe not in TIMEFRAME_MAP or timeframe in seen:
+            continue
+        seen.add(timeframe)
+        out.append(timeframe)
+        if len(out) >= max_scan:
+            break
+    if out:
+        return out
+
+    fallback: List[str] = []
+    for timeframe in TIMEFRAME_MAP.keys():
+        tf = str(timeframe).strip().upper()
+        if tf in seen:
+            continue
+        seen.add(tf)
+        fallback.append(tf)
+        if len(fallback) >= max_scan:
+            break
+    return fallback
+
+
+def _patterns_detect_deps() -> PatternsDetectDeps:
+    return PatternsDetectDeps(
+        compact_patterns_payload=_compact_patterns_payload,
+        fetch_pattern_data=_fetch_pattern_data,
+        classic_cfg_cls=_ClassicCfg,
+        elliott_cfg_cls=_ElliottCfg,
+        fractal_cfg_cls=_FractalCfg,
+        harmonic_cfg_cls=_HarmonicCfg,
+        apply_config_to_obj=_apply_config_to_obj,
+        select_classic_engines=_select_classic_engines,
+        available_classic_engines=_available_classic_engines,
+        run_classic_engine=_run_classic_engine,
+        resolve_engine_weights=_resolve_engine_weights,
+        merge_classic_ensemble=_merge_classic_ensemble,
+        enrich_classic_patterns=_enrich_classic_patterns,
+        summarize_engine_findings=_summarize_engine_findings,
+        summarize_pattern_bias=_summarize_pattern_bias,
+        build_pattern_response=_build_pattern_response,
+        format_elliott_patterns=_format_elliott_patterns,
+        format_fractal_patterns=_format_fractal_patterns,
+        format_harmonic_patterns=_format_harmonic_patterns,
+        detect_candlestick_patterns=_detect_candlestick_patterns,
+        elliott_timeframe_suggestion=_elliott_timeframe_suggestion,
+        resolve_elliott_scan_timeframes=_resolve_elliott_scan_timeframes,
+        validate_classic_config_errors=_fatal_classic_detector_config_errors,
+        validate_fractal_config=_validate_fractal_detector_config,
+        validate_harmonic_config=_validate_harmonic_detector_config,
+        summarize_fractal_context=_summarize_fractal_context,
+        compute_volume_profile_payload=compute_volume_profile_payload,
+        annotate_level_confluence=annotate_level_confluence,
+        format_time_minimal=_format_time_minimal,
+        to_float_np=__to_float_np,
+    )
 
 
 def _build_pattern_response(
@@ -117,12 +361,26 @@ def _build_pattern_response(
     include_series: bool,
     series_time: str,
     df: pd.DataFrame,
+    detail: PatternsDetailLiteral = "compact",
 ) -> Dict[str, Any]:
     """Build the response dict for pattern detection results."""
+    # Harmonic detectors report completed Fibonacci structures only. Treat
+    # those completions as the mode's primary findings instead of applying the
+    # forming-only visibility policy used by lifecycle-aware detectors.
+    include_completed = bool(include_completed or str(mode).lower() == "harmonic")
     # Filter patterns based on include_completed
-    filtered = patterns if include_completed else [
-        d for d in patterns if str(d.get('status', '')).lower() == 'forming'
-    ]
+    filtered = _visible_pattern_rows(patterns, include_completed=include_completed)
+    hidden_status = "broken" if str(mode).lower() == "fractal" else "completed"
+    completed_hidden = (
+        0
+        if include_completed
+        else _count_patterns_with_status(patterns, hidden_status)
+    )
+    elliott_preview = (
+        _elliott_completed_preview(patterns, timeframe=timeframe)
+        if str(mode).lower() == "elliott" and completed_hidden > 0
+        else []
+    )
     
     resp: Dict[str, Any] = {
         "success": True,
@@ -133,6 +391,133 @@ def _build_pattern_response(
         "patterns": filtered,
         "n_patterns": int(len(filtered)),
     }
+    if str(mode).lower() == "elliott":
+        adaptation = df.attrs.get("elliott_adaptation")
+        if isinstance(adaptation, dict):
+            resp["adaptation"] = _round_value(adaptation)
+    if completed_hidden > 0:
+        hidden_count_key = (
+            "broken_levels_hidden"
+            if str(mode).lower() == "fractal"
+            else "completed_patterns_hidden"
+        )
+        resp[hidden_count_key] = int(completed_hidden)
+        if elliott_preview:
+            resp["completed_patterns_preview"] = elliott_preview
+        resp["note"] = (
+            _elliott_hidden_completed_note(completed_hidden, elliott_preview)
+            if str(mode).lower() == "elliott"
+            else (
+                (
+                    f"{int(completed_hidden)} broken fractal level(s) hidden; "
+                    "set include_completed=true to include them."
+                )
+                if str(mode).lower() == "fractal"
+                else (
+                    f"{int(completed_hidden)} completed pattern(s) hidden; "
+                    "set include_completed=true to include them."
+                )
+            )
+        )
+    if str(mode).lower() == "elliott" and int(len(filtered)) == 0:
+        if completed_hidden > 0:
+            resp["diagnostic"] = (
+                f"No developing Elliott Wave structures detected in {int(limit)} {timeframe} bars. "
+                f"{int(completed_hidden)} confirmed structure(s) were detected but hidden by default. "
+                f"{_elliott_timeframe_suggestion(timeframe)} "
+                "You can also increase lookback or focus on a clearer trending segment."
+            )
+        else:
+            resp["diagnostic"] = (
+                f"No valid Elliott Wave structures detected in {int(limit)} {timeframe} bars. "
+                f"{_elliott_timeframe_suggestion(timeframe)} "
+                "You can also increase lookback or focus on a clearer trending segment."
+            )
+    if str(mode).lower() != "elliott" and int(len(filtered)) == 0 and "note" not in resp:
+        resp["note"] = _empty_patterns_note(mode, limit, timeframe)
+    
+    # Add data freshness metadata for high timeframes with ancient patterns
+    # For MN1 (monthly) and W1 (weekly), check if patterns are very old
+    tf_upper = str(timeframe).upper()
+    if tf_upper in ("MN1", "W1") and filtered:
+        oldest_pattern_time = None
+        newest_pattern_time = None
+        
+        # Extract pattern times from all detected patterns
+        for pattern in filtered:
+            try:
+                if "end_date" in pattern:
+                    # Pattern end_date is a string like "2011-08-31 21:00"
+                    end_date_str = str(pattern.get("end_date", ""))
+                    if end_date_str and oldest_pattern_time is None:
+                        oldest_pattern_time = end_date_str
+                        newest_pattern_time = end_date_str
+                    elif end_date_str:
+                        # Keep track of oldest and newest
+                        if end_date_str < oldest_pattern_time:
+                            oldest_pattern_time = end_date_str
+                        if end_date_str > newest_pattern_time:
+                            newest_pattern_time = end_date_str
+                elif "time" in pattern:
+                    time_val = pattern.get("time")
+                    if time_val and oldest_pattern_time is None:
+                        oldest_pattern_time = str(time_val)
+                        newest_pattern_time = str(time_val)
+                    elif time_val:
+                        time_str = str(time_val)
+                        if time_str < oldest_pattern_time:
+                            oldest_pattern_time = time_str
+                        if time_str > newest_pattern_time:
+                            newest_pattern_time = time_str
+            except Exception:
+                continue
+        
+        # Add data freshness info if we found pattern times
+        if oldest_pattern_time and newest_pattern_time:
+            resp["data_freshness"] = {
+                "oldest_pattern": oldest_pattern_time,
+                "newest_pattern": newest_pattern_time,
+            }
+            
+            # Calculate years spanned
+            try:
+                # Try to extract years from date strings (format: "YYYY-MM-DD HH:MM")
+                oldest_year = int(oldest_pattern_time.split("-")[0]) if oldest_pattern_time else None
+                newest_year = int(newest_pattern_time.split("-")[0]) if newest_pattern_time else None
+                if oldest_year and newest_year:
+                    years_spanned = newest_year - oldest_year
+                    if years_spanned >= 10:
+                        resp["data_freshness"]["years_spanned"] = years_spanned
+                        # Add warning if patterns are very old or span many years
+                        if "warnings" not in resp:
+                            resp["warnings"] = []
+                        if isinstance(resp["warnings"], list):
+                            warning_msg = (
+                                f"Caution: Monthly timeframe patterns span {years_spanned}+ years "
+                                f"(from {oldest_year} to {newest_year}). "
+                                "Older patterns may not reflect current market structure. "
+                                "Consider using W1 or D1 for more recent patterns, or increase "
+                                "the limit to see more recent bars."
+                            )
+                            resp["warnings"].append(warning_msg)
+            except Exception:
+                pass
+    
+    warnings_out = df.attrs.get("warnings")
+    if isinstance(warnings_out, list) and warnings_out:
+        filtered_warnings = _filter_non_actionable_elliott_warnings(
+            warnings_out,
+            mode=mode,
+            diagnostic=resp.get("diagnostic"),
+            n_patterns=int(len(filtered)),
+        )
+        if filtered_warnings:
+            if "warnings" not in resp:
+                resp["warnings"] = []
+            if isinstance(resp["warnings"], list):
+                for warning_text in filtered_warnings:
+                    if warning_text not in resp["warnings"]:
+                        resp["warnings"].append(warning_text)
     
     # Include series data if requested
     if include_series:
@@ -144,11 +529,42 @@ def _build_pattern_response(
                 resp["series_time"] = [
                     _format_time_minimal(float(v)) for v in __to_float_np(df.get('time')).tolist()
                 ]
-    
-    return resp
+
+    detail_value = str(detail).lower().strip()
+    if detail_value in ("compact", "summary"):
+        compact_resp = _compact_patterns_payload(resp)
+        if detail_value == "summary":
+            return {
+                key: value
+                for key, value in compact_resp.items()
+                if key
+                in {
+                    "success",
+                    "symbol",
+                    "timeframe",
+                    "lookback",
+                    "mode",
+                    "n_patterns",
+                    "summary",
+                    "recent_patterns",
+                    "show_all_hint",
+                    "warnings",
+                    "note",
+                    "failed_timeframes",
+                    "adaptation",
+                }
+            }
+        return compact_resp
+    if detail_value == "standard" and isinstance(resp.get("adaptation"), dict):
+        standard_adaptation = dict(resp["adaptation"])
+        standard_adaptation.pop("candidate_metrics", None)
+        resp["adaptation"] = standard_adaptation
+    return _dedupe_repeated_regime_context(resp)
 
 
-def _format_elliott_patterns(df: pd.DataFrame, cfg: _ElliottCfg) -> List[Dict[str, Any]]:
+def _format_elliott_patterns(  # noqa: C901 - response contract is intentionally explicit
+    df: pd.DataFrame, cfg: _ElliottCfg
+) -> List[Dict[str, Any]]:
     """Run Elliott detection on prepared data and normalize result rows."""
     pats = _detect_elliott_waves(df, cfg)
     out_list: List[Dict[str, Any]] = []
@@ -157,63 +573,345 @@ def _format_elliott_patterns(df: pd.DataFrame, cfg: _ElliottCfg) -> List[Dict[st
     for p in pats:
         try:
             start_date, end_date = _format_pattern_dates(p.start_time, p.end_time)
-            recent_bars = 3
-            status = 'forming' if int(p.end_index) >= int(n_bars - recent_bars) else 'completed'
-
-            out_list.append(
-                {
-                    "wave_type": p.wave_type,
-                    "status": status,
-                    "confidence": float(max(0.0, min(1.0, p.confidence))),
-                    "start_index": int(p.start_index),
-                    "end_index": int(p.end_index),
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "details": {k: _round_value(v) for k, v in (p.details or {}).items()},
-                }
+            details = {k: _round_value(v) for k, v in (p.details or {}).items()}
+            wave_type = str(p.wave_type or "")
+            state = str(
+                details.get("structure_state")
+                or getattr(p, "structure_state", "")
+                or ""
+            ).strip().lower()
+            if not state and "pattern_confirmed" in details:
+                state = "confirmed" if bool(details.get("pattern_confirmed")) else "developing"
+            status = (
+                "fallback"
+                if wave_type.strip().lower() == "candidate" or state == "fallback"
+                else "confirmed"
+                if state == "confirmed"
+                else "developing"
             )
+            row: Dict[str, Any] = {
+                "wave_type": wave_type,
+                "status": status,
+                "confidence": float(max(0.0, min(1.0, p.confidence))),
+                "start_index": int(p.start_index),
+                "end_index": int(p.end_index),
+                "start_date": start_date,
+                "end_date": end_date,
+                "details": details,
+            }
+            available_at_index = getattr(p, "available_at_index", None)
+            if available_at_index is not None:
+                row["available_at_index"] = int(available_at_index)
+            available_at_time = getattr(p, "available_at_time", None)
+            if available_at_time is not None:
+                row["available_at_time"] = float(available_at_time)
+            if details.get("structural_score") is not None:
+                row["structural_score"] = float(details["structural_score"])
+            for key in (
+                "rule_valid",
+                "template_fit",
+                "candidate_score",
+                "scan_threshold_pct",
+                "scan_scale_id",
+                "alternate_group_id",
+                "alternate_count",
+                "span_bars",
+                "span_share_of_lookback",
+            ):
+                if details.get(key) is not None:
+                    row[key] = details[key]
+
+            if wave_type.strip().lower() == "candidate":
+                wave_points = details.get("wave_points_labeled") or details.get("wave_points") or []
+                wave_count = len(wave_points) if isinstance(wave_points, list) else None
+                validates_as = str(details.get("candidate_validates_as") or "").strip().lower()
+                if validates_as:
+                    structure = f"{validates_as}-validating"
+                elif wave_count == 6:
+                    structure = "impulse-like"
+                elif wave_count == 4:
+                    structure = "correction-like"
+                elif wave_count:
+                    structure = f"{wave_count}-pivot"
+                else:
+                    structure = "unvalidated"
+                row["pattern"] = f"Elliott {structure} candidate"
+                row["validation_status"] = "fallback_candidate"
+                if validates_as:
+                    row["candidate_note"] = (
+                        "Low-confidence fallback candidate; structure passes "
+                        f"{validates_as} hard rules but is not promoted to a full "
+                        "Elliott detection (recent-structure fallback only)."
+                    )
+                else:
+                    row["candidate_note"] = (
+                        "Low-confidence fallback candidate; Elliott rules did not "
+                        "validate a specific impulse or outer ABC structure."
+                    )
+                if wave_count:
+                    row["wave_count"] = int(wave_count)
+                violations = details.get("rule_violations")
+                if isinstance(violations, list) and violations:
+                    row["validation_issues"] = [str(item) for item in violations[:3]]
+
+            # v2 status is causal; recency is independent metadata.
+            structure_complete = details.get("structure_complete")
+            if structure_complete is None:
+                structure_complete = details.get("pattern_confirmed")
+            terminal_confirmed = details.get("terminal_confirmed")
+            if terminal_confirmed is None and "has_unconfirmed_terminal_pivot" in details:
+                terminal_confirmed = not bool(details.get("has_unconfirmed_terminal_pivot"))
+            try:
+                bars_since_geometry_end = max(
+                    0, int(n_bars) - 1 - int(p.end_index)
+                )
+            except Exception:
+                bars_since_geometry_end = None
+            available_index = getattr(p, "available_at_index", None)
+            if available_index is None:
+                available_index = details.get("available_at_index")
+            try:
+                bars_since_confirmation = max(
+                    0, int(n_bars) - 1 - int(available_index)
+                )
+            except Exception:
+                bars_since_confirmation = None
+            if structure_complete is not None:
+                row["structure_complete"] = bool(structure_complete)
+                details["structure_complete"] = bool(structure_complete)
+            if terminal_confirmed is not None:
+                row["terminal_confirmed"] = bool(terminal_confirmed)
+                details["terminal_confirmed"] = bool(terminal_confirmed)
+            if bars_since_geometry_end is not None:
+                row["bars_since_geometry_end"] = int(bars_since_geometry_end)
+                details["bars_since_geometry_end"] = int(bars_since_geometry_end)
+            if bars_since_confirmation is not None:
+                row["bars_since_confirmation"] = int(bars_since_confirmation)
+                details["bars_since_confirmation"] = int(bars_since_confirmation)
+                configured_recent = getattr(cfg, "recent_bars", None)
+                recent_bars = max(
+                    1,
+                    int(configured_recent)
+                    if configured_recent is not None
+                    else max(3, min(20, round(n_bars * 0.05))),
+                )
+                row["is_recent"] = bool(bars_since_confirmation < recent_bars)
+                details["is_recent"] = bool(
+                    bars_since_confirmation < recent_bars
+                )
+            details.setdefault("status_basis", "causal_confirmation")
+            row["details"] = details
+            out_list.append(row)
         except Exception:
+            logger.debug("Dropping Elliott pattern during formatting", exc_info=True)
+            continue
+    return _enrich_elliott_patterns(out_list, df, cfg)
+
+
+def _format_pattern_timestamp(epoch_value: Any) -> Optional[str]:
+    try:
+        epoch = float(epoch_value)
+    except Exception:
+        return None
+    if not np.isfinite(epoch):
+        return None
+    return _format_time_minimal(epoch)
+
+
+def _format_fractal_patterns(
+    df: pd.DataFrame,
+    cfg: _FractalCfg,
+) -> List[Dict[str, Any]]:
+    pats = _detect_fractal_patterns(df, cfg)
+    out_list: List[Dict[str, Any]] = []
+    close_arr = __to_float_np(df.get("close"))
+    current_close: Optional[float] = None
+    if close_arr.size > 0:
+        last_close = float(close_arr[-1])
+        if np.isfinite(last_close):
+            current_close = float(last_close)
+
+    for p in pats:
+        try:
+            start_date, end_date = _format_pattern_dates(p.start_time, p.end_time)
+            details = {k: _round_value(v) for k, v in (p.details or {}).items()}
+            bias = str(details.get("bias") or p.direction or "").strip().lower()
+            if bias not in {"bullish", "bearish", "neutral", "mixed"}:
+                bias = str(p.direction).strip().lower()
+            row: Dict[str, Any] = {
+                "name": p.name,
+                "status": p.status,
+                "confidence": float(max(0.0, min(1.0, p.confidence))),
+                "start_index": int(p.start_index),
+                "end_index": int(p.end_index),
+                "start_date": start_date,
+                "end_date": end_date,
+                "direction": str(p.direction),
+                "bias": bias,
+                "price": float(p.price),
+                "level_price": float(p.price),
+                "details": details,
+            }
+            if current_close is not None:
+                row["reference_price"] = float(current_close)
+            for key in (
+                "level_state",
+                "level_role",
+                "confirmation_index",
+                "bars_since_confirmation",
+                "breakout_direction",
+                "breakout_index",
+                "breakout_price",
+                "breakout_bars_after_confirmation",
+                "breakout_basis",
+                "prominence_pct",
+            ):
+                value = details.get(key)
+                if value not in (None, ""):
+                    row[key] = value
+            confirmation_date = _format_pattern_timestamp(details.get("confirmation_time"))
+            if confirmation_date:
+                row["confirmation_date"] = confirmation_date
+            breakout_date = _format_pattern_timestamp(details.get("breakout_time"))
+            if breakout_date:
+                row["breakout_date"] = breakout_date
+            out_list.append(row)
+        except Exception:
+            logger.debug("Dropping fractal pattern during formatting", exc_info=True)
             continue
     return out_list
 
 
-def _estimate_classic_bars_to_completion(
-    name: str,
-    details: Dict[str, Any],
-    start_idx: int,
-    end_idx: int,
-    n_bars: int,
-) -> Optional[int]:
-    try:
-        length = max(1, int(end_idx) - int(start_idx) + 1)
-        nm = str(name).lower()
-        if all(k in details for k in ("top_slope", "top_intercept", "bottom_slope", "bottom_intercept")):
-            s_top = float(details.get("top_slope"))
-            b_top = float(details.get("top_intercept"))
-            s_bot = float(details.get("bottom_slope"))
-            b_bot = float(details.get("bottom_intercept"))
-            denom = (s_top - s_bot)
-            if abs(denom) <= 1e-12:
-                return None
-            t_star = (b_bot - b_top) / denom
-            bars = int(max(0, int(round(t_star - (n_bars - 1)))))
-            return int(min(max(0, bars), 3 * length))
-        if all(k in details for k in ("upper_slope", "upper_intercept", "lower_slope", "lower_intercept")):
-            s_top = float(details.get("upper_slope"))
-            b_top = float(details.get("upper_intercept"))
-            s_bot = float(details.get("lower_slope"))
-            b_bot = float(details.get("lower_intercept"))
-            denom = (s_top - s_bot)
-            if abs(denom) <= 1e-12:
-                return None
-            t_star = (b_bot - b_top) / denom
-            bars = int(max(0, int(round(t_star - (n_bars - 1)))))
-            return int(min(max(0, bars), 3 * length))
-        if nm in ("pennants", "flag", "bull pennants", "bear pennants", "bull flag", "bear flag") or ("pennant" in nm or "flag" in nm):
-            return int(max(1, min(2 * length, int(round(0.3 * length)))))
-    except Exception:
-        return None
-    return None
+def _format_harmonic_patterns(
+    df: pd.DataFrame,
+    cfg: _HarmonicCfg,
+) -> List[Dict[str, Any]]:
+    pats = _detect_harmonic_patterns(df, cfg)
+    out_list: List[Dict[str, Any]] = []
+    for p in pats:
+        try:
+            start_date, end_date = _format_pattern_dates(p.start_time, p.end_time)
+            details = {k: _round_value(v) for k, v in (p.details or {}).items()}
+            bias = str(details.get("bias") or p.bias or "").strip().lower()
+            target_prices = [
+                float(value)
+                for value in getattr(p, "target_prices", [])
+                if isinstance(value, (int, float, np.integer, np.floating))
+            ]
+            target_1 = target_prices[0] if target_prices else None
+            target_2 = target_prices[1] if len(target_prices) > 1 else None
+            price_levels: Dict[str, Any] = {
+                "entry": float(p.entry_price),
+                "target_1": target_1,
+                "target_2": target_2,
+                "invalidation": float(p.invalidation_price),
+            }
+            for key in ("prz_low", "prz_mid", "prz_high"):
+                value = details.get(key)
+                if isinstance(value, (int, float, np.integer, np.floating)):
+                    price_levels[key] = float(value)
+
+            row: Dict[str, Any] = {
+                "name": p.name,
+                "status": p.status,
+                "confidence": float(max(0.0, min(1.0, p.confidence))),
+                "start_index": int(p.start_index),
+                "end_index": int(p.end_index),
+                "start_date": start_date,
+                "end_date": end_date,
+                "direction": bias,
+                "bias": bias,
+                "entry_price": float(p.entry_price),
+                "reference_price": float(p.entry_price),
+                "invalidation_price": float(p.invalidation_price),
+                "price_levels": {
+                    key: _round_value(value)
+                    for key, value in price_levels.items()
+                    if value not in (None, "")
+                },
+                "details": details,
+            }
+            if target_1 is not None:
+                row["target_price"] = float(target_1)
+                row["target_price_1"] = float(target_1)
+            if target_2 is not None:
+                row["target_price_2"] = float(target_2)
+            out_list.append(row)
+        except Exception:
+            logger.debug("Dropping harmonic pattern during formatting", exc_info=True)
+            continue
+    return out_list
+
+
+def _summarize_fractal_context(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    active_levels: Dict[str, Dict[str, Any]] = {}
+    latest_breakouts: Dict[str, Dict[str, Any]] = {}
+
+    def _latest_row(
+        candidates: List[Dict[str, Any]],
+        key_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        latest: Optional[Dict[str, Any]] = None
+        latest_value = float("-inf")
+        for row in candidates:
+            try:
+                value = float(row.get(key_name))
+            except Exception:
+                value = float("-inf")
+            if value >= latest_value:
+                latest = row
+                latest_value = value
+        return latest
+
+    for direction in ("bullish", "bearish"):
+        active_candidates = [
+            row
+            for row in rows
+            if str(row.get("direction", "")).strip().lower() == direction
+            and str(row.get("level_state", "")).strip().lower() == "active"
+        ]
+        latest_active = _latest_row(active_candidates, "confirmation_index")
+        if latest_active is not None:
+            item: Dict[str, Any] = {
+                "pattern": latest_active.get("name"),
+                "level_price": latest_active.get("level_price", latest_active.get("price")),
+                "status": latest_active.get("status"),
+                "bias": latest_active.get("bias"),
+            }
+            for key in ("confirmation_date", "bars_since_confirmation", "reference_price"):
+                value = latest_active.get(key)
+                if value not in (None, ""):
+                    item[key] = value
+            active_levels[direction] = item
+
+    for breakout_direction in ("bullish", "bearish"):
+        breakout_candidates = [
+            row
+            for row in rows
+            if str(row.get("breakout_direction", "")).strip().lower() == breakout_direction
+        ]
+        latest_breakout = _latest_row(breakout_candidates, "breakout_index")
+        if latest_breakout is not None:
+            item = {
+                "pattern": latest_breakout.get("name"),
+                "breakout_direction": latest_breakout.get("breakout_direction"),
+                "level_price": latest_breakout.get("level_price", latest_breakout.get("price")),
+                "breakout_price": latest_breakout.get("breakout_price"),
+                "status": latest_breakout.get("status"),
+                "bias": latest_breakout.get("bias"),
+            }
+            for key in ("breakout_date", "confirmation_date", "reference_price"):
+                value = latest_breakout.get(key)
+                if value not in (None, ""):
+                    item[key] = value
+            latest_breakouts[breakout_direction] = item
+
+    out: Dict[str, Any] = {}
+    if active_levels:
+        out["active_levels"] = active_levels
+    if latest_breakouts:
+        out["latest_breakouts"] = latest_breakouts
+    return out
 
 
 def _format_classic_native_patterns(df: pd.DataFrame, cfg: _ClassicCfg) -> List[Dict[str, Any]]:
@@ -241,31 +939,34 @@ def _format_classic_native_patterns(df: pd.DataFrame, cfg: _ClassicCfg) -> List[
                     d["bars_to_completion"] = int(est)
             out_list.append(d)
         except Exception:
+            logger.debug("Dropping classic pattern during formatting", exc_info=True)
             continue
     return out_list
 
 
-def _normalize_engine_name(value: Any) -> str:
-    return str(value or "").strip().lower().replace("-", "_")
+def _register_classic_engine(name: str) -> Callable[[ClassicEngineRunner], ClassicEngineRunner]:
+    norm_name = _normalize_engine_name(name)
+
+    def _decorator(func: ClassicEngineRunner) -> ClassicEngineRunner:
+        _CLASSIC_ENGINE_REGISTRY[norm_name] = func
+        return func
+
+    return _decorator
 
 
-def _parse_engine_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
-        return [_normalize_engine_name(p) for p in parts]
-    if isinstance(value, (list, tuple, set)):
-        return [_normalize_engine_name(p) for p in value if str(p).strip()]
-    return [_normalize_engine_name(value)]
+def _available_classic_engines() -> Tuple[str, ...]:
+    ordered = [name for name in _CLASSIC_ENGINE_ORDER if name in _CLASSIC_ENGINE_REGISTRY]
+    ordered.extend(name for name in _CLASSIC_ENGINE_REGISTRY.keys() if name not in ordered)
+    return tuple(ordered)
 
 
 def _select_classic_engines(engine: str, ensemble: bool) -> Tuple[List[str], List[str]]:
+    available = _available_classic_engines()
     requested = _parse_engine_list(engine)
     if not requested:
         requested = ["native"]
     if ensemble and requested == ["native"]:
-        requested = list(_CLASSIC_ENGINE_ORDER)
+        requested = list(available)
     if ensemble and "native" not in requested:
         requested = ["native"] + requested
     unique: List[str] = []
@@ -273,7 +974,7 @@ def _select_classic_engines(engine: str, ensemble: bool) -> Tuple[List[str], Lis
     for e in requested:
         if e in unique:
             continue
-        if e in _CLASSIC_ENGINE_ORDER:
+        if e in available:
             unique.append(e)
         else:
             invalid.append(e)
@@ -282,165 +983,7 @@ def _select_classic_engines(engine: str, ensemble: bool) -> Tuple[List[str], Lis
     return unique, invalid
 
 
-def _to_jsonable(value: Any) -> Any:
-    if isinstance(value, (np.floating, np.integer)):
-        return value.item()
-    if isinstance(value, pd.Timestamp):
-        return value.strftime("%Y-%m-%d %H:%M")
-    if isinstance(value, dict):
-        return {str(k): _to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_to_jsonable(v) for v in value]
-    return value
-
-
-def _timestamp_to_label(ts: Any) -> Optional[str]:
-    try:
-        if isinstance(ts, pd.Timestamp):
-            return ts.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return None
-    return None
-
-
-def _load_stock_pattern_utils(config: Optional[Dict[str, Any]]) -> Tuple[Optional[Any], Optional[str]]:
-    _ = config
-    # Resolve from currently active Python environment only.
-    candidate_modules = (
-        "stock_pattern.utils",
-        "stockpattern.utils",
-    )
-    required = ("get_max_min", "find_double_top", "find_double_bottom")
-    last_err: Optional[str] = None
-    for mod_name in candidate_modules:
-        if mod_name in _STOCK_PATTERN_UTILS_CACHE:
-            return _STOCK_PATTERN_UTILS_CACHE[mod_name], None
-        try:
-            mod = importlib.import_module(mod_name)
-        except Exception as ex:
-            last_err = str(ex)
-            continue
-        if not all(callable(getattr(mod, fn, None)) for fn in required):
-            last_err = f"module '{mod_name}' missing required stock-pattern functions"
-            continue
-        _STOCK_PATTERN_UTILS_CACHE[mod_name] = mod
-        return mod, None
-
-    tail = f" Last import error: {last_err}" if last_err else ""
-    return None, (
-        "stock-pattern engine unavailable in current environment; "
-        "install an importable stock-pattern module exposing stock_pattern.utils." + tail
-    )
-
-
-def _index_pos_for_timestamp(index: pd.Index, ts: Any) -> Optional[int]:
-    try:
-        loc = index.get_loc(pd.Timestamp(ts))
-        if isinstance(loc, slice):
-            return int(loc.start)
-        if isinstance(loc, np.ndarray):
-            return int(loc[0]) if loc.size else None
-        if isinstance(loc, list):
-            return int(loc[0]) if loc else None
-        return int(loc)
-    except Exception:
-        return None
-
-
-def _build_stock_pattern_frame(df: pd.DataFrame) -> pd.DataFrame:
-    src = df.copy()
-    close_col = "close" if "close" in src.columns else "Close"
-    open_col = "open" if "open" in src.columns else "Open"
-    high_col = "high" if "high" in src.columns else "High"
-    low_col = "low" if "low" in src.columns else "Low"
-    vol_col = "volume" if "volume" in src.columns else ("tick_volume" if "tick_volume" in src.columns else "Volume")
-
-    out = pd.DataFrame(
-        {
-            "Open": pd.to_numeric(src.get(open_col), errors="coerce"),
-            "High": pd.to_numeric(src.get(high_col), errors="coerce"),
-            "Low": pd.to_numeric(src.get(low_col), errors="coerce"),
-            "Close": pd.to_numeric(src.get(close_col), errors="coerce"),
-            "Volume": pd.to_numeric(src.get(vol_col), errors="coerce"),
-        }
-    )
-
-    if "time" in src.columns:
-        try:
-            idx = pd.to_datetime(pd.to_numeric(src["time"], errors="coerce"), unit="s", utc=True)
-            out.index = pd.DatetimeIndex(idx).tz_localize(None)
-        except Exception:
-            out.index = pd.RangeIndex(start=0, stop=len(out), step=1)
-    else:
-        out.index = pd.RangeIndex(start=0, stop=len(out), step=1)
-    return out.dropna(subset=["Open", "High", "Low", "Close"]).copy()
-
-
-def _map_stock_pattern_name(row: Dict[str, Any]) -> str:
-    code = str(row.get("pattern", "")).upper().strip()
-    alt = str(row.get("alt_name", "")).strip()
-    if code == "TRNG" and alt:
-        return f"{alt} Triangle"
-    if alt:
-        return alt
-    return _STOCK_PATTERN_CODE_TO_NAME.get(code, code or "Unknown")
-
-
-def _to_float_safe(value: Any, default: float = 0.6) -> float:
-    try:
-        v = float(value)
-        if np.isfinite(v):
-            return v
-    except Exception:
-        pass
-    return float(default)
-
-
-def _infer_stock_pattern_confidence(row: Dict[str, Any]) -> float:
-    if "confidence" in row:
-        return float(max(0.0, min(1.0, _to_float_safe(row.get("confidence"), 0.6))))
-    touches = row.get("touches")
-    if touches is not None:
-        t = _to_float_safe(touches, 0.0)
-        return float(max(0.35, min(0.95, 0.5 + 0.05 * t)))
-    return 0.6
-
-
-def _parse_native_scale_factors(config: Optional[Dict[str, Any]]) -> List[float]:
-    cfg_map = config if isinstance(config, dict) else {}
-    raw = cfg_map.get("native_scale_factors", cfg_map.get("native_scales"))
-    vals: List[float] = []
-    if isinstance(raw, str):
-        parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
-        for p in parts:
-            try:
-                vals.append(float(p))
-            except Exception:
-                continue
-    elif isinstance(raw, (list, tuple, set)):
-        for item in raw:
-            try:
-                vals.append(float(item))
-            except Exception:
-                continue
-    if not vals:
-        vals = [0.8, 1.0, 1.25]
-    out: List[float] = []
-    seen = set()
-    for v in vals:
-        if not np.isfinite(v) or v <= 0:
-            continue
-        clamped = float(max(0.3, min(3.0, v)))
-        key = round(clamped, 4)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(clamped)
-    if 1.0 not in [round(v, 4) for v in out]:
-        out.insert(0, 1.0)
-    return out
-
-
+@_register_classic_engine("native")
 def _run_classic_engine_native(
     symbol: str,
     df: pd.DataFrame,
@@ -510,6 +1053,17 @@ def _run_classic_engine_native(
     return merged, None
 
 
+def _infer_stock_pattern_status(row: Dict[str, Any]) -> str:
+    """Map explicit external lifecycle metadata without inventing a state."""
+    status = str(row.get("status") or "").strip().lower()
+    if status in {"completed", "confirmed"}:
+        return "completed"
+    if status in {"forming", "developing", "fallback"}:
+        return "forming"
+    return "detected"
+
+
+@_register_classic_engine("stock_pattern")
 def _run_classic_engine_stock_pattern(
     symbol: str,
     df: pd.DataFrame,
@@ -559,6 +1113,17 @@ def _run_classic_engine_stock_pattern(
         ("find_uptrend_line", "low"),
         ("find_downtrend_line", "high"),
     ]
+    stock_pattern_bias = {
+        "find_double_top": "bearish",
+        "find_double_bottom": "bullish",
+        "find_triangles": "neutral",
+        "find_hns": "bearish",
+        "find_reverse_hns": "bullish",
+        "find_bullish_flag": "bullish",
+        "find_bearish_flag": "bearish",
+        "find_uptrend_line": "bullish",
+        "find_downtrend_line": "bearish",
+    }
     out_list: List[Dict[str, Any]] = []
     n_bars = len(df)
     for fn_name, pivot_type in fn_specs:
@@ -603,49 +1168,35 @@ def _run_classic_engine_stock_pattern(
                 }
             }
         )
+        if isinstance(details, dict):
+            details = dict(details)
+            details.setdefault("bias", stock_pattern_bias.get(fn_name, "neutral"))
+        status = _infer_stock_pattern_status(res)
+        confidence_cap = 0.95 if status == "forming" else 1.0
         d: Dict[str, Any] = {
             "name": name,
-            "status": "forming",
-            "confidence": float(max(0.0, min(1.0, _infer_stock_pattern_confidence(res)))),
+            "status": status,
+            "confidence": float(
+                max(0.0, min(confidence_cap, _infer_stock_pattern_confidence(res)))
+            ),
             "start_index": int(s_idx),
             "end_index": int(e_idx),
             "start_date": _timestamp_to_label(start_ts),
             "end_date": _timestamp_to_label(end_ts),
             "details": {k: _round_value(v) for k, v in dict(details).items()} if isinstance(details, dict) else {"raw": details},
         }
-        est = _estimate_classic_bars_to_completion(name, d["details"], int(d["start_index"]), int(d["end_index"]), n_bars)
-        if est is not None:
-            d["bars_to_completion"] = int(est)
+        if status == "forming":
+            est = _estimate_classic_bars_to_completion(
+                name,
+                d["details"],
+                int(d["start_index"]),
+                int(d["end_index"]),
+                n_bars,
+            )
+            if est is not None:
+                d["bars_to_completion"] = int(est)
         out_list.append(d)
     return out_list, None
-
-
-def _run_classic_engine_precise_patterns(
-    symbol: str,
-    df: pd.DataFrame,
-    cfg: _ClassicCfg,
-    config: Optional[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    _ = symbol
-    _ = df
-    _ = cfg
-    _ = config
-    try:
-        patterns_mod = importlib.import_module("precise_patterns.patterns")
-    except Exception:
-        return [], "precise-patterns engine unavailable (install package to enable)"
-
-    reg = getattr(patterns_mod, "Registry", None)
-    if reg is None or not hasattr(reg, "all"):
-        return [], "precise-patterns has no stable Registry API for pattern extraction"
-    try:
-        names = list((reg.all() or {}).keys())  # type: ignore[call-arg]
-    except Exception:
-        names = []
-    if not names:
-        return [], "precise-patterns has no registered pattern implementations"
-    return [], "precise-patterns adapter is experimental and currently yields no classic detections"
-
 
 def _run_classic_engine(
     engine: str,
@@ -654,210 +1205,93 @@ def _run_classic_engine(
     cfg: _ClassicCfg,
     config: Optional[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if engine == "native":
-        return _run_classic_engine_native(symbol, df, cfg, config)
-    if engine == "stock_pattern":
-        return _run_classic_engine_stock_pattern(symbol, df, cfg, config)
-    if engine == "precise_patterns":
-        return _run_classic_engine_precise_patterns(symbol, df, cfg, config)
-    return [], f"Unsupported classic engine: {engine}"
+    runner = _CLASSIC_ENGINE_REGISTRY.get(_normalize_engine_name(engine))
+    if runner is None:
+        return [], f"Unsupported classic engine: {engine}"
+    return runner(symbol, df, cfg, config)
 
 
-def _interval_overlap_ratio(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
-    lo = max(int(a_start), int(b_start))
-    hi = min(int(a_end), int(b_end))
-    inter = max(0, hi - lo + 1)
-    union = max(int(a_end), int(b_end)) - min(int(a_start), int(b_start)) + 1
-    if union <= 0:
-        return 0.0
-    return float(inter) / float(union)
+def _apply_config_to_obj(cfg: Any, config: Optional[Dict[str, Any]]) -> List[str]:
+    """Apply config dict values to a config object's attributes.
 
-
-def _resolve_engine_weights(
-    engines: List[str],
-    ensemble_weights: Optional[Dict[str, Any]],
-) -> Dict[str, float]:
-    out = {e: 1.0 for e in engines}
-    if not isinstance(ensemble_weights, dict):
-        return out
-    for k, v in ensemble_weights.items():
-        ek = _normalize_engine_name(k)
-        if ek not in out:
-            continue
-        try:
-            w = float(v)
-            if np.isfinite(w) and w > 0:
-                out[ek] = w
-        except Exception:
-            continue
-    return out
-
-
-def _merge_classic_ensemble(
-    engine_patterns: Dict[str, List[Dict[str, Any]]],
-    weights: Dict[str, float],
-    overlap_threshold: float = 0.5,
-) -> List[Dict[str, Any]]:
-    groups: List[Dict[str, Any]] = []
-    for engine, pats in engine_patterns.items():
-        for p in pats:
-            try:
-                nm = str(p.get("name", "")).strip().lower()
-                s_idx = int(p.get("start_index", 0))
-                e_idx = int(p.get("end_index", s_idx))
-            except Exception:
-                continue
-            target: Optional[Dict[str, Any]] = None
-            for g in groups:
-                if g["name_norm"] != nm:
-                    continue
-                if _interval_overlap_ratio(s_idx, e_idx, int(g["start_index"]), int(g["end_index"])) >= float(overlap_threshold):
-                    target = g
-                    break
-            if target is None:
-                target = {
-                    "name_norm": nm,
-                    "start_index": s_idx,
-                    "end_index": e_idx,
-                    "items": [],
-                }
-                groups.append(target)
-            target["start_index"] = min(int(target["start_index"]), s_idx)
-            target["end_index"] = max(int(target["end_index"]), e_idx)
-            target["items"].append((engine, p))
-
-    merged: List[Dict[str, Any]] = []
-    for g in groups:
-        items: List[Tuple[str, Dict[str, Any]]] = g.get("items", [])
-        if not items:
-            continue
-        by_engine: Dict[str, Dict[str, Any]] = {}
-        for eng, p in items:
-            # Keep the strongest candidate per engine inside a merge group.
-            prev = by_engine.get(eng)
-            if prev is None or float(p.get("confidence", 0.0)) > float(prev.get("confidence", 0.0)):
-                by_engine[eng] = p
-        engines = list(by_engine.keys())
-        total_w = float(sum(weights.get(e, 1.0) for e in engines)) or 1.0
-        conf = float(
-            sum(float(by_engine[e].get("confidence", 0.0)) * float(weights.get(e, 1.0)) for e in engines) / total_w
-        )
-        anchor_engine = max(engines, key=lambda e: float(by_engine[e].get("confidence", 0.0)))
-        anchor = dict(by_engine[anchor_engine])
-        statuses = [str(by_engine[e].get("status", "forming")).lower() for e in engines]
-        anchor["status"] = "completed" if statuses and all(s == "completed" for s in statuses) else "forming"
-        anchor["confidence"] = float(max(0.0, min(1.0, conf)))
-        anchor["support_count"] = int(len(engines))
-        anchor["source_engines"] = engines
-        details = anchor.get("details")
-        if not isinstance(details, dict):
-            details = {}
-        details = dict(details)
-        details["engine_confidences"] = {
-            e: float(max(0.0, min(1.0, float(by_engine[e].get("confidence", 0.0)))))
-            for e in engines
-        }
-        details["consensus_support"] = int(len(engines))
-        anchor["details"] = details
-        merged.append(anchor)
-
-    merged.sort(
-        key=lambda p: (
-            int(p.get("support_count", 1)),
-            float(p.get("confidence", 0.0)),
-            int(p.get("end_index", -1)),
-        ),
-        reverse=True,
-    )
-    return merged
-
-
-def _format_pattern_dates(start_time: Optional[float], end_time: Optional[float]) -> Tuple[Optional[str], Optional[str]]:
-    """Format epoch times to date strings."""
-    st_epoch = float(start_time) if start_time is not None else None
-    et_epoch = float(end_time) if end_time is not None else None
-    
-    try:
-        start_date = _format_time_minimal(st_epoch) if st_epoch is not None else None
-    except Exception:
-        start_date = None
-    
-    try:
-        end_date = _format_time_minimal(et_epoch) if et_epoch is not None else None
-    except Exception:
-        end_date = None
-    
-    return start_date, end_date
-
-
-def _apply_config_to_obj(cfg: Any, config: Optional[Dict[str, Any]]) -> None:
-    """Apply config dict values to a config object's attributes."""
-
-    def _coerce_bool(value: Any) -> Any:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            s = value.strip().lower()
-            if s in {"true", "1", "yes", "y", "on"}:
-                return True
-            if s in {"false", "0", "no", "n", "off"}:
-                return False
-        return value
+    Returns keys that were not applied to the target object, including both
+    unknown keys and keys whose values were invalid or could not be coerced.
+    """
 
     if not isinstance(config, dict):
-        return
+        return []
+    invalid_keys: List[str] = []
     for k, v in config.items():
-        if hasattr(cfg, k):
-            current = getattr(cfg, k)
-            try:
-                # Handle list-like attrs from common CLI forms, e.g. "impulse,correction".
-                if isinstance(current, list):
-                    if isinstance(v, str):
-                        parsed = [p.strip() for p in v.replace(";", ",").split(",") if p.strip()]
-                        setattr(cfg, k, parsed)
-                    elif isinstance(v, (list, tuple, set)):
-                        setattr(cfg, k, [x for x in v])
-                    else:
-                        setattr(cfg, k, [v])
-                elif isinstance(current, bool):
-                    coerced = _coerce_bool(v)
-                    setattr(cfg, k, bool(coerced) if isinstance(coerced, bool) else current)
+        if not hasattr(cfg, k):
+            invalid_keys.append(str(k))
+            continue
+        current = getattr(cfg, k)
+        try:
+            # Handle list-like attrs from common CLI forms, e.g. "impulse,correction".
+            if isinstance(current, list):
+                if isinstance(v, str):
+                    parsed = [p.strip() for p in v.replace(";", ",").split(",") if p.strip()]
+                    setattr(cfg, k, parsed)
+                elif isinstance(v, (list, tuple, set)):
+                    setattr(cfg, k, [x for x in v])
                 else:
-                    setattr(cfg, k, type(current)(v))
-            except Exception:
-                try:
-                    setattr(cfg, k, v)
-                except Exception:
-                    pass
+                    setattr(cfg, k, [v])
+            elif isinstance(current, bool):
+                coerced = parse_bool_like(v)
+                if coerced is UNPARSED_BOOL:
+                    invalid_keys.append(str(k))
+                    continue
+                setattr(cfg, k, bool(coerced))
+            elif current is None:
+                setattr(cfg, k, v)
+            else:
+                setattr(cfg, k, type(current)(v))
+        except Exception:
+            invalid_keys.append(str(k))
+    deduped: List[str] = []
+    for key in invalid_keys:
+        if key not in deduped:
+            deduped.append(key)
+    return deduped
+
+
+def _attach_pattern_usage_notice(result: Dict[str, Any]) -> None:
+    if not isinstance(result, dict) or result.get("error"):
+        return
+    result.setdefault("is_signal", False)
+    result.setdefault("usage", "information_only")
+    compact_shape = "patterns_shown" in result or (
+        result.get("mode") == "all" and "highlights" in result
+    )
+    if compact_shape:
+        result.setdefault(
+            "confidence_basis",
+            "confidence/pattern_confidence are heuristic pattern scores (0-1), not historical win rates",
+        )
+        return
+    result.setdefault(
+        "calibration",
+        {
+            "confidence": "heuristic pattern score, not historical win rate",
+            "note": (
+                "Validate patterns with labels_triple_barrier or a backtest before "
+                "treating bias/action fields as trading signals."
+            ),
+        },
+    )
+
 
 @mcp.tool()
-@_auto_connect_wrapper
 def patterns_detect(
-    symbol: str,
-    timeframe: Optional[TimeframeLiteral] = None,
-    mode: Literal['candlestick', 'classic', 'elliott'] = 'candlestick',  # type: ignore
-    limit: int = 1000,
-    # Candlestick specific
-    min_strength: float = 0.95,
-    min_gap: int = 3,
-    robust_only: bool = True,
-    whitelist: Optional[str] = None,
-    top_k: int = 1,
-    # Classic/Elliott specific
-    denoise: Optional[Dict[str, Any]] = None,
-    config: Optional[Dict[str, Any]] = None,
-    engine: str = "native",
-    ensemble: bool = False,
-    ensemble_weights: Optional[Dict[str, Any]] = None,
-    include_series: bool = False,
-    series_time: str = "string",
-    include_completed: bool = False,
+    request: PatternsDetectRequest,
 ) -> Dict[str, Any]:
-    """Detect chart patterns (candlestick, classic chart patterns, or Elliott Wave).
+    """Detect chart patterns (candlestick, classic, harmonic, fractal, or Elliott Wave).
     
     **REQUIRED**: symbol parameter must be provided (e.g., "EURUSD", "BTCUSD")
+    
+    By default (mode="candlestick"), scans recent H1 candlestick patterns.
+    Use `mode="all"` to run all pattern types across the default multi-timeframe
+    set (`M30`, `H1`, `H4`, `D1`, `W1`).
     
     Parameters:
     -----------
@@ -866,34 +1300,61 @@ def patterns_detect(
     
     timeframe : str, optional
         Chart timeframe: "M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"
-        For `mode="elliott"`, when omitted, all available timeframes are scanned and
-        returned in a single aggregated output.
+        For `mode="all"`, when omitted, a default multi-timeframe set
+        (`M30`, `H1`, `H4`, `D1`, `W1`) is scanned automatically.
+        For `mode="elliott"`, when omitted, a higher-structure subset
+        (`H1`, `H4`, `D1`) is scanned automatically.
     
     mode : str, optional (default="candlestick")
         Pattern detection method:
+        - "all": Comprehensive scan - candlestick + classic + harmonic + fractal + Elliott across
+          multiple timeframes. Returns sectioned output.
         - "candlestick": Japanese candlestick patterns (Doji, Hammer, Engulfing, etc.)
         - "classic": Chart patterns (Head & Shoulders, Triangles, Flags, etc.)
+        - "harmonic": Fibonacci-ratio patterns (ABCD, Gartley, Bat, Butterfly, Crab, etc.)
+        - "fractal": Bill Williams-style bullish/bearish fractal levels with breakout context
         - "elliott": Elliott Wave patterns
+
+    detail : str, optional (default="compact")
+        Output verbosity:
+        - "compact": trader-focused summary with recent patterns and pattern mix.
+        - "standard": sectioned all-mode output with trimmed pattern rows.
+        - "summary": quick-read highlights and aggregate bias/counts only.
+        - "full": complete pattern rows suitable for research/debugging.
     
-    limit : int, optional (default=1000)
-        Number of historical bars to analyze
+    limit : int, optional (default=150)
+        Maximum number of historical bars to analyze after applying any time window
+
+    start/end : str, optional
+        UTC-compatible analysis window. If only `end` is supplied, the most recent
+        `limit` bars ending at `end` are used.
     
     Candlestick Mode Parameters:
     ----------------------------
-    min_strength : float, optional (default=0.95)
-        Minimum pattern strength threshold (0.0 to 1.0)
+    min_strength : float, optional (default=0.70)
+        Minimum semantic conviction threshold (0.0 to 1.0). This filters on a
+        normalized candlestick strength score that combines pattern reliability,
+        multi-bar span, and any raw detector bonus rather than raw pandas_ta
+        signal magnitude alone.
     
     min_gap : int, optional (default=3)
         Minimum gap between patterns (in bars)
     
-    robust_only : bool, optional (default=True)
+    robust_only : bool, optional (default=False)
         Only return high-confidence patterns
     
     whitelist : str, optional
-        Comma-separated list of specific patterns to detect (e.g., "doji,hammer,engulfing")
+        Candlestick mode only. Comma-separated list of specific candlestick
+        patterns to detect (e.g., "doji,hammer,engulfing").
     
-    top_k : int, optional (default=1)
-        Return only the top K strongest patterns
+    top_k : int, optional (default=3)
+        Result preview budget. `limit` controls the scanned bar window;
+        `top_k` controls how many `top_patterns` rows compact output returns
+        and is reported as `patterns_shown`.
+
+    last_n_bars : int, optional
+        Candlestick mode only. Restrict detections to patterns that occur in the
+        most recent N bars.
     
     Classic/Elliott Mode Parameters:
     ---------------------------------
@@ -907,10 +1368,30 @@ def patterns_detect(
         - native_scale_factors: list[float] (e.g. [0.8, 1.0, 1.25])
         - pivot_use_hl, pivot_use_atr_adaptive_prominence, pivot_use_atr_adaptive_distance
         - calibrate_confidence, confidence_calibration_map, confidence_calibration_blend
+        Elliott v2 options include:
+        - scale_mode: "auto" (default) or "fixed"
+        - adaptive_denoise: "auto", "off", or "diagnostic"
+        - adaptive_window_bars and adaptive_min_improvement
+        - swing_threshold_pct for one exact scan, or scan_thresholds_pct for a multi-scale scan
+        - scan_min_distances, pattern_types, min_impulse_bars, min_correction_bars
+        - min_structural_score, max_pattern_span_bars, max_pattern_age_bars
+        - pivot_price_source: "close" or "ohlc"
+        Elliott v2 reports outer-leg geometry and causal pivot confirmation. It
+        does not infer nested degrees, internal 5-3-5 subdivisions, the current
+        wave number, or a prospective next leg.
+        Useful fractal options include:
+        - left_bars, right_bars
+        - breakout_basis: "close" or "high_low"
+        - min_prominence_pct, confidence_prominence_cap_pct
+        Useful harmonic options include:
+        - pattern_types: list[str] (for example ["gartley", "bat", "crab", "abcd"])
+        - ratio_tolerance, min_confidence, max_pivots, max_pattern_age_bars
+        - min_prominence_pct, min_distance, pivot_use_hl
 
-    engine : str, optional (default="native")
-        Classic engine selection: "native", "stock_pattern", "precise_patterns",
-        or comma-separated list when `ensemble=True`.
+    engine : str, optional
+        Classic-mode engine selection: "native", "stock_pattern", or a
+        comma-separated list when `ensemble=True`. Omitted classic calls use
+        "native". Supplying engine for another mode is an error.
 
     ensemble : bool, optional (default=False)
         For classic mode, merge detections from multiple engines into consensus results.
@@ -926,7 +1407,9 @@ def patterns_detect(
         Time format for series data
     
     include_completed : bool, optional (default=False)
-        Include completed patterns alongside forming results (when False, only forming patterns are returned)
+        Include completed structures alongside forming results. Harmonic mode
+        always returns its completed structures because it has no forming
+        lifecycle output.
     
     Returns:
     --------
@@ -939,204 +1422,46 @@ def patterns_detect(
     
     Examples:
     ---------
-    # Detect candlestick patterns
+    # Candlestick-only H1 scan (default)
     patterns_detect(symbol="EURUSD")
+
+    # Comprehensive scan across all pattern types and default timeframes
+    patterns_detect(symbol="EURUSD", mode="all")
     
-    # Detect candlestick patterns on M15 with custom parameters
-    patterns_detect(symbol="EURUSD", timeframe="M15", min_strength=0.90, top_k=3)
+    # Comprehensive scan on a single timeframe
+    patterns_detect(symbol="EURUSD", mode="all", timeframe="H4")
+    
+    # Detect candlestick patterns only
+    patterns_detect(symbol="EURUSD", mode="candlestick", timeframe="M15", min_strength=0.70, top_k=3)
     
     # Detect classic chart patterns
     patterns_detect(symbol="GBPUSD", mode="classic", limit=500)
-    
+
+    # Detect fractal levels and breakouts
+    patterns_detect(symbol="EURUSD", mode="fractal", timeframe="H1", config={"breakout_basis": "high_low"})
+
+    # Detect Fibonacci harmonic patterns
+    patterns_detect(symbol="EURUSD", mode="harmonic", timeframe="H1", limit=500)
+
     # Detect Elliott Wave patterns
-    patterns_detect(symbol="BTCUSD", mode="elliott", timeframe="H4")
+    patterns_detect(symbol="BTCUSD", mode="elliott", timeframe="H4", detail="full")
     """
-    try:
-        tf_norm: Optional[str] = str(timeframe).strip().upper() if timeframe is not None else None
-        if not tf_norm:
-            tf_norm = None
+    def _run() -> Dict[str, Any]:
+        connection_error = _patterns_connection_error()
+        if connection_error is not None:
+            return connection_error
+        result = run_patterns_detect(request, _patterns_detect_deps())
+        if isinstance(result, dict) and "error" not in result:
+            result.setdefault("timezone", "UTC")
+            _attach_pattern_usage_notice(result)
+        return result
 
-        if mode == 'candlestick':
-            tf_single = tf_norm or "H1"
-            return _detect_candlestick_patterns(
-                symbol=symbol,
-                timeframe=tf_single,
-                limit=limit,
-                min_strength=min_strength,
-                min_gap=min_gap,
-                robust_only=robust_only,
-                whitelist=whitelist,
-                top_k=top_k,
-            )
-
-        elif mode == 'classic':
-            tf_single = tf_norm or "H1"
-            # Fetch and prepare data using shared helper
-            df, err = _fetch_pattern_data(symbol, tf_single, limit, denoise)
-            if err:
-                return err
-
-            cfg = _ClassicCfg()
-            _apply_config_to_obj(cfg, config)
-            engines, invalid_engines = _select_classic_engines(engine, ensemble)
-            if invalid_engines:
-                return {
-                    "error": (
-                        f"Invalid classic engine(s): {invalid_engines}. "
-                        f"Valid options: {list(_CLASSIC_ENGINE_ORDER)}"
-                    )
-                }
-
-            per_engine: Dict[str, List[Dict[str, Any]]] = {}
-            engine_errors: Dict[str, str] = {}
-            for eng in engines:
-                patt_rows, eng_err = _run_classic_engine(eng, symbol, df, cfg, config)
-                if eng_err:
-                    engine_errors[eng] = eng_err
-                per_engine[eng] = patt_rows
-
-            non_empty = {e: p for e, p in per_engine.items() if p}
-            if not non_empty:
-                if engine_errors and len(engine_errors) == len(engines):
-                    return {
-                        "error": "No classic engines produced results",
-                        "engines_run": engines,
-                        "engine_errors": engine_errors,
-                    }
-                resp = _build_pattern_response(
-                    symbol, tf_single, limit, mode, [],
-                    include_completed, include_series, series_time, df
-                )
-                resp["engine"] = "ensemble" if (bool(ensemble) or len(engines) > 1) else engines[0]
-                resp["engines_run"] = engines
-                resp["engine_findings"] = [
-                    {
-                        "engine": e,
-                        "n_patterns": int(len(per_engine.get(e, []))),
-                        "n_forming": int(sum(1 for p in per_engine.get(e, []) if str(p.get("status", "")).lower() == "forming")),
-                        "n_completed": int(sum(1 for p in per_engine.get(e, []) if str(p.get("status", "")).lower() == "completed")),
-                    }
-                    for e in engines
-                ]
-                if engine_errors:
-                    resp["engine_errors"] = engine_errors
-                return resp
-
-            run_ensemble = bool(ensemble) or len(non_empty) > 1
-            if run_ensemble:
-                weight_map = _resolve_engine_weights(
-                    engines,
-                    ensemble_weights if isinstance(ensemble_weights, dict) else (
-                        (config or {}).get("ensemble_weights") if isinstance(config, dict) else None
-                    ),
-                )
-                out_list = _merge_classic_ensemble(non_empty, weight_map)
-            else:
-                # keep single-engine behavior when only one engine produces output
-                only_engine = next(iter(non_empty.keys()))
-                out_list = list(non_empty.get(only_engine, []))
-
-            resp = _build_pattern_response(
-                symbol, tf_single, limit, mode, out_list,
-                include_completed, include_series, series_time, df
-            )
-            resp["engine"] = "ensemble" if run_ensemble else next(iter(non_empty.keys()))
-            resp["engines_run"] = engines
-            resp["engine_findings"] = [
-                {
-                    "engine": e,
-                    "n_patterns": int(len(per_engine.get(e, []))),
-                    "n_forming": int(sum(1 for p in per_engine.get(e, []) if str(p.get("status", "")).lower() == "forming")),
-                    "n_completed": int(sum(1 for p in per_engine.get(e, []) if str(p.get("status", "")).lower() == "completed")),
-                }
-                for e in engines
-            ]
-            if engine_errors:
-                resp["engine_errors"] = engine_errors
-            return resp
-
-        elif mode == 'elliott':
-            cfg = _ElliottCfg()
-            _apply_config_to_obj(cfg, config)
-
-            if tf_norm:
-                # Fetch and prepare data using shared helper
-                df, err = _fetch_pattern_data(symbol, tf_norm, limit, denoise)
-                if err:
-                    return err
-
-                out_list = _format_elliott_patterns(df, cfg)
-                return _build_pattern_response(
-                    symbol, tf_norm, limit, mode, out_list,
-                    include_completed, include_series, series_time, df
-                )
-
-            # If timeframe is omitted for Elliott mode, scan all available timeframes.
-            scanned_timeframes = list(TIMEFRAME_MAP.keys())
-            findings: List[Dict[str, Any]] = []
-            combined_patterns: List[Dict[str, Any]] = []
-            failed_timeframes: Dict[str, str] = {}
-            series_by_timeframe: Dict[str, Dict[str, Any]] = {}
-
-            for tf in scanned_timeframes:
-                df, err = _fetch_pattern_data(symbol, tf, limit, denoise)
-                if err:
-                    failed_timeframes[tf] = str(err.get("error", "Unknown error"))
-                    continue
-
-                tf_patterns = _format_elliott_patterns(df, cfg)
-                filtered = tf_patterns if include_completed else [
-                    d for d in tf_patterns if str(d.get('status', '')).lower() == 'forming'
-                ]
-                findings.append({
-                    "timeframe": tf,
-                    "n_patterns": int(len(filtered)),
-                    "patterns": filtered,
-                })
-
-                for row in filtered:
-                    merged = dict(row)
-                    merged["timeframe"] = tf
-                    combined_patterns.append(merged)
-
-                if include_series:
-                    series_payload: Dict[str, Any] = {
-                        "series_close": [float(v) for v in __to_float_np(df.get('close')).tolist()]
-                    }
-                    if 'time' in df.columns:
-                        if str(series_time).lower() == 'epoch':
-                            series_payload["series_epoch"] = [float(v) for v in __to_float_np(df.get('time')).tolist()]
-                        else:
-                            series_payload["series_time"] = [
-                                _format_time_minimal(float(v)) for v in __to_float_np(df.get('time')).tolist()
-                            ]
-                    series_by_timeframe[tf] = series_payload
-
-            if not findings:
-                return {
-                    "error": f"Failed to fetch sufficient bars for {symbol} across all timeframes",
-                    "failed_timeframes": failed_timeframes,
-                }
-
-            resp: Dict[str, Any] = {
-                "success": True,
-                "symbol": symbol,
-                "timeframe": "ALL",
-                "lookback": int(limit),
-                "mode": mode,
-                "scanned_timeframes": scanned_timeframes,
-                "findings": findings,
-                "patterns": combined_patterns,
-                "n_patterns": int(len(combined_patterns)),
-            }
-            if failed_timeframes:
-                resp["failed_timeframes"] = failed_timeframes
-            if include_series:
-                resp["series_by_timeframe"] = series_by_timeframe
-            return resp
-        
-        else:
-            return {"error": f"Unknown mode: {mode}"}
-
-    except Exception as e:
-        return {"error": f"Error detecting patterns: {str(e)}"}
+    return run_logged_operation(
+        logger,
+        operation="patterns_detect",
+        symbol=request.symbol,
+        timeframe=request.timeframe,
+        mode=request.mode,
+        detail=request.detail,
+        func=_run,
+    )

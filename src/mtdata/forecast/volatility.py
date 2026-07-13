@@ -1,21 +1,73 @@
-from typing import Any, Dict, Optional, List, Literal
-from datetime import datetime
+import difflib
+import math
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional
+
 import numpy as np
 import pandas as pd
-import MetaTrader5 as mt5
-import json
-import math
 
-from ..core.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
-from ..core.schema import TimeframeLiteral, DenoiseSpec
-from ..utils.mt5 import _mt5_epoch_to_utc, _mt5_copy_rates_from, _ensure_symbol_ready
-from ..utils.utils import _parse_start_datetime
-from ..utils.denoise import _apply_denoise, normalize_denoise_spec as _normalize_denoise_spec
+from ..services.data_service import (
+    _is_last_bar_forming,
+    _resolve_live_rate_auto_shift_seconds,
+    _shift_rate_times,
+)
+from ..shared.constants import SANITY_BARS_TOLERANCE, TIMEFRAME_MAP, TIMEFRAME_SECONDS
+from ..shared.schema import DetailLiteral, DenoiseSpec, TimeframeLiteral
+from ..shared.symbols import is_probably_crypto_symbol, is_probably_forex_symbol
+from ..shared.validators import (
+    invalid_timeframe_error,
+    unsupported_timeframe_seconds_error,
+)
+from ..utils.denoise import _apply_denoise
+from ..utils.denoise import normalize_denoise_spec as _normalize_denoise_spec
+from ..utils.freshness import (
+    closed_session_context,
+    format_age_seconds,
+    format_freshness_label,
+)
+from ..utils.mt5 import (
+    _ensure_symbol_ready,
+    _mt5_copy_rates_from,
+    _mt5_copy_rates_range,
+    mt5,
+)
+from ..utils.time import _format_time_minimal
+from ..utils.utils import _parse_start_datetime, parse_kv_or_json
+from .common import (
+    bars_per_year as _bars_per_year,
+)
 from .common import (
     default_seasonality as _default_seasonality_period,
+)
+from .common import (
     log_returns_from_prices as _log_returns_from_prices,
+)
+from .common import next_times_from_last, uses_standard_weekend_projection
+from .common import (
     pd_freq_from_timeframe as _pd_freq_from_timeframe,
 )
+
+_VOLATILITY_METHOD_HINTS = (
+    "ewma",
+    "garch",
+    "har_rv",
+    "arima",
+    "sarima",
+    "ets",
+    "theta",
+    "ensemble",
+)
+
+_VOLATILITY_METHOD_CONCEPT_HINTS = {
+    "close_to_close": "rolling_std",
+    "historical": "rolling_std",
+    "historical_volatility": "rolling_std",
+    "realized": "realized_kernel",
+    "realized_volatility": "realized_kernel",
+    "standard_deviation": "rolling_std",
+    "stddev": "rolling_std",
+}
+
 
 # Optional availability flags (match server discovery)
 try:
@@ -200,31 +252,96 @@ def get_volatility_methods_data() -> Dict[str, Any]:
         "method": "ensemble",
         "available": True,
         "requires": [],
-        "description": "Blend of multiple price/return forecast methods applied to the volatility proxy.",
+        "description": "Blend of multiple direct/general volatility methods.",
         "params": [
-            {"name": "methods", "type": "list[str]", "default": [], "description": "Base forecast methods to blend (leave blank for defaults)."},
+            {"name": "methods", "type": "list[str]", "default": [], "description": "Volatility methods to blend (leave blank for defaults)."},
             {"name": "aggregator", "type": "str", "default": "mean", "description": "Aggregation strategy: mean, median, weighted."},
             {"name": "weights", "type": "list[float]", "default": [], "description": "Optional weights for the weighted aggregator."},
             {"name": "expose_components", "type": "bool", "default": True, "description": "Expose individual component forecasts in the response."},
+            {"name": "method_params", "type": "dict", "default": {}, "description": "Optional per-method params merged into the shared params payload."},
         ],
     })
 
     return {"methods": methods}
-# Use shared helpers from common.py for seasonality and pandas freq mapping
 
-def _bars_per_year(timeframe: str) -> int:
-    """Approximate number of bars per year for a given timeframe.
 
-    Uses 365 days; for intraday frames computes 365*24*3600 / seconds_per_bar.
-    """
+def _forecast_method_supports(method: str) -> Dict[str, bool]:
     try:
-        secs = TIMEFRAME_SECONDS.get(timeframe)
-        if not secs or secs <= 0:
-            return 0
-        return int(round((365.0 * 24.0 * 3600.0) / float(secs)))
-    except Exception:
-        return 0
+        from .forecast_methods import get_method_supports
 
+        supports = get_method_supports(method)
+    except Exception:
+        return {}
+    if not isinstance(supports, dict) or not any(bool(v) for v in supports.values()):
+        return {}
+    return {
+        str(key): bool(value)
+        for key, value in supports.items()
+        if key in {"price", "return", "volatility", "ci"}
+    }
+
+
+def _invalid_volatility_method_error(
+    method: Any,
+    *,
+    valid_methods: set[str],
+) -> Dict[str, Any]:
+    method_text = str(method).strip()
+    method_l = method_text.lower()
+    valid_method_list = sorted(valid_methods)
+    normalized_method = method_l.replace("-", "_").replace(" ", "_")
+    suggested_method = _VOLATILITY_METHOD_CONCEPT_HINTS.get(normalized_method)
+    if suggested_method not in valid_methods:
+        matches = difflib.get_close_matches(normalized_method, valid_method_list, n=1, cutoff=0.55)
+        suggested_method = matches[0] if matches else None
+    suggestion_text = f" Did you mean: {suggested_method}?" if suggested_method else ""
+    supports = _forecast_method_supports(method_l)
+    supported_quantities = [
+        quantity
+        for quantity in ("price", "return", "volatility")
+        if supports.get(quantity)
+    ]
+
+    if supports and not supports.get("volatility"):
+        supported_text = ", ".join(supported_quantities) or "none"
+        hints = ", ".join(_VOLATILITY_METHOD_HINTS)
+        return {
+            "error": (
+                f"Method '{method_text}' does not support quantity='volatility'. "
+                f"Supported quantities: {supported_text}. Use "
+                f"forecast_volatility_estimate with a volatility method such as {hints}."
+            ),
+            "error_code": "unsupported_quantity_method",
+            "method": method_l,
+            "quantity": "volatility",
+            "supported_quantities": supported_quantities,
+            "valid_volatility_methods": valid_method_list,
+        }
+
+    if supports:
+        return {
+            "error": (
+                f"Method '{method_text}' is registered for forecast_generate but is "
+                "not a forecast_volatility_estimate method. Use one of: "
+                f"{', '.join(valid_method_list)}.{suggestion_text}"
+            ),
+            "error_code": "unsupported_volatility_method",
+            "method": method_l,
+            "quantity": "volatility",
+            "supported_quantities": supported_quantities,
+            "valid_volatility_methods": valid_method_list,
+            **({"suggested_method": suggested_method} if suggested_method else {}),
+        }
+
+    return {
+        "error": (
+            f"Invalid volatility method: {method_text}. Use one of: "
+            f"{', '.join(valid_method_list)}.{suggestion_text}"
+        ),
+        "error_code": "invalid_volatility_method",
+        "valid_volatility_methods": valid_method_list,
+        **({"suggested_method": suggested_method} if suggested_method else {}),
+    }
 
 
 # --- Range-based variance helpers -------------------------------------------------
@@ -312,81 +429,620 @@ def _realized_kernel_variance(
     return float(rk / max(1, n))
 
 
-def forecast_volatility(
+def _ewma_param_explanations(lambda_source: str) -> Dict[str, str]:
+    """Human-readable explanations for EWMA parameters in API output."""
+    out = {
+        "lambda_": (
+            "EWMA decay factor for volatility weights (0-1). "
+            "Higher values retain older bars longer; lower values react faster to recent moves."
+        ),
+    }
+    if lambda_source == "halflife":
+        out["halflife"] = (
+            "Half-life in bars used to derive lambda_ "
+            "(lambda_ = exp(-ln(2) / halflife); for halflife=22, "
+            "lambda_ is approximately 0.969)."
+        )
+    return out
+
+
+def _annualize_horizon_sigma(
+    horizon_sigma_return: float,
+    bars_per_year: float,
+    horizon: int,
+) -> float:
+    """Express the horizon-scaled sigma on the annualized return scale."""
+    horizon_bars = max(1, int(horizon))
+    return float(horizon_sigma_return * math.sqrt(bars_per_year / horizon_bars))
+
+
+def _volatility_annualization_context(symbol: str, timeframe: str) -> tuple[float, str]:
+    timeframe_name = str(timeframe or "").strip().upper()
+    if is_probably_crypto_symbol(symbol):
+        seconds = TIMEFRAME_SECONDS.get(timeframe_name)
+        try:
+            seconds_value = float(seconds)
+        except (TypeError, ValueError):
+            seconds_value = 0.0
+        if math.isfinite(seconds_value) and seconds_value > 0.0:
+            return (
+                float((365.0 * 24.0 * 60.0 * 60.0) / seconds_value),
+                "365_calendar_days_24h_crypto",
+            )
+    if is_probably_forex_symbol(symbol):
+        return float(_bars_per_year(timeframe_name, symbol)), "260_fx_weekdays_24h"
+    return float(_bars_per_year(timeframe_name, symbol)), "252_trading_days_generic_session"
+
+
+def _volatility_input_context(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    timeframe: str,
+    returns_used: int,
+    live_window: bool,
+    horizon: int = 1,
+    now_epoch: Optional[float] = None,
+) -> Dict[str, Any]:
+    if "time" not in df.columns or len(df) == 0:
+        return {}
+    try:
+        first_epoch = float(df["time"].iloc[0])
+        last_epoch = float(df["time"].iloc[-1])
+    except (TypeError, ValueError):
+        return {}
+
+    out: Dict[str, Any] = {
+        "data_as_of": _format_time_minimal(last_epoch),
+        "data_window": {
+            "start": _format_time_minimal(first_epoch),
+            "end": _format_time_minimal(last_epoch),
+            "bars_used": int(len(df)),
+            "returns_used": int(returns_used),
+            "input_bar_policy": "closed_bars_only",
+        },
+    }
+    tf_secs = int(TIMEFRAME_SECONDS.get(timeframe, 0) or 0)
+    forecast_epochs = (
+        next_times_from_last(
+            last_epoch,
+            tf_secs,
+            max(1, int(horizon)),
+            skip_weekends=uses_standard_weekend_projection(symbol, tf_secs),
+        )
+        if tf_secs > 0
+        else []
+    )
+    if forecast_epochs:
+        start_epoch = float(forecast_epochs[0])
+        end_epoch = float(forecast_epochs[-1])
+        out["forecast_window"] = {
+            "anchor": _format_time_minimal(last_epoch),
+            "start": _format_time_minimal(start_epoch),
+            "end": _format_time_minimal(end_epoch),
+            "bars": int(len(forecast_epochs)),
+            "step_seconds": tf_secs,
+            "forecast_start_gap_bars": round(
+                (start_epoch - last_epoch) / float(tf_secs),
+                4,
+            ),
+            "calendar_policy": (
+                "forex_weekend_skipped"
+                if uses_standard_weekend_projection(symbol, tf_secs)
+                else "continuous_no_weekend_skip"
+            ),
+        }
+    if not live_window:
+        return out
+
+    if now_epoch is None:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+    age_seconds = max(0, int(round(float(now_epoch) - last_epoch)))
+    stale_after = int(
+        max(1, int(TIMEFRAME_SECONDS.get(timeframe, 0) or 0))
+        * max(1, int(SANITY_BARS_TOLERANCE))
+    )
+    out.update(
+        {
+            "data_age_seconds": age_seconds,
+            "data_stale": age_seconds > stale_after,
+            "stale_after_seconds": stale_after,
+            "freshness_basis": "bar_policy",
+        }
+    )
+    closed_session = closed_session_context(
+        symbol,
+        now_epoch=now_epoch,
+        item="data",
+        data_age_seconds=age_seconds,
+    )
+    if closed_session:
+        out.update(closed_session)
+    out["usable_for_live_trading"] = not bool(out.get("data_stale")) and not bool(closed_session)
+    freshness = format_freshness_label(
+        data_stale=out.get("data_stale"),
+        market_status=(
+            out.get("market_status")
+            if out.get("freshness_policy_relaxed") is not False
+            else None
+        ),
+        market_status_reason=(
+            out.get("market_status_reason")
+            if out.get("freshness_policy_relaxed") is not False
+            else None
+        ),
+        age_seconds=age_seconds,
+        age_text=format_age_seconds(age_seconds),
+        item="data",
+    )
+    if freshness:
+        out["freshness"] = freshness
+    return out
+
+
+def _finalize_volatility_with_context(
+    payload: Dict[str, Any],
+    *,
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str,
+    returns_used: int,
+    live_window: bool,
+    detail: str,
+) -> Dict[str, Any]:
+    annualization_bars, annualization_basis = _volatility_annualization_context(
+        symbol,
+        timeframe,
+    )
+    if math.isfinite(annualization_bars) and annualization_bars > 0:
+        payload.setdefault("bars_per_year", round(annualization_bars, 4))
+        payload.setdefault("annualization_basis", annualization_basis)
+    payload.update(
+        _volatility_input_context(
+            df,
+            symbol=symbol,
+            timeframe=timeframe,
+            returns_used=returns_used,
+            live_window=live_window,
+            horizon=int(payload.get("horizon", 1) or 1),
+        )
+    )
+    return _finalize_volatility_output(payload, detail=detail)
+
+
+def _finalize_volatility_output(
+    payload: Dict[str, Any],
+    *,
+    detail: str = "full",
+) -> Dict[str, Any]:
+    """Add trader-friendly volatility aliases and explanatory metadata."""
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return payload
+
+    out = dict(payload)
+    detail_mode = str(detail or "compact").strip().lower()
+    # One-way migration for residual legacy keys; emit trader keys only.
+    for legacy_key, trader_key in (
+        ("sigma_bar_return", "volatility_per_bar"),
+        ("sigma_annual_return", "volatility_annualized"),
+        ("horizon_sigma_return", "volatility_horizon"),
+        ("horizon_sigma_annual", "volatility_horizon_annualized"),
+    ):
+        legacy_value = out.get(legacy_key)
+        if out.get(trader_key) is None and legacy_value is not None:
+            out[trader_key] = legacy_value
+        out.pop(legacy_key, None)
+    out.setdefault("volatility_unit", "return_fraction")
+    out.setdefault("volatility_measure", "standard_deviation_of_returns")
+    out.setdefault(
+        "volatility_unit_note",
+        "Volatility values are decimal return fractions; *_pct aliases are percentages.",
+    )
+    for source_key, pct_key in (
+        ("volatility_per_bar", "volatility_per_bar_pct"),
+        ("volatility_annualized", "volatility_annualized_pct"),
+        ("volatility_horizon", "volatility_horizon_pct"),
+        ("volatility_horizon_annualized", "volatility_horizon_annualized_pct"),
+    ):
+        value = out.get(source_key)
+        if value is None:
+            continue
+        try:
+            out.setdefault(pct_key, round(float(value) * 100.0, 6))
+        except Exception:
+            pass
+
+    if detail_mode != "full":
+        for key in (
+            "params_explained",
+            "params_used",
+            "volatility_interpretation",
+        ):
+            out.pop(key, None)
+        horizon = out.get("horizon")
+        if isinstance(horizon, (int, float)) and int(horizon) == 1:
+            out.setdefault(
+                "horizon_note",
+                "horizon=1, so volatility_horizon equals volatility_per_bar.",
+            )
+        for key in (
+            "volatility_per_bar",
+            "volatility_annualized",
+            "volatility_horizon",
+            "volatility_horizon_annualized",
+        ):
+            try:
+                out[key] = round(float(out[key]), 6)
+            except Exception:
+                pass
+        for key in (
+            "volatility_per_bar_pct",
+            "volatility_annualized_pct",
+            "volatility_horizon_pct",
+            "volatility_horizon_annualized_pct",
+        ):
+            try:
+                out[key] = round(float(out[key]), 4)
+            except Exception:
+                pass
+        try:
+            if math.isclose(
+                float(out.get("volatility_horizon_annualized")),
+                float(out.get("volatility_annualized")),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                out.pop("volatility_horizon_annualized", None)
+                out.pop("volatility_horizon_annualized_pct", None)
+                out.setdefault(
+                    "volatility_annualized_note",
+                    "volatility_horizon_annualized equals volatility_annualized under sqrt-time scaling; "
+                    "volatility_horizon remains scaled to the requested horizon.",
+                )
+        except Exception:
+            pass
+        if detail_mode == "compact":
+            for key in (
+                "volatility_per_bar_pct",
+                "volatility_annualized_pct",
+                "volatility_horizon_pct",
+                "volatility_horizon_annualized_pct",
+                "volatility_unit_note",
+                "volatility_annualized_note",
+                "horizon_note",
+            ):
+                out.pop(key, None)
+        return out
+
+    horizon = out.get("horizon")
+    interpretation = {
+        "volatility_per_bar": "Estimated one-bar return volatility for the selected timeframe.",
+        "volatility_annualized": "volatility_per_bar annualized using the timeframe's bars-per-year convention.",
+        "volatility_horizon": "Return volatility scaled to the requested horizon in bars.",
+        "volatility_horizon_annualized": (
+            "volatility_horizon expressed on the same annualized return scale. "
+            "With sqrt-time scaling this can equal volatility_annualized for horizon > 1."
+        ),
+        "volatility_unit": "All volatility values are decimal return fractions; 0.0525 means 5.25%.",
+    }
+    if isinstance(horizon, (int, float)) and int(horizon) == 1:
+        interpretation["horizon_note"] = (
+            "horizon=1, so volatility_horizon equals volatility_per_bar."
+        )
+    out.setdefault("volatility_interpretation", interpretation)
+
+    return out
+
+
+def _fetch_mt5_rates_guarded(
+    symbol: str,
+    mt5_timeframe: Any,
+    count: int,
+    *,
+    as_of: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    timeframe: Optional[str] = None,
+) -> tuple[Optional[Any], Optional[str]]:
+    if as_of and (start or end):
+        return None, "as_of cannot be combined with start/end."
+    info_before = mt5.symbol_info(symbol)
+    was_visible = bool(info_before.visible) if info_before is not None else None
+    try:
+        err = _ensure_symbol_ready(symbol)
+        if err:
+            return None, str(err)
+        start_dt = _parse_start_datetime(start) if start else None
+        if start and start_dt is None:
+            return None, "Invalid start time."
+        end_dt = _parse_start_datetime(end) if end else None
+        if end and end_dt is None:
+            return None, "Invalid end time."
+        if start_dt is not None and end_dt is None:
+            end_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        if start_dt is not None and end_dt is not None and start_dt > end_dt:
+            return None, "start must be before or equal to end."
+        if start_dt is not None:
+            rates = _mt5_copy_rates_range(symbol, mt5_timeframe, start_dt, end_dt)
+            if rates is not None and len(rates) > int(count):
+                rates = rates[-int(count):]
+            return rates, None
+        if end_dt is not None:
+            return _mt5_copy_rates_from(symbol, mt5_timeframe, end_dt, count), None
+        if as_of:
+            to_dt = _parse_start_datetime(as_of)
+            if not to_dt:
+                return None, "Invalid as_of time."
+            return _mt5_copy_rates_from(symbol, mt5_timeframe, to_dt, count), None
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is not None and getattr(tick, "time", None):
+            t_utc = float(tick.time)
+            server_now_dt = datetime.fromtimestamp(t_utc, tz=timezone.utc)
+        else:
+            server_now_dt = datetime.now(timezone.utc)
+        rates = _mt5_copy_rates_from(symbol, mt5_timeframe, server_now_dt, count)
+        timeframe_name = str(timeframe).upper().strip() if timeframe is not None else None
+        if timeframe_name:
+            auto_shift_seconds = _resolve_live_rate_auto_shift_seconds(
+                symbol=symbol,
+                timeframe=timeframe_name,
+                start_datetime=None,
+                end_datetime=None,
+            )
+            if auto_shift_seconds:
+                rates = _shift_rate_times(rates, auto_shift_seconds)
+        return rates, None
+    finally:
+        if was_visible is False:
+            try:
+                mt5.symbol_select(symbol, False)
+            except Exception:
+                pass
+
+
+def _drop_forming_live_bar(
+    frame: pd.DataFrame,
+    rates: Any,
+    *,
+    timeframe: str,
+    live_window: bool,
+) -> pd.DataFrame:
+    if live_window and len(frame) >= 2 and _is_last_bar_forming(rates, timeframe):
+        return frame.iloc[:-1]
+    return frame
+
+
+def forecast_volatility(  # noqa: C901
     symbol: str,
     timeframe: TimeframeLiteral = "H1",
     horizon: int = 1,
-    method: Literal['ewma','parkinson','gk','rs','yang_zhang','rolling_std','realized_kernel','har_rv','garch','egarch','gjr_garch','garch_t','egarch_t','gjr_garch_t','figarch','arima','sarima','ets','theta'] = 'ewma',  # type: ignore
+    method: Literal['ewma','parkinson','gk','rs','yang_zhang','rolling_std','realized_kernel','har_rv','garch','egarch','gjr_garch','garch_t','egarch_t','gjr_garch_t','figarch','arima','sarima','ets','theta','ensemble'] = 'ewma',  # type: ignore
     proxy: Optional[Literal['squared_return','abs_return','log_r2']] = None,  # type: ignore
     params: Optional[Dict[str, Any]] = None,
     as_of: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     denoise: Optional[DenoiseSpec] = None,
+    detail: DetailLiteral = "full",
 ) -> Dict[str, Any]:
     """Forecast volatility over `horizon` bars with direct estimators/GARCH or general forecasters on a proxy.
 
     Direct: ewma, parkinson, gk, rs, yang_zhang, rolling_std, realized_kernel, har_rv, garch(+variants).
     General: arima, sarima, ets, theta (require `proxy`: squared_return|abs_return|log_r2).
+    Meta: ensemble aggregates multiple successful component volatility forecasts.
     """
     try:
         if timeframe not in TIMEFRAME_MAP:
-            return {"error": f"Invalid timeframe: {timeframe}. Valid options: {list(TIMEFRAME_MAP.keys())}"}
+            return {"error": invalid_timeframe_error(timeframe, TIMEFRAME_MAP)}
         mt5_tf = TIMEFRAME_MAP[timeframe]
         tf_secs = TIMEFRAME_SECONDS.get(timeframe)
         if not tf_secs:
-            return {"error": f"Unsupported timeframe seconds for {timeframe}"}
+            return {"error": unsupported_timeframe_seconds_error(timeframe)}
+        annualization_bars_per_year, annualization_basis = (
+            _volatility_annualization_context(symbol, timeframe)
+        )
         method_l = str(method).lower().strip()
         garch_family = {'garch','egarch','gjr_garch','garch_t','egarch_t','gjr_garch_t','figarch'}
         valid_direct = {'ewma','parkinson','gk','rs','yang_zhang','rolling_std','realized_kernel','har_rv'} | garch_family
         valid_general = {'arima','sarima','ets','theta'}
-        if method_l not in valid_direct.union(valid_general):
-            return {"error": f"Invalid method: {method}"}
+        valid_meta = {'ensemble'}
+        valid_methods = valid_direct.union(valid_general).union(valid_meta)
+        if method_l not in valid_methods:
+            return _invalid_volatility_method_error(method, valid_methods=valid_methods)
+        if method_l in valid_direct and proxy is not None:
+            return {
+                "error": (
+                    f"Direct volatility method '{method_l}' does not accept proxy. "
+                    "Omit proxy or use arima, sarima, ets, or theta."
+                )
+            }
         if method_l in garch_family and not _ARCH_AVAILABLE:
             return {"error": f"{method_l} requires 'arch' package."}
 
         # Parse method params: accept dict, JSON string, or k=v pairs
         __stage = 'parse_params'
-        if isinstance(params, dict):
-            p = dict(params)
-        elif isinstance(params, str):
-            s = params.strip()
-            if (s.startswith('{') and s.endswith('}')):
-                try:
-                    p = json.loads(s)
-                except Exception:
-                    # Fallback to colon or equals pairs within braces
-                    p = {}
-                    toks = [tok for tok in s.strip().strip('{}').split() if tok]
-                    i = 0
-                    while i < len(toks):
-                        tok = toks[i].strip().strip(',')
-                        if not tok:
-                            i += 1; continue
-                        if '=' in tok:
-                            k, v = tok.split('=', 1)
-                            p[k.strip()] = v.strip().strip(',')
-                            i += 1; continue
-                        if tok.endswith(':'):
-                            key = tok[:-1].strip()
-                            val = ''
-                            if i + 1 < len(toks):
-                                val = toks[i+1].strip().strip(',')
-                                i += 2
-                            else:
-                                i += 1
-                            p[key] = val
-                            continue
-                        i += 1
+        p = parse_kv_or_json(params)
+
+        if method_l == "ewma":
+            allowed_ewma_params = {"halflife", "lambda_", "lookback"}
+            unknown_ewma_params = sorted(set(p) - allowed_ewma_params)
+            if unknown_ewma_params:
+                return {
+                    "error": (
+                        "Unknown EWMA parameter(s): "
+                        f"{', '.join(unknown_ewma_params)}. Use one of: "
+                        f"{', '.join(sorted(allowed_ewma_params))}."
+                    )
+                }
+
+        if method_l == 'ensemble':
+            default_methods = ['ewma', 'parkinson', 'rolling_std']
+            base_methods_in = p.get('methods')
+            if isinstance(base_methods_in, str):
+                base_methods = [tok.strip().lower() for tok in base_methods_in.split(',') if tok.strip()]
+            elif isinstance(base_methods_in, (list, tuple)):
+                base_methods = [str(item).strip().lower() for item in base_methods_in if str(item).strip()]
             else:
-                # Parse simple k=v pairs separated by comma/space
-                p = {}
-                for tok in s.split():
-                    t = tok.strip().strip(',')
-                    if '=' in t:
-                        k, v = t.split('=', 1)
-                        p[k.strip()] = v.strip()
-                    # ignore stray tokens without '='
-        else:
-            p = {}
+                base_methods = list(default_methods)
+            base_methods = [m for m in base_methods if m in valid_direct.union(valid_general) and m != 'ensemble']
+            seen_methods: set[str] = set()
+            base_methods = [m for m in base_methods if not (m in seen_methods or seen_methods.add(m))]
+            if not base_methods:
+                return {"error": "Ensemble requires at least one valid component method."}
+
+            aggregator = str(p.get('aggregator', 'mean')).lower().strip()
+            if aggregator not in {'mean', 'median', 'weighted'}:
+                aggregator = 'mean'
+
+            expose_components = bool(p.get('expose_components', True))
+            method_params = p.get('method_params') if isinstance(p.get('method_params'), dict) else {}
+            shared_params = dict(p)
+            for key in ('methods', 'aggregator', 'weights', 'expose_components', 'method_params'):
+                shared_params.pop(key, None)
+
+            raw_weights = p.get('weights')
+            weight_map: dict[str, float] = {}
+            if isinstance(raw_weights, (list, tuple)) and len(raw_weights) == len(base_methods):
+                parsed_weights: list[float] = []
+                for item in raw_weights:
+                    try:
+                        weight = float(item)
+                    except Exception:
+                        parsed_weights = []
+                        break
+                    if not np.isfinite(weight) or weight <= 0.0:
+                        parsed_weights = []
+                        break
+                    parsed_weights.append(weight)
+                if parsed_weights:
+                    total_weight = float(sum(parsed_weights))
+                    if total_weight > 0.0:
+                        weight_map = {
+                            method_name: float(weight / total_weight)
+                            for method_name, weight in zip(base_methods, parsed_weights)
+                        }
+
+            component_results: list[dict[str, Any]] = []
+            component_errors: list[dict[str, Any]] = []
+            first_component_context: Optional[Dict[str, Any]] = None
+            for base_method in base_methods:
+                call_params = dict(shared_params)
+                per_method_params = method_params.get(base_method)
+                if isinstance(per_method_params, dict):
+                    call_params.update(per_method_params)
+                result = forecast_volatility(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    horizon=horizon,
+                    method=base_method,  # type: ignore[arg-type]
+                    proxy=proxy if base_method in valid_general else None,
+                    params=call_params or None,
+                    as_of=as_of,
+                    start=start,
+                    end=end,
+                    denoise=denoise,
+                    detail="full",
+                )
+                if not isinstance(result, dict) or not result.get('success'):
+                    err = result.get('error') if isinstance(result, dict) else None
+                    component_errors.append({"method": base_method, "error": str(err or "Component forecast failed")})
+                    continue
+                try:
+                    sigma_bar = float(result['volatility_per_bar'])
+                    horizon_sigma = float(result['volatility_horizon'])
+                except Exception:
+                    component_errors.append({"method": base_method, "error": "Component output missing volatility metrics"})
+                    continue
+                if not (np.isfinite(sigma_bar) and np.isfinite(horizon_sigma)):
+                    component_errors.append({"method": base_method, "error": "Component output contains non-finite volatility metrics"})
+                    continue
+                component_row: dict[str, Any] = {
+                    "method": base_method,
+                    "volatility_per_bar": sigma_bar,
+                    "volatility_horizon": horizon_sigma,
+                    "volatility_annualized": float(
+                        result.get('volatility_annualized', float('nan'))
+                    ),
+                    "volatility_horizon_annualized": float(
+                        result.get(
+                            'volatility_horizon_annualized',
+                            result.get('volatility_annualized', float('nan')),
+                        )
+                    ),
+                    "params_used": result.get('params_used'),
+                }
+                if result.get('proxy') is not None:
+                    component_row['proxy'] = result.get('proxy')
+                component_results.append(component_row)
+                if first_component_context is None:
+                    first_component_context = {
+                        key: result[key]
+                        for key in (
+                            "data_as_of",
+                            "data_window",
+                            "data_age_seconds",
+                            "data_stale",
+                            "stale_after_seconds",
+                            "freshness_basis",
+                            "freshness",
+                            "market_status",
+                            "market_status_reason",
+                            "market_status_source",
+                            "note",
+                        )
+                        if result.get(key) is not None
+                    }
+
+            if not component_results:
+                return {"error": "Ensemble failed: no successful component methods", "component_errors": component_errors}
+
+            def _aggregate_metric(metric_name: str) -> float:
+                values = np.asarray([float(row[metric_name]) for row in component_results], dtype=float)
+                if aggregator == 'median':
+                    return float(np.median(values))
+                if aggregator == 'weighted' and weight_map:
+                    weights = np.asarray([float(weight_map.get(str(row['method']), 0.0)) for row in component_results], dtype=float)
+                    total = float(np.sum(weights))
+                    if total > 0.0:
+                        return float(np.sum(values * weights) / total)
+                return float(np.mean(values))
+
+            bpy = annualization_bars_per_year
+            sigma_bar_return = _aggregate_metric('volatility_per_bar')
+            horizon_sigma_return = _aggregate_metric('volatility_horizon')
+            out: Dict[str, Any] = {
+                "success": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "method": "ensemble",
+                "horizon": int(horizon),
+                "volatility_per_bar": sigma_bar_return,
+                "volatility_annualized": float(sigma_bar_return * math.sqrt(bpy)),
+                "volatility_horizon": horizon_sigma_return,
+                "volatility_horizon_annualized": _annualize_horizon_sigma(
+                    horizon_sigma_return,
+                    bpy,
+                    int(horizon),
+                ),
+                "bars_per_year": round(bpy, 4),
+                "annualization_basis": annualization_basis,
+                "params_used": {
+                    "methods": base_methods,
+                    "aggregator": aggregator,
+                    "weights": [weight_map.get(method_name) for method_name in base_methods] if weight_map else None,
+                },
+            }
+            if proxy is not None:
+                out["proxy"] = str(proxy).lower().strip()
+            if expose_components:
+                out["components"] = component_results
+            if component_errors:
+                out["component_errors"] = component_errors
+                out["warning"] = f"{len(component_errors)} ensemble component(s) failed."
+            if first_component_context:
+                out.update(first_component_context)
+            return _finalize_volatility_output(out, detail=detail)
 
         # If using general forecasters on proxy, compute proxy series and return using internal logic
         if method_l in valid_general:
@@ -394,36 +1050,26 @@ def forecast_volatility(
             # Reuse unified forecast branch for fetching by delegating to data_fetch_candles/forecast_generate where possible is heavy; implement lightweight here
             # Determine lookback bars
             need = max(300, int(horizon) + 50)
-            _info_before = mt5.symbol_info(symbol)
-            _was_visible = bool(_info_before.visible) if _info_before is not None else None
-            err = _ensure_symbol_ready(symbol)
-            if err:
-                return {"error": err}
-            try:
-                if as_of:
-                    to_dt = _parse_start_datetime(as_of)
-                    if not to_dt:
-                        return {"error": "Invalid as_of time."}
-                    rates = _mt5_copy_rates_from(symbol, mt5_tf, to_dt, need)
-                else:
-                    _tick = mt5.symbol_info_tick(symbol)
-                    if _tick is not None and getattr(_tick, 'time', None):
-                        t_utc = _mt5_epoch_to_utc(float(_tick.time))
-                        server_now_dt = datetime.utcfromtimestamp(t_utc)
-                    else:
-                        server_now_dt = datetime.utcnow()
-                    rates = _mt5_copy_rates_from(symbol, mt5_tf, server_now_dt, need)
-            finally:
-                if _was_visible is False:
-                    try:
-                        mt5.symbol_select(symbol, False)
-                    except Exception:
-                        pass
+            rates, fetch_error = _fetch_mt5_rates_guarded(
+                symbol,
+                mt5_tf,
+                need,
+                as_of=as_of,
+                start=start,
+                end=end,
+                timeframe=timeframe,
+            )
+            if fetch_error:
+                return {"error": fetch_error}
             if rates is None or len(rates) < 5:
                 return {"error": f"Failed to get sufficient rates for {symbol}: {mt5.last_error()}"}
             df = pd.DataFrame(rates)
-            if as_of is None and len(df) >= 2:
-                df = df.iloc[:-1]
+            df = _drop_forming_live_bar(
+                df,
+                rates,
+                timeframe=timeframe,
+                live_window=as_of is None and end is None,
+            )
             if len(df) < 5:
                 return {"error": "Not enough closed bars"}
             if denoise:
@@ -483,9 +1129,11 @@ def forecast_volatility(
                 if not _MLF_AVAILABLE:
                     return {"error": "mlf_rf requires 'mlforecast' and 'scikit-learn'"}
                 try:
-                    from mlforecast import MLForecast as _MLForecast  # type: ignore
-                    from sklearn.ensemble import RandomForestRegressor as _RF  # type: ignore
                     import pandas as _pd
+                    from mlforecast import MLForecast as _MLForecast  # type: ignore
+                    from sklearn.ensemble import (
+                        RandomForestRegressor as _RF,  # type: ignore
+                    )
                 except Exception as ex:
                     return {"error": f"Failed to import mlforecast/sklearn: {ex}"}
                 try:
@@ -515,9 +1163,11 @@ def forecast_volatility(
                 if not _NF_AVAILABLE:
                     return {"error": "nhits requires 'neuralforecast[torch]'"}
                 try:
-                    from neuralforecast import NeuralForecast as _NeuralForecast  # type: ignore
-                    from neuralforecast.models import NHITS as _NF_NHITS  # type: ignore
                     import pandas as _pd
+                    from neuralforecast import (
+                        NeuralForecast as _NeuralForecast,  # type: ignore
+                    )
+                    from neuralforecast.models import NHITS as _NF_NHITS  # type: ignore
                 except Exception as ex:
                     return {"error": f"Failed to import neuralforecast: {ex}"}
                 max_epochs = int(p.get('max_epochs', 30))
@@ -561,15 +1211,144 @@ def forecast_volatility(
             elif back == 'abs':
                 sig = np.maximum(0.0, yhat) * math.sqrt(math.pi/2.0)
             else:
-                sig = np.sqrt(np.exp(yhat))
+                # Duan smearing corrects the Jensen gap when converting a
+                # forecast of E[log(r²)] back to the arithmetic r² scale.
+                centered_log_r2 = y - float(np.mean(y))
+                log_r2_smearing_factor = float(np.mean(np.exp(centered_log_r2)))
+                if not math.isfinite(log_r2_smearing_factor) or log_r2_smearing_factor <= 0:
+                    log_r2_smearing_factor = 1.0
+                sig = np.sqrt(np.exp(yhat) * log_r2_smearing_factor)
             hsig = float(math.sqrt(np.sum(sig[:fh]**2)))
-            # Current sigma (baseline)
-            sbar = float(np.std(r[-100:], ddof=0) if r.size>=5 else np.std(r, ddof=0))
-            bpy = float(365.0*24.0*3600.0/float(tf_secs))
-            return {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "proxy": proxy_l,
-                    "horizon": int(horizon), "sigma_bar_return": sbar, "sigma_annual_return": float(sbar*math.sqrt(bpy)),
-                    "horizon_sigma_return": hsig, "horizon_sigma_annual": float(hsig*math.sqrt(bpy/max(1,int(horizon)))),
-                    "params_used": p}
+            # Root-mean-square forecast sigma per modeled horizon step.
+            sbar = float(hsig / math.sqrt(max(1, int(fh))))
+            bpy = annualization_bars_per_year
+            return _finalize_volatility_with_context(
+                {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "proxy": proxy_l,
+                 "horizon": int(horizon), "volatility_per_bar": sbar, "volatility_annualized": float(sbar*math.sqrt(bpy)),
+                 "volatility_horizon": hsig, "volatility_horizon_annualized": _annualize_horizon_sigma(hsig, bpy, int(horizon)),
+                 "params_used": {
+                     **p,
+                     "per_bar_volatility_basis": "forecast_horizon_rms",
+                     **(
+                         {"log_r2_smearing_factor": log_r2_smearing_factor}
+                         if back == "exp_sqrt"
+                         else {}
+                     ),
+                 }},
+                df=df,
+                symbol=symbol,
+                timeframe=timeframe,
+                returns_used=int(r.size),
+                live_window=as_of is None and end is None,
+                detail=detail,
+            )
+
+        if method_l == 'har_rv':
+            dn_spec_used = None
+            denoise_columns_provided = isinstance(denoise, dict) and 'columns' in denoise
+            if denoise is not None:
+                try:
+                    dn_spec_used = _normalize_denoise_spec(denoise, default_when='pre_ti')
+                except Exception:
+                    dn_spec_used = None
+                if dn_spec_used and not denoise_columns_provided:
+                    dn_spec_used['columns'] = ['open', 'high', 'low', 'close']
+
+            try:
+                rv_tf = str(p.get('rv_timeframe', 'M5')).upper()
+                rv_mt5_tf = TIMEFRAME_MAP.get(rv_tf)
+                if rv_mt5_tf is None:
+                    return {"error": f"Invalid rv_timeframe: {rv_tf}"}
+                days = int(p.get('days', 120))
+                w = int(p.get('window_w', 5))
+                m = int(p.get('window_m', 22))
+                rv_tf_secs = TIMEFRAME_SECONDS.get(rv_tf, 300)
+                bars_needed = int(days * max(1, (86400 // max(1, rv_tf_secs))) + 50)
+                rates_rv, fetch_error = _fetch_mt5_rates_guarded(
+                    symbol,
+                    rv_mt5_tf,
+                    bars_needed,
+                    as_of=as_of,
+                    start=start,
+                    end=end,
+                    timeframe=rv_tf,
+                )
+                if fetch_error:
+                    return {"error": fetch_error}
+                if rates_rv is None or len(rates_rv) < 50:
+                    return {"error": f"Failed to get intraday rates for RV: {mt5.last_error()}"}
+                dfrv = pd.DataFrame(rates_rv)
+                dfrv = _drop_forming_live_bar(
+                    dfrv,
+                    rates_rv,
+                    timeframe=rv_tf,
+                    live_window=as_of is None and end is None,
+                )
+                if dn_spec_used:
+                    try:
+                        _apply_denoise(dfrv, dn_spec_used, default_when='pre_ti')
+                    except Exception:
+                        pass
+                c = dfrv['close'].astype(float).to_numpy()
+                if c.size < 10:
+                    return {"error": "Insufficient intraday bars for RV"}
+                rr = _log_returns_from_prices(c)
+                rr = rr[np.isfinite(rr)]
+                dt = pd.to_datetime(dfrv['time'].iloc[1:].astype(float), unit='s', utc=True)
+                days_idx = pd.DatetimeIndex(dt).floor('D')
+                df_r = pd.DataFrame({'day': days_idx, 'r2': rr * rr})
+                daily_rv = df_r.groupby('day')['r2'].sum().astype(float)
+                if len(daily_rv) < max(30, m + 5):
+                    return {"error": "Not enough daily RV observations for HAR-RV"}
+                RV = daily_rv.to_numpy(dtype=float)
+                Dlag = RV[:-1]
+
+                def rmean(arr, k):
+                    s = pd.Series(arr)
+                    return s.rolling(window=k, min_periods=k).mean().to_numpy()
+
+                Wlag_full = rmean(RV, w)
+                Mlag_full = rmean(RV, m)
+                y = RV[1:]
+                Wlag = Wlag_full[:-1]
+                Mlag = Mlag_full[:-1]
+                Xd = Dlag
+                mask = np.isfinite(Xd) & np.isfinite(Wlag) & np.isfinite(Mlag) & np.isfinite(y)
+                X = np.vstack([np.ones_like(Xd[mask]), Xd[mask], Wlag[mask], Mlag[mask]]).T
+                yv = y[mask]
+                if X.shape[0] < 20:
+                    return {"error": "Insufficient samples after alignment for HAR-RV"}
+                beta, *_ = np.linalg.lstsq(X, yv, rcond=None)
+                D_last = RV[-1]
+                W_last = float(pd.Series(RV).tail(w).mean())
+                M_last = float(pd.Series(RV).tail(m).mean())
+                rv_next = float(beta[0] + beta[1]*D_last + beta[2]*W_last + beta[3]*M_last)
+                rv_next = max(0.0, rv_next)
+                tf_secs = TIMEFRAME_SECONDS.get(timeframe)
+                if not tf_secs:
+                    return {"error": unsupported_timeframe_seconds_error(timeframe)}
+                bars_per_day = float(86400.0 / float(tf_secs))
+                sbar = float(math.sqrt(rv_next / bars_per_day))
+                h_days = float(int(horizon)) / bars_per_day
+                hsig = float(math.sqrt(rv_next * max(h_days, 0.0)))
+                bpy = annualization_bars_per_year
+                return _finalize_volatility_with_context(
+                    {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
+                     "volatility_per_bar": sbar, "volatility_annualized": float(sbar*math.sqrt(bpy)),
+                     "volatility_horizon": hsig, "volatility_horizon_annualized": _annualize_horizon_sigma(hsig, bpy, int(horizon)),
+                     "params_used": {"rv_timeframe": rv_tf, "window_w": w, "window_m": m,
+                                      "beta": [float(b) for b in beta.tolist()],
+                                      "days": days},
+                     "denoise_used": dn_spec_used},
+                    df=dfrv,
+                    symbol=symbol,
+                    timeframe=rv_tf,
+                    returns_used=int(rr.size),
+                    live_window=as_of is None and end is None,
+                    detail=detail,
+                )
+            except Exception as ex:
+                return {"error": f"HAR-RV error: {ex}"}
 
         # Direct volatility methods
         # Fetch history sized by method
@@ -583,37 +1362,27 @@ def forecast_volatility(
             return max(300, int(horizon) + 50)
 
         need = _need_bars_direct()
-        _info_before = mt5.symbol_info(symbol)
-        _was_visible = bool(_info_before.visible) if _info_before is not None else None
-        err = _ensure_symbol_ready(symbol)
-        if err:
-            return {"error": err}
-        try:
-            if as_of:
-                to_dt = _parse_start_datetime(as_of)
-                if not to_dt:
-                    return {"error": "Invalid as_of time."}
-                rates = _mt5_copy_rates_from(symbol, mt5_tf, to_dt, need)
-            else:
-                _tick = mt5.symbol_info_tick(symbol)
-                if _tick is not None and getattr(_tick, 'time', None):
-                    t_utc = _mt5_epoch_to_utc(float(_tick.time))
-                    server_now_dt = datetime.utcfromtimestamp(t_utc)
-                else:
-                    server_now_dt = datetime.utcnow()
-                rates = _mt5_copy_rates_from(symbol, mt5_tf, server_now_dt, need)
-        finally:
-            if _was_visible is False:
-                try:
-                    mt5.symbol_select(symbol, False)
-                except Exception:
-                    pass
+        rates, fetch_error = _fetch_mt5_rates_guarded(
+            symbol,
+            mt5_tf,
+            need,
+            as_of=as_of,
+            start=start,
+            end=end,
+            timeframe=timeframe,
+        )
+        if fetch_error:
+            return {"error": fetch_error}
         if rates is None or len(rates) < 3:
             return {"error": f"Failed to get sufficient rates for {symbol}: {mt5.last_error()}"}
 
         df = pd.DataFrame(rates)
-        if as_of is None and len(df) >= 2:
-            df = df.iloc[:-1]
+        df = _drop_forming_live_bar(
+            df,
+            rates,
+            timeframe=timeframe,
+            live_window=as_of is None and end is None,
+        )
         if len(df) < 3:
             return {"error": "Not enough closed bars"}
         # Normalize and apply denoise spec (uniform behavior)
@@ -633,24 +1402,44 @@ def forecast_volatility(
         r = r[np.isfinite(r)]
         if r.size < 5:
             return {"error": "Insufficient returns to estimate volatility"}
-        bpy = float(365.0*24.0*3600.0/float(tf_secs))
+        bpy = annualization_bars_per_year
 
         if method_l == 'ewma':
-            lb = int(p.get('lookback', 1500)); halflife = p.get('halflife'); lam = p.get('lambda_', 0.94)
+            lb = int(p.get('lookback', 1500))
+            halflife = p.get('halflife')
+            lam = p.get('lambda_', 0.94)
+            lambda_source = "lambda_"
+            halflife_used = None
             tail = r[-lb:] if r.size >= lb else r
             if halflife is not None:
-                try: lam = 1.0 - math.log(2.0) / float(halflife)
-                except Exception: lam = 0.94
+                try:
+                    halflife_used = float(halflife)
+                    lam = math.exp(-math.log(2.0) / halflife_used)
+                    lambda_source = "halflife"
+                except Exception:
+                    lam = 0.94
             lam = float(lam)
             w = np.power(lam, np.arange(len(tail)-1, -1, -1, dtype=float)); w /= float(np.sum(w))
             sigma2 = float(np.sum(w * (tail * tail)))
             sbar = math.sqrt(max(0.0, sigma2))
             hsig = float(sbar * math.sqrt(max(1, int(horizon))))
-            return {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
-                    "sigma_bar_return": sbar, "sigma_annual_return": float(sbar*math.sqrt(bpy)),
-                    "horizon_sigma_return": hsig, "horizon_sigma_annual": float(hsig*math.sqrt(bpy/max(1,int(horizon)))),
-                    "params_used": {"lookback": lb, "lambda_": lam},
-                    "denoise_used": dn_spec_used}
+            params_used = {"lookback": lb, "lambda_": lam, "lambda_source": lambda_source}
+            if halflife_used is not None:
+                params_used["halflife"] = halflife_used
+            return _finalize_volatility_with_context(
+                {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
+                 "volatility_per_bar": sbar, "volatility_annualized": float(sbar*math.sqrt(bpy)),
+                 "volatility_horizon": hsig, "volatility_horizon_annualized": _annualize_horizon_sigma(hsig, bpy, int(horizon)),
+                 "params_used": params_used,
+                 "params_explained": _ewma_param_explanations(lambda_source),
+                 "denoise_used": dn_spec_used},
+                df=df,
+                symbol=symbol,
+                timeframe=timeframe,
+                returns_used=int(r.size),
+                live_window=as_of is None and end is None,
+                detail=detail,
+            )
 
         if method_l in {'parkinson','gk','rs','yang_zhang','rolling_std'}:
             window = int(p.get('window', 20))
@@ -675,17 +1464,32 @@ def forecast_volatility(
                 co_var = pd.Series(co).rolling(window=window, min_periods=window).var(ddof=0).to_numpy()
                 oc_var = pd.Series(oc).rolling(window=window, min_periods=window).var(ddof=0).to_numpy()
                 rs_mean = pd.Series(rs).rolling(window=window, min_periods=window).mean().to_numpy()
-                v = (co_var + k*oc_var + (1-k)*rs_mean)
+                v = (oc_var + k*co_var + (1-k)*rs_mean)
             else:
-                v = pd.Series(r*r).rolling(window=window, min_periods=window).mean().to_numpy()
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    simple_returns = np.diff(c) / c[:-1]
+                v = (
+                    pd.Series(simple_returns)
+                    .rolling(window=window, min_periods=window)
+                    .var(ddof=0)
+                    .to_numpy()
+                )
             sigma2 = float(v[-1]) if np.isfinite(v[-1]) else float(np.nanmean(v[-window:]))
             sbar = math.sqrt(max(0.0, sigma2))
             hsig = float(sbar * math.sqrt(max(1, int(horizon))))
-            return {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
-                    "sigma_bar_return": sbar, "sigma_annual_return": float(sbar*math.sqrt(bpy)),
-                    "horizon_sigma_return": hsig, "horizon_sigma_annual": float(hsig*math.sqrt(bpy/max(1,int(horizon)))),
-                    "params_used": {"window": int(window)},
-                    "denoise_used": dn_spec_used}
+            return _finalize_volatility_with_context(
+                {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
+                 "volatility_per_bar": sbar, "volatility_annualized": float(sbar*math.sqrt(bpy)),
+                 "volatility_horizon": hsig, "volatility_horizon_annualized": _annualize_horizon_sigma(hsig, bpy, int(horizon)),
+                 "params_used": {"window": int(window)},
+                 "denoise_used": dn_spec_used},
+                df=df,
+                symbol=symbol,
+                timeframe=timeframe,
+                returns_used=int(r.size),
+                live_window=as_of is None and end is None,
+                detail=detail,
+            )
 
         if method_l == 'realized_kernel':
             window = int(p.get('window', 50))
@@ -701,22 +1505,35 @@ def forecast_volatility(
                 return {"error": "Failed to compute realized kernel variance"}
             sigma_bar = math.sqrt(rk_var)
             sigma_h = math.sqrt(max(1, int(horizon)) * rk_var)
-            return {
-                "success": True,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "method": method_l,
-                "horizon": int(horizon),
-                "sigma_bar_return": float(sigma_bar),
-                "sigma_annual_return": float(sigma_bar * math.sqrt(bpy)),
-                "horizon_sigma_return": float(sigma_h),
-                "horizon_sigma_annual": float(sigma_h * math.sqrt(bpy / max(1, int(horizon)))),
-                "params_used": {"window": int(window), "kernel": kernel, "bandwidth": bandwidth_val},
-                "denoise_used": dn_spec_used,
-            }
+            return _finalize_volatility_with_context(
+                {
+                    "success": True,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "method": method_l,
+                    "horizon": int(horizon),
+                    "volatility_per_bar": float(sigma_bar),
+                    "volatility_annualized": float(sigma_bar * math.sqrt(bpy)),
+                    "volatility_horizon": float(sigma_h),
+                    "volatility_horizon_annualized": _annualize_horizon_sigma(float(sigma_h), bpy, int(horizon)),
+                    "params_used": {"window": int(window), "kernel": kernel, "bandwidth": bandwidth_val},
+                    "denoise_used": dn_spec_used,
+                },
+                df=df,
+                symbol=symbol,
+                timeframe=timeframe,
+                returns_used=int(r.size),
+                live_window=as_of is None and end is None,
+                detail=detail,
+            )
 
         if method_l in garch_family:
-            fit_bars = int(p.get('fit_bars', 2000)); mean_model = str(p.get('mean','Zero')).lower(); dist = str(p.get('dist','normal'))
+            fit_bars = int(p.get('fit_bars', 2000))
+            mean_model = {
+                'zero': 'Zero',
+                'constant': 'Constant',
+            }.get(str(p.get('mean', 'Zero')).strip().lower(), 'Zero')
+            dist = str(p.get('dist','normal'))
             r_pct = 100.0 * r
             r_fit = r_pct[-fit_bars:] if r_pct.size > fit_bars else r_pct
             try:
@@ -726,14 +1543,14 @@ def forecast_volatility(
                 p_order = int(p.get('p', 1))
                 q_order = int(p.get('q', 1))
                 if base_method == 'egarch':
-                    am = _arch_model(r_fit, mean=mean_model if mean_model in ('zero','constant') else 'zero', vol='EGARCH', p=p_order, q=q_order, dist=dist)
+                    am = _arch_model(r_fit, mean=mean_model, vol='EGARCH', p=p_order, q=q_order, dist=dist)
                 elif base_method == 'gjr_garch':
                     o_order = int(p.get('o', 1))
-                    am = _arch_model(r_fit, mean=mean_model if mean_model in ('zero','constant') else 'zero', vol='GARCH', p=p_order, o=o_order, q=q_order, dist=dist)
+                    am = _arch_model(r_fit, mean=mean_model, vol='GARCH', p=p_order, o=o_order, q=q_order, dist=dist)
                 elif base_method == 'figarch':
-                    am = _arch_model(r_fit, mean=mean_model if mean_model in ('zero','constant') else 'zero', vol='FIGARCH', p=p_order, q=q_order, dist=dist)
+                    am = _arch_model(r_fit, mean=mean_model, vol='FIGARCH', p=p_order, q=q_order, dist=dist)
                 else:
-                    am = _arch_model(r_fit, mean=mean_model if mean_model in ('zero','constant') else 'zero', vol='GARCH', p=p_order, q=q_order, dist=dist)
+                    am = _arch_model(r_fit, mean=mean_model, vol='GARCH', p=p_order, q=q_order, dist=dist)
                 res = am.fit(disp='off')
                 fc = res.forecast(horizon=max(1, int(horizon)), reindex=False)
                 variances = fc.variance.values[-1]
@@ -748,478 +1565,22 @@ def forecast_volatility(
                 })
                 if base_method == 'gjr_garch':
                     params_used['o'] = int(p.get('o', 1))
-                return {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
-                        "sigma_bar_return": sbar, "sigma_annual_return": float(sbar*math.sqrt(bpy)),
-                        "horizon_sigma_return": hsig, "horizon_sigma_annual": float(hsig*math.sqrt(bpy/max(1,int(horizon)))),
-                        "params_used": params_used,
-                        "denoise_used": dn_spec_used}
+                return _finalize_volatility_with_context(
+                    {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
+                     "volatility_per_bar": sbar, "volatility_annualized": float(sbar*math.sqrt(bpy)),
+                     "volatility_horizon": hsig, "volatility_horizon_annualized": _annualize_horizon_sigma(hsig, bpy, int(horizon)),
+                     "params_used": params_used,
+                     "denoise_used": dn_spec_used},
+                    df=df,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    returns_used=int(r.size),
+                    live_window=as_of is None and end is None,
+                    detail=detail,
+                )
             except Exception as ex:
                 return {"error": f"{method_l} error: {ex}"}
 
-        # Ensemble meta-method: aggregate multiple base forecasts
-        if method_l == 'ensemble':
-            try:
-                # Determine default base methods based on availability
-                default_methods = ['theta', 'fourier_ols']
-                if _SM_ETS_AVAILABLE:
-                    default_methods.append('holt')
-                # ARIMA/SARIMA can be added by user explicitly to avoid latency by default
-
-                base_methods_in = p.get('methods')
-                if isinstance(base_methods_in, (list, tuple)) and base_methods_in:
-                    base_methods = [str(m).lower().strip() for m in base_methods_in]
-                else:
-                    base_methods = list(default_methods)
-                # Remove invalid or recursive entries
-                base_methods = [m for m in base_methods if m in _FORECAST_METHODS and m != 'ensemble']
-                # Deduplicate while preserving order
-                seen = set()
-                base_methods = [m for m in base_methods if not (m in seen or seen.add(m))]
-                if not base_methods:
-                    return {"error": "Ensemble requires at least one valid base method"}
-
-                aggregator = str(p.get('aggregator', 'mean')).lower()
-                weights = p.get('weights')
-                expose_components = bool(p.get('expose_components', True))
-
-                # Normalize weights if provided
-                w = None
-                if isinstance(weights, (list, tuple)) and len(weights) == len(base_methods):
-                    try:
-                        w_arr = np.array([float(x) for x in weights], dtype=float)
-                        if np.all(np.isfinite(w_arr)) and np.any(w_arr > 0):
-                            w = w_arr.clip(min=0)
-                            s = float(np.sum(w))
-                            if s > 0:
-                                w = w / s
-                            else:
-                                w = None
-                        else:
-                            w = None
-                    except Exception:
-                        w = None
-
-                comp_results = []
-                for bm in base_methods:
-                    try:
-                        # Pass through common args; avoid per-method params for MVP simplicity
-                        r = forecast(
-                            symbol=symbol,
-                            timeframe=timeframe,
-                            method=bm,  # type: ignore
-                            horizon=horizon,
-                            lookback=lookback,
-                            as_of=as_of,
-                            params=None,
-                            ci_alpha=ci_alpha,
-                            target=target,  # type: ignore
-                            denoise=denoise,
-                        )
-                        if isinstance(r, dict) and r.get('success') and r.get('forecast_price'):
-                            comp_results.append((bm, r))
-                    except Exception:
-                        continue
-
-                if not comp_results:
-                    return {"error": "Ensemble failed: no successful base forecasts"}
-
-                # Establish reference horizon and timestamps from first successful component
-                first_method, first_res = comp_results[0]
-                ref_prices = np.array(first_res.get('forecast_price', []), dtype=float)
-                fh = int(len(ref_prices))
-                if fh <= 0:
-                    return {"error": "Ensemble failed: empty forecast from base methods"}
-
-                # Collect aligned component arrays; drop any mismatched lengths
-                comps_prices = []
-                comps_returns = []
-                lower_list = []
-                upper_list = []
-                used_methods = []
-                for bm, r in comp_results:
-                    fp = r.get('forecast_price')
-                    if not isinstance(fp, (list, tuple)) or len(fp) != fh:
-                        continue
-                    used_methods.append(bm)
-                    comps_prices.append(np.array(fp, dtype=float))
-                    fr = r.get('forecast_return')
-                    if isinstance(fr, (list, tuple)) and len(fr) == fh:
-                        comps_returns.append(np.array(fr, dtype=float))
-                    lp = r.get('lower_price'); up = r.get('upper_price')
-                    if isinstance(lp, (list, tuple)) and isinstance(up, (list, tuple)) and len(lp) == fh and len(up) == fh:
-                        lower_list.append(np.array(lp, dtype=float))
-                        upper_list.append(np.array(up, dtype=float))
-
-                if len(comps_prices) == 0:
-                    return {"error": "Ensemble failed: no aligned component forecasts"}
-
-                M = len(comps_prices)
-                # Choose weights
-                if aggregator == 'weighted' and w is not None and len(w) == M:
-                    w_use = np.array(w, dtype=float)
-                else:
-                    w_use = np.full(M, 1.0 / M, dtype=float)
-                    aggregator = 'mean' if aggregator == 'weighted' else aggregator
-
-                X = np.vstack(comps_prices)  # shape (M, fh)
-                if aggregator == 'median':
-                    agg_price = np.median(X, axis=0)
-                else:  # mean or default
-                    agg_price = np.average(X, axis=0, weights=w_use)
-
-                # Aggregate returns if all components provided them; otherwise skip
-                if len(comps_returns) == M:
-                    XR = np.vstack(comps_returns)
-                    if aggregator == 'median':
-                        agg_return = np.median(XR, axis=0)
-                    else:
-                        agg_return = np.average(XR, axis=0, weights=w_use)
-                else:
-                    agg_return = None
-
-                # Aggregate confidence intervals only if all components have them
-                if len(lower_list) == M and len(upper_list) == M:
-                    L = np.vstack(lower_list)
-                    U = np.vstack(upper_list)
-                    if aggregator == 'median':
-                        agg_lower = np.median(L, axis=0)
-                        agg_upper = np.median(U, axis=0)
-                    else:
-                        agg_lower = np.average(L, axis=0, weights=w_use)
-                        agg_upper = np.average(U, axis=0, weights=w_use)
-                else:
-                    agg_lower = None
-                    agg_upper = None
-
-                # Build payload using the first component as template for metadata/times
-                payload: Dict[str, Any] = {
-                    "success": True,
-                    "symbol": first_res.get('symbol', symbol),
-                    "timeframe": first_res.get('timeframe', timeframe),
-                    "method": "ensemble",
-                    "target": first_res.get('target', str(target)),
-                    "params_used": {
-                        "base_methods": used_methods,
-                        "aggregator": aggregator,
-                        "weights": [float(x) for x in (w_use.tolist() if isinstance(w_use, np.ndarray) else [])],
-                    },
-                    "lookback_used": int(first_res.get('lookback_used', 0)),
-                    "horizon": int(first_res.get('horizon', horizon)),
-                    "seasonality_period": int(first_res.get('seasonality_period', 0)),
-                    "as_of": first_res.get('as_of', as_of or None),
-                    "train_start": first_res.get('train_start'),
-                    "train_end": first_res.get('train_end'),
-                    "times": first_res.get('times'),
-                    "forecast_price": [float(v) for v in agg_price.tolist()],
-                }
-                # Timezone flag passthrough if present
-                if 'timezone' in first_res:
-                    payload['timezone'] = first_res.get('timezone')
-                # Trend: reuse first component's for simplicity
-                if 'forecast_trend' in first_res:
-                    payload['forecast_trend'] = first_res.get('forecast_trend')
-                if agg_return is not None:
-                    payload['forecast_return'] = [float(v) for v in agg_return.tolist()]
-                if agg_lower is not None and agg_upper is not None and ci_alpha is not None:
-                    payload['lower_price'] = [float(v) for v in agg_lower.tolist()]
-                    payload['upper_price'] = [float(v) for v in agg_upper.tolist()]
-                    payload['ci_alpha'] = float(ci_alpha)
-
-                if expose_components:
-                    comps_out = []
-                    for i, (bm, r) in enumerate(comp_results):
-                        try:
-                            comps_out.append({
-                                "method": bm,
-                                "weight": float(w_use[i]) if i < len(w_use) else float(1.0 / M),
-                                "forecast_price": r.get('forecast_price'),
-                            })
-                        except Exception:
-                            continue
-                    payload['components'] = comps_out
-
-                return payload
-            except Exception as ex:
-                return {"error": f"Error computing ensemble forecast: {ex}"}
-        # Backward compatibility for 'lambda' -> 'lambda_'
-        if 'lambda' in p and 'lambda_' not in p:
-            p['lambda_'] = p['lambda']
-
-        # Determine bars required
-        if method_l == 'ewma':
-            lookback = int(p.get('lookback', 1500))
-            need = max(lookback + 2, 100)
-        elif method_l in ('parkinson','gk','rs'):
-            window = int(p.get('window', 20))
-            need = max(window + 2, 50)
-        else:  # garch
-            fit_bars = int(p.get('fit_bars', 2000))
-            need = max(fit_bars + 2, 500)
-
-        # Ensure symbol is ready; remember original visibility to restore later
-        _info_before = mt5.symbol_info(symbol)
-        _was_visible = bool(_info_before.visible) if _info_before is not None else None
-        err = _ensure_symbol_ready(symbol)
-        if err:
-            return {"error": err}
-
-        try:
-            # Use explicit as-of time if provided, else server time for alignment
-            if as_of:
-                to_dt = _parse_start_datetime(as_of)
-                if not to_dt:
-                    return {"error": "Invalid as_of_datetime. Try '2025-08-29', '2025-08-29 14:30', 'yesterday 14:00'."}
-                rates = _mt5_copy_rates_from(symbol, mt5_tf, to_dt, need)
-            else:
-                _tick = mt5.symbol_info_tick(symbol)
-                if _tick is not None and getattr(_tick, 'time', None):
-                    t_utc = _mt5_epoch_to_utc(float(_tick.time))
-                    server_now_dt = datetime.utcfromtimestamp(t_utc)
-                else:
-                    server_now_dt = datetime.utcnow()
-                rates = _mt5_copy_rates_from(symbol, mt5_tf, server_now_dt, need)
-        finally:
-            if _was_visible is False:
-                try:
-                    mt5.symbol_select(symbol, False)
-                except Exception:
-                    pass
-
-        if rates is None or len(rates) < 3:
-            return {"error": f"Failed to get sufficient rates for {symbol}: {mt5.last_error()}"}
-
-        df = pd.DataFrame(rates)
-        # Drop forming last bar only when using current 'now' as anchor; keep all for historical as_of
-        if as_of is None and len(df) >= 2:
-            df = df.iloc[:-1]
-        if len(df) < 3:
-            return {"error": "Not enough closed bars to compute volatility"}
-
-        # Optionally denoise relevant columns prior to volatility estimation
-        __stage = 'denoise'
-        if denoise:
-            try:
-                # Default columns by method if user didn't provide
-                _spec = dict(denoise)
-                if 'columns' not in _spec or not _spec.get('columns'):
-                    if method_l in ('ewma', 'garch'):
-                        _spec['columns'] = ['close']
-                    else:  # range-based estimators rely on OHLC
-                        _spec['columns'] = ['open', 'high', 'low', 'close']
-                _apply_denoise(df, _spec, default_when='pre_ti')
-            except Exception:
-                # Fail-safe: ignore denoise errors and proceed with raw data
-                pass
-
-        # Prefer denoised columns if user asked to keep originals
-        def _col(name: str) -> str:
-            dn = f"{name}_dn"
-            return dn if dn in df.columns else name
-
-        closes = df[_col('close')].to_numpy(dtype=float)
-        highs = df[_col('high')].to_numpy(dtype=float) if 'high' in df.columns else None
-        lows = df[_col('low')].to_numpy(dtype=float) if 'low' in df.columns else None
-        opens = df[_col('open')].to_numpy(dtype=float) if 'open' in df.columns else None
-        last_close = float(closes[-1])
-
-        bars_per_year = _bars_per_year(timeframe)
-        ann_factor = math.sqrt(bars_per_year) if bars_per_year > 0 else float('nan')
-
-        sigma_bar = float('nan')
-        sigma_ann = float('nan')
-        sigma_h_bar = float('nan')  # horizon sigma of sum of returns over k bars
-        params_used: Dict[str, Any] = {}
-
-        if method_l == 'ewma':
-            r = _log_returns_from_prices(closes)
-            if r.size < 5:
-                return {"error": "Not enough return observations for EWMA"}
-            lam = p.get('lambda_')
-            hl = p.get('halflife')
-            if hl is not None:
-                try:
-                    hl = float(hl)
-                except Exception:
-                    hl = None
-            if lam is not None:
-                try:
-                    lam = float(lam)
-                except Exception:
-                    lam = None
-            if lam is not None and (hl is None):
-                alpha = 1.0 - float(lam)
-                var_series = pd.Series(r).ewm(alpha=alpha, adjust=False).var(bias=False)
-                params_used['lambda'] = float(lam)
-            else:
-                # default halflife if not provided
-                if hl is None:
-                    # heuristic per timeframe
-                    default_hl = 60 if timeframe.startswith('H') else (11 if timeframe == 'D1' else 180)
-                    hl = float(p.get('halflife', default_hl))
-                var_series = pd.Series(r).ewm(halflife=float(hl), adjust=False).var(bias=False)
-                params_used['halflife'] = float(hl)
-            v = float(var_series.iloc[-1])
-            v = v if math.isfinite(v) and v >= 0 else float('nan')
-            sigma_bar = math.sqrt(v) if math.isfinite(v) and v >= 0 else float('nan')
-            sigma_h_bar = math.sqrt(max(1, int(horizon)) * v) if math.isfinite(v) and v >= 0 else float('nan')
-        elif method_l in ('parkinson','gk','rs'):
-            if highs is None or lows is None:
-                return {"error": "High/Low data required for range-based estimators"}
-            window = int(p.get('window', 20))
-            params_used['window'] = window
-            if method_l == 'parkinson':
-                var_bars = _parkinson_sigma_sq(highs, lows)
-            elif method_l == 'gk':
-                if opens is None:
-                    return {"error": "Open data required for Garman–Klass"}
-                var_bars = _garman_klass_sigma_sq(opens, highs, lows, closes)
-            else:  # rs
-                if opens is None:
-                    return {"error": "Open data required for Rogers–Satchell"}
-                var_bars = _rogers_satchell_sigma_sq(opens, highs, lows, closes)
-            s = pd.Series(var_bars)
-            v = float(s.tail(window).mean(skipna=True))
-            v = v if math.isfinite(v) and v >= 0 else float('nan')
-            sigma_bar = math.sqrt(v) if math.isfinite(v) and v >= 0 else float('nan')
-            sigma_h_bar = math.sqrt(max(1, int(horizon)) * v) if math.isfinite(v) and v >= 0 else float('nan')
-        elif method_l == 'har_rv':
-            # HAR-RV on daily realized variance computed from intraday returns
-            try:
-                rv_tf = str(p.get('rv_timeframe', 'M5')).upper()
-                rv_mt5_tf = TIMEFRAME_MAP.get(rv_tf)
-                if rv_mt5_tf is None:
-                    return {"error": f"Invalid rv_timeframe: {rv_tf}"}
-                days = int(p.get('days', 120))
-                w = int(p.get('window_w', 5))
-                m = int(p.get('window_m', 22))
-                rv_tf_secs = TIMEFRAME_SECONDS.get(rv_tf, 300)
-                bars_needed = int(days * max(1, (86400 // max(1, rv_tf_secs))) + 50)
-                _info_before = mt5.symbol_info(symbol)
-                _was_visible = bool(_info_before.visible) if _info_before is not None else None
-                err = _ensure_symbol_ready(symbol)
-                if err:
-                    return {"error": err}
-                try:
-                    if as_of:
-                        to_dt = _parse_start_datetime(as_of)
-                        if not to_dt:
-                            return {"error": "Invalid as_of time."}
-                        rates_rv = _mt5_copy_rates_from(symbol, rv_mt5_tf, to_dt, bars_needed)
-                    else:
-                        _tick = mt5.symbol_info_tick(symbol)
-                        if _tick is not None and getattr(_tick, 'time', None):
-                            t_utc = _mt5_epoch_to_utc(float(_tick.time))
-                            server_now_dt = datetime.utcfromtimestamp(t_utc)
-                        else:
-                            server_now_dt = datetime.utcnow()
-                        rates_rv = _mt5_copy_rates_from(symbol, rv_mt5_tf, server_now_dt, bars_needed)
-                finally:
-                    if _was_visible is False:
-                        try:
-                            mt5.symbol_select(symbol, False)
-                        except Exception:
-                            pass
-                if rates_rv is None or len(rates_rv) < 50:
-                    return {"error": f"Failed to get intraday rates for RV: {mt5.last_error()}"}
-                dfrv = pd.DataFrame(rates_rv)
-                if as_of is None and len(dfrv) >= 2:
-                    dfrv = dfrv.iloc[:-1]
-                c = dfrv['close'].astype(float).to_numpy()
-                if c.size < 10:
-                    return {"error": "Insufficient intraday bars for RV"}
-                rr = _log_returns_from_prices(c)
-                rr = rr[np.isfinite(rr)]
-                dt = pd.to_datetime(dfrv['time'].iloc[1:].astype(float), unit='s', utc=True)
-                days_idx = pd.DatetimeIndex(dt).floor('D')
-                df_r = pd.DataFrame({'day': days_idx, 'r2': rr * rr})
-                daily_rv = df_r.groupby('day')['r2'].sum().astype(float)
-                if len(daily_rv) < max(30, m + 5):
-                    return {"error": "Not enough daily RV observations for HAR-RV"}
-                RV = daily_rv.to_numpy(dtype=float)
-                # Lagged features
-                Dlag = RV[:-1]
-                def rmean(arr, k):
-                    s = pd.Series(arr)
-                    return s.rolling(window=k, min_periods=k).mean().to_numpy()
-                Wlag_full = rmean(RV, w)  # aligned to current index
-                Mlag_full = rmean(RV, m)
-                # Build design for y=RV[1:]
-                y = RV[1:]
-                Wlag = Wlag_full[:-1]
-                Mlag = Mlag_full[:-1]
-                Xd = Dlag
-                mask = np.isfinite(Xd) & np.isfinite(Wlag) & np.isfinite(Mlag) & np.isfinite(y)
-                X = np.vstack([np.ones_like(Xd[mask]), Xd[mask], Wlag[mask], Mlag[mask]]).T
-                yv = y[mask]
-                if X.shape[0] < 20:
-                    return {"error": "Insufficient samples after alignment for HAR-RV"}
-                beta, *_ = np.linalg.lstsq(X, yv, rcond=None)
-                # Next-day forecast from last lags
-                D_last = RV[-1]
-                W_last = float(pd.Series(RV).tail(w).mean())
-                M_last = float(pd.Series(RV).tail(m).mean())
-                rv_next = float(beta[0] + beta[1]*D_last + beta[2]*W_last + beta[3]*M_last)
-                rv_next = max(0.0, rv_next)
-                # Map to per-bar and horizon sigma for requested timeframe
-                tf_secs = TIMEFRAME_SECONDS.get(timeframe)
-                if not tf_secs:
-                    return {"error": f"Unsupported timeframe seconds for {timeframe}"}
-                bars_per_day = float(86400.0 / float(tf_secs))
-                sbar = float(math.sqrt(rv_next / bars_per_day))
-                h_days = float(int(horizon)) / bars_per_day
-                hsig = float(math.sqrt(rv_next * max(h_days, 0.0)))
-                bpy = float(365.0 * 24.0 * 3600.0 / float(tf_secs))
-                return {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
-                        "sigma_bar_return": sbar, "sigma_annual_return": float(sbar*math.sqrt(bpy)),
-                        "horizon_sigma_return": hsig, "horizon_sigma_annual": float(hsig*math.sqrt(bpy/max(1,int(horizon)))),
-                        "params_used": {"rv_timeframe": rv_tf, "window_w": w, "window_m": m,
-                                         "beta": [float(b) for b in beta.tolist()],
-                                         "days": days},
-                        "denoise_used": dn_spec_used}
-            except Exception as ex:
-                return {"error": f"HAR-RV error: {ex}"}
-        else:  # garch
-            r = _log_returns_from_prices(closes)
-            if r.size < 100:
-                return {"error": "Not enough return observations for GARCH (need >=100)"}
-            fit_bars = int(p.get('fit_bars', min(2000, r.size)))
-            mean_model = str(p.get('mean', 'Zero'))
-            dist = str(p.get('dist', 'normal'))
-            params_used.update({'fit_bars': fit_bars, 'mean': mean_model, 'dist': dist})
-            r_fit = pd.Series(r[-fit_bars:]) * 100.0  # scale to percent
-            try:
-                am = _arch_model(r_fit, mean=mean_model.lower(), vol='GARCH', p=1, q=1, dist=dist)
-                res = am.fit(disp='off')
-                # Current conditional variance (percent^2)
-                cond_vol = float(res.conditional_volatility.iloc[-1])  # percent
-                sigma_bar = cond_vol / 100.0
-                # k-step ahead variance forecasts (percent^2)
-                fc = res.forecast(horizon=max(1, int(horizon)), reindex=False)
-                var_path = np.array(fc.variance.iloc[-1].values, dtype=float)  # shape (horizon,)
-                var_sum = float(np.nansum(var_path))  # percent^2
-                sigma_h_bar = math.sqrt(var_sum) / 100.0
-            except Exception as ex:
-                return {"error": f"GARCH fitting error: {ex}"}
-
-        sigma_ann = sigma_bar * ann_factor if math.isfinite(sigma_bar) and math.isfinite(ann_factor) else float('nan')
-        sigma_h_ann = sigma_h_bar * ann_factor if math.isfinite(sigma_h_bar) and math.isfinite(ann_factor) else float('nan')
-
-        return {
-            "success": True,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "method": method_l,
-            "params_used": params_used,
-            "bars_used": int(len(df)),
-            "horizon": int(horizon),
-            "last_close": last_close,
-            "sigma_bar_return": sigma_bar,
-            "sigma_annual_return": sigma_ann,
-            "horizon_sigma_return": sigma_h_bar,
-            "horizon_sigma_annual": sigma_h_ann,
-            "as_of": as_of or None,
-            "denoise_used": dn_spec_used,
-        }
+        return {"error": f"Unsupported direct volatility method: {method_l}"}
     except Exception as e:
         return {"error": f"Error computing volatility forecast: {str(e)}"}
-

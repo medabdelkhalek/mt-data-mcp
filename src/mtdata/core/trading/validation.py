@@ -1,0 +1,996 @@
+"""Trading input validation helpers."""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Literal, Optional, Tuple, Union
+
+from ...utils.coercion import coerce_finite_float
+from ...utils.utils import coerce_scalar
+from .gateway import MT5TradingGateway, create_trading_gateway, trading_connection_error
+
+MarketOrderTypeLiteral = Literal["BUY", "SELL"]
+OrderTypeLiteral = Literal[
+    "BUY",
+    "SELL",
+    "BUY_LIMIT",
+    "BUY_STOP",
+    "SELL_LIMIT",
+    "SELL_STOP",
+]
+
+MarketOrderTypeInput = MarketOrderTypeLiteral | str
+OrderTypeInput = OrderTypeLiteral | str
+
+_SUPPORTED_ORDER_TYPES = {
+    "BUY",
+    "SELL",
+    "BUY_LIMIT",
+    "BUY_STOP",
+    "SELL_LIMIT",
+    "SELL_STOP",
+}
+def _normalize_order_type_input(order_type: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize order_type inputs from MCP clients into canonical MT5 order names."""
+    if order_type is None:
+        return None, "order_type is required."
+
+    if isinstance(order_type, bool):
+        return None, f"Unsupported order_type '{order_type}'."
+    if isinstance(order_type, (int, float)):
+        return None, f"Unsupported order_type '{order_type}'. Use canonical string order types."
+
+    text = str(order_type).strip()
+    if not text:
+        return None, "order_type is required."
+
+    scalar = coerce_scalar(text)
+    if isinstance(scalar, (int, float)) and not isinstance(scalar, bool):
+        return None, f"Unsupported order_type '{order_type}'. Use canonical string order types."
+
+    normalized = text.upper().replace("-", "_").replace(" ", "_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    if normalized in _SUPPORTED_ORDER_TYPES:
+        return normalized, None
+
+    return (
+        None,
+        (
+            f"Unsupported order_type '{order_type}'. "
+            "Use BUY/SELL or BUY_LIMIT/BUY_STOP/SELL_LIMIT/SELL_STOP."
+        ),
+    )
+
+
+def _normalize_trade_side_filter(side: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize read-only trade side filters into canonical BUY/SELL only."""
+    if side is None:
+        return None, None
+    if isinstance(side, bool):
+        return None, "side must be BUY or SELL."
+
+    text = str(side).strip()
+    if not text:
+        return None, None
+
+    normalized = text.upper().replace("-", "_").replace(" ", "_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    if normalized in {"BUY", "LONG"}:
+        return "BUY", None
+    if normalized in {"SELL", "SHORT"}:
+        return "SELL", None
+    return None, "side must be BUY or SELL."
+
+
+def _validate_volume(volume: Union[int, float], symbol_info: Any) -> Tuple[Optional[float], Optional[str]]:
+    """Validate lot size against symbol constraints."""
+    vol = coerce_finite_float(volume)
+    if vol is None:
+        try:
+            raw_volume = float(volume)
+        except (TypeError, ValueError):
+            return None, "volume must be numeric"
+        if not math.isfinite(raw_volume):
+            return None, "volume must be positive and finite"
+        return None, "volume must be numeric"
+
+    if vol <= 0:
+        return None, "volume must be positive and finite"
+
+    min_vol = coerce_finite_float(getattr(symbol_info, "volume_min", None))
+    if min_vol is not None and min_vol <= 0:
+        min_vol = None
+
+    max_vol = coerce_finite_float(getattr(symbol_info, "volume_max", None))
+    if max_vol is not None and max_vol <= 0:
+        max_vol = None
+
+    step = coerce_finite_float(getattr(symbol_info, "volume_step", None))
+    if step is not None and step <= 0:
+        step = None
+
+    if min_vol is not None and vol < (min_vol - 1e-12):
+        return None, f"volume must be >= {min_vol}"
+    if max_vol is not None and vol > (max_vol + 1e-12):
+        return None, f"volume must be <= {max_vol}"
+
+    if step is not None:
+        normalized = round(vol / step) * step
+        normalized = float(f"{normalized:.10f}")
+        tol = step * 1e-6
+        if abs(normalized - vol) > tol:
+            aligned_down = math.floor(vol / step) * step
+            aligned_down = float(f"{aligned_down:.10f}")
+            if aligned_down > 0.0:
+                return None, f"volume must align to step {step}. Try {aligned_down}"
+            minimum_aligned = float(f"{step:.10f}")
+            return None, f"volume must align to step {step}. Minimum aligned volume is {minimum_aligned}"
+        vol = normalized
+        if min_vol is not None and vol < (min_vol - 1e-12):
+            return None, f"volume must be >= {min_vol}"
+        if max_vol is not None and vol > (max_vol + 1e-12):
+            return None, f"volume must be <= {max_vol}"
+
+    return vol, None
+
+
+def _validate_deviation(deviation: Union[int, float]) -> Tuple[Optional[int], Optional[str]]:
+    """Validate/normalize MT5 deviation in points."""
+    try:
+        dev = int(float(deviation))
+    except (TypeError, ValueError):
+        return None, "deviation must be numeric"
+    if dev < 0:
+        return None, "deviation must be >= 0"
+    return dev, None
+
+
+def _resolve_slippage_to_deviation(
+    *,
+    deviation: Optional[Union[int, float]] = None,
+    slippage_pips: Optional[float] = None,
+    symbol_info: Any = None,
+) -> Tuple[Optional[int], Optional[Dict[str, Any]], Optional[str]]:
+    """Convert user-facing slippage inputs to MT5 deviation (points).
+
+    Precedence: explicit *deviation* wins; then *slippage_pips* is converted
+    using the symbol's ``point`` attribute.  Returns ``(deviation, metadata, error)``.
+    """
+    # Explicit deviation takes precedence
+    if deviation is not None:
+        dev, err = _validate_deviation(deviation)
+        if err:
+            return None, None, err
+        return dev, {"source": "deviation", "deviation": dev}, None
+
+    if slippage_pips is None:
+        return 20, {"source": "default", "deviation": 20}, None
+
+    pips = coerce_finite_float(slippage_pips)
+    if pips is None:
+        return None, None, "slippage_pips must be numeric."
+    if pips < 0:
+        return None, None, "slippage_pips must be >= 0 and finite."
+
+    point = None
+    if symbol_info is not None:
+        point = coerce_finite_float(getattr(symbol_info, "point", None))
+
+    if point is None or point <= 0:
+        return None, None, (
+            "Cannot convert slippage_pips: symbol point value unavailable."
+        )
+
+    # 1 pip = 10 points for 5-digit brokers (point=0.00001),
+    # 1 pip = 1 point for 4-digit (point=0.0001), etc.
+    digits = 0
+    if symbol_info is not None:
+        try:
+            digits = int(getattr(symbol_info, "digits", 0))
+        except (TypeError, ValueError):
+            digits = 0
+
+    if digits >= 4:
+        points_per_pip = int(10 ** max(digits - 4, 0))
+    else:
+        points_per_pip = int(10 ** max(digits - 2, 0))
+
+    dev = max(0, int(round(pips * points_per_pip)))
+    meta = {
+        "source": "slippage_pips",
+        "slippage_pips": pips,
+        "points_per_pip": points_per_pip,
+        "deviation": dev,
+    }
+    return dev, meta, None
+
+
+def _safe_int_attr(obj: Any, name: str, default: int) -> int:
+    """Safely coerce an object attribute to an integer fallback."""
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return default
+    if value is None or isinstance(value, bool):
+        return default
+    if not isinstance(value, (int, float, str)):
+        return default
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        return default
+    return int(numeric)
+
+
+def _safe_float_attr(obj: Any, name: str, default: Optional[float] = 0.0) -> Optional[float]:
+    """Safely coerce an object attribute to a float with fallback.
+
+    Mirrors ``_safe_int_attr`` but for float extraction.  Handles missing
+    attributes, ``None``, non-numeric values, and non-finite results
+    (NaN / ±Inf) by returning *default* (``0.0`` for validation callers,
+    ``None`` for callers that need to distinguish missing values).
+    """
+    try:
+        raw = getattr(obj, name, None)
+    except Exception:
+        return default
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+def _time_sort_key(obj: Any, fields: tuple[str, ...]) -> float:
+    """Return the first valid MT5 timestamp normalized to epoch seconds."""
+    for field in fields:
+        try:
+            raw_value = getattr(obj, field, None)
+            if raw_value is None or isinstance(raw_value, bool):
+                continue
+            value = float(raw_value)
+            if not math.isfinite(value) or value <= 0.0:
+                continue
+            return value / 1000.0 if field.endswith("_msc") else value
+        except Exception:
+            continue
+    return 0.0
+
+
+def _resolve_position_side(position: Any, mt5: Any = None) -> Optional[str]:
+    """Resolve an MT5 position type to ``BUY`` or ``SELL``."""
+    try:
+        raw_type = getattr(position, "type")
+    except Exception:
+        return None
+
+    if isinstance(raw_type, str):
+        normalized = raw_type.strip().upper()
+        if normalized.startswith("BUY"):
+            return "BUY"
+        if normalized.startswith("SELL"):
+            return "SELL"
+
+    position_type_buy = _safe_int_attr(
+        mt5,
+        "POSITION_TYPE_BUY",
+        _safe_int_attr(mt5, "ORDER_TYPE_BUY", 0),
+    )
+    position_type_sell = _safe_int_attr(
+        mt5,
+        "POSITION_TYPE_SELL",
+        _safe_int_attr(mt5, "ORDER_TYPE_SELL", 1),
+    )
+    try:
+        position_type = int(raw_type)
+    except Exception:
+        return None
+    if position_type == int(position_type_buy):
+        return "BUY"
+    if position_type == int(position_type_sell):
+        return "SELL"
+    return None
+
+
+def _trade_done_codes(mt5: Any) -> set[int]:
+    return {
+        _safe_int_attr(mt5, "TRADE_RETCODE_PLACED", 10008),
+        _safe_int_attr(mt5, "TRADE_RETCODE_DONE", 10009),
+        _safe_int_attr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010),
+    }
+
+
+def _retcode_is_done(
+    mt5: Any,
+    retcode: Any,
+    done_codes: Optional[set[int]] = None,
+) -> bool:
+    try:
+        if done_codes is None:
+            done_codes = _trade_done_codes(mt5)
+        return int(retcode) in done_codes
+    except Exception:
+        return False
+
+
+def _candidate_fill_modes(mt5: Any, symbol_info: Any = None) -> list[int]:
+    """Return deduplicated fill-mode candidates with stable MT5-compatible fallbacks."""
+    fill_modes: list[int] = []
+    preferred_fill_mode = None
+    if symbol_info is not None:
+        try:
+            raw_fill_mode = getattr(symbol_info, "filling_mode", None)
+        except Exception:
+            raw_fill_mode = None
+        if isinstance(raw_fill_mode, (int, float)) and not isinstance(raw_fill_mode, bool):
+            preferred_fill_mode = int(raw_fill_mode)
+
+    if preferred_fill_mode is not None:
+        for symbol_attr, fill_attr, default in (
+            ("SYMBOL_FILLING_FOK", "ORDER_FILLING_FOK", 0),
+            ("SYMBOL_FILLING_IOC", "ORDER_FILLING_IOC", 1),
+            ("SYMBOL_FILLING_RETURN", "ORDER_FILLING_RETURN", 2),
+        ):
+            symbol_flag = _safe_int_attr(mt5, symbol_attr, None)
+            fill_mode = _safe_int_attr(mt5, fill_attr, default)
+            if (
+                symbol_flag is not None
+                and symbol_flag > 0
+                and (preferred_fill_mode & symbol_flag) == symbol_flag
+                and fill_mode not in fill_modes
+            ):
+                fill_modes.append(fill_mode)
+
+    for fill_attr, default in (
+        ("ORDER_FILLING_IOC", 1),
+        ("ORDER_FILLING_FOK", 0),
+        ("ORDER_FILLING_RETURN", 2),
+    ):
+        fill_mode = _safe_int_attr(mt5, fill_attr, default)
+        if fill_mode not in fill_modes:
+            fill_modes.append(fill_mode)
+    return fill_modes
+
+
+def _safe_last_error(mt5: Any) -> Any:
+    """Best-effort access to mt5.last_error()."""
+    try:
+        if hasattr(mt5, "last_error"):
+            return mt5.last_error()
+    except Exception:
+        return None
+    return None
+
+
+def _normalize_price_for_symbol(
+    value: Optional[Union[int, float]],
+    *,
+    point: float,
+    digits: int,
+) -> Optional[float]:
+    """Normalize a price to symbol precision, rejecting zero and non-finite outputs."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric == 0.0:
+        return None
+    if point > 0:
+        numeric = round(numeric / point) * point
+    else:
+        numeric = round(numeric, digits)
+    if not math.isfinite(numeric) or numeric == 0.0:
+        return None
+    return float(numeric)
+
+
+def _zero_price_requested(value: Optional[Union[int, float]]) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        numeric = float(value)
+    except Exception:
+        return False
+    return math.isfinite(numeric) and math.isclose(numeric, 0.0, abs_tol=1e-9)
+
+
+def _normalize_requested_protection_price(
+    value: Optional[Union[int, float]],
+    *,
+    field_name: str,
+    point: float,
+    digits: int,
+) -> Tuple[Optional[float], bool, Optional[str]]:
+    explicit_remove = _zero_price_requested(value)
+    if value is None or explicit_remove:
+        return None, explicit_remove, None
+    normalized = _normalize_price_for_symbol(value, point=point, digits=digits)
+    if normalized is None:
+        return None, explicit_remove, f"{field_name} must be a non-zero finite price after symbol normalization."
+    return float(normalized), explicit_remove, None
+
+
+def _symbol_price_context(symbol_info: Any) -> Dict[str, Any]:
+    try:
+        point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+    except Exception:
+        point = 0.0
+    digits = _safe_int_attr(symbol_info, "digits", 5)
+    return {
+        "point": point,
+        "digits": digits,
+    }
+
+
+def _normalize_trade_price_inputs(
+    *,
+    symbol_info: Any,
+    price: Optional[Union[int, float]] = None,
+    price_field_name: str = "price",
+    require_price: bool = False,
+    stop_loss: Optional[Union[int, float]] = None,
+    take_profit: Optional[Union[int, float]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    context = _symbol_price_context(symbol_info)
+    point = float(context["point"])
+    digits = int(context["digits"])
+
+    normalized_price = None
+    if price is not None or require_price:
+        normalized_price = _normalize_price_for_symbol(price, point=point, digits=digits)
+        if normalized_price is None:
+            return None, f"{price_field_name} must be a non-zero finite number after symbol normalization."
+
+    requested_sl, explicit_remove_sl, sl_error = _normalize_requested_protection_price(
+        stop_loss,
+        field_name="stop_loss",
+        point=point,
+        digits=digits,
+    )
+    if sl_error is not None:
+        return None, sl_error
+    requested_tp, explicit_remove_tp, tp_error = _normalize_requested_protection_price(
+        take_profit,
+        field_name="take_profit",
+        point=point,
+        digits=digits,
+    )
+    if tp_error is not None:
+        return None, tp_error
+
+    return {
+        **context,
+        "price": normalized_price,
+        "stop_loss": requested_sl,
+        "take_profit": requested_tp,
+        "explicit_remove_stop_loss": explicit_remove_sl,
+        "explicit_remove_take_profit": explicit_remove_tp,
+    }, None
+
+
+def _broker_distance_metadata(symbol_info: Any) -> Dict[str, float]:
+    try:
+        point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+    except Exception:
+        point = 0.0
+    if not math.isfinite(point) or point <= 0:
+        point = 0.0
+
+    try:
+        stops_level_points = int(float(getattr(symbol_info, "trade_stops_level", 0) or 0))
+    except Exception:
+        stops_level_points = 0
+    if stops_level_points < 0:
+        stops_level_points = 0
+
+    try:
+        freeze_level_points = int(float(getattr(symbol_info, "trade_freeze_level", 0) or 0))
+    except Exception:
+        freeze_level_points = 0
+    if freeze_level_points < 0:
+        freeze_level_points = 0
+
+    min_distance_points = max(stops_level_points, freeze_level_points)
+    min_distance_price = float(min_distance_points) * point if point > 0 else 0.0
+    price_tolerance = point * 0.1 if point > 0 else 1e-9
+
+    return {
+        "point": point,
+        "trade_stops_level": stops_level_points,
+        "trade_freeze_level": freeze_level_points,
+        "min_distance_points": min_distance_points,
+        "min_distance_price": min_distance_price,
+        "price_tolerance": price_tolerance,
+    }
+
+
+def _validate_pending_order_levels(  # noqa: C901
+    *,
+    symbol_info: Any,
+    tick: Any,
+    order_type_value: int,
+    price: float,
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    mt5: Any,
+) -> Optional[Dict[str, Any]]:
+    """Validate pending entry and protection levels against quotes and broker distances."""
+    try:
+        bid = float(getattr(tick, "bid", float("nan")) or float("nan"))
+    except Exception:
+        bid = float("nan")
+    try:
+        ask = float(getattr(tick, "ask", float("nan")) or float("nan"))
+    except Exception:
+        ask = float("nan")
+    if not math.isfinite(bid) or not math.isfinite(ask):
+        return {"error": "Failed to get valid current bid/ask for pending-order validation."}
+
+    distance = _broker_distance_metadata(symbol_info)
+    min_distance_points = int(distance["min_distance_points"])
+    min_distance_price = float(distance["min_distance_price"])
+    tol = float(distance["price_tolerance"])
+
+    buy_limit = _safe_int_attr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)
+    sell_limit = _safe_int_attr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)
+    buy_stop = _safe_int_attr(mt5, "ORDER_TYPE_BUY_STOP", 4)
+    sell_stop = _safe_int_attr(mt5, "ORDER_TYPE_SELL_STOP", 5)
+
+    order_labels = {
+        buy_limit: "BUY_LIMIT",
+        sell_limit: "SELL_LIMIT",
+        buy_stop: "BUY_STOP",
+        sell_stop: "SELL_STOP",
+    }
+    order_label = order_labels.get(int(order_type_value), str(order_type_value))
+    buy_types = {buy_limit, buy_stop}
+    sell_types = {sell_limit, sell_stop}
+
+    def _metadata() -> Dict[str, Any]:
+        return {
+            "order_type": order_label,
+            "price": price,
+            "bid": bid,
+            "ask": ask,
+            "trade_stops_level": int(distance["trade_stops_level"]),
+            "trade_freeze_level": int(distance["trade_freeze_level"]),
+            "min_distance_points": min_distance_points,
+            "min_distance_price": min_distance_price,
+        }
+
+    if order_type_value == buy_limit:
+        if price >= (ask - tol):
+            if abs(price - ask) <= tol:
+                return {
+                    "error": (
+                        "price is at market for BUY_LIMIT. "
+                        f"price={price}, ask={ask}. Use a market order or choose a price below ask."
+                    ),
+                    **_metadata(),
+                }
+            return {"error": f"Price must be below ask for BUY_LIMIT. price={price}, ask={ask}", **_metadata()}
+        if min_distance_price > 0 and (ask - price) < (min_distance_price - tol):
+            return {
+                "error": (
+                    "pending entry is too close to the live ask for BUY_LIMIT. "
+                    f"price={price}, ask={ask}, min_distance_points={min_distance_points}"
+                ),
+                **_metadata(),
+            }
+    elif order_type_value == buy_stop:
+        if price <= (ask + tol):
+            if abs(price - ask) <= tol:
+                return {
+                    "error": (
+                        "price is at market for BUY_STOP. "
+                        f"price={price}, ask={ask}. Use a market order or choose a price above ask."
+                    ),
+                    **_metadata(),
+                }
+            return {"error": f"Price must be above ask for BUY_STOP. price={price}, ask={ask}", **_metadata()}
+        if min_distance_price > 0 and (price - ask) < (min_distance_price - tol):
+            return {
+                "error": (
+                    "pending entry is too close to the live ask for BUY_STOP. "
+                    f"price={price}, ask={ask}, min_distance_points={min_distance_points}"
+                ),
+                **_metadata(),
+            }
+    elif order_type_value == sell_limit:
+        if price <= (bid + tol):
+            if abs(price - bid) <= tol:
+                return {
+                    "error": (
+                        "price is at market for SELL_LIMIT. "
+                        f"price={price}, bid={bid}. Use a market order or choose a price above bid."
+                    ),
+                    **_metadata(),
+                }
+            return {"error": f"Price must be above bid for SELL_LIMIT. price={price}, bid={bid}", **_metadata()}
+        if min_distance_price > 0 and (price - bid) < (min_distance_price - tol):
+            return {
+                "error": (
+                    "pending entry is too close to the live bid for SELL_LIMIT. "
+                    f"price={price}, bid={bid}, min_distance_points={min_distance_points}"
+                ),
+                **_metadata(),
+            }
+    elif order_type_value == sell_stop:
+        if price >= (bid - tol):
+            if abs(price - bid) <= tol:
+                return {
+                    "error": (
+                        "price is at market for SELL_STOP. "
+                        f"price={price}, bid={bid}. Use a market order or choose a price below bid."
+                    ),
+                    **_metadata(),
+                }
+            return {"error": f"Price must be below bid for SELL_STOP. price={price}, bid={bid}", **_metadata()}
+        if min_distance_price > 0 and (bid - price) < (min_distance_price - tol):
+            return {
+                "error": (
+                    "pending entry is too close to the live bid for SELL_STOP. "
+                    f"price={price}, bid={bid}, min_distance_points={min_distance_points}"
+                ),
+                **_metadata(),
+            }
+    else:
+        return {"error": f"Unsupported pending order type {order_type_value}.", **_metadata()}
+
+    if stop_loss is not None:
+        sl = float(stop_loss)
+        if order_type_value in buy_types:
+            if sl >= (price - tol):
+                return {
+                    "error": f"stop_loss must be below entry for BUY orders. sl={sl}, price={price}",
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (price - sl) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "stop_loss is too close to entry for BUY pending orders. "
+                        f"sl={sl}, price={price}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+        elif order_type_value in sell_types:
+            if sl <= (price + tol):
+                return {
+                    "error": f"stop_loss must be above entry for SELL orders. sl={sl}, price={price}",
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (sl - price) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "stop_loss is too close to entry for SELL pending orders. "
+                        f"sl={sl}, price={price}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+
+    if take_profit is not None:
+        tp = float(take_profit)
+        if order_type_value in buy_types:
+            if tp <= (price + tol):
+                return {
+                    "error": f"take_profit must be above entry for BUY orders. tp={tp}, price={price}",
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (tp - price) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "take_profit is too close to entry for BUY pending orders. "
+                        f"tp={tp}, price={price}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+        elif order_type_value in sell_types:
+            if tp >= (price - tol):
+                return {
+                    "error": f"take_profit must be below entry for SELL orders. tp={tp}, price={price}",
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (price - tp) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "take_profit is too close to entry for SELL pending orders. "
+                        f"tp={tp}, price={price}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+
+    return None
+
+
+def _validate_live_protection_levels(
+    *,
+    symbol_info: Any,
+    tick: Any,
+    side: str,
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """Validate live SL/TP attachment against current quotes and broker distances."""
+    side_norm = str(side).upper().strip()
+    if side_norm not in {"BUY", "SELL"}:
+        return None
+
+    try:
+        bid = float(getattr(tick, "bid", float("nan")) or float("nan"))
+    except Exception:
+        bid = float("nan")
+    try:
+        ask = float(getattr(tick, "ask", float("nan")) or float("nan"))
+    except Exception:
+        ask = float("nan")
+    if not math.isfinite(bid) or not math.isfinite(ask):
+        return {"error": "Failed to get valid current bid/ask for SL/TP validation."}
+
+    reference_price = bid if side_norm == "BUY" else ask
+    reference_label = "bid" if side_norm == "BUY" else "ask"
+    distance = _broker_distance_metadata(symbol_info)
+    min_distance_points = int(distance["min_distance_points"])
+    min_distance_price = float(distance["min_distance_price"])
+    tol = float(distance["price_tolerance"])
+
+    def _metadata() -> Dict[str, Any]:
+        return {
+            "side": side_norm,
+            "bid": bid,
+            "ask": ask,
+            "reference_price": reference_price,
+            "reference_label": reference_label,
+            "trade_stops_level": int(distance["trade_stops_level"]),
+            "trade_freeze_level": int(distance["trade_freeze_level"]),
+            "min_distance_points": min_distance_points,
+            "min_distance_price": min_distance_price,
+        }
+
+    if stop_loss is not None:
+        sl = float(stop_loss)
+        if side_norm == "BUY":
+            if sl >= (reference_price - tol):
+                return {
+                    "error": (
+                        "stop_loss must be below the live bid for BUY positions "
+                        f"before TP/SL can be attached. sl={sl}, bid={bid}, ask={ask}"
+                    ),
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (reference_price - sl) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "stop_loss is too close to the live bid for BUY positions. "
+                        f"sl={sl}, bid={bid}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+        else:
+            if sl <= (reference_price + tol):
+                return {
+                    "error": (
+                        "stop_loss must be above the live ask for SELL positions "
+                        f"before TP/SL can be attached. sl={sl}, bid={bid}, ask={ask}"
+                    ),
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (sl - reference_price) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "stop_loss is too close to the live ask for SELL positions. "
+                        f"sl={sl}, ask={ask}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+
+    if take_profit is not None:
+        tp = float(take_profit)
+        if side_norm == "BUY":
+            if tp <= (reference_price + tol):
+                return {
+                    "error": (
+                        "take_profit must be above the live bid for BUY positions "
+                        f"before TP/SL can be attached. tp={tp}, bid={bid}, ask={ask}"
+                    ),
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (tp - reference_price) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "take_profit is too close to the live bid for BUY positions. "
+                        f"tp={tp}, bid={bid}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+        else:
+            if tp >= (reference_price - tol):
+                return {
+                    "error": (
+                        "take_profit must be below the live ask for SELL positions "
+                        f"before TP/SL can be attached. tp={tp}, bid={bid}, ask={ask}"
+                    ),
+                    **_metadata(),
+                }
+            if min_distance_price > 0 and (reference_price - tp) < (min_distance_price - tol):
+                return {
+                    "error": (
+                        "take_profit is too close to the live ask for SELL positions. "
+                        f"tp={tp}, ask={ask}, min_distance_points={min_distance_points}"
+                    ),
+                    **_metadata(),
+                }
+
+    return None
+
+
+def _prevalidate_trade_place_market_input(
+    symbol: str,
+    volume: Any,
+    gateway: Optional[MT5TradingGateway] = None,
+) -> Optional[Dict[str, Any]]:
+    """Validate symbol and volume before market-order SL/TP enforcement returns."""
+    mt5 = create_trading_gateway(gateway=gateway)
+    connection_error = trading_connection_error(mt5)
+    if connection_error is not None:
+        return connection_error
+
+    def _prevalidate():
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return {"error": f"Symbol {symbol} not found"}
+
+        if not getattr(symbol_info, "visible", True):
+            if not mt5.symbol_select(symbol, True):
+                return {"error": f"Failed to select symbol {symbol}"}
+
+        _, volume_error = _validate_volume(volume, symbol_info)
+        if volume_error:
+            return {"error": volume_error}
+        return {"success": True}
+
+    result = _prevalidate()
+    if isinstance(result, dict):
+        err = result.get("error")
+        if isinstance(err, str):
+            if err.strip():
+                return result
+        elif err not in (None, False):
+            return result
+    return None
+
+
+def _normalize_ticket_filter(ticket: Any, *, name: str) -> Tuple[Optional[int], Optional[str]]:
+    if ticket in (None, ""):
+        return None, None
+    value = coerce_finite_float(ticket)
+    if value is None or not float(value).is_integer():
+        return None, f"{name} must be an integer ticket."
+    return int(value), None
+
+
+def _normalize_minutes_back(minutes_back: Any) -> Tuple[Optional[int], Optional[str]]:
+    if minutes_back in (None, ""):
+        return None, None
+    value = coerce_finite_float(minutes_back)
+    if value is None or not float(value).is_integer():
+        return None, "minutes_back must be a positive integer."
+    minutes = int(value)
+    if minutes <= 0:
+        return None, "minutes_back must be a positive integer."
+    return minutes, None
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            return None
+        return bool(value)
+    return None
+
+
+def _safe_int_ticket(value: Any) -> Optional[int]:
+    """Best-effort conversion for MT5 ticket-like values."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            fv = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(fv) or not fv.is_integer():
+            return None
+        iv = int(fv)
+        return iv if iv > 0 else None
+    try:
+        scalar = coerce_scalar(str(value).strip())
+    except Exception:
+        scalar = value
+    if isinstance(scalar, (int, float)) and not isinstance(scalar, bool):
+        try:
+            fv = float(scalar)
+        except Exception:
+            return None
+        if not math.isfinite(fv) or not fv.is_integer():
+            return None
+        iv = int(fv)
+        return iv if iv > 0 else None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Tick freshness
+# ---------------------------------------------------------------------------
+
+import time as _time_module
+
+_DEFAULT_TICK_MAX_AGE_SECONDS = 30.0
+
+
+def _tick_age_seconds(tick: Any) -> Optional[float]:
+    """Compute tick age in seconds from tick timestamp fields.
+
+    Prefers ``time_msc`` (millisecond epoch) over ``time`` (second epoch).
+    Returns ``None`` when the tick has no usable timestamp.
+
+    Assumes tick timestamps have already been normalized to UTC by the MT5
+    adapter before comparing to system time.
+    """
+    now_utc = _time_module.time()
+
+    for field in ("time_msc", "time"):
+        try:
+            raw = getattr(tick, field, None)
+            if raw is None:
+                continue
+            val = float(raw)
+            if not math.isfinite(val) or val <= 0:
+                continue
+
+            if field == "time_msc":
+                tick_utc = val / 1000.0
+            else:
+                tick_utc = val
+
+            age_s = now_utc - tick_utc
+            return max(0.0, age_s)
+        except Exception:
+            continue
+    return None
+
+
+def _validate_tick_freshness(
+    tick: Any,
+    *,
+    symbol: str,
+    max_age_seconds: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return an error dict if *tick* is stale or has unknown age."""
+    threshold = (
+        float(max_age_seconds)
+        if max_age_seconds is not None
+        else _DEFAULT_TICK_MAX_AGE_SECONDS
+    )
+    age = _tick_age_seconds(tick)
+    if age is None:
+        return {
+            "error": f"Tick for {symbol} has no usable timestamp; freshness cannot be verified.",
+            "tick_age_status": "unknown",
+            "tick_max_age_seconds": threshold,
+        }
+    if age <= threshold:
+        return None
+    return {
+        "error": f"Tick for {symbol} is stale ({age:.1f}s old, threshold {threshold:.0f}s).",
+        "tick_age_seconds": round(age, 2),
+        "tick_max_age_seconds": threshold,
+    }

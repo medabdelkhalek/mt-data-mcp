@@ -1,0 +1,439 @@
+"""Unified news MCP tool."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+from ..services.unified_news import fetch_unified_news
+from ..shared.schema import DetailLiteral
+from ..utils.time import format_relative_time
+from ._mcp_instance import mcp
+from .execution_logging import run_logged_operation
+from .output_contract import normalize_output_verbosity_detail
+
+logger = logging.getLogger(__name__)
+
+_NEWS_COMPACT_TOP_LEVEL_KEYS = frozenset(
+    {
+        "instrument",
+        "sources_used",
+        "source_details",
+        "matching",
+        "general_count",
+        "related_count",
+        "market_context",
+        "market_context_count",
+        "impact_count",
+        "upcoming_count",
+        "recent_count",
+    }
+)
+_NEWS_BUCKET_KEYS = (
+    "related_news",
+    "general_news",
+    "impact_news",
+    "upcoming_events",
+    "recent_events",
+    "market_context",
+)
+_NEWS_SYMBOL_LIMIT_BUCKET_KEYS = ("related_news",)
+_NEWS_BUCKET_COUNT_KEYS = {
+    "general_news": "general_count",
+    "related_news": "related_count",
+    "market_context": "market_context_count",
+    "impact_news": "impact_count",
+    "upcoming_events": "upcoming_count",
+    "recent_events": "recent_count",
+}
+_NEWS_COMPACT_ITEM_DROP_KEYS = frozenset(
+    {
+        "provider",
+        "priority",
+        "relevance_score",
+        "importance_score",
+        "metadata",
+        "url",
+        "category",
+    }
+)
+
+
+def _news_datetime_utc(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        published_at = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            published_at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    if published_at.tzinfo is None:
+        return published_at.replace(tzinfo=timezone.utc)
+    return published_at.astimezone(timezone.utc)
+
+
+def _news_time_utc_text(value: datetime) -> str:
+    published_at = value.astimezone(timezone.utc).replace(microsecond=0)
+    if published_at.second:
+        return published_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return published_at.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _news_data_fetched_at() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _news_compact_time_field(
+    published_at_value: Any,
+    *,
+    metadata_relative_time: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    published_at = _news_datetime_utc(published_at_value)
+    if metadata_relative_time:
+        return "relative_time", metadata_relative_time
+    if published_at is None:
+        return None, None
+    relative_time = format_relative_time(published_at)
+    if relative_time:
+        return "relative_time", relative_time
+    return "time_utc", _news_time_utc_text(published_at)
+
+
+def _strip_news_compact_item_fields(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+
+    existing_relative_time = value.get("relative_time")
+    if isinstance(existing_relative_time, str) and existing_relative_time.strip():
+        time_field_name = "relative_time"
+        time_field_value = existing_relative_time.strip()
+    else:
+        metadata_relative_time = None
+        metadata = value.get("metadata")
+        if isinstance(metadata, dict):
+            metadata_relative = metadata.get("relative_time")
+            if isinstance(metadata_relative, str) and metadata_relative.strip():
+                metadata_relative_time = metadata_relative.strip()
+        time_field_name, time_field_value = _news_compact_time_field(
+            value.get("published_at"),
+            metadata_relative_time=metadata_relative_time,
+        )
+        if not time_field_name:
+            existing_time_utc = value.get("time_utc")
+            if isinstance(existing_time_utc, str) and existing_time_utc.strip():
+                time_field_name = "time_utc"
+                time_field_value = existing_time_utc.strip()
+
+    out = {}
+    title = value.get("title")
+    if title is not None:
+        out["title"] = title
+    source = value.get("source")
+    if source not in (None, ""):
+        out["source"] = source
+    kind = value.get("kind")
+    if kind not in (None, ""):
+        out["kind"] = kind
+    published_at = value.get("published_at")
+    if published_at not in (None, ""):
+        out["published_at"] = published_at
+    if time_field_name and time_field_value:
+        out[time_field_name] = time_field_value
+    for key, subvalue in value.items():
+        key_text = str(key)
+        if key_text in {
+            "title",
+            "source",
+            "kind",
+            "published_at",
+            "relative_time",
+            "time_utc",
+        }:
+            continue
+        if key_text in _NEWS_COMPACT_ITEM_DROP_KEYS:
+            continue
+        if key_text == "summary" and subvalue is None:
+            continue
+        out[key] = subvalue
+    return out
+
+
+def normalize_news_output(
+    result: Dict[str, Any],
+    *,
+    detail: Any = None,
+) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return dict(result)
+
+    detail_mode = normalize_output_verbosity_detail(detail)
+    if detail_mode == "full":
+        return dict(result)
+
+    out: Dict[str, Any] = {}
+    for key, subvalue in result.items():
+        key_text = str(key)
+        if key_text in _NEWS_COMPACT_TOP_LEVEL_KEYS:
+            continue
+        if key_text == "symbol" and subvalue is None:
+            continue
+        if key_text in _NEWS_BUCKET_KEYS and isinstance(subvalue, list):
+            if not subvalue:
+                continue
+            out[key] = [
+                _strip_news_compact_item_fields(item)
+                for item in subvalue
+            ]
+            continue
+        out[key] = subvalue
+    return out
+
+
+def _apply_news_limit(
+    result: Dict[str, Any],
+    *,
+    limit: Optional[int],
+    limit_per_bucket: Optional[int] = None,
+    offset: int = 0,
+    symbol_mode: bool = False,
+) -> Dict[str, Any]:
+    if limit is None and limit_per_bucket is None and not offset:
+        return result
+    out = dict(result)
+    total_candidates = 0
+    returned = 0
+    truncated = False
+    remaining = int(limit) if limit is not None else None
+    remaining_offset = max(0, int(offset or 0))
+    if symbol_mode and limit is not None and limit_per_bucket is None:
+        bucket_keys = _NEWS_SYMBOL_LIMIT_BUCKET_KEYS
+        limit_scope = "symbol"
+        drop_bucket_keys = set(_NEWS_BUCKET_KEYS) - set(bucket_keys)
+    else:
+        bucket_keys = _NEWS_BUCKET_KEYS
+        drop_bucket_keys = set()
+        limit_scope = (
+            "global" if limit is not None else "per_bucket" if limit_per_bucket is not None else "offset"
+        )
+
+    bucket_truncation: Dict[str, bool] = {}
+    for key in drop_bucket_keys:
+        out.pop(key, None)
+        count_key = _NEWS_BUCKET_COUNT_KEYS.get(key)
+        if count_key:
+            out.pop(count_key, None)
+
+    for key in bucket_keys:
+        value = out.get(key)
+        if isinstance(value, list):
+            total_candidates += len(value)
+            original_len = len(value)
+            bucket_skipped = 0
+            if remaining_offset:
+                skip_count = min(remaining_offset, len(value))
+                value = value[skip_count:]
+                remaining_offset -= skip_count
+                truncated = truncated or skip_count > 0
+                bucket_skipped = skip_count
+            bucket_limit = len(value)
+            if limit_per_bucket is not None:
+                bucket_limit = min(bucket_limit, int(limit_per_bucket))
+            if remaining is not None:
+                bucket_limit = min(bucket_limit, max(0, remaining))
+            if len(value) > bucket_limit:
+                out[key] = value[:bucket_limit]
+                truncated = True
+                value = out[key]
+                bucket_truncation[key] = True
+            elif bucket_skipped:
+                bucket_truncation[key] = True
+            else:
+                bucket_truncation[key] = False
+            if remaining is not None:
+                remaining = max(0, remaining - len(value))
+            count_key = _NEWS_BUCKET_COUNT_KEYS.get(key)
+            if count_key in out:
+                out[count_key] = len(value)
+            returned += len(value)
+            if not value:
+                out.pop(key, None)
+            else:
+                out[key] = value
+            if original_len == len(value) and not bucket_skipped:
+                bucket_truncation.setdefault(key, False)
+    out["total_candidates"] = total_candidates
+    out["returned"] = returned
+    out["truncated"] = truncated
+    out["offset"] = int(offset or 0)
+    out["has_more"] = bool(max(0, total_candidates - int(offset or 0) - returned) > 0)
+    out["limit_scope"] = limit_scope
+    if bucket_truncation:
+        out["bucket_truncation"] = bucket_truncation
+    return out
+
+
+def _attach_news_row_keys(result: Dict[str, Any]) -> Dict[str, Any]:
+    row_keys = [
+        key
+        for key in _NEWS_BUCKET_KEYS
+        if isinstance(result.get(key), list)
+    ]
+    if row_keys:
+        out = dict(result)
+        out["row_keys"] = row_keys
+        summary_present = False
+        summary_missing = False
+        for key in row_keys:
+            rows = result.get(key)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if "summary" in row:
+                    summary_present = True
+                else:
+                    summary_missing = True
+        if summary_present and summary_missing:
+            out["optional_item_fields"] = {
+                "summary": "source-dependent preview; omitted when unavailable"
+            }
+        return out
+    return result
+
+
+@mcp.tool()
+def news(
+    symbol: Optional[str] = None,
+    detail: DetailLiteral = "compact",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    limit_per_bucket: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch important general news and, optionally, symbol-relevant news.
+
+    This is the preferred trader-facing news tool. It merges Finviz, MT5, and
+    CNBC sources when available, then ranks and buckets headlines by relevance,
+    market impact, and event timing. Use Finviz-specific news tools only when
+    you need raw provider pagination, URLs, blogs, or Finviz-only rows.
+
+    With no symbol, returns the most important recent general news from all
+    available sources.
+
+    With a symbol, returns separate news/event buckets:
+    - `general_news`: important recent market-wide items.
+    - `related_news`: items relevant to the instrument, including direct symbol
+      news and macro headlines whose text and metadata suggest likely impact
+      on the instrument.
+    - `impact_news`: high-importance systemic headlines, such as war or energy
+      shocks, that may matter even when they are not direct lexical matches.
+    - `upcoming_events`: future economic-calendar items relevant to the
+      instrument, surfaced separately so scheduled releases are easy to spot.
+    - `recent_events`: the latest relevant economic releases, surfaced
+      separately so actual values are easy to scan.
+    Full detail also includes `market_context` for quote/performance snapshots;
+    compact detail hides it so default news scans stay headline-focused.
+
+    Matching uses symbol aliases, asset-class terms, MT5 symbol metadata, and a
+    lightweight cosine-similarity score over headline/event text.
+
+    Parameters
+    ----------
+    symbol : str, optional
+        Instrument to contextualize the news for, such as `AAPL`, `EURUSD`, or
+        `BTCUSD`.
+    detail : {"compact", "full"}, optional
+        Response detail level. `compact` (default) keeps concise buckets with
+        relative-time labels plus absolute timestamps and omits redundant URLs
+        when possible, while `full` preserves the richer source, matching, and
+        item metadata payloads.
+    limit : int, optional
+        Maximum items to return. With `symbol`, this caps `related_news` only
+        and omits general buckets; without `symbol`, it caps across all buckets.
+    limit_per_bucket : int, optional
+        Maximum number of items to return per news bucket. Use this only when
+        you explicitly want a per-bucket cap.
+    offset : int, optional
+        Number of ranked bucket-order items to skip before applying limit.
+
+    Returns
+    -------
+    dict
+        Unified response containing:
+        - `instrument`: inferred symbol context when `symbol` is provided
+        - `general_news`: important recent general news
+        - `related_news`: symbol-relevant news and events
+        - `market_context`: quote/performance context in `detail="full"`
+        - `impact_news`: high-importance systemic market headlines
+        - `upcoming_events`: future scheduled events relevant to the instrument
+        - `recent_events`: latest relevant scheduled releases for the instrument
+        - `source_details`: per-source candidate and selected counts
+        - `matching`: summary of the relevance model
+    """
+
+    detail_mode = normalize_output_verbosity_detail(detail)
+    limit_value: Optional[int] = None
+    if limit is not None:
+        try:
+            limit_value = int(limit)
+        except (TypeError, ValueError):
+            return {"error": "limit must be a positive integer."}
+        if limit_value < 1:
+            return {"error": "limit must be a positive integer."}
+    limit_per_bucket_value: Optional[int] = None
+    if limit_per_bucket is not None:
+        try:
+            limit_per_bucket_value = int(limit_per_bucket)
+        except (TypeError, ValueError):
+            return {"error": "limit_per_bucket must be a positive integer."}
+        if limit_per_bucket_value < 1:
+            return {"error": "limit_per_bucket must be a positive integer."}
+    try:
+        offset_value = int(offset or 0)
+    except (TypeError, ValueError):
+        return {"error": "offset must be a non-negative integer."}
+    if offset_value < 0:
+        return {"error": "offset must be >= 0."}
+
+    def _run() -> Dict[str, Any]:
+        raw = fetch_unified_news(symbol=symbol)
+        if isinstance(raw, dict) and raw.get("success") is False:
+            return raw
+        out = _apply_news_limit(
+            normalize_news_output(
+                raw,
+                detail=detail_mode,
+            ),
+            limit=limit_value,
+            limit_per_bucket=limit_per_bucket_value,
+            offset=offset_value,
+            symbol_mode=symbol not in (None, ""),
+        )
+        out = _attach_news_row_keys(out)
+        out.setdefault("data_fetched_at", _news_data_fetched_at())
+        if detail_mode == "full":
+            out.setdefault("tool_scope", "unified_trading_news")
+            out.setdefault("timezone", "UTC")
+        return out
+
+    return run_logged_operation(
+        logger,
+        operation="news",
+        symbol=symbol,
+        detail=detail_mode,
+        limit=limit_value,
+        offset=offset_value,
+        limit_per_bucket=limit_per_bucket_value,
+        func=_run,
+    )

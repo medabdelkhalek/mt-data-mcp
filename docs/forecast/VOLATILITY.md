@@ -16,11 +16,11 @@ Volatility measures how much price typically moves. It's essential for:
 
 ```bash
 # EWMA volatility (fast, reliable)
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 --method ewma
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 --method ewma
 
 # With custom smoothing
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
-  --method ewma --params "lambda=0.94"
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
+  --method ewma --params "lambda_=0.94"
 ```
 
 ---
@@ -64,13 +64,13 @@ Use recent data to estimate current volatility. Best for quick calculations.
 
 **EWMA Example:**
 ```bash
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
-  --method ewma --params "lambda=0.94"
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
+  --method ewma --params "lambda_=0.94"
 ```
 
 **Parkinson Example:**
 ```bash
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
   --method parkinson
 ```
 
@@ -82,14 +82,24 @@ Models volatility clustering—the tendency for high-volatility periods to follo
 
 | Method | Description |
 |--------|-------------|
-| `garch` | Standard GARCH(1,1) |
-| `egarch` | Exponential GARCH (asymmetric) |
-| `gjr_garch` | GJR-GARCH (leverage effect) |
+| `garch` | Standard GARCH(1,1) — Normal innovations |
+| `garch_t` | GARCH(1,1) — Student-t innovations (heavier tails) |
+| `egarch` | Exponential GARCH (asymmetric) — Normal innovations |
+| `egarch_t` | EGARCH — Student-t innovations |
+| `gjr_garch` | GJR-GARCH (leverage effect) — Normal innovations |
+| `gjr_garch_t` | GJR-GARCH — Student-t innovations |
 | `figarch` | Long-memory GARCH |
+| `arima` | ARIMA on volatility proxy |
+| `sarima` | Seasonal ARIMA on volatility proxy |
+| `ets` | Exponential smoothing state-space |
+| `theta` | Theta method |
+| `nhits` | Neural Hierarchical Interpolation (requires neuralforecast) |
+| `mlf_rf` | Random Forest via MLForecast |
+| `ensemble` | Ensemble of fast estimators |
 
 **GARCH Example:**
 ```bash
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 --method garch
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 --method garch
 ```
 
 **When to use:** When volatility clusters are visible (big moves follow big moves). GARCH is slower but more accurate for regime-switching markets.
@@ -107,7 +117,7 @@ Uses high-frequency data to compute more accurate volatility estimates.
 
 **HAR-RV Example:**
 ```bash
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
   --method har_rv --params "rv_timeframe=M5,days=150"
 ```
 
@@ -127,14 +137,14 @@ Forecast a volatility proxy (like squared returns) using any forecasting method.
 
 **Example:**
 ```bash
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 12 \
   --method theta --proxy squared_return
 ```
 
 **Proxies available:**
 - `squared_return`: (close/prev_close - 1)²
 - `abs_return`: |close/prev_close - 1|
-- `range`: (high - low) / close
+- `log_r2`: squared log-return
 
 ---
 
@@ -146,7 +156,7 @@ Use volatility to set stops that won't be hit by normal noise:
 
 ```bash
 # Get hourly volatility
-python cli.py forecast_volatility_estimate EURUSD --timeframe H1 --horizon 1 --method ewma
+mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 1 --method ewma
 # Output: sigma_bar_return: 0.00062 (0.062%)
 
 # For EURUSD at 1.1750:
@@ -174,7 +184,7 @@ Use volatility-scaled barriers instead of fixed percentages:
 
 ```bash
 # Let the optimizer scale barriers to current volatility
-python cli.py forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
+mtdata-cli forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
   --grid-style volatility --vol-window 250
 ```
 
@@ -201,10 +211,10 @@ python cli.py forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
 
 | Task | Command |
 |------|---------|
-| EWMA volatility | `python cli.py forecast_volatility_estimate EURUSD --method ewma` |
-| Parkinson (H/L) | `python cli.py forecast_volatility_estimate EURUSD --method parkinson` |
-| GARCH | `python cli.py forecast_volatility_estimate EURUSD --method garch` |
-| HAR-RV | `python cli.py forecast_volatility_estimate EURUSD --method har_rv --params "rv_timeframe=M5"` |
+| EWMA volatility | `mtdata-cli forecast_volatility_estimate EURUSD --method ewma` |
+| Parkinson (H/L) | `mtdata-cli forecast_volatility_estimate EURUSD --method parkinson` |
+| GARCH | `mtdata-cli forecast_volatility_estimate EURUSD --method garch` |
+| HAR-RV | `mtdata-cli forecast_volatility_estimate EURUSD --method har_rv --params "rv_timeframe=M5"` |
 
 ---
 

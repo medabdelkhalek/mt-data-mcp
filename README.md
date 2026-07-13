@@ -1,8 +1,8 @@
 # mtdata
 
-**mtdata** is a research and automation toolkit for MetaTrader 5 (MT5). It provides tools for forecasting, regime detection, signal processing, risk analysis, and reporting—bridging raw market data with data science.
+**mtdata** is a Windows-first research and automation toolkit for MetaTrader 5 (MT5). It turns a running MT5 terminal into repeatable CLI commands, MCP tools, and a local Web API for market data, forecasting, regime detection, signal processing, risk analysis, and reporting.
 
-It runs as a **Model Context Protocol (MCP)** server or a standalone **CLI**.
+Use it to explore ideas, build repeatable research workflows, and integrate MT5 data with assistants or local applications. It is a toolkit, not a trading strategy or financial advice.
 
 ## Who Is This For?
 
@@ -14,45 +14,82 @@ It runs as a **Model Context Protocol (MCP)** server or a standalone **CLI**.
 
 - **Windows is required** to run MetaTrader 5 (and therefore to run `mtdata` against MT5).
 - If you're on macOS/Linux, run `mtdata` on a **Windows VM or Windows machine** and connect remotely (MCP/Web API).
+- **Python 3.14 is the supported runtime** for the packaged dependency set in this repo.
 
 ## Safety First
 
 - `mtdata` includes `trade_*` commands that can **place/modify/close real orders** on the account currently logged into MT5.
 - Use a **demo account** until you understand the tools and your broker setup.
 - There is no built-in “paper trading” mode in mtdata; use an MT5 demo account for simulated execution.
+- When a trading command supports `--dry-run true`, preview the action before sending anything to MT5.
 - If you only want research, stick to `data_*`, `forecast_*`, `regime_*`, `patterns_*`, and `report_*` commands.
 
 ## Capabilities
 
 | Category | What It Does | Key Tools |
 |----------|--------------|-----------|
-| **Data** | Fetch candles, ticks, market depth from MT5 | `data_fetch_candles`, `data_fetch_ticks`, `market_depth_fetch` |
-| **Forecasting** | Predict price paths with classical or ML models | `forecast_generate`, `forecast_backtest_run` |
-| **Volatility** | Estimate future price movement magnitude | `forecast_volatility_estimate` |
+| **Data** | Fetch candles, ticks, market depth, and ranked market scans from MT5 | `data_fetch_candles`, `data_fetch_ticks`, `market_depth_fetch`, `market_ticker`, `symbols_top_markets` |
+| **Forecasting** | Predict price paths with classical, ML, or foundation models | `forecast_generate`, `forecast_backtest_run` |
+| **Volatility** | Estimate future movement and compare realized volatility across horizons | `forecast_volatility_estimate`, `volatility_term_structure` |
 | **Regimes** | Detect trending, ranging, or crisis market states | `regime_detect` |
 | **Barriers** | Calculate TP/SL hit probabilities via simulation | `forecast_barrier_prob`, `forecast_barrier_optimize` |
-| **Patterns** | Identify candlestick and chart patterns | `patterns_detect` |
+| **Patterns** | Identify candlestick, chart, Elliott, and fractal patterns | `patterns_detect` |
 | **Indicators** | Compute 100+ technical indicators | `data_fetch_candles --indicators` |
 | **Denoising** | Smooth price data to reveal trends | `--denoise` option |
-| **Trading** | Place orders, manage positions | `trade_place`, `trade_close` |
+| **Temporal** | Test stationarity and discover automatic or calendar seasonality | `stationarity_test`, `seasonality_detect`, `temporal_analyze` |
+| **Diagnostics** | Flag anomalous returns, volume, and bar ranges | `outliers_detect` |
+| **Multi-asset** | Explore correlation, lead/lag structure, and pairwise or multivariate cointegration | `correlation_matrix`, `cross_correlation`, `cointegration_test` |
+| **Scanning** | Screen MT5 symbols by spread, price change, volume, RSI, and SMA | `symbols_top_markets`, `market_scan` |
+| **Advanced Analytics** | Analyze tick liquidity, execution quality, robust strategy evidence, portfolio tail risk, and relative strength | `market_microstructure_analyze`, `trade_execution_quality`, `strategy_validate`, `portfolio_risk_decompose`, `market_relative_strength` |
+| **Strategy Backtesting** | Backtest simple SMA/EMA/RSI trading rules on MT5 candles | `strategy_backtest` |
+| **Trading** | Place orders, manage positions, review performance, and estimate tail or scenario risk | `trade_place`, `trade_close`, `trade_var_cvar_calculate`, `trade_stress_test` |
+| **Async Training** | Run heavyweight forecast training in the background and reuse cached models | `forecast_train`, `forecast_task_status`, `forecast_task_wait`, `forecast_models_list`, `forecast_models_delete` |
+| **News** | Unified, ranked news + economic calendar relevant to a symbol | `news` |
+| **Fundamentals** | US equity data, screening, news, calendars | `finviz_fundamentals`, `finviz_screen`, `finviz_calendar` |
+| **Options** | Options chains and QuantLib barrier pricing | `options_chain`, `options_barrier_price` |
+
+Notes:
+- `market_depth_fetch` is enabled only when `MTDATA_ENABLE_MARKET_DEPTH_FETCH=1` and your broker provides Level 2/DOM data.
+- Options-chain tools use Yahoo Finance by default and support Tradier with `MTDATA_OPTIONS_PROVIDER=tradier` plus `MTDATA_OPTIONS_API_KEY`. The pure QuantLib calculator `options_barrier_price` works independently of external options-chain data.
 
 ## Quick Start
 
-**Prerequisites:** Windows + MetaTrader 5 installed and running (demo account recommended).
+**Prerequisites:** Windows + Python 3.14 + MetaTrader 5 installed and running (demo account recommended). For the full install on Windows, also install Visual Studio Build Tools 2022 with the **Desktop development with C++** workload.
 
 ```bash
-# Install dependencies
+# Optional but recommended: create an isolated conda environment first
+conda create -n mtdata python=3.14 -y
+conda activate mtdata
+
+# Lean core install
+pip install -e .
+
+# Full stable research/web install
 pip install -r requirements.txt
 
 # Verify MT5 connection (lists symbols from the running terminal)
-python cli.py symbols_list --limit 5
+mtdata-cli symbols_list --limit 5
+
+# Scan the current MT5 watchlist for top markets
+mtdata-cli symbols_top_markets --rank-by all --limit 5 --timeframe H1
 
 # Fetch recent candles
-python cli.py data_fetch_candles EURUSD --timeframe H1 --limit 50
+mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 50
 
 # Generate a baseline price forecast
-python cli.py forecast_generate EURUSD --timeframe H1 --horizon 12 --model theta
+mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta
 ```
+
+After these commands work, move through the docs in the learning path below. Keep the first session read-only unless you are using a demo account and intentionally testing trading commands.
+
+Notes:
+- `pip install -e .` now installs the lean core package only.
+- `pip install -r requirements.txt` installs the validated Python 3.14 stack from package-index releases, including Chronos, StatsForecast, sktime, mlforecast, news embeddings, and the Web API.
+- NeuralForecast-based models (`nhits`, `tft`, `patchtst`, `nbeatsx`) are not installed by `requirements.txt` or any package extra today; install them manually with `pip install neuralforecast torch` if you want to experiment with them.
+- Conda is a supported way to isolate the install before running the pip commands above.
+- Git-backed add-ons stay explicit: `pip install -e .[forecast-timesfm]` for TimesFM, `pip install -e .[patterns-ext]` for `stock-pattern`, `pip install -e .[news-ycnbc]` for the CNBC adapter, or `pip install -e .[all-git]` for everything in one go.
+- GluonTS/Lag-Llama and GluonTS `gt_*` methods remain excluded from the supported Python 3.14 environment because upstream runtime constraints are still incompatible.
+- Optional accelerators `hnswlib` and `tsdownsample` remain excluded from the supported default install, but an opt-in native/source-build path is documented via `requirements-optional-src.txt` and [docs/SETUP.md](docs/SETUP.md).
 
 ## Documentation
 
@@ -63,16 +100,26 @@ New here? Follow this learning path:
 - **[Setup & Configuration](docs/SETUP.md)** — Installation, MT5 connection, environment variables
 - **[CLI Guide](docs/CLI.md)** — Command conventions, output formats, help system
 - **[Glossary](docs/GLOSSARY.md)** — Explanations of all technical terms with real-world examples
+- **[Advanced Analytics](docs/ADVANCED_ANALYTICS.md)** — MT5-native microstructure, execution, validation, portfolio-risk, and relative-strength tools
 - **[Docs Index](docs/README.md)** — One-page map of all docs
 
 ### Core Topics
 - **[Forecasting](docs/FORECAST.md)** — Price prediction methods (Theta, ARIMA, Chronos, etc.)
+- **[Forecast Methods Reference](docs/forecast/METHODS.md)** — Per-method categories, libraries, defaults, and dependencies
 - **[Volatility](docs/forecast/VOLATILITY.md)** — Estimating price movement magnitude
 - **[Regime Detection](docs/forecast/REGIMES.md)** — Identifying market states (trending vs. ranging)
 - **[Barrier Analysis](docs/BARRIER_FUNCTIONS.md)** — TP/SL hit probability calculation
 - **[Technical Indicators](docs/TECHNICAL_INDICATORS.md)** — Available indicators and usage
+- **[Price Levels](docs/LEVELS.md)** — Pivots, support/resistance, confluence zones, volume profile
 - **[Denoising](docs/DENOISING.md)** — Smoothing filters to reveal trends
 - **[Pattern Detection](docs/forecast/PATTERN_SEARCH.md)** — Candlestick and chart patterns
+- **[Temporal Analysis](docs/TEMPORAL.md)** — Session effects, day-of-week, and seasonal patterns
+- **[Trading Risk Analytics](docs/TRADING_RISK.md)** — Position sizing (fixed-fraction + Kelly), VaR/CVaR, stress tests
+- **[Trading Safety Runbook](docs/TRADING_SAFETY.md)** — Dry-run previews, guardrails, and broker behavior for `trade_*`
+
+### External Data & Options
+- **[Finviz Fundamentals](docs/FINVIZ.md)** — US equity data, screening, news, calendars
+- **[Options & QuantLib](docs/OPTIONS_QUANTLIB.md)** — Options chains, barrier pricing, Heston calibration
 
 ### Tutorials
 - **[Sample Trade Workflow](docs/SAMPLE-TRADE.md)** — Step-by-step analysis for a trade decision
@@ -80,6 +127,12 @@ New here? Follow this learning path:
 - **[End-to-End Example](docs/EXAMPLE.md)** — Complete research loop with all tools
 
 ### Reference
+- **[Environment Variables](docs/ENV_VARS.md)** — Complete `.env` reference (MT5, MCP, Web API, GPU, etc.)
+- **[Output Contract](docs/OUTPUT.md)** — Response envelope, `detail`/`extras`, pagination, and error codes
+- **[Timestamps & Timezones](docs/TIMESTAMPS.md)** — Broker time, UTC, client-local, and provider time
+- **[Web API](docs/WEB_API.md)** — REST endpoints for the Web UI and integrations
+- **[Deployment](docs/DEPLOYMENT.md)** — Run the MCP server or Web API as a persistent local service
+- **[Known Limitations](docs/LIMITATIONS.md)** — Practical caveats and documentation gaps
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** — Common issues and fixes
 
 ## Configuration
@@ -90,22 +143,36 @@ Create a `.env` file in the project root:
 MT5_LOGIN=12345678
 MT5_PASSWORD=your_password
 MT5_SERVER=your_broker_server
-MT5_TIME_OFFSET_MINUTES=0  # Adjust if broker server time differs from UTC
+MT5_SERVER_TZ=Europe/Athens   # Or use MT5_TIME_OFFSET_MINUTES=120
+
+# Optional trade guardrails
+MTDATA_TRADE_GUARDRAILS_ENABLED=1
+MTDATA_TRADE_ALLOWED_SYMBOLS=EURUSD,BTCUSD,XAUUSD
+MTDATA_TRADE_MAX_VOLUME_BY_SYMBOL=EURUSD:0.50,BTCUSD:0.03
+MTDATA_TRADE_MAX_RISK_PCT_OF_EQUITY=1.5
 ```
+
+mtdata reads dozens of environment variables covering MT5 connection, timezone, MCP/Web API server settings, news embeddings, Finviz tuning, GPU acceleration, and more. See **[Environment Variables Reference](docs/ENV_VARS.md)** for the full list, including the trade-guardrail variables and a starter `.env` template.
 
 ## Architecture
 
 ```
 mtdata/
-├── cli.py              # CLI entry point
-├── server.py           # MCP server entry point
-├── webui.py            # Web API (FastAPI + React UI)
+├── requirements-optional-src.txt  # Opt-in native/source-built accelerators
 ├── src/mtdata/
-│   ├── core/           # Tool registry, schemas, server logic
-│   ├── forecast/       # Forecasting methods and engines
+│   ├── bootstrap/      # Runtime startup, settings, tool loading
+│   ├── core/           # Tool registry, schemas, server logic, MCP tools
+│   │   ├── cli/        # Dynamic CLI (argparse) + parsing/, runtime/ subpackages
+│   │   ├── data/       # `data_fetch_*` and `wait_event` tools
+│   │   ├── regime/     # Regime detection (HMM, BOCPD, MS-AR)
+│   │   ├── report/     # `report_generate` runtime
+│   │   ├── report_templates/  # Per-style report templates
+│   │   └── trading/    # `trade_*` tools, account / positions / risk modules
+│   ├── forecast/       # Forecasting methods, engines, model store, task manager
 │   ├── patterns/       # Pattern detection algorithms
-│   ├── services/       # MT5 data access layer
-│   └── utils/          # Shared utilities
+│   ├── services/       # MT5 data access, Finviz, options/news data
+│   ├── shared/         # Shared constants, schemas, validators
+│   └── utils/          # Shared utilities (indicators, denoising, etc.)
 ├── webui/              # React + Vite frontend
 ├── docs/               # Documentation
 └── tests/              # Test suite
