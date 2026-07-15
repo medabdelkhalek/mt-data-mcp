@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Dynamic CLI wrapper for testing MetaTrader5 MCP server functions
 Automatically discovers function parameters and creates CLI arguments
@@ -6,9 +5,9 @@ Automatically discovers function parameters and creates CLI arguments
 
 import argparse
 import difflib
-import inspect
 import json
 import os
+import shlex
 import sys
 import types
 import warnings
@@ -31,7 +30,7 @@ from typing import (
 from pydantic import BaseModel
 
 from ...bootstrap.settings import load_environment
-from ...bootstrap.tools import bootstrap_tools
+from ...bootstrap.tools import bootstrap_tools, cli_tool_module_names
 from ...forecast.requests import ForecastGenerateRequest
 from .._mcp_instance import mcp
 from .._mcp_tools import _get_pydantic_model_fields, _select_output_fields
@@ -104,6 +103,11 @@ class _CLIHelpFormatter(
     argparse.ArgumentDefaultsHelpFormatter,
 ):
     """Preserve command descriptions while showing effective defaults."""
+
+    def _format_args(self, action: argparse.Action, default_metavar: str) -> str:
+        if getattr(action, "_cli_logically_required", False):
+            return self._metavar_formatter(action, default_metavar)(1)[0]
+        return super()._format_args(action, default_metavar)
 
 def _is_typed_dict_type(value: Any) -> bool:
     try:
@@ -540,90 +544,41 @@ class _CLIArgumentParser(argparse.ArgumentParser):
     """Emit parse failures in the selected CLI transport format."""
 
     def error(self, message: str) -> None:
+        market_depth_disabled = (
+            "market_depth_fetch" in str(message)
+            and str(os.getenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH") or "")
+            .strip()
+            .lower()
+            not in {"1", "true", "yes", "on"}
+        )
+        if market_depth_disabled:
+            message = (
+                "market_depth_fetch is disabled; set "
+                "MTDATA_ENABLE_MARKET_DEPTH_FETCH=1 before starting the CLI. "
+                "The broker must also provide Level 2/DOM data."
+            )
         if _json_parse_errors_requested():
             payload = {
                 "success": False,
                 "error": str(message),
-                "error_code": "cli_invalid_arguments",
-                "remediation": f"Run '{self.prog} --help' to inspect valid arguments.",
+                "error_code": (
+                    "feature_disabled" if market_depth_disabled else "cli_invalid_arguments"
+                ),
+                "remediation": (
+                    "Set MTDATA_ENABLE_MARKET_DEPTH_FETCH=1 and restart the process."
+                    if market_depth_disabled
+                    else f"Run '{self.prog} --help' to inspect valid arguments."
+                ),
             }
+            if market_depth_disabled:
+                payload["details"] = {
+                    "feature": "market_depth_fetch",
+                    "enable_env": "MTDATA_ENABLE_MARKET_DEPTH_FETCH",
+                    "broker_prerequisite": "Level 2/DOM market data",
+                }
             _write_cli_text(json.dumps(payload, ensure_ascii=False, indent=2))
             self.exit(2)
         super().error(message)
-
-
-def _safe_argument_parser(*args: Any, **kwargs: Any) -> argparse.ArgumentParser:
-    original_kwargs = dict(kwargs)
-    try:
-        signature = inspect.signature(_CLIArgumentParser)
-        if not any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
-        ):
-            kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key in signature.parameters
-            }
-    except Exception:
-        fallback = dict(original_kwargs)
-        fallback.pop("suggest_on_error", None)
-        fallback.pop("color", None)
-        kwargs = fallback
-    try:
-        return _CLIArgumentParser(*args, **kwargs)
-    except TypeError:
-        fallback = dict(kwargs)
-        fallback.pop("suggest_on_error", None)
-        fallback.pop("color", None)
-        if fallback == kwargs:
-            raise
-        return _CLIArgumentParser(*args, **fallback)
-
-
-def _safe_add_subparser(
-    subparsers: Any, name: str, **kwargs: Any
-) -> argparse.ArgumentParser:
-    original_kwargs = dict(kwargs)
-    try:
-        signature = inspect.signature(subparsers.add_parser)
-        if not any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
-        ):
-            kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key in signature.parameters
-            }
-    except Exception:
-        fallback = dict(original_kwargs)
-        fallback.pop("suggest_on_error", None)
-        fallback.pop("color", None)
-        kwargs = fallback
-    try:
-        parser_class = getattr(subparsers, "_parser_class", argparse.ArgumentParser)
-        parser_signature = inspect.signature(parser_class)
-        if not any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in parser_signature.parameters.values()
-        ):
-            if "suggest_on_error" not in parser_signature.parameters:
-                kwargs.pop("suggest_on_error", None)
-            if "color" not in parser_signature.parameters:
-                kwargs.pop("color", None)
-    except Exception:
-        kwargs.pop("suggest_on_error", None)
-        kwargs.pop("color", None)
-    try:
-        return subparsers.add_parser(name, **kwargs)
-    except TypeError:
-        fallback = dict(kwargs)
-        fallback.pop("suggest_on_error", None)
-        fallback.pop("color", None)
-        if fallback == kwargs:
-            raise
-        return subparsers.add_parser(name, **fallback)
 
 
 def get_function_info(func):
@@ -673,7 +628,7 @@ def _is_literal_origin(origin: Any) -> bool:
     }
 
 
-def discover_tools():
+def discover_tools(module_names: Optional[Tuple[str, ...]] = None):
     """Discover MCP tools from the shared bootstrap registry.
 
     Priority:
@@ -683,7 +638,7 @@ def discover_tools():
     """
     _DISCOVERY_ERRORS.clear()
     return _discover_tools_impl(
-        bootstrap_tools=bootstrap_tools,
+        bootstrap_tools=lambda: bootstrap_tools(module_names),
         get_registered_tools=get_registered_tools,
         mcp=mcp,
         get_mcp_registry=get_mcp_registry,
@@ -1208,6 +1163,19 @@ def _command_help_category(command: str) -> str:
     return "OTHER TOOLS"
 
 
+_CLI_DESCRIPTION = (
+    "Dynamic CLI for MetaTrader5 MCP tools "
+    "(TOON by default; set MTDATA_OUTPUT_FORMAT=json for JSON). "
+    "One-shot commands initialize the requested tool family; for repeated local calls "
+    "use `mtdata-cli shell`, and for agents use a long-lived stdio or HTTP server."
+)
+
+
+def _sort_subparser_help_choices(subparsers: argparse._SubParsersAction) -> None:
+    """Keep custom command parsers in the alphabetical help listing."""
+    subparsers._choices_actions.sort(key=lambda action: action.dest)
+
+
 def _build_epilog(functions: Dict[str, ToolInfo]) -> str:
     lines = []
     lines.append("Commands and Arguments by Category:")
@@ -1328,11 +1296,14 @@ _TIMEFRAMELESS_GLOBAL_COMMANDS: set[str] = {
     "indicators_describe",
     "indicators_list",
     "market_ticker",
+    "data_fetch_ticks",
     "options_barrier_price",
     "options_chain",
     "options_expirations",
     "options_heston_calibrate",
     "symbols_describe",
+    "symbols_list",
+    "tools_list",
     "trade_account_info",
     "trade_close",
     "trade_history",
@@ -1578,7 +1549,7 @@ def _print_extended_help(functions: Dict[str, ToolInfo], query: str) -> None:
                 "  Recovery: auto_close_on_sl_tp_fail defaults true; set --auto-close-on-sl-tp-fail false only if you will handle unprotected fills manually."
             )
             print(
-                "  Preview: set --dry-run true to preview routing without sending an order to MT5."
+                "  Preview: dry_run=true is the default; set --dry-run false explicitly to send an order to MT5."
             )
         print(f"  Example: {base_example}")
         if advanced_example and advanced_example != base_example:
@@ -1595,9 +1566,16 @@ def main():
         return 0
 
     load_environment()
-    # Discover functions to expose dynamically
+    # Discover only the requested command family for one-shot execution. Root
+    # help, search, tools_list, and unknown commands retain full discovery.
     _DISCOVERY_ERRORS.clear()
-    functions = discover_tools()
+    raw_command = raw_argv[0] if raw_argv and not raw_argv[0].startswith("-") else ""
+    selective_modules = cli_tool_module_names(raw_command)
+    functions = (
+        discover_tools(selective_modules)
+        if selective_modules is not None
+        else discover_tools()
+    )
     if not functions:
         print("No tools discovered from server module.", file=sys.stderr)
         if _DISCOVERY_ERRORS:
@@ -1615,12 +1593,9 @@ def main():
 
     parser_prog = os.path.basename(str(sys.argv[0] or "")) or CLI_PROGRAM
 
-    parser = _safe_argument_parser(
+    parser = _CLIArgumentParser(
         prog=parser_prog,
-        description=(
-            "Dynamic CLI for MetaTrader5 MCP tools "
-            "(TOON by default; set MTDATA_OUTPUT_FORMAT=json for JSON)"
-        ),
+        description=_CLI_DESCRIPTION,
         formatter_class=_CLIHelpFormatter,
         epilog=_build_epilog(functions),
         allow_abbrev=False,
@@ -1651,6 +1626,18 @@ def main():
         dest="command", help="Available commands", metavar="<command>"
     )
 
+    shell_parser = subparsers.add_parser(
+        "shell",
+        help="Run repeated CLI commands in one warm Python process",
+        description=(
+            "Run an interactive mtdata-cli session. Enter ordinary command lines "
+            "without the mtdata-cli prefix; use exit or quit to stop."
+        ),
+        formatter_class=_CLIHelpFormatter,
+        allow_abbrev=False,
+    )
+    shell_parser.set_defaults(func=lambda _args: run_shell())
+
     # Dynamically create subparsers for each function, except forecast_generate
     forecast_tool = None
     forecast_tool_info = None
@@ -1665,8 +1652,7 @@ def main():
             continue
 
         # Create subparser
-        cmd_parser = _safe_add_subparser(
-            subparsers,
+        cmd_parser = subparsers.add_parser(
             cmd_name,
             help=(
                 (
@@ -1696,6 +1682,8 @@ def main():
         # Add global parameters to each subparser, excluding any that conflict with function params
         existing_param_names = [p["name"] for p in func_info["params"]]
         exclude_globals = list(existing_param_names)
+        if "timeframe" not in existing_param_names:
+            exclude_globals.append("timeframe")
         if cmd_name == "report_generate":
             exclude_globals.append("timeframe")
         # Finviz tools don't use MT5 timeframe
@@ -1723,8 +1711,7 @@ def main():
         func = forecast_tool["func"]
         func_info = forecast_tool_info or get_function_info(func)
         meta = forecast_tool.get("meta") or {}
-        cmd_parser = _safe_add_subparser(
-            subparsers,
+        cmd_parser = subparsers.add_parser(
             cmd_name,
             help=(
                 (
@@ -1881,6 +1868,10 @@ def main():
 
         cmd_parser.set_defaults(func=_forecast_generate_cmd)
 
+        # forecast_generate uses a custom parser, but belongs in the same
+        # alphabetical top-level command list as dynamically generated tools.
+        _sort_subparser_help_choices(subparsers)
+
     # Parse arguments
     args = parser.parse_args(argv)
     args = _apply_global_cli_overrides(args, argv)
@@ -1907,6 +1898,39 @@ def main():
             traceback.print_exc()
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+
+def run_shell() -> int:
+    """Run repeated CLI commands while reusing the initialized Python process."""
+    print("mtdata-cli shell (type 'exit' or 'quit' to stop)")
+    original_argv = list(sys.argv)
+    try:
+        while True:
+            try:
+                line = input("mtdata> ")
+            except EOFError:
+                print("")
+                return 0
+            except KeyboardInterrupt:
+                print("")
+                continue
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.lower() in {"exit", "quit"}:
+                return 0
+            try:
+                command_argv = shlex.split(stripped, posix=False)
+            except ValueError as exc:
+                print(f"Invalid command line: {exc}", file=sys.stderr)
+                continue
+            if command_argv and command_argv[0].lower() == "shell":
+                print("A shell session is already active.", file=sys.stderr)
+                continue
+            sys.argv = [original_argv[0], *command_argv]
+            main()
+    finally:
+        sys.argv = original_argv
 
 
 if __name__ == "__main__":

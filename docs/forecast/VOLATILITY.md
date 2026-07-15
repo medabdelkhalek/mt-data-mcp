@@ -1,18 +1,14 @@
-# Volatility Forecasting
+# Volatility forecasting
 
-Volatility measures how much price typically moves. It's essential for:
-- Setting realistic stop-loss and take-profit distances
-- Sizing positions (risk more when volatility is low)
-- Understanding barrier hit probabilities
+How much does price usually move? Volatility answers that — and it drives **realistic TP/SL distances**, **position size**, and **barrier hit odds**. mtdata estimates and forecasts vol with EWMA, HAR-RV, GARCH-family methods, and term-structure views.
 
-**Related:**
-- [GLOSSARY.md](../GLOSSARY.md) — Definitions of volatility terms
-- [FORECAST.md](../FORECAST.md) — Price forecasting
-- [BARRIER_FUNCTIONS.md](../BARRIER_FUNCTIONS.md) — Using volatility for TP/SL sizing
+**Dense terms:** [Volatility](../GLOSSARY.md#volatility) · [EWMA](../GLOSSARY.md#ewma-exponentially-weighted-moving-average) · [GARCH](../GLOSSARY.md#garch-generalized-autoregressive-conditional-heteroskedasticity) · [HAR-RV](../GLOSSARY.md#har-rv-heterogeneous-autoregressive-realized-volatility) · [ATR](../GLOSSARY.md#atr-average-true-range)
+
+**Related:** [Glossary](../GLOSSARY.md) · [Forecasting](../FORECAST.md) · [Barriers](../BARRIER_FUNCTIONS.md) · [Risk analytics](../TRADING_RISK.md)
 
 ---
 
-## Quick Start
+## Quick start
 
 ```bash
 # EWMA volatility (fast, reliable)
@@ -33,14 +29,19 @@ success: true
   timeframe: H1
   method: ewma
   horizon: 12
-  sigma_bar_return: 0.00062     # Per-bar volatility (as return)
-  sigma_annual_return: 0.058    # Annualized volatility
-  horizon_sigma_return: 0.002145  # Expected volatility over horizon
+  volatility_per_bar: 0.00062     # Per-bar volatility (as return)
+  volatility_annualized: 0.058    # Annualized volatility
+  volatility_horizon: 0.002145  # Expected volatility over horizon
 ```
 
+For session-limited instruments, intraday annualization uses the median bar
+count from complete observed sessions. The response reports `bars_per_year`
+and `annualization_basis`; `252_trading_days_assumed_24h` means there were not
+enough timestamps to infer a session and the generic 24-hour fallback was used.
+
 **Interpretation:**
-- `sigma_bar_return: 0.00062` → Expect ~0.06% moves per hour (1 standard deviation)
-- `horizon_sigma_return: 0.002145` → Over 12 hours, expect ~0.21% total range (1 σ)
+- `volatility_per_bar: 0.00062` → Expect ~0.06% moves per hour (1 standard deviation)
+- `volatility_horizon: 0.002145` → Over 12 hours, expect ~0.21% total range (1 σ)
 - For EURUSD at 1.1750, 0.21% ≈ 25 pips
 
 **Rule of thumb:** Set stop-loss at 1.5-2x horizon volatility to avoid getting stopped by noise.
@@ -157,7 +158,7 @@ Use volatility to set stops that won't be hit by normal noise:
 ```bash
 # Get hourly volatility
 mtdata-cli forecast_volatility_estimate EURUSD --timeframe H1 --horizon 1 --method ewma
-# Output: sigma_bar_return: 0.00062 (0.062%)
+# Output: volatility_per_bar: 0.00062 (0.062%)
 
 # For EURUSD at 1.1750:
 # 1σ = 1.1750 × 0.00062 = 0.00073 (7.3 pips)

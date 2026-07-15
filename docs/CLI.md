@@ -1,63 +1,71 @@
 # CLI Guide
 
-The CLI is the quickest way to explore mtdata capabilities. All tools are accessible via `mtdata-cli <command>`.
+The CLI is the one-shot interface for scripts and occasional exploration. Every
+tool is one command:
 
-**Related:**
-- [README.md](../README.md) — Project overview
-- [SETUP.md](SETUP.md) — Installation and configuration
-- [GLOSSARY.md](GLOSSARY.md) — Term definitions
+```bash
+mtdata-cli <command> [options]
+```
+
+Use it for scripts, exploration, and copy-paste workflows. Each one-shot
+invocation starts Python and discovers the requested command family. For repeated
+local exploration, run `mtdata-cli shell` and enter ordinary command lines
+without the `mtdata-cli` prefix; imports remain warm until `exit` or `quit`.
+Repeated agent or application calls should keep a process alive with
+`mtdata-stdio`, `mtdata-streamable-http`, or `mtdata-webapi`. The full tool surface is also
+available over [MCP](GLOSSARY.md#mcp-model-context-protocol). The Web API
+exposes a focused subset with the same canonical payload semantics for
+operations shared across interfaces. Default text presentation is
+[TOON](GLOSSARY.md#toon); use `--json` for machines.
+
+Stuck on an acronym in output (BOCPD, Kelly, CVaR, …)? See the [glossary quick find](GLOSSARY.md#quick-find).
+
+**Related:** [README](../README.md) · [Setup](SETUP.md) · [Glossary](GLOSSARY.md) · [Output contract](OUTPUT.md)
 
 ---
 
-## Safety (Trading Commands)
+## Safety (trading commands)
 
-`trade_*` commands can place/modify/close real orders on the account currently logged into MT5 (demo or live). Use a demo account until you're confident in your setup.
+`trade_*` can place, modify, or close **real** orders on the account logged into MT5.
 
-There is no built-in “paper trading” mode in mtdata; for simulated execution use an MT5 demo account and double-check which account is logged in before running any `trade_*` commands.
+- Prefer a **demo account** while learning.
+- mtdata has no separate paper mode — demo terminal = simulated execution.
+- Preview with `--dry-run true` before live sends.
 
-Use read-only commands for research and reserve execution commands for intentional account operations:
-
-| Safer Research Commands | Live Execution Commands |
-|-------------------------|-------------------------|
+| Safer research | Live execution |
+|----------------|----------------|
 | `symbols_*`, `market_*`, `data_fetch_*` | `trade_place` |
 | `forecast_*`, `regime_detect`, `patterns_detect` | `trade_modify` |
 | `report_generate`, `trade_risk_analyze`, `trade_get_*` | `trade_close` |
 
-`trade_place`, `trade_modify`, and `trade_close` all default to `dry_run=false`,
-so they execute live unless you pass `--dry-run true` to preview. Bulk closes
-still require `--close-all` and explicit confirmation.
-The CLI expects boolean values as `true` or `false`.
+`trade_place`, `trade_modify`, and `trade_close` default to **preview mode** (`dry_run=true`). Set `--dry-run false` explicitly for a live request. Bulk closes still require `--close-all` and explicit confirmation. Booleans on the CLI are `true` / `false`.
 
-## Getting Help
+Full runbook: [TRADING_SAFETY.md](TRADING_SAFETY.md).
 
-**List all commands:**
+## Getting help
+
 ```bash
+# List all commands
 mtdata-cli --help
-```
 
-**Search for commands by topic:**
-```bash
+# Search by topic
 mtdata-cli --help forecast
 mtdata-cli --help barrier
 mtdata-cli --help regime
-```
 
-**Get help for a specific command:**
-```bash
+# Help for one command
 mtdata-cli forecast_generate --help
 mtdata-cli regime_detect --help
-```
 
-**Discover tools programmatically:**
-```bash
-mtdata-cli tools_list --category forecast --json   # filter/paginate the tool catalog
+# Tool catalog (filter / paginate)
+mtdata-cli tools_list --category forecast --json
 ```
 
 ---
 
-## Output Contract
+## Output contract
 
-Every tool returns the same canonical payload; the transport only adapts presentation. For the full response envelope — the `success`/error structure, `detail` levels, `extras` sections, pagination, and error codes — see [OUTPUT.md](OUTPUT.md).
+Every tool returns the **same canonical payload**; CLI, MCP, and Web API only change presentation. For the full envelope (`success` / error, `detail`, `extras`, pagination, error codes), see [OUTPUT.md](OUTPUT.md).
 
 ### TOON (Default)
 Human-readable compact TOON output:
@@ -171,6 +179,11 @@ mtdata-cli data_fetch_ticks EURUSD --limit 20000 \
   --simplify rdp --simplify-params "points=2000"
 ```
 
+Tick rows preserve MT5 snapshot fields: `bid`, `ask`, `last`, `volume`,
+`volume_real`, and `flags`. The volume fields describe the current last trade,
+not a row-level tick count; use `flags` to identify trade-change events. Candle
+rows continue to use `tick_volume` for the broker's per-bar tick count.
+
 See [SIMPLIFICATION.md](SIMPLIFICATION.md) for algorithms and parameters.
 
 ### Method Parameters
@@ -211,7 +224,7 @@ mtdata-cli data_fetch_candles EURUSD --start "2025-12-01" --end "2025-12-31"
 | `market_ticker` | Get current bid/ask/spread snapshot |
 | `market_snapshot` | Unified pre-trade snapshot (quote, levels, patterns; optional regime/forecast sections) |
 | `market_status` | Get market trading hours and session status |
-| `wait_event` | Stream real-time market events |
+| `wait_event` | **Blocking:** wait up to 15 seconds by default for a market event; set an explicit longer timeout on persistent transports |
 
 ### Forecasting
 | Command | Description |
@@ -520,8 +533,8 @@ mtdata-cli trade_place BTCUSD --volume 0.01 --order-type BUY \
 For account-level safety, configure trade guardrails in [ENV_VARS.md](ENV_VARS.md#trade-guardrails) before moving from preview to live execution.
 
 ### Close or Modify Positions
-Use exact tickets whenever possible. Because `trade_close` defaults to live
-execution, pass `--dry-run true` explicitly when previewing a close:
+Use exact tickets whenever possible. `trade_close` defaults to preview mode;
+set `--dry-run false` explicitly only when you intend a live close:
 
 ```bash
 mtdata-cli trade_get_open --json

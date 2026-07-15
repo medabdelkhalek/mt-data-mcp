@@ -4,6 +4,8 @@ import logging
 import math
 from typing import Any, Dict, Optional
 
+from ...shared.constants import BROKER_VOLUME_UNIT
+from ...utils.coercion import round_finite
 from .._mcp_instance import mcp
 from ..execution_logging import run_logged_operation
 from ..market_depth import market_ticker
@@ -16,6 +18,7 @@ from .requests import (
     TradeGetPendingRequest,
     TradeSessionContextRequest,
 )
+from .safety import assess_margin_stress
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +95,8 @@ def _price_precision_from_quote(quote: Any) -> int:
 
 
 def _round_trade_session_price(value: Any, *, digits: int) -> Any:
-    try:
-        numeric = float(value)
-    except Exception:
-        return value
-    if not math.isfinite(numeric):
-        return value
-    return float(round(numeric, max(0, int(digits))))
+    rounded = round_finite(value, digits, on_invalid="passthrough")
+    return float(rounded) if isinstance(rounded, (int, float)) and not isinstance(rounded, bool) else rounded
 
 
 def _round_trade_session_prices(value: Any, *, digits: int, key: Optional[str] = None) -> Any:
@@ -147,10 +145,21 @@ def _build_trade_ready(
 ) -> Dict[str, Any]:
     blockers: list[str] = []
     margin_free = None
+    margin_level = None
+    margin_utilization_pct = None
     if not isinstance(account, dict) or account.get("error") not in (None, ""):
         blockers.append("account_unavailable")
     else:
+        margin_stress = assess_margin_stress(account)
         margin_free = account.get("margin_free")
+        margin_level = account.get("margin_level")
+        try:
+            margin = float(account.get("margin"))
+            equity = float(account.get("equity"))
+            if math.isfinite(margin) and math.isfinite(equity) and equity > 0:
+                margin_utilization_pct = round((margin / equity) * 100.0, 2)
+        except Exception:
+            margin_utilization_pct = None
         if account.get("execution_ready") is False:
             blockers.append("account_execution_not_ready")
         execution_blockers = account.get("execution_blockers")
@@ -161,9 +170,13 @@ def _build_trade_ready(
                 blockers.append("no_free_margin")
         except Exception:
             pass
+        if margin_stress["status"] == "critical":
+            blockers.append("critical_margin_stress")
 
     if not isinstance(quote, dict) or quote.get("error") not in (None, ""):
         blockers.append("quote_unavailable")
+    elif quote.get("usable_for_live_trading") is False:
+        blockers.append("quote_not_live")
     elif bool(quote.get("data_stale")):
         blockers.append("quote_stale")
 
@@ -181,11 +194,19 @@ def _build_trade_ready(
     except Exception:
         margin_sufficient = None
     result = {
-        "can_trade": not deduped_blockers,
+        "execution_preconditions_met": not deduped_blockers,
         "any_blockers": bool(deduped_blockers),
         "blockers": deduped_blockers,
         "margin_sufficient_for_min_lot": margin_sufficient,
+        "readiness_scope": "connectivity_account_quote_and_symbol_not_portfolio_risk_approval",
+        "portfolio_risk_assessed": False,
     }
+    if isinstance(account, dict) and account.get("error") in (None, ""):
+        result["margin_stress"] = assess_margin_stress(account)
+    if margin_level not in (None, ""):
+        result["margin_level"] = margin_level
+    if margin_utilization_pct is not None:
+        result["margin_utilization_pct"] = margin_utilization_pct
     if can_open_new_positions is not None:
         result["can_open_new_positions"] = can_open_new_positions
     return result
@@ -225,15 +246,24 @@ def _build_quote_quality(quote: Any) -> Dict[str, Any]:
         }
     age_seconds = quote.get("data_age_seconds")
     stale = bool(quote.get("data_stale"))
-    status = "stale" if stale else "reliable"
+    execution_usable = quote.get("usable_for_live_trading") is True
+    status = "stale" if stale else "live" if execution_usable else "recent"
     out: Dict[str, Any] = {
         "status": status,
-        "is_live": not stale,
+        "is_live": execution_usable,
         "data_stale": stale,
     }
     if age_seconds not in (None, ""):
         out["age_seconds"] = age_seconds
-    for key in ("freshness", "market_status", "timezone", "time"):
+    for key in (
+        "freshness",
+        "freshness_state",
+        "usable_for_live_trading",
+        "live_max_age_seconds",
+        "market_status",
+        "timezone",
+        "time",
+    ):
         value = quote.get(key)
         if value not in (None, ""):
             out[key] = value
@@ -243,11 +273,23 @@ def _build_quote_quality(quote: Any) -> Dict[str, Any]:
     return out
 
 
+def _is_empty_trade_session_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def _compact_trade_session_items(
     section: Any,
     *,
     field_map: tuple[tuple[str, ...], ...],
+    is_empty=None,
 ) -> Optional[list[Dict[str, Any]]]:
+    """Project trade-session list sections onto a compact field map.
+
+    ``is_empty`` defaults to rejecting ``None`` and blank strings. CLI callers
+    may pass a stricter emptiness check.
+    """
+    if is_empty is None:
+        is_empty = _is_empty_trade_session_value
     if not isinstance(section, dict):
         return None
     items = section.get("items")
@@ -261,7 +303,7 @@ def _compact_trade_session_items(
         compact: Dict[str, Any] = {}
         for out_key, *input_keys in field_map:
             for input_key in input_keys:
-                if input_key in item and item.get(input_key) not in (None, ""):
+                if input_key in item and not is_empty(item.get(input_key)):
                     compact[out_key] = item.get(input_key)
                     break
         if compact:
@@ -306,6 +348,10 @@ def _compact_trade_session_context_payload(payload: Dict[str, Any]) -> Dict[str,
                     "margin_level",
                     "currency",
                     "leverage",
+                    "account_type",
+                    "is_demo",
+                    "is_live",
+                    "server",
                 )
                 if account.get(key) not in (None, "")
             }
@@ -341,6 +387,10 @@ def _compact_trade_session_context_payload(payload: Dict[str, Any]) -> Dict[str,
                     "data_age_seconds",
                     "data_age",
                     "data_stale",
+                    "freshness_state",
+                    "usable_for_live_trading",
+                    "usable_for_live_trading_basis",
+                    "live_max_age_seconds",
                     "stale_warning",
                     "warning",
                 )
@@ -377,6 +427,7 @@ def _compact_trade_session_context_payload(payload: Dict[str, Any]) -> Dict[str,
                         "current_price",
                         "Current Price",
                     ),
+                    ("price_current_basis", "price_current_basis"),
                     ("sl", "sl", "SL"),
                     ("tp", "tp", "TP"),
                     ("profit", "profit", "Profit"),
@@ -391,7 +442,7 @@ def _compact_trade_session_context_payload(payload: Dict[str, Any]) -> Dict[str,
                 compact["open_positions"] = []
             compact["open_positions_count"] = int(open_positions.get("count") or 0)
             if compact["open_positions_count"] > 0:
-                volume_units["volume"] = "lots"
+                volume_units["volume"] = BROKER_VOLUME_UNIT
 
     pending_orders = payload.get("pending_orders")
     if isinstance(pending_orders, dict):
@@ -433,6 +484,7 @@ def _compact_trade_session_context_payload(payload: Dict[str, Any]) -> Dict[str,
                         "current_price",
                         "Current Price",
                     ),
+                    ("price_current_basis", "price_current_basis"),
                     ("sl", "sl", "SL"),
                     ("tp", "tp", "TP"),
                     ("comment", "comment", "Comments"),
@@ -446,7 +498,7 @@ def _compact_trade_session_context_payload(payload: Dict[str, Any]) -> Dict[str,
                 compact["pending_orders"] = []
             compact["pending_orders_count"] = int(pending_orders.get("count") or 0)
             if compact["pending_orders_count"] > 0:
-                volume_units["volume"] = "lots"
+                volume_units["volume"] = BROKER_VOLUME_UNIT
 
     if volume_units:
         compact["units"] = volume_units

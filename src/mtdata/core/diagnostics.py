@@ -85,6 +85,36 @@ def _seasonality_signal_quality(score: float, acf: float, spectral_strength: flo
     return "strong"
 
 
+def _seasonality_period_context(period_bars: int, timeframe: str) -> Dict[str, Any]:
+    seconds_per_bar = int(TIMEFRAME_SECONDS.get(str(timeframe).upper(), 0) or 0)
+    duration_seconds = max(0, int(period_bars) * seconds_per_bar)
+    if duration_seconds <= 0:
+        return {}
+    if duration_seconds % 86_400 == 0:
+        duration = f"{duration_seconds // 86_400:g} days"
+    elif duration_seconds >= 86_400:
+        duration = f"{duration_seconds / 86_400:.2f} days"
+    elif duration_seconds % 3_600 == 0:
+        duration = f"{duration_seconds // 3_600:g} hours"
+    elif duration_seconds >= 3_600:
+        duration = f"{duration_seconds / 3_600:.2f} hours"
+    else:
+        duration = f"{duration_seconds / 60:g} minutes"
+    aliases = {
+        86_400: "calendar_day",
+        604_800: "calendar_week",
+        2_592_000: "30_day_month",
+    }
+    nearest = min(aliases, key=lambda value: abs(value - duration_seconds))
+    out: Dict[str, Any] = {
+        "period_duration": duration,
+        "period_duration_seconds": duration_seconds,
+    }
+    if abs(nearest - duration_seconds) / nearest <= 0.05:
+        out["calendar_alias"] = aliases[nearest]
+    return out
+
+
 def _critical_values(values: Any) -> Dict[str, float]:
     if not isinstance(values, dict):
         return {}
@@ -325,6 +355,7 @@ def seasonality_detect(
             spectral_rounded = round(spectral_strength, 6)
             row: Dict[str, Any] = {
                 "period_bars": int(period),
+                **_seasonality_period_context(int(period), timeframe),
                 "score": score_rounded,
                 "acf": acf_rounded,
                 "spectral_strength": spectral_rounded,
@@ -416,7 +447,7 @@ def outliers_detect(
     symbol: str,
     timeframe: TimeframeLiteral = "H1",
     lookback: int = 500,
-    fields: str = "return,volume,range",
+    score_fields: str = "return,volume,range",
     method: Literal["mad", "iqr", "zscore"] = "mad",
     threshold: float = 3.5,
     limit: int = 50,
@@ -427,10 +458,19 @@ def outliers_detect(
     def _run() -> Dict[str, Any]:
         if int(lookback) < 20 or int(limit) < 1 or float(threshold) <= 0:
             return {"error": "lookback >= 20, limit >= 1, and threshold > 0 are required."}
-        requested = [part.strip().lower() for part in str(fields or "").split(",") if part.strip()]
+        requested = [
+            part.strip().lower()
+            for part in str(score_fields or "").split(",")
+            if part.strip()
+        ]
         requested = list(dict.fromkeys(requested))
         if not requested or any(field not in {"return", "volume", "range"} for field in requested):
-            return {"error": "fields must contain one or more of: return, volume, range."}
+            return {
+                "error": (
+                    "score_fields must contain one or more of: "
+                    "return, volume, range."
+                )
+            }
         gateway = create_mt5_gateway(adapter=mt5, ensure_connection_impl=ensure_mt5_connection_or_raise)
         gateway.ensure_connection()
         frame, fetch_error = _fetch_diagnostic_bars(symbol, timeframe, int(lookback))
@@ -586,6 +626,14 @@ def volatility_term_structure(
                 {
                     "horizon_bars": int(horizon),
                     "current_volatility": round(current, 8),
+                    "per_bar_volatility": round(current / factor, 8),
+                    "stability": (
+                        "very_low"
+                        if horizon < 5
+                        else "low"
+                        if horizon < 10
+                        else "moderate"
+                    ),
                     "percentile_rank": round(percentile_rank, 2),
                     "cone": cone,
                     "samples": int(len(distribution)),
@@ -598,16 +646,19 @@ def volatility_term_structure(
             "symbol": symbol,
             "timeframe": timeframe,
             "annualized": bool(annualize),
+            "analysis_kind": "historical_realized_volatility_cones",
+            "comparable_to_options_iv": False,
             "unit": "annualized_decimal_volatility" if annualize else "per_bar_decimal_volatility",
             "unit_note": (
                 "Volatility values are decimal return fractions; 0.01 means 1%."
             ),
             "units": {
                 "current_volatility": "decimal_return_fraction",
+                "per_bar_volatility": "per_bar_decimal_return_fraction",
                 "cone": "decimal_return_fraction",
                 "percentile_rank": "percentage_points (0-100)",
             },
-            "cone_methodology": "percentiles of the historical distribution of rolling realized volatility at each horizon; percentile_rank shows where current vol sits in that distribution",
+            "cone_methodology": "percentiles of the historical distribution of rolling realized volatility at each horizon; percentile_rank shows where current vol sits in that distribution; short horizons are sampling-noisy and this is not an options implied-volatility term structure",
             "items": rows,
             "count": len(rows),
         }

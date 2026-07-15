@@ -6,19 +6,14 @@ from typing import Any, Dict, List, Literal, Optional
 import numpy as np
 import pandas as pd
 
-from ..services.data_service import (
-    _is_last_bar_forming,
-    _resolve_live_rate_auto_shift_seconds,
-    _shift_rate_times,
-)
+from ..services.data_service import _is_last_bar_forming
 from ..shared.constants import SANITY_BARS_TOLERANCE, TIMEFRAME_MAP, TIMEFRAME_SECONDS
-from ..shared.schema import DetailLiteral, DenoiseSpec, TimeframeLiteral
-from ..shared.symbols import is_probably_crypto_symbol, is_probably_forex_symbol
+from ..shared.schema import DenoiseSpec, DetailLiteral, TimeframeLiteral
 from ..shared.validators import (
     invalid_timeframe_error,
     unsupported_timeframe_seconds_error,
 )
-from ..utils.denoise import _apply_denoise
+from ..utils.denoise import apply_denoise
 from ..utils.denoise import normalize_denoise_spec as _normalize_denoise_spec
 from ..utils.freshness import (
     closed_session_context,
@@ -34,7 +29,7 @@ from ..utils.mt5 import (
 from ..utils.time import _format_time_minimal
 from ..utils.utils import _parse_start_datetime, parse_kv_or_json
 from .common import (
-    bars_per_year as _bars_per_year,
+    annualization_context as _annualization_context,
 )
 from .common import (
     default_seasonality as _default_seasonality_period,
@@ -447,31 +442,28 @@ def _ewma_param_explanations(lambda_source: str) -> Dict[str, str]:
 
 
 def _annualize_horizon_sigma(
-    horizon_sigma_return: float,
+    horizon_volatility: float,
     bars_per_year: float,
     horizon: int,
 ) -> float:
     """Express the horizon-scaled sigma on the annualized return scale."""
     horizon_bars = max(1, int(horizon))
-    return float(horizon_sigma_return * math.sqrt(bars_per_year / horizon_bars))
+    return float(horizon_volatility * math.sqrt(bars_per_year / horizon_bars))
 
 
-def _volatility_annualization_context(symbol: str, timeframe: str) -> tuple[float, str]:
-    timeframe_name = str(timeframe or "").strip().upper()
-    if is_probably_crypto_symbol(symbol):
-        seconds = TIMEFRAME_SECONDS.get(timeframe_name)
-        try:
-            seconds_value = float(seconds)
-        except (TypeError, ValueError):
-            seconds_value = 0.0
-        if math.isfinite(seconds_value) and seconds_value > 0.0:
-            return (
-                float((365.0 * 24.0 * 60.0 * 60.0) / seconds_value),
-                "365_calendar_days_24h_crypto",
-            )
-    if is_probably_forex_symbol(symbol):
-        return float(_bars_per_year(timeframe_name, symbol)), "260_fx_weekdays_24h"
-    return float(_bars_per_year(timeframe_name, symbol)), "252_trading_days_generic_session"
+def _volatility_annualization_context(
+    symbol: str,
+    timeframe: str,
+    *,
+    observed_times: Any = None,
+    observed_timeframe: Optional[str] = None,
+) -> tuple[float, str]:
+    return _annualization_context(
+        timeframe,
+        symbol,
+        observed_times=observed_times,
+        observed_timeframe=observed_timeframe,
+    )
 
 
 def _volatility_input_context(
@@ -558,7 +550,8 @@ def _volatility_input_context(
     )
     if closed_session:
         out.update(closed_session)
-    out["usable_for_live_trading"] = not bool(out.get("data_stale")) and not bool(closed_session)
+    history_policy_ok = not bool(out.get("data_stale")) and not bool(closed_session)
+    out["history_policy_ok"] = history_policy_ok
     freshness = format_freshness_label(
         data_stale=out.get("data_stale"),
         market_status=(
@@ -589,10 +582,13 @@ def _finalize_volatility_with_context(
     returns_used: int,
     live_window: bool,
     detail: str,
+    data_timeframe: Optional[str] = None,
 ) -> Dict[str, Any]:
     annualization_bars, annualization_basis = _volatility_annualization_context(
         symbol,
         timeframe,
+        observed_times=df.get("time"),
+        observed_timeframe=data_timeframe or timeframe,
     )
     if math.isfinite(annualization_bars) and annualization_bars > 0:
         payload.setdefault("bars_per_year", round(annualization_bars, 4))
@@ -601,7 +597,7 @@ def _finalize_volatility_with_context(
         _volatility_input_context(
             df,
             symbol=symbol,
-            timeframe=timeframe,
+            timeframe=data_timeframe or timeframe,
             returns_used=returns_used,
             live_window=live_window,
             horizon=int(payload.get("horizon", 1) or 1),
@@ -615,23 +611,12 @@ def _finalize_volatility_output(
     *,
     detail: str = "full",
 ) -> Dict[str, Any]:
-    """Add trader-friendly volatility aliases and explanatory metadata."""
+    """Add explanatory metadata to canonical volatility output."""
     if not isinstance(payload, dict) or not payload.get("success"):
         return payload
 
     out = dict(payload)
     detail_mode = str(detail or "compact").strip().lower()
-    # One-way migration for residual legacy keys; emit trader keys only.
-    for legacy_key, trader_key in (
-        ("sigma_bar_return", "volatility_per_bar"),
-        ("sigma_annual_return", "volatility_annualized"),
-        ("horizon_sigma_return", "volatility_horizon"),
-        ("horizon_sigma_annual", "volatility_horizon_annualized"),
-    ):
-        legacy_value = out.get(legacy_key)
-        if out.get(trader_key) is None and legacy_value is not None:
-            out[trader_key] = legacy_value
-        out.pop(legacy_key, None)
     out.setdefault("volatility_unit", "return_fraction")
     out.setdefault("volatility_measure", "standard_deviation_of_returns")
     out.setdefault(
@@ -782,16 +767,6 @@ def _fetch_mt5_rates_guarded(
         else:
             server_now_dt = datetime.now(timezone.utc)
         rates = _mt5_copy_rates_from(symbol, mt5_timeframe, server_now_dt, count)
-        timeframe_name = str(timeframe).upper().strip() if timeframe is not None else None
-        if timeframe_name:
-            auto_shift_seconds = _resolve_live_rate_auto_shift_seconds(
-                symbol=symbol,
-                timeframe=timeframe_name,
-                start_datetime=None,
-                end_datetime=None,
-            )
-            if auto_shift_seconds:
-                rates = _shift_rate_times(rates, auto_shift_seconds)
         return rates, None
     finally:
         if was_visible is False:
@@ -990,6 +965,8 @@ def forecast_volatility(  # noqa: C901
                             "market_status_reason",
                             "market_status_source",
                             "note",
+                            "bars_per_year",
+                            "annualization_basis",
                         )
                         if result.get(key) is not None
                     }
@@ -1008,25 +985,32 @@ def forecast_volatility(  # noqa: C901
                         return float(np.sum(values * weights) / total)
                 return float(np.mean(values))
 
-            bpy = annualization_bars_per_year
-            sigma_bar_return = _aggregate_metric('volatility_per_bar')
-            horizon_sigma_return = _aggregate_metric('volatility_horizon')
+            try:
+                bpy = float((first_component_context or {}).get("bars_per_year"))
+            except (TypeError, ValueError):
+                bpy = annualization_bars_per_year
+            component_annualization_basis = str(
+                (first_component_context or {}).get("annualization_basis")
+                or annualization_basis
+            )
+            volatility_per_bar = _aggregate_metric('volatility_per_bar')
+            volatility_horizon = _aggregate_metric('volatility_horizon')
             out: Dict[str, Any] = {
                 "success": True,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "method": "ensemble",
                 "horizon": int(horizon),
-                "volatility_per_bar": sigma_bar_return,
-                "volatility_annualized": float(sigma_bar_return * math.sqrt(bpy)),
-                "volatility_horizon": horizon_sigma_return,
+                "volatility_per_bar": volatility_per_bar,
+                "volatility_annualized": float(volatility_per_bar * math.sqrt(bpy)),
+                "volatility_horizon": volatility_horizon,
                 "volatility_horizon_annualized": _annualize_horizon_sigma(
-                    horizon_sigma_return,
+                    volatility_horizon,
                     bpy,
                     int(horizon),
                 ),
                 "bars_per_year": round(bpy, 4),
-                "annualization_basis": annualization_basis,
+                "annualization_basis": component_annualization_basis,
                 "params_used": {
                     "methods": base_methods,
                     "aggregator": aggregator,
@@ -1072,8 +1056,13 @@ def forecast_volatility(  # noqa: C901
             )
             if len(df) < 5:
                 return {"error": "Not enough closed bars"}
+            bpy, _ = _volatility_annualization_context(
+                symbol,
+                timeframe,
+                observed_times=df.get("time"),
+            )
             if denoise:
-                _apply_denoise(df, denoise, default_when='pre_ti')
+                apply_denoise(df, denoise, default_when='pre_ti')
             r = _log_returns_from_prices(df['close'].astype(float).to_numpy())
             r = r[np.isfinite(r)]
             if r.size < 10:
@@ -1221,7 +1210,6 @@ def forecast_volatility(  # noqa: C901
             hsig = float(math.sqrt(np.sum(sig[:fh]**2)))
             # Root-mean-square forecast sigma per modeled horizon step.
             sbar = float(hsig / math.sqrt(max(1, int(fh))))
-            bpy = annualization_bars_per_year
             return _finalize_volatility_with_context(
                 {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "proxy": proxy_l,
                  "horizon": int(horizon), "volatility_per_bar": sbar, "volatility_annualized": float(sbar*math.sqrt(bpy)),
@@ -1286,9 +1274,15 @@ def forecast_volatility(  # noqa: C901
                 )
                 if dn_spec_used:
                     try:
-                        _apply_denoise(dfrv, dn_spec_used, default_when='pre_ti')
+                        apply_denoise(dfrv, dn_spec_used, default_when='pre_ti')
                     except Exception:
                         pass
+                bpy, _ = _volatility_annualization_context(
+                    symbol,
+                    timeframe,
+                    observed_times=dfrv.get("time"),
+                    observed_timeframe=rv_tf,
+                )
                 c = dfrv['close'].astype(float).to_numpy()
                 if c.size < 10:
                     return {"error": "Insufficient intraday bars for RV"}
@@ -1331,7 +1325,6 @@ def forecast_volatility(  # noqa: C901
                 sbar = float(math.sqrt(rv_next / bars_per_day))
                 h_days = float(int(horizon)) / bars_per_day
                 hsig = float(math.sqrt(rv_next * max(h_days, 0.0)))
-                bpy = annualization_bars_per_year
                 return _finalize_volatility_with_context(
                     {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
                      "volatility_per_bar": sbar, "volatility_annualized": float(sbar*math.sqrt(bpy)),
@@ -1342,10 +1335,11 @@ def forecast_volatility(  # noqa: C901
                      "denoise_used": dn_spec_used},
                     df=dfrv,
                     symbol=symbol,
-                    timeframe=rv_tf,
+                    timeframe=timeframe,
                     returns_used=int(rr.size),
                     live_window=as_of is None and end is None,
                     detail=detail,
+                    data_timeframe=rv_tf,
                 )
             except Exception as ex:
                 return {"error": f"HAR-RV error: {ex}"}
@@ -1385,6 +1379,11 @@ def forecast_volatility(  # noqa: C901
         )
         if len(df) < 3:
             return {"error": "Not enough closed bars"}
+        bpy, _ = _volatility_annualization_context(
+            symbol,
+            timeframe,
+            observed_times=df.get("time"),
+        )
         # Normalize and apply denoise spec (uniform behavior)
         dn_spec_used = None
         if denoise is not None:
@@ -1395,15 +1394,13 @@ def forecast_volatility(  # noqa: C901
             if dn_spec_used:
                 if method_l in {'parkinson','gk','rs','yang_zhang'} and not dn_spec_used.get('columns'):
                     dn_spec_used['columns'] = ['open','high','low','close']
-                _apply_denoise(df, dn_spec_used, default_when='pre_ti')
+                apply_denoise(df, dn_spec_used, default_when='pre_ti')
 
         # Compute returns and helpers
         r = _log_returns_from_prices(df['close'].astype(float).to_numpy())
         r = r[np.isfinite(r)]
         if r.size < 5:
             return {"error": "Insufficient returns to estimate volatility"}
-        bpy = annualization_bars_per_year
-
         if method_l == 'ewma':
             lb = int(p.get('lookback', 1500))
             halflife = p.get('halflife')
@@ -1443,6 +1440,8 @@ def forecast_volatility(  # noqa: C901
 
         if method_l in {'parkinson','gk','rs','yang_zhang','rolling_std'}:
             window = int(p.get('window', 20))
+            if window < 1:
+                return {"error": "window must be at least 1 bar."}
             o = df['open'].astype(float).to_numpy(); h = df['high'].astype(float).to_numpy(); l = df['low'].astype(float).to_numpy(); c = df['close'].astype(float).to_numpy()
             if method_l == 'parkinson':
                 v = _parkinson_sigma_sq(h, l)
@@ -1474,7 +1473,19 @@ def forecast_volatility(  # noqa: C901
                     .var(ddof=0)
                     .to_numpy()
                 )
-            sigma2 = float(v[-1]) if np.isfinite(v[-1]) else float(np.nanmean(v[-window:]))
+            if method_l in {'parkinson', 'gk', 'rs'}:
+                range_tail = np.asarray(v[-window:], dtype=float)
+                finite_tail = range_tail[np.isfinite(range_tail)]
+                if finite_tail.size < window:
+                    return {
+                        "error": (
+                            f"{method_l} requires {window} finite range observations; "
+                            f"only {finite_tail.size} are available."
+                        )
+                    }
+                sigma2 = float(np.mean(finite_tail))
+            else:
+                sigma2 = float(v[-1]) if np.isfinite(v[-1]) else float(np.nanmean(v[-window:]))
             sbar = math.sqrt(max(0.0, sigma2))
             hsig = float(sbar * math.sqrt(max(1, int(horizon))))
             return _finalize_volatility_with_context(
@@ -1584,3 +1595,4 @@ def forecast_volatility(  # noqa: C901
         return {"error": f"Unsupported direct volatility method: {method_l}"}
     except Exception as e:
         return {"error": f"Error computing volatility forecast: {str(e)}"}
+

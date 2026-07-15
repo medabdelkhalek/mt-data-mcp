@@ -1,19 +1,19 @@
-# Pattern Detection & Similarity Search
+# Pattern detection and similarity search
 
-This document covers two related capabilities:
-1. **Pattern Detection:** Identify known candlestick and chart patterns
-2. **Analog Forecasting:** Find historical windows similar to the current market
+Two related ideas:
 
-**Related:**
-- [../FORECAST.md](../FORECAST.md) — Price forecasting
-- [../TECHNICAL_INDICATORS.md](../TECHNICAL_INDICATORS.md) — Technical analysis context
-- [../GLOSSARY.md](../GLOSSARY.md) — Term definitions
+1. **Pattern detection** — flag known candlestick and chart shapes
+2. **Analog / similarity search** — find historical windows that look like *now*, then study what happened next
+
+Use patterns as **context**, not automatic entry rules. Confirm with regime, volatility, and risk tools.
+
+**Related:** [Forecasting](../FORECAST.md) · [Indicators](../TECHNICAL_INDICATORS.md) · [Glossary](../GLOSSARY.md) · [Levels](../LEVELS.md)
 
 ---
 
-## Pattern Detection (`patterns_detect`)
+## Pattern detection (`patterns_detect`)
 
-Identifies specific visual patterns that traders use for entry/exit signals.
+Identifies visual patterns traders often watch for structure and timing context.
 
 ### Candlestick Patterns
 
@@ -32,7 +32,7 @@ data[29]{time,pattern}:
     ...
 ```
 
-**Filter to robust patterns only:**
+**Filter to the curated robust pattern subset:**
 ```bash
 mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true
 ```
@@ -139,15 +139,16 @@ use `--include-completed true` to include broken levels as well.
 |-----------|---------|-------------|
 | `--mode` | `candlestick` | Pattern type: all, candlestick, classic, harmonic, fractal, elliott |
 | `--limit` | 150 | Bars to analyze |
-| `--robust-only` | false | Only return high-confidence candlestick patterns. Pass `true` to filter to the robust subset. |
+| `--robust-only` | false | Restrict detection to a curated subset of established multi-bar candlestick types. This is a name preset, not a confidence threshold. |
 | `--whitelist` | — | Comma-separated list of specific patterns |
 | `--min-strength` | 0.70 | Minimum semantic candlestick conviction score (0.0-1.0) |
 | `--config` | — | Detector-specific overrides. Fractals support `left_bars`, `right_bars`, `breakout_basis`, `min_prominence_pct`, and `confidence_prominence_cap_pct`. Harmonics support `pattern_types`, `ratio_tolerance`, `min_confidence`, and pivot controls. |
 
 Pattern names listed in this guide describe detector coverage, not a promise
 that every pattern is returned at the default threshold. `robust_only=true`
-further restricts candlesticks to the robust subset; lower-strength and
-deprioritized formations such as many dojis may be absent by default.
+restricts which candlestick methods run based on pattern name, while
+`min_strength` independently filters their conviction scores. Lower-strength
+and deprioritized formations such as many dojis may be absent by default.
 
 ### Filtering Patterns
 
@@ -165,7 +166,7 @@ mtdata-cli patterns_detect EURUSD --mode candlestick \
 
 **By confidence:**
 ```bash
-mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true
+mtdata-cli patterns_detect EURUSD --mode candlestick --min-strength 0.85
 ```
 
 ---
@@ -324,7 +325,7 @@ data[5]{time,pattern}:
 | Task | Command |
 |------|---------|
 | Candlestick patterns | `mtdata-cli patterns_detect EURUSD --mode candlestick` |
-| Robust patterns only | `mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true` |
+| Curated candlestick subset | `mtdata-cli patterns_detect EURUSD --mode candlestick --robust-only true` |
 | Chart patterns | `mtdata-cli patterns_detect EURUSD --mode classic` |
 | Harmonic patterns | `mtdata-cli patterns_detect EURUSD --mode harmonic` |
 | Fractal levels and breakouts | `mtdata-cli patterns_detect EURUSD --mode fractal` |
@@ -338,4 +339,3 @@ data[5]{time,pattern}:
 - [../FORECAST.md](../FORECAST.md) — Price forecasting overview
 - [../TECHNICAL_INDICATORS.md](../TECHNICAL_INDICATORS.md) — Technical indicators
 - [../GLOSSARY.md](../GLOSSARY.md) — Term definitions
-

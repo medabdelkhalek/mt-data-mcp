@@ -1,13 +1,46 @@
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional
+import logging
+from typing import Any, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.signal import find_peaks
 
 from ..shared.constants import TIMEFRAME_SECONDS
-from ..shared.symbols import FIAT_CURRENCY_CODES, is_probably_crypto_symbol
+from ..shared.symbols import is_probably_crypto_symbol, is_probably_forex_symbol
+from ..utils.utils import to_float_np
+
+
+def compute_atr_sma(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int,
+) -> np.ndarray:
+    """SMA of true range over ``period`` (min_periods = max(2, period//2))."""
+    h = np.asarray(high, dtype=float)
+    l = np.asarray(low, dtype=float)
+    c = np.asarray(close, dtype=float)
+    n = min(h.size, l.size, c.size)
+    if n <= 0:
+        return np.asarray([], dtype=float)
+    h = h[:n]
+    l = l[:n]
+    c = c[:n]
+    prev_c = np.concatenate(([c[0]], c[:-1]))
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+    win = max(2, int(period))
+    try:
+        return (
+            pd.Series(tr)
+            .rolling(win, min_periods=max(2, win // 2))
+            .mean()
+            .to_numpy(dtype=float)
+        )
+    except (TypeError, ValueError):
+        return tr.astype(float)
 
 
 def fallback_local_extrema(
@@ -84,6 +117,143 @@ def fallback_local_extrema(
     return np.asarray(reduced, dtype=int)
 
 
+def compute_pivot_thresholds(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    cfg: Any,
+) -> Tuple[float, int]:
+    """ATR-adaptive prominence/distance for pivot extraction.
+
+    ``cfg`` is duck-typed (Classic/Harmonic detector configs share these fields).
+    """
+    x = np.asarray(close, dtype=float)
+    finite = x[np.isfinite(x)]
+    base = float(np.median(finite)) if finite.size else 0.0
+    if not np.isfinite(base) or abs(base) <= 1e-12:
+        base = float(np.mean(finite)) if finite.size else 1.0
+    prom_abs = abs(base) * (float(getattr(cfg, "min_prominence_pct", 0.5)) / 100.0)
+    min_dist = max(2, int(getattr(cfg, "min_distance", 5)))
+
+    use_prom = bool(getattr(cfg, "pivot_use_atr_adaptive_prominence", False))
+    use_dist = bool(getattr(cfg, "pivot_use_atr_adaptive_distance", False))
+    if use_prom or use_dist:
+        atr = compute_atr_sma(high, low, x, int(getattr(cfg, "pivot_atr_period", 14)))
+        finite_atr = atr[np.isfinite(atr) & (atr > 0.0)]
+        if finite_atr.size > 0:
+            atr_med = float(np.median(finite_atr))
+            if use_prom:
+                prom_abs = max(
+                    prom_abs,
+                    float(getattr(cfg, "pivot_atr_prominence_mult", 1.0)) * atr_med,
+                )
+            if use_dist and abs(base) > 1e-12:
+                atr_pct = abs(atr_med / base) * 100.0
+                dist_mult = float(getattr(cfg, "pivot_atr_distance_mult", 0.0))
+                scale = 1.0 + max(0.0, dist_mult) * atr_pct
+                max_scale = float(max(1.0, getattr(cfg, "pivot_max_distance_scale", 3.0)))
+                scale = min(max_scale, max(1.0, scale))
+                base_dist = float(getattr(cfg, "min_distance", 5))
+                min_dist = max(2, int(round(base_dist * scale)))
+    return float(max(1e-12, prom_abs)), int(min_dist)
+
+
+def detect_pivots(
+    close: np.ndarray,
+    cfg: Any,
+    high: Optional[np.ndarray] = None,
+    low: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return peak and trough indices using close or optional high/low arrays."""
+    x = np.asarray(close, dtype=float)
+    if x.size < max(5, int(getattr(cfg, "min_distance", 5)) * 3):
+        return np.asarray([], dtype=int), np.asarray([], dtype=int)
+
+    hi = np.asarray(high, dtype=float) if high is not None else x
+    lo = np.asarray(low, dtype=float) if low is not None else x
+    if hi.size != x.size or not np.isfinite(hi).all():
+        hi = x
+    if lo.size != x.size or not np.isfinite(lo).all():
+        lo = x
+
+    prom_abs, min_dist = compute_pivot_thresholds(x, hi, lo, cfg)
+    src_hi = hi if bool(getattr(cfg, "pivot_use_hl", True)) else x
+    src_lo = lo if bool(getattr(cfg, "pivot_use_hl", True)) else x
+    try:
+        peaks, _ = find_peaks(src_hi, prominence=prom_abs, distance=min_dist)
+        troughs, _ = find_peaks(-src_lo, prominence=prom_abs, distance=min_dist)
+    except ValueError:
+        return np.asarray([], dtype=int), np.asarray([], dtype=int)
+
+    if bool(getattr(cfg, "pivot_enable_fallback", True)):
+        min_peaks = int(max(0, getattr(cfg, "pivot_fallback_min_peaks", 2)))
+        min_troughs = int(max(0, getattr(cfg, "pivot_fallback_min_troughs", 2)))
+        order = max(1, int(getattr(cfg, "pivot_fallback_order", 2)))
+        if int(peaks.size) < min_peaks:
+            peaks = fallback_local_extrema(src_hi, min_dist, order, prefer_high=True)
+        if int(troughs.size) < min_troughs:
+            troughs = fallback_local_extrema(src_lo, min_dist, order, prefer_high=False)
+    return peaks.astype(int), troughs.astype(int)
+
+
+def prepare_ohlc_pattern_inputs(
+    df: pd.DataFrame,
+    *,
+    max_bars: int,
+    min_input_bars: int,
+    log_label: str = "Pattern detection",
+    log_extra: str = "",
+    time_mode: Literal["empty", "arange"] = "arange",
+) -> Optional[Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]]:
+    """Slice history and extract close/high/low/time arrays for pattern detectors."""
+    if not isinstance(df, pd.DataFrame) or "close" not in df.columns:
+        return None
+    if len(df) > int(max_bars):
+        df = df.iloc[-int(max_bars) :].copy()
+
+    close = to_float_np(df["close"])
+    used_close_for_high = "high" not in df.columns
+    used_close_for_low = "low" not in df.columns
+    high = to_float_np(df["high"]) if not used_close_for_high else close
+    low = to_float_np(df["low"]) if not used_close_for_low else close
+    if high.size != close.size:
+        used_close_for_high = True
+        high = close
+    if low.size != close.size:
+        used_close_for_low = True
+        low = close
+    if used_close_for_high or used_close_for_low:
+        logging.getLogger(__name__).warning(
+            "%s falling back to close for missing/mismatched "
+            "high/low columns (high_fallback=%s, low_fallback=%s)%s",
+            log_label,
+            used_close_for_high,
+            used_close_for_low,
+            log_extra,
+        )
+
+    n = int(close.size)
+    if n < int(min_input_bars):
+        return None
+
+    if "time" in df.columns:
+        try:
+            times = to_float_np(df["time"])
+        except (TypeError, ValueError):
+            times = np.asarray([], dtype=float)
+        if times.size != n or not np.isfinite(times).any():
+            if time_mode == "arange":
+                times = np.arange(n, dtype=float)
+            else:
+                times = np.asarray([], dtype=float)
+    elif time_mode == "arange":
+        times = np.arange(n, dtype=float)
+    else:
+        times = np.asarray([], dtype=float)
+
+    return df, times, close, high, low, n
+
+
 @dataclass
 class PatternResultBase:
     confidence: float
@@ -119,15 +289,6 @@ def interval_overlap_ratio(a_start: int, a_end: int, b_start: int, b_end: int) -
     if union <= 0:
         return 0.0
     return float(inter) / float(union)
-
-
-def _is_probably_forex_symbol(symbol: Any) -> bool:
-    text = "".join(ch for ch in str(symbol or "").upper().strip() if ch.isalnum())
-    if len(text) < 6:
-        return False
-    base = text[:3]
-    quote = text[3:6]
-    return base in FIAT_CURRENCY_CODES and quote in FIAT_CURRENCY_CODES
 
 
 def _crosses_weekend(start_epoch: float, end_epoch: float) -> bool:
@@ -188,7 +349,7 @@ def data_quality_warnings(
                 if gaps.size > 0 and float(np.nanmax(gaps)) > threshold:
                     expected_weekend_gaps = 0
                     unexpected_gaps = 0
-                    is_fx = _is_probably_forex_symbol(symbol)
+                    is_fx = is_probably_forex_symbol(symbol)
                     is_crypto = is_probably_crypto_symbol(symbol)
                     for idx, gap in enumerate(gaps):
                         if not np.isfinite(gap) or float(gap) <= threshold:

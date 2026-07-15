@@ -1,7 +1,12 @@
-# MT5-Native Advanced Analytics
+# MT5-native advanced analytics
 
-These five read-only tools extend the basic tick, journal, backtest, risk, and
-scanner workflows. They use data from the connected MT5 terminal only.
+Five **read-only** tools that go beyond basic candles and scans: tick microstructure, execution quality, robust strategy evidence, portfolio tail risk, and relative strength — all from the connected MetaTrader 5 terminal (no external market-data vendor required for these).
+
+Use them when you already have a research loop and want **execution-aware** or **portfolio-level** depth.
+
+**Dense terms:** [Microstructure](GLOSSARY.md#microstructure) · [Execution quality](GLOSSARY.md#execution-quality) · [Relative strength](GLOSSARY.md#relative-strength) · [VaR / CVaR](GLOSSARY.md#var-value-at-risk) · [Spread](GLOSSARY.md#spread)
+
+**Related:** [Trading risk](TRADING_RISK.md) · [CLI](CLI.md) · [Example workflow](EXAMPLE.md) · [Glossary](GLOSSARY.md)
 
 ## Tick microstructure
 
@@ -16,6 +21,10 @@ The result identifies the feed as `quote_only`, `trade_ticks`, or
 `trade_volume`. Volume-impact metrics are omitted unless the broker supplies
 enough non-zero real trade volume. Quote pressure is a proxy, not centralized
 FX order flow.
+
+MT5 tick rows are complete snapshots. The analyzer uses the `flags` bitmask to
+identify trade events, so a quote update that repeats the last price and volume
+is not counted as another trade.
 
 ## Execution quality
 

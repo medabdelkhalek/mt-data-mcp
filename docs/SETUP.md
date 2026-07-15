@@ -1,49 +1,47 @@
 # Setup & Configuration
 
-Use this guide to install mtdata, connect it to MetaTrader 5, and verify a safe read-only workflow before enabling any trading actions.
+Get mtdata installed, talking to MetaTrader 5, and through a **safe first workflow** — all before you enable any trading.
 
-**Related:**
-- [README.md](../README.md) — Project overview
-- [ENV_VARS.md](ENV_VARS.md) — Complete environment variables reference
-- [CLI.md](CLI.md) — Command usage
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Common issues
+You do not need every optional dependency on day one. Start lean, confirm candles work, then add forecasting or web extras as you need them.
+
+**Related:** [README](../README.md) · [Env vars](ENV_VARS.md) · [CLI](CLI.md) · [Troubleshooting](TROUBLESHOOTING.md)
 
 ---
 
-> Important: The MetaTrader 5 Python integration is **Windows-only**. If you're on macOS/Linux, run `mtdata` on a Windows VM or Windows machine and connect remotely (MCP/Web API).
+> **Platform:** The MetaTrader 5 Python integration is **Windows-only**. On macOS/Linux, run mtdata on a Windows machine or VM and connect remotely (MCP or Web API).
 
-## Requirements
+## What you need
 
-- **Operating System:** Windows (required for MetaTrader 5)
-- **Python:** 3.14
-- **MetaTrader 5:** Installed and running
-- **Windows Build Tools:** Visual Studio Build Tools 2022 with the **Desktop development with C++** workload for `pip install -r requirements.txt`, Git-backed extras, and optional native accelerators
+| Requirement | Detail |
+|-------------|--------|
+| **OS** | Windows (required for MT5) |
+| **Python** | **3.14** |
+| **MetaTrader 5** | Installed, running, and logged in (demo recommended) |
+| **Build tools** | Visual Studio Build Tools 2022 with **Desktop development with C++** for the full install, Git-backed extras, and optional native builds |
 
----
+## Recommended first run
 
-## Recommended First-Run Path
+1. Install the lean package: `pip install -e .`
+2. Confirm MT5 connectivity: `mtdata-cli symbols_list --limit 10`
+3. Set `CLIENT_TZ=UTC` for deterministic timestamp presentation
+4. Stay **read-only** at first: symbols, candles, forecast, report
+5. Only then try `trade_*` — on a **demo** account, with `--dry-run true` when the command supports it
 
-1. Install the lean package with `pip install -e .`.
-2. Confirm MT5 connectivity with `mtdata-cli symbols_list --limit 10`.
-3. Set broker timezone configuration before relying on timestamps or backtests.
-4. Run read-only examples first: symbols, candles, forecast, and report commands.
-5. Use a demo account and `--dry-run true` before testing any `trade_*` command that supports it.
+### Install path cheatsheet
 
-Choose the smallest install that fits your current task:
-
-| Need | Install Path |
-|------|--------------|
+| Need | Install |
+|------|---------|
 | CLI, MT5 data, indicators, core analysis | `pip install -e .` |
-| Validated local research stack used by most docs | `pip install -r requirements.txt` |
-| Web API / Web UI backend only | `pip install -e .[web]` |
-| Heavy forecasting and optimization extras | `pip install -e .[forecast-classical]` and/or `pip install -e .[forecast-foundation]` |
-| Git-backed experimental integrations | Install the specific Git-backed extra only when needed |
+| Full research stack used by most docs | `pip install -r requirements.txt` |
+| Web API / UI backend only | `pip install -e .[web]` |
+| Heavy forecast extras | `pip install -e .[forecast-classical]` and/or `pip install -e .[forecast-foundation]` |
+| Git-backed experiments (TimesFM, etc.) | Install that extra only when you need it |
 
 ---
 
 ## Installation
 
-### 1. Create an Isolated Conda Environment (Optional but Recommended)
+### 1. Create an isolated conda environment (optional but recommended)
 
 If you use Conda/Miniconda, start with a clean Python 3.14 environment:
 
@@ -72,7 +70,7 @@ pip install -r requirements.txt
 ```
 
 This path intentionally stays on package-index releases. Git-backed add-ons such as TimesFM, `stock-pattern`, and `ycnbc` stay opt-in so the default install does not depend on Git checkouts.
-NeuralForecast-based models are also kept out of this default path; current Windows Python 3.14 resolution can fail on transitive dependencies, so treat `nhits`, `tft`, `patchtst`, and `nbeatsx` as manual/nonstandard setup.
+NeuralForecast-based models are also kept out of this default path: on Windows Python 3.14, `neuralforecast` cannot resolve because its required `ray` dependency does not publish Windows wheels for 3.14 (Ray has cp314 wheels for Linux/macOS only). Treat `nhits`, `tft`, `patchtst`, and `nbeatsx` as manual/nonstandard setup.
 
 ### 4. Optional Dependencies
 
@@ -88,6 +86,8 @@ The base package is intentionally lean. Install extras as needed:
   `pip install -e .[forecast-timesfm]`
 - Web API:
   `pip install -e .[web]`
+- Dimensionality reduction (UMAP):
+  `pip install -e .[dimred-ext]`
 - Experimental pattern engines (Git-backed, requires manual install):
   `pip install -e .[patterns-ext]` (Note: stock-pattern requires manual copy to site-packages; see below)
 - News embeddings (semantic reranking):
@@ -103,18 +103,18 @@ Feature notes:
 
 - Causal discovery (`causal_discover_signals`) and classical ARIMA/ETS: `statsmodels`
 - Wavelet denoising: `PyWavelets`
-- Dimred UMAP (Web UI / analysis): `umap-learn`
+- Dimred UMAP (Web UI / analysis): `umap-learn` via `pip install -e .[dimred-ext]` (also included in `[all]`)
 - Foundation models:
   - Chronos (`chronos2`, `chronos_bolt`): `chronos-forecasting`, `torch`
   - TimesFM (`timesfm`): `timesfm`, `torch` (install with `pip install -e .[forecast-timesfm]`; Git-backed extra)
-  - GluonTS / Lag-Llama are not shipped in mtdata because they are unsupported on the project's Python 3.14 runtime
-- Forecasting libraries: `statsforecast`, `sktime`, `mlforecast` (plus `lightgbm` for GBMs)
+  - GluonTS / Lag-Llama are not shipped in mtdata (stack conflicts with the supported Python 3.14 scientific deps)
+- Forecasting libraries: `statsforecast` (1.x only on this runtime), `sktime`, `mlforecast` (plus `lightgbm` for GBMs)
 - Volatility (GARCH/ARCH): `arch`
-- Simplification accelerator: `tsdownsample` is included in the full package-index install path (`requirements.txt` / `[all]`) and remains optional for lean installs
+- Simplification accelerator: `tsdownsample` is included in the full package-index install path (`requirements.txt` / `[all]`; pin `>=0.1.5.1`) and remains optional for lean installs
 - Optional pattern-search accelerator omitted from the default Python 3.14 install: `hnswlib` (see the opt-in helper file `requirements-optional-src.txt` below)
 - Barrier option pricing & Heston calibration: `QuantLib`
 - Bayesian hyperparameter optimization: `optuna`
-- Neural network forecasters (`nhits`, `tft`, `patchtst`, `nbeatsx`): manual/nonstandard setup only; not included in `requirements.txt` or a package extra
+- Neural network forecasters (`nhits`, `tft`, `patchtst`, `nbeatsx`): manual/nonstandard setup only; not included in `requirements.txt` or a package extra (blocked on Windows 3.14 by missing `ray` wheels)
 
 ### 5. Optional Native Accelerator Source-Build Path
 
@@ -135,7 +135,7 @@ Notes:
 - `hnswlib` is a C++ extension build. On Windows, install Visual Studio Build Tools 2022 with the **Desktop development with C++** workload first.
 - If you only want this accelerator, install it directly instead of the helper file:
   - `pip install hnswlib==0.8.0`
-- If you want the LTTB simplification accelerator without the full `[all]` extra, install it directly with `pip install "tsdownsample>=0.1.5"`.
+- If you want the LTTB simplification accelerator without the full `[all]` extra, install it directly with `pip install "tsdownsample>=0.1.5.1"`.
 
 Tip: `mtdata-cli forecast_list_methods --json` shows `available` and `requires` per method.
 
@@ -219,10 +219,11 @@ MT5_LOGIN=12345678
 MT5_PASSWORD=your_password
 MT5_SERVER=your_broker_server
 
-# Timezone Configuration (choose one server-time method)
-MT5_SERVER_TZ=Europe/Athens  # Timezone name
-# OR
-MT5_TIME_OFFSET_MINUTES=120  # If server is UTC+2
+# Deterministic timestamp presentation
+CLIENT_TZ=UTC
+
+# Optional broker session/calendar timezone
+MT5_SERVER_TZ=Europe/Athens
 
 # Optional trade guardrails
 MTDATA_TRADE_GUARDRAILS_ENABLED=1
@@ -235,9 +236,16 @@ For the full guardrail surface, including blocklists, wallet-risk limits, and pe
 
 ### Timezone Configuration
 
-MT5 server times vary by broker. Configure timezone for correct timestamp normalization.
+MT5 documents UTC request datetimes and returned epochs. Most terminals follow
+that contract; mtdata also detects terminals that expose broker server-clock
+epochs and normalizes them at the adapter boundary. Set `CLIENT_TZ` to control
+presentation, and retain the payload time metadata with saved data.
 
-Use one method at a time. `MT5_SERVER_TZ` is preferred because it handles DST; `MT5_TIME_OFFSET_MINUTES` is useful when you only know a fixed broker offset. If both are set and `MT5_TIME_OFFSET_MINUTES` is non-zero, the fixed offset wins and mtdata logs a warning because static offsets do not adjust for DST.
+`MT5_SERVER_TZ` and `MT5_TIME_OFFSET_MINUTES` provide broker-clock context. Use
+one when broker-local calendar boundaries matter or when the terminal exposes
+server-clock epochs.
+`MT5_SERVER_TZ` is preferred because it handles DST. If both are set and
+`MT5_TIME_OFFSET_MINUTES` is non-zero, the fixed session offset wins.
 
 **Option 1: Offset in minutes**
 ```ini
@@ -251,22 +259,15 @@ MT5_SERVER_TZ=Europe/Athens
 MT5_SERVER_TZ=America/New_York
 ```
 
-**How to determine your broker's timezone/offset (practical):**
-1. Prefer `MT5_SERVER_TZ` if you know the broker's IANA timezone name (handles DST automatically).
-2. If you don't know it, estimate an offset during active market hours (so ticks are current):
-   ```bash
-   python scripts/detect_mt5_time_offset.py --symbol EURUSD
-   ```
-   Then set `MT5_TIME_OFFSET_MINUTES` to the recommended value.
-
-Set `MT5_SERVER_TZ` or `MT5_TIME_OFFSET_MINUTES` explicitly before starting `mtdata-webapi`; the Web API no longer mutates process environment state at startup.
-
-What happens if it's wrong?
-- Candle timestamps may be shifted, which can affect **daily pivots**, **session filters**, and **backtests**.
+An incorrect setting can misclassify broker-local boundaries. On a terminal
+detected as `server_clock`, it can also mis-normalize candle, tick, order, or deal
+epochs; inspect `timestamp_mode` in metadata when diagnosing a clock offset.
 
 ---
 
 ## Running mtdata
+
+Same toolkit, three surfaces — pick what fits the job.
 
 ### CLI
 
@@ -275,9 +276,9 @@ What happens if it's wrong?
 mtdata-cli <command> [options]
 ```
 
-### MCP Server
+### MCP server
 
-mtdata supports three MCP transport modes:
+Three transports for AI clients and custom hosts:
 
 ```bash
 # SSE transport (default) — for browser/HTTP-based MCP clients
@@ -444,19 +445,25 @@ npm run build   # Production build
 
 ### Timezone Issues
 
-1. Check server time in MT5: Tools → Options → Server
-2. Set `MT5_SERVER_TZ` in `.env` when you know the broker's IANA timezone, or `MT5_TIME_OFFSET_MINUTES` when you only know a fixed offset
+1. Check the payload's `timezone` field
+2. Set `CLIENT_TZ=UTC` for deterministic presentation
 3. Verify with: `mtdata-cli data_fetch_candles EURUSD --limit 1 --json`
+
+Configure `MT5_SERVER_TZ` for broker-local calculations and for terminals that
+are detected as exposing server-clock epochs.
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for more issues.
 
 ---
 
-## Next Steps
+## Next steps
 
-- [CLI.md](CLI.md) — Learn command usage
-- [EXAMPLE.md](EXAMPLE.md) — Follow an end-to-end workflow
-- [GLOSSARY.md](GLOSSARY.md) — Understand terminology
-- [LIMITATIONS.md](LIMITATIONS.md) — Review practical caveats before deeper integrations
-- [FINVIZ.md](FINVIZ.md) — Fundamental data and screening
-- [TEMPORAL.md](TEMPORAL.md) — Session and seasonal analysis
+Once candles list and a simple forecast run:
+
+1. [CLI.md](CLI.md) — Commands, help, and output formats
+2. [GLOSSARY.md](GLOSSARY.md) — Terms used across the docs
+3. [SAMPLE-TRADE.md](SAMPLE-TRADE.md) — Guided research workflow
+4. [EXAMPLE.md](EXAMPLE.md) — Compact end-to-end research loop
+5. [LIMITATIONS.md](LIMITATIONS.md) — Caveats before deep integrations
+
+Also useful later: [FINVIZ.md](FINVIZ.md) · [TEMPORAL.md](TEMPORAL.md) · [FORECAST.md](FORECAST.md)

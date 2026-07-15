@@ -1,10 +1,14 @@
-# Time-Series Diagnostics
+# Time-series diagnostics
 
-These read-only tools analyze recent MT5 bars before forecasting, modeling, or risk decisions.
+**Read-only** checks on recent MT5 bars *before* you forecast or size risk: stationarity, seasonality, outliers, and related health metrics. Think of this as a pre-flight panel for your series.
+
+**Dense terms:** [Stationarity](GLOSSARY.md#stationarity) · [ADF / KPSS / PP](GLOSSARY.md#stationarity-tests-adf-kpss-phillipsperron) · [Log return](GLOSSARY.md#log-return) · [Seasonality](GLOSSARY.md#autocorrelation--seasonality-periodogram) · [Outliers (MAD/IQR)](GLOSSARY.md#outlier-scores-mad-iqr-z-score) · [Volatility](GLOSSARY.md#volatility)
+
+**Related:** [Forecasting](FORECAST.md) · [Temporal analysis](TEMPORAL.md) · [Volatility](forecast/VOLATILITY.md) · [CLI](CLI.md) · [Glossary](GLOSSARY.md)
 
 ## Stationarity
 
-`stationarity_test` runs ADF and KPSS from `statsmodels`; Phillips-Perron is also available when the `arch` extra is installed.
+`stationarity_test` runs [ADF and KPSS](GLOSSARY.md#stationarity-tests-adf-kpss-phillipsperron) from `statsmodels`; Phillips–Perron is also available when the `arch` extra is installed.
 
 ```bash
 mtdata-cli stationarity_test EURUSD --timeframe H1 --lookback 500 \
@@ -30,7 +34,7 @@ The dominant period is exploratory evidence, not proof of a stable calendar effe
 
 ```bash
 mtdata-cli outliers_detect EURUSD --timeframe H1 --lookback 500 \
-  --fields return,volume,range --method mad --threshold 3.5 --json
+  --score-fields return,volume,range --method mad --threshold 3.5 --json
 ```
 
 Use `--detail full` to include field-level scores and OHLC values for each flagged bar.

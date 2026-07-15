@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..shared.schema import (
-    DetailLiteral,
     DenoiseSpec,
+    DetailLiteral,
     ForecastLibraryLiteral,
     TimeframeLiteral,
     reject_removed_field,
@@ -47,7 +47,7 @@ class ForecastGenerateRequest(BaseModel):
     end: Optional[str] = None
     params: Optional[Dict[str, Any]] = None
     ci_alpha: Optional[float] = Field(
-        0.05,
+        None,
         ge=0.0,
         le=0.5,
         description="Interval tail probability; confidence is 1 - ci_alpha. Use None to omit intervals.",
@@ -68,7 +68,10 @@ class ForecastGenerateRequest(BaseModel):
     )
     model_id: Optional[str] = Field(
         None,
-        description="Explicit trained-model params_hash to use for prediction. Skips training if the model exists in the store.",
+        description=(
+            "Canonical trained model ID (method/data_scope/params_hash) returned by "
+            "forecast_train or forecast_models_list. Skips training when found."
+        ),
     )
     detail: DetailLiteral = "compact"
 
@@ -144,7 +147,9 @@ class StrategyBacktestRequest(BaseModel):
     oversold: float = Field(30.0, gt=0.0, lt=100.0)
     overbought: float = Field(70.0, gt=0.0, lt=100.0)
     max_hold_bars: Optional[int] = Field(None, ge=1)
-    slippage_bps: float = 0.0
+    cost_model: Literal["mt5_observed", "fixed"] = "mt5_observed"
+    spread_bps: Optional[float] = Field(None, ge=0.0)
+    slippage_bps: float = 1.0
 
     @model_validator(mode="after")
     def _validate_strategy_thresholds(self) -> "StrategyBacktestRequest":
@@ -248,7 +253,7 @@ class ForecastBarrierProbRequest(BaseModel):
     symbol: str
     timeframe: TimeframeLiteral = "H1"
     horizon: int = Field(12, ge=1, le=MAX_FORECAST_HORIZON)
-    method: str = "hmm_mc"
+    method: str = "mc_gbm_bb"
     direction: str = "long"
     same_bar_policy: Literal["sl_first", "tp_first", "neutral"] = "sl_first"
     tp_abs: Optional[float] = Field(None, description="Take-profit absolute price. Do not combine with percent or tick barriers.")

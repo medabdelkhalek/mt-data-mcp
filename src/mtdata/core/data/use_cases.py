@@ -46,6 +46,9 @@ _COMPACT_TICK_TOP_LEVEL_FIELDS = (
     "success",
     "symbol",
     "count",
+    "tick_count",
+    "trade_event_count",
+    "quote_update_count",
     "data",
     "timezone",
     "price_precision",
@@ -53,11 +56,15 @@ _COMPACT_TICK_TOP_LEVEL_FIELDS = (
     "price_currency",
     "units",
     "freshness",
+    "freshness_state",
     "data_age_seconds",
     "data_age_anchor",
     "data_age_metric",
     "data_stale",
+    "history_policy_ok",
     "usable_for_live_trading",
+    "usable_for_live_trading_basis",
+    "live_max_age_seconds",
     "market_status",
     "market_status_reason",
     "market_status_source",
@@ -68,6 +75,7 @@ _COMPACT_TICK_TOP_LEVEL_FIELDS = (
 )
 
 _ANALYSIS_CANDLE_DEFAULT_LIMIT = 100
+_RANGE_CANDLE_DEFAULT_LIMIT = 100_000
 
 
 def _ensure_gateway_connection(gateway: Any) -> Dict[str, Any] | None:
@@ -239,6 +247,11 @@ def _run_data_fetch_candles_impl(
         elif detail_mode == "standard":
             result = _standard_candles_payload(result)
         _attach_candle_machine_freshness(result)
+        _attach_forming_candle_update_freshness(
+            result,
+            request=request,
+            gateway=gateway,
+        )
     if isinstance(result, dict) and isinstance(result.get("data"), list):
         out = attach_collection_contract(
             result,
@@ -251,6 +264,53 @@ def _run_data_fetch_candles_impl(
             out.pop("canonical_source", None)
         return out
     return result
+
+
+def _attach_forming_candle_update_freshness(
+    payload: Dict[str, Any],
+    *,
+    request: DataFetchCandlesRequest,
+    gateway: Any,
+) -> None:
+    if not request.include_incomplete or payload.get("error"):
+        return
+    data_window = payload.get("data_window")
+    if not isinstance(data_window, dict) or data_window.get("latest_bar_complete") is not False:
+        return
+    try:
+        tick = gateway.symbol_info_tick(request.symbol)
+    except Exception:
+        return
+    tick_msc = getattr(tick, "time_msc", None) if tick is not None else None
+    tick_seconds = getattr(tick, "time", None) if tick is not None else None
+    try:
+        tick_epoch = float(tick_msc) / 1000.0 if tick_msc else float(tick_seconds)
+    except (TypeError, ValueError):
+        return
+    if not np.isfinite(tick_epoch) or tick_epoch <= 0:
+        return
+    update_age = max(0.0, float(time.time()) - tick_epoch)
+    bar_open_age = payload.get("data_age_seconds")
+    try:
+        bar_open_age_value = max(0.0, float(bar_open_age))
+    except (TypeError, ValueError):
+        bar_open_age_value = None
+    if bar_open_age_value is not None:
+        payload["bar_open_age_seconds"] = round(bar_open_age_value, 3)
+        data_window["latest_bar_open_age_seconds"] = round(bar_open_age_value, 3)
+    payload["last_update_age_seconds"] = round(update_age, 3)
+    payload["data_age_seconds"] = round(update_age, 3)
+    payload["data_age_anchor"] = FRESHNESS_ANCHOR_WALL_CLOCK
+    payload["data_age_metric"] = FRESHNESS_METRIC_LAST_TICK_AGE
+    data_window["latest_bar_update_age_seconds"] = round(update_age, 3)
+    update_text = _format_age_seconds(update_age)
+    if bar_open_age_value is not None:
+        payload["freshness"] = (
+            f"forming bar open {_format_age_seconds(bar_open_age_value)} ago; "
+            f"last update {update_text} ago"
+        )
+    else:
+        payload["freshness"] = f"forming bar; last update {update_text} ago"
 
 
 def _normalize_candle_query_error(
@@ -269,7 +329,7 @@ def _normalize_candle_query_error(
     remediation: Optional[str] = None
 
     if "not found" in normalized and "symbol" in normalized:
-        error_code = "data_fetch_candles_symbol_unavailable"
+        error_code = "symbol_not_found"
         remediation = (
             "Use the broker's exact MT5 symbol name; call market_ticker for symbol "
             "discovery when the broker uses suffixes or aliases."
@@ -322,6 +382,8 @@ def _effective_candle_limit(request: DataFetchCandlesRequest) -> int:
         limit = DATA_FETCH_CANDLES_DEFAULT_LIMIT
     fields_set = getattr(request, "model_fields_set", set())
     limit_explicit = "limit" in fields_set
+    if (request.start or request.end) and not limit_explicit:
+        return _RANGE_CANDLE_DEFAULT_LIMIT
     has_indicators = request.indicators not in (None, "", [], {})
     if has_indicators and not limit_explicit:
         return max(limit, _ANALYSIS_CANDLE_DEFAULT_LIMIT)
@@ -485,6 +547,19 @@ def _compact_candles_payload(
         "volume_note",
         "bar_time_convention",
         "meta",
+        "raw_time_basis",
+        "time_basis",
+        "time_normalization",
+        "timestamp_mode",
+        "broker_server_tz",
+        "broker_utc_offset_seconds",
+        "timezone_note",
+        "volume_semantics",
+        "data_age_anchor",
+        "data_age_metric",
+        "query_end_gap_anchor",
+        "query_end_gap_metric",
+        "mt5_time_alignment",
     ):
         compact.pop(key, None)
     if not bool(compact.get("has_forming_candle")):
@@ -503,10 +578,10 @@ def _compact_candles_payload(
         "query_type",
         "freshness",
         "data_age_seconds",
-        "data_age_anchor",
-        "data_age_metric",
         "data_stale",
+        "history_policy_ok",
         "usable_for_live_trading",
+        "usable_for_live_trading_basis",
         "freshness_policy_relaxed",
         "market_status",
         "market_status_reason",
@@ -514,9 +589,6 @@ def _compact_candles_payload(
         "note",
         "query_end_gap_seconds",
         "query_end_gap",
-        "query_end_gap_anchor",
-        "query_end_gap_metric",
-        "mt5_time_alignment",
         "indicator_warmup_bars",
         "history_bars_fetched",
     ):
@@ -542,14 +614,11 @@ def _attach_candle_timestamp_metadata(payload: Dict[str, Any]) -> None:
             continue
         if isinstance(timestamp_value, (int, float)) and np.isfinite(float(timestamp_value)):
             payload["timestamp_format"] = "epoch_seconds"
-            payload["timestamp_format_hint"] = (
-                "time is Unix epoch seconds in UTC; request timestamp_format=iso "
-                "for UTC text timestamps."
-            )
+            payload.pop("timestamp_format_hint", None)
             return
         if isinstance(timestamp_value, str) and timestamp_value.strip():
             payload["timestamp_format"] = "iso_utc"
-            payload["timestamp_format_hint"] = "time is a UTC timestamp string."
+            payload.pop("timestamp_format_hint", None)
             return
 
 
@@ -561,6 +630,7 @@ def _attach_denoise_disclosure(payload: Dict[str, Any]) -> None:
 
     methods: List[str] = []
     overwritten: List[str] = []
+    causalities: List[str] = []
     for app in applications:
         if not isinstance(app, dict):
             continue
@@ -575,6 +645,9 @@ def _attach_denoise_disclosure(payload: Dict[str, Any]) -> None:
         method = str(app.get("method") or "").strip().lower()
         if method and method != "none" and method not in methods:
             methods.append(method)
+        causality = str(app.get("causality") or "").strip().lower()
+        if causality and causality not in causalities:
+            causalities.append(causality)
         if bool(app.get("keep_original")):
             continue
         for column in overwritten_for_app:
@@ -585,12 +658,21 @@ def _attach_denoise_disclosure(payload: Dict[str, Any]) -> None:
     if not methods and not overwritten:
         return
     payload["denoise_applied"] = True
+    payload["denoise_status"] = "applied"
     if methods:
         payload["denoise_method"] = methods[0] if len(methods) == 1 else methods
     if overwritten:
         payload["denoise_overwrote_columns"] = overwritten
         if "close" in overwritten and methods:
             payload["price_column"] = f"close ({methods[0]}-smoothed)"
+            payload["price_is_synthetic"] = True
+    if "zero_phase" in causalities:
+        payload["denoise_live_safe"] = False
+        payload.setdefault("warnings", []).append(
+            "Zero-phase denoise uses future observations and is not usable for live trading."
+        )
+    elif causalities:
+        payload["denoise_live_safe"] = True
     payload.pop("denoise", None)
 
 
@@ -652,7 +734,9 @@ def _standard_candles_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         "query_type",
         "freshness",
         "data_stale",
+        "history_policy_ok",
         "usable_for_live_trading",
+        "usable_for_live_trading_basis",
         "data_age_seconds",
         "data_age_anchor",
         "data_age_metric",
@@ -681,16 +765,13 @@ def _attach_candle_machine_freshness(payload: Dict[str, Any]) -> None:
     for key in (
         "query_type",
         "data_age_seconds",
-        "data_age_anchor",
-        "data_age_metric",
         "data_stale",
+        "history_policy_ok",
         "usable_for_live_trading",
+        "usable_for_live_trading_basis",
         "freshness_policy_relaxed",
         "query_end_gap_seconds",
         "query_end_gap",
-        "query_end_gap_anchor",
-        "query_end_gap_metric",
-        "mt5_time_alignment",
     ):
         if key in public_diagnostics:
             payload.setdefault(key, public_diagnostics[key])
@@ -910,7 +991,8 @@ def _public_candle_diagnostics(result: Dict[str, Any]) -> Dict[str, Any]:
                 within_policy is not None
                 and not bool(within_policy)
             )
-            public["usable_for_live_trading"] = not stale and not relaxed_policy
+            history_policy_ok = not stale and not relaxed_policy
+            public["history_policy_ok"] = history_policy_ok
             public["data_stale"] = stale
             freshness_label = format_freshness_label(
                 data_stale=stale,
@@ -937,8 +1019,9 @@ def _public_candle_diagnostics(result: Dict[str, Any]) -> Dict[str, Any]:
                     "reason",
                     "warning",
                     "probe_timeframe",
-                    "inferred_offset_seconds",
-                    "offset_mismatch_seconds",
+                    "timestamp_contract",
+                    "tick_age_seconds",
+                    "current_bar_delta_seconds",
                 )
                 if mt5_time_alignment.get(key) is not None
             }
@@ -1085,7 +1168,7 @@ def _compact_tick_rows_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             compact["units"] = compact_units
         compact["volume_fields"] = [
             field
-            for field in ("tick_volume", "real_volume")
+            for field in ("volume", "volume_real")
             if field in present_fields
         ]
     quote_completeness = _tick_quote_completeness_pct(payload)
@@ -1119,7 +1202,7 @@ def _compact_tick_quality(payload: Dict[str, Any]) -> Optional[str]:
         if incomplete is not None and incomplete > 0 and total:
             notes.append(f"partial_quotes={incomplete}/{total}")
         else:
-            status = str(data_quality.get("one_sided_zero_spread_status") or "").strip().lower()
+            status = str(data_quality.get("incomplete_quote_status") or "").strip().lower()
             if status and status not in {"ok", "info"}:
                 notes.append(f"quote_quality={status}")
     if payload.get("last_unavailable") is True:
@@ -1180,10 +1263,35 @@ def _compact_tick_row(
         spread_mid = _tick_row_price(compact.get("mid"))
         if spread_mid is not None and spread_mid > 0.0:
             compact["spread_pct"] = round((numeric_spread / spread_mid) * 100.0, 6)
-    for field in ("tick_volume", "real_volume"):
+    last = _tick_row_price(row.get("last"))
+    if last is not None and last > 0.0:
+        compact["last"] = last
+    for field in ("volume", "volume_real"):
         volume = _tick_row_price(row.get(field))
         if volume is not None and volume != 0.0:
             compact[field] = volume
+    flags = _as_nonnegative_int(row.get("flags"))
+    if flags is not None:
+        compact["flags"] = flags
+    decoded = row.get("flags_decoded")
+    if isinstance(decoded, list) and decoded:
+        compact["flags_decoded"] = list(decoded)
+        quote_flags = {str(value).strip().lower() for value in decoded}
+        bid_updated = "bid" in quote_flags
+        ask_updated = "ask" in quote_flags
+        if bid_updated != ask_updated:
+            compact["quote_update_type"] = (
+                "bid_only_update" if bid_updated else "ask_only_update"
+            )
+            compact["spread_valid"] = False
+            compact["ask" if bid_updated else "bid"] = None
+            compact["spread"] = None
+            for field in ("mid", "mid_inferred", "spread_points", "spread_pct"):
+                compact.pop(field, None)
+            numeric_spread = None
+        elif bid_updated and ask_updated:
+            compact["quote_update_type"] = "bid_ask_update"
+            compact["spread_valid"] = True
     return compact, numeric_spread
 
 

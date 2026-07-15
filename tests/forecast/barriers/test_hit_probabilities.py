@@ -37,9 +37,28 @@ def test_barrier_history_freshness_keeps_absolute_weekend_staleness():
     )
 
     assert result["data_stale"] is True
-    assert result["usable_for_live_trading"] is False
+    assert result["history_policy_ok"] is False
+    assert "usable_for_live_trading" not in result
     assert result["market_status_reason"] == "weekend"
     assert result["freshness"].startswith("closed weekend, data ")
+
+
+def test_barrier_history_age_uses_completed_bar_end():
+    bar_open = datetime(2026, 7, 14, 15, tzinfo=timezone.utc).timestamp()
+    now = datetime(2026, 7, 14, 16, 25, tzinfo=timezone.utc).timestamp()
+    frame = pd.DataFrame({"time": [bar_open]})
+
+    result = _history_freshness_context(
+        frame,
+        "H1",
+        symbol="EURUSD",
+        now_epoch=now,
+    )
+
+    assert result["history_last_bar_open_epoch"] == bar_open
+    assert result["data_as_of_epoch"] == bar_open + 3600
+    assert result["data_freshness_seconds"] == 25 * 60
+    assert result["data_stale"] is False
 
 
 def test_barrier_optimize_rejects_removed_profile_alias():
@@ -87,6 +106,25 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
         self.assertIn("prob_sl_first_se", result)
         self.assertEqual(result["intra_bar_hit_detection"], "simulated_bar_close")
         self.assertTrue(any("intra-bar touches" in item for item in result["warnings"]))
+
+    def test_default_method_counts_intrabar_touches(self):
+        result = forecast_barrier_hit_probabilities(
+            symbol="EURUSD",
+            timeframe="H1",
+            horizon=5,
+            direction="long",
+            tp_pct=0.5,
+            sl_pct=0.5,
+            params={"n_sims": 100},
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["method"], "mc_gbm_bb")
+        self.assertEqual(result["intra_bar_hit_detection"], "brownian_bridge")
+        self.assertTrue(result["bridge_correction"])
+        self.assertFalse(
+            any("intra-bar touches" in item for item in result.get("warnings", []))
+        )
 
     def test_forecast_barrier_hit_probabilities_default_seed_is_deterministic(self):
         dates = pd.date_range(start='2023-01-01', periods=500, freq='h')
@@ -237,7 +275,7 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
         self._set_flat_history(1.0, bars=200)
         paths = self._sample_paths()
         with patch(f'{_BARRIER_PROB_ROOT}._simulate_gbm_mc') as mock_sim, \
-             patch("mtdata.utils.denoise._apply_denoise", side_effect=RuntimeError("bad denoise")):
+             patch("mtdata.utils.denoise.apply_denoise", side_effect=RuntimeError("bad denoise")):
             mock_sim.return_value = {"price_paths": paths}
             result = forecast_barrier_hit_probabilities(
                 symbol="EURUSD",
@@ -346,3 +384,4 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
 
 if __name__ == '__main__':
     unittest.main()
+

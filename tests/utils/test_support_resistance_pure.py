@@ -336,6 +336,33 @@ def test_compute_support_resistance_returns_ranked_levels_around_current_price()
     assert resistance["strength_score_normalized"] == 1.0
 
 
+def test_compute_support_resistance_measures_levels_from_external_reference_price():
+    result = compute_support_resistance_levels(
+        _clustered_levels_frame(),
+        symbol="EURUSD",
+        timeframe="H1",
+        limit=200,
+        tolerance_pct=0.005,
+        min_touches=2,
+        max_levels=3,
+        reaction_bars=4,
+        reference_price=111.1,
+        reference_price_source="live_tick_mid",
+    )
+
+    assert result["current_price"] == 111.1
+    assert result["current_price_source"] == "live_tick_mid"
+    assert result["reference_price_structure"] == 105.0
+    assert result["supports"]
+    assert result["resistances"] == []
+    nearest = result["supports"][0]
+    assert nearest["type"] == "support"
+    assert nearest["distance_pct"] == pytest.approx(
+        abs(nearest["value"] - 111.1) / 111.1 * 100.0,
+        abs=1e-6,
+    )
+
+
 def test_build_zone_overlap_detects_intersecting_nearest_support_and_resistance_zones():
     overlap = _build_zone_overlap(
         support_level={
@@ -672,7 +699,7 @@ def test_no_extrema_returns_empty_levels():
     assert result["resistances"] == []
 
 
-def test_falls_back_to_best_cluster_when_touch_requirement_is_strict():
+def test_strict_touch_requirement_returns_no_unqualified_clusters():
     result = compute_support_resistance_levels(
         _weighted_supports_frame(),
         min_touches=5,
@@ -681,7 +708,9 @@ def test_falls_back_to_best_cluster_when_touch_requirement_is_strict():
         reaction_bars=4,
     )
 
-    assert len(result["levels"]) == 1
+    assert result["levels"] == []
+    assert result["supports"] == []
+    assert result["resistances"] == []
 
 
 def test_max_distance_filter_hides_far_levels_but_preserves_coverage_gap_metadata():
@@ -793,6 +822,8 @@ def test_episode_counting_keeps_raw_touches_secondary_to_distinct_tests():
 
     support = next(level for level in result["supports"] if level["dominant_source"] == "support")
     assert result["qualification_basis"] == "episodes"
+    assert result["score_basis"]["scale"] == "unbounded_nonnegative"
+    assert "strength_score_normalized" in result["score_basis"]["comparison"]
     assert support["touches"] > support["episodes"]
     assert support["episodes"] == 2
     assert support["source_episodes"]["support"] == 2

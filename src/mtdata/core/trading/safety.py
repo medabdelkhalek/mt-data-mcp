@@ -80,6 +80,58 @@ def _normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
+def assess_margin_stress(account: Any) -> Dict[str, Any]:
+    """Classify account margin pressure using conservative broker-agnostic bands."""
+    getter = account.get if isinstance(account, dict) else lambda key, default=None: getattr(account, key, default)
+
+    def _number(key: str) -> Optional[float]:
+        try:
+            value = float(getter(key, None))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    equity = _number("equity")
+    margin = _number("margin")
+    margin_free = _number("margin_free")
+    margin_level = _number("margin_level")
+    utilization = (margin / equity * 100.0) if equity and equity > 0 and margin is not None else None
+    free_ratio = (margin_free / equity * 100.0) if equity and equity > 0 and margin_free is not None else None
+
+    reasons: List[str] = []
+    if margin is not None and margin <= 0:
+        status = "healthy"
+    elif (
+        (margin_level is not None and 0 < margin_level <= 120.0)
+        or (utilization is not None and utilization >= 90.0)
+        or (free_ratio is not None and free_ratio <= 10.0)
+    ):
+        status = "critical"
+        if margin_level is not None and 0 < margin_level <= 120.0:
+            reasons.append("margin_level_at_or_below_120_pct")
+        if utilization is not None and utilization >= 90.0:
+            reasons.append("margin_utilization_at_or_above_90_pct")
+        if free_ratio is not None and free_ratio <= 10.0:
+            reasons.append("free_margin_at_or_below_10_pct_of_equity")
+    elif (
+        (margin_level is not None and 0 < margin_level <= 150.0)
+        or (utilization is not None and utilization >= 75.0)
+        or (free_ratio is not None and free_ratio <= 25.0)
+    ):
+        status = "stressed"
+    elif any(value is not None for value in (margin_level, utilization, free_ratio)):
+        status = "healthy"
+    else:
+        status = "unknown"
+    return {
+        "status": status,
+        "margin_level_pct": round(margin_level, 2) if margin_level is not None else None,
+        "margin_utilization_pct": round(utilization, 2) if utilization is not None else None,
+        "free_margin_pct_of_equity": round(free_ratio, 2) if free_ratio is not None else None,
+        "reasons": reasons,
+    }
+
+
 def _normalize_side(value: Any) -> Optional[str]:
     text = str(value or "").strip().upper()
     if not text:
@@ -412,6 +464,7 @@ def _estimate_order_risk_currency(
     entry_price: float,
     stop_loss: Optional[float],
     side: str,
+    allow_profit_stop: bool = False,
 ) -> tuple[Optional[float], Optional[str]]:
     normalized_stop_loss = _normalize_stop_loss_value(stop_loss)
     if normalized_stop_loss is None:
@@ -434,7 +487,11 @@ def _estimate_order_risk_currency(
         risk_ticks = (float(entry_price) - normalized_stop_loss) / tick_size
     else:
         risk_ticks = (normalized_stop_loss - float(entry_price)) / tick_size
-    if not math.isfinite(risk_ticks) or risk_ticks <= 0:
+    if not math.isfinite(risk_ticks):
+        return None, "stop_loss_wrong_side"
+    if risk_ticks <= 0:
+        if allow_profit_stop:
+            return 0.0, None
         return None, "stop_loss_wrong_side"
 
     risk_currency = abs(float(volume) * risk_ticks * risk_tick_value)
@@ -581,6 +638,7 @@ def _total_portfolio_risk_currency(
             entry_price=entry_price,
             stop_loss=stop_loss,
             side=side,
+            allow_profit_stop=True,
         )
         if risk_currency is None:
             issues.append(f"{symbol}: unable to quantify risk ({risk_error}).")
@@ -697,6 +755,7 @@ def _evaluate_wallet_risk_limits(
                 entry_price=pos_entry,
                 stop_loss=pos_sl,
                 side=pos_side,
+                allow_profit_stop=True,
             )
             if pos_risk is None or pos_volume <= 0:
                 continue

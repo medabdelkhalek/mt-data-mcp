@@ -1,16 +1,12 @@
 # Troubleshooting
 
-Common issues when running mtdata and how to resolve them.
+Something broken? Start with a **small read-only snapshot** — it usually tells you whether the problem is install, MT5 connection, symbol visibility, or history. Then jump to the matching section below.
 
-**Related:**
-- [SETUP.md](SETUP.md) — Installation and configuration
-- [CLI.md](CLI.md) — Command usage
+**Related:** [Setup](SETUP.md) · [CLI](CLI.md) · [Limitations](LIMITATIONS.md) · [Timestamps](TIMESTAMPS.md)
 
 ---
 
-## Start Here: Diagnostic Snapshot
-
-When something fails, collect a small read-only snapshot first. It usually separates install, MT5 connection, symbol, and data-history problems quickly.
+## Start here: diagnostic snapshot
 
 ```bash
 python --version
@@ -131,10 +127,10 @@ pip install chronos-forecasting torch  # For Chronos
 pip install statsforecast              # For StatsForecast models
 pip install arch                       # For GARCH
 pip install statsmodels                # For ARIMA/ETS + causal_discover_signals
-pip install umap-learn                 # For UMAP dimred (Web UI / analysis)
+pip install -e ".[dimred-ext]"         # For UMAP dimred (Web UI / analysis); or: pip install umap-learn
 pip install QuantLib                   # For barrier option pricing & Heston calibration
 pip install optuna                     # For Bayesian hyperparameter tuning
-pip install neuralforecast torch       # For neural models; may not resolve on Windows Python 3.14
+pip install neuralforecast torch       # For neural models; fails on Windows Python 3.14 (no ray win/cp314 wheel)
 pip install -e .[forecast-timesfm]     # From the repo root; installs the TimesFM Git-backed extra
 ```
 
@@ -209,26 +205,20 @@ mtdata-cli data_fetch_candles EURUSD --limit 100
 
 ### Timestamps Look Wrong
 
-**Cause:** Server timezone offset not configured.
+**Cause:** The payload may be displayed in the detected client-local timezone,
+the request may not represent the intended instant, or a broker server-clock
+terminal may lack the correct broker timezone configuration.
 
-**Solution:** Set one timezone method in `.env`. Prefer an IANA timezone name because it handles DST:
+**Solution:** Pin presentation to UTC and check the payload's `timezone` field:
 ```ini
-MT5_SERVER_TZ=Europe/Athens
+CLIENT_TZ=UTC
 ```
 
-If you only know a fixed broker offset, use minutes from UTC instead:
-```ini
-MT5_TIME_OFFSET_MINUTES=120  # If server is UTC+2
-```
-
-Avoid setting both unless you intentionally want a non-zero `MT5_TIME_OFFSET_MINUTES` value to override `MT5_SERVER_TZ`.
-
-To estimate an offset quickly (run during active market hours so ticks are current):
-```bash
-python scripts/detect_mt5_time_offset.py --symbol EURUSD
-```
-
-Set `MT5_SERVER_TZ` or `MT5_TIME_OFFSET_MINUTES` explicitly before starting `mtdata-webapi`. The Web API no longer auto-detects broker offset or mutates environment variables at startup.
+Request the `metadata` extra and inspect `timestamp_mode`. Native terminals use
+UTC epochs directly. If `server_clock` is detected, configure `MT5_SERVER_TZ`
+(preferred) or `MT5_TIME_OFFSET_MINUTES`; mtdata then normalizes at the adapter
+boundary. Never manually shift an already-normalized payload. See
+[TIMESTAMPS.md](TIMESTAMPS.md).
 
 ### Volume is Always Zero
 
@@ -368,7 +358,7 @@ pip install hnswlib==0.8.0
 
 If `hnswlib` fails, leave it out and use `search_engine=ckdtree` instead.
 
-`tsdownsample` is no longer part of this source-build helper. It is included in the full package-index install path and can also be installed directly with `pip install "tsdownsample>=0.1.5"`. If it is absent, mtdata falls back to the built-in Python simplification path.
+`tsdownsample` is no longer part of this source-build helper. It is included in the full package-index install path and can also be installed directly with `pip install "tsdownsample>=0.1.5.1"`. If it is absent, mtdata falls back to the built-in Python simplification path.
 
 ### QuantLib Import Error
 
@@ -407,7 +397,7 @@ pip install optuna
 ```bash
 pip install neuralforecast torch
 ```
-These models require PyTorch and a NeuralForecast dependency stack compatible with your Python version. On Windows Python 3.14, current releases may fail to resolve because some transitive dependencies do not publish compatible wheels.
+These models require PyTorch and a NeuralForecast dependency stack compatible with your Python version. On Windows Python 3.14, install fails because `ray` (required by NeuralForecast) does not publish Windows wheels for Python 3.14.
 
 ---
 
@@ -420,19 +410,19 @@ These models require PyTorch and a NeuralForecast dependency stack compatible wi
 | Invalid timeframe | Use a supported MT5 interval listed in the Timeframe section above |
 | Method not available | Check `forecast_list_methods` and install deps |
 | Output hard to read | Add `--json` |
-| Wrong timestamps | Set `MT5_SERVER_TZ` in `.env`, or `MT5_TIME_OFFSET_MINUTES` if you only know a fixed offset |
+| Wrong timestamps | Check the payload `timezone`, set `CLIENT_TZ=UTC`, and verify that request inputs identify the intended absolute instant |
 | Command slow | Reduce `--limit`, use faster method |
 | QuantLib import error | `pip install QuantLib` |
 | Finviz empty data | Check network / firewall (finvizfinance is pre-installed) |
 | Optuna not found | `pip install optuna` |
-| Neural models unavailable | Use `forecast_list_methods --json`; NeuralForecast is manual/nonstandard on Windows Python 3.14 |
+| Neural models unavailable | Use `forecast_list_methods --json`; NeuralForecast needs `ray` Windows cp314 wheels (not published yet) |
 
 ---
 
-## See Also
+## See also
 
-- [SETUP.md](SETUP.md) — Installation guide
-- [CLI.md](CLI.md) — Command usage
-- [GLOSSARY.md](GLOSSARY.md) — Term definitions
-- [FINVIZ.md](FINVIZ.md) — Finviz fundamental data reference
-- [OPTIONS_QUANTLIB.md](OPTIONS_QUANTLIB.md) — Options & QuantLib tools
+- [SETUP.md](SETUP.md) — Install and first connection
+- [CLI.md](CLI.md) — Commands and output
+- [LIMITATIONS.md](LIMITATIONS.md) — Known caveats
+- [TIMESTAMPS.md](TIMESTAMPS.md) — Shifted candle times
+- [TRADING_SAFETY.md](TRADING_SAFETY.md) — Live order concerns

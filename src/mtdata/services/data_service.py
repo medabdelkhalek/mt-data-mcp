@@ -32,11 +32,12 @@ from ..shared.constants import (
 from ..shared.market_units import forex_points_per_pip
 from ..shared.schema import DenoiseSpec, IndicatorSpec, SimplifySpec, TimeframeLiteral
 from ..shared.validators import invalid_timeframe_error
+from ..utils.coercion import round_finite
 from ..utils.denoise import (
-    _apply_denoise as _apply_denoise_util,
+    apply_denoise as apply_denoise_util,
 )
 from ..utils.denoise import (
-    _consume_denoise_warnings,
+    consume_denoise_warnings,
 )
 from ..utils.denoise import (
     normalize_denoise_spec as _normalize_denoise_spec,
@@ -53,7 +54,6 @@ from ..utils.market_metadata import (
     FRESHNESS_ANCHOR_WALL_CLOCK,
     FRESHNESS_METRIC_LAST_COMPLETED_BAR_AGE,
     FRESHNESS_METRIC_REQUESTED_RANGE_END_GAP,
-    TICK_VOLUME_SEMANTICS,
     build_tick_freshness_context,
 )
 
@@ -70,6 +70,11 @@ from ..utils.mt5 import (
     get_symbol_info_cached,
     mt5,
     resolve_broker_symbol_name,
+    symbol_candle_price_basis as _symbol_candle_price_basis,
+    symbol_path as _symbol_path,
+    symbol_price_currency as _symbol_price_currency,
+    symbol_price_digits as _symbol_price_digits,
+    symbol_price_point as _symbol_price_point,
 )
 from ..utils.ohlcv import validate_and_clean_ohlcv_frame
 
@@ -80,6 +85,7 @@ from ..utils.simplify import (
     _select_indices_for_timeseries,
     _simplify_dataframe_rows_ext,
 )
+from ..utils.tick_flags import is_mt5_trade_event
 from ..utils.time import (
     _format_datetime_minute_explicit,
     _format_time_explicit,
@@ -99,8 +105,6 @@ from ..utils.utils import (
 logger = logging.getLogger(__name__)
 
 
-_AUTO_TIME_ALIGNMENT_MIN_SHIFT_SECONDS = 1800
-_AUTO_TIME_ALIGNMENT_MAX_SHIFT_SECONDS = 18 * 3600
 _TICK_SUMMARY_MIN_ANALYTIC_TICKS = 20
 _ONE_SIDED_TICK_WARNING_RATIO = 0.50
 _DATE_FORMAT_HINT = (
@@ -135,8 +139,8 @@ _TICK_ROW_UNITS = {
     "spread_pips": "pips",
     "spread_pct": "percentage_points (1.0 = 1%)",
     "tick_gap_ms": "milliseconds",
-    "tick_volume": "broker_tick_count",
-    "real_volume": "traded_volume",
+    "volume": "last_trade_volume",
+    "volume_real": "last_trade_volume_real",
 }
 def _format_mt5_last_error() -> str:
     try:
@@ -149,82 +153,10 @@ def _format_mt5_last_error() -> str:
     return str(err)
 
 
-def _symbol_price_digits(*infos: Any) -> int:
-    for info in infos:
-        try:
-            digits_raw = getattr(info, "digits", None)
-        except Exception:
-            digits_raw = None
-        if isinstance(digits_raw, (int, float)):
-            return max(0, int(digits_raw))
-    return 0
-
-
-def _symbol_price_currency(*infos: Any) -> Optional[str]:
-    for info in infos:
-        for attr in ("currency_profit", "currency_margin"):
-            try:
-                value = getattr(info, attr, None)
-            except Exception:
-                value = None
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
-def _symbol_candle_price_basis(*infos: Any) -> str:
-    for info in infos:
-        try:
-            chart_mode = getattr(info, "chart_mode", None)
-        except Exception:
-            chart_mode = None
-        if isinstance(chart_mode, str):
-            normalized = chart_mode.strip().lower()
-            if "bid" in normalized:
-                return "bid"
-            if "last" in normalized:
-                return "last_trade"
-        if isinstance(chart_mode, (int, float)) and not isinstance(chart_mode, bool):
-            if int(chart_mode) == 0:
-                return "bid"
-            if int(chart_mode) == 1:
-                return "last_trade"
-    return "broker_chart_price"
-
-
-def _symbol_price_point(*infos: Any) -> Optional[float]:
-    for info in infos:
-        try:
-            point_raw = getattr(info, "point", None)
-        except Exception:
-            point_raw = None
-        if isinstance(point_raw, (int, float)):
-            point = float(point_raw)
-            if math.isfinite(point) and point > 0.0:
-                return point
-    return None
-
-
-def _symbol_path(*infos: Any) -> str:
-    for info in infos:
-        try:
-            path = getattr(info, "path", None)
-        except Exception:
-            path = None
-        if isinstance(path, str) and path.strip():
-            return path.strip()
-    return ""
-
-
 def _round_price_value(value: Any, digits: int) -> Any:
-    if digits <= 0 or value is None or isinstance(value, bool):
+    if digits <= 0:
         return value
-    if not isinstance(value, (int, float)):
-        return value
-    numeric = float(value)
-    if not math.isfinite(numeric):
-        return value
-    return round(numeric, digits)
+    return round_finite(value, digits, on_invalid="passthrough")
 
 
 def _round_row_price_columns(
@@ -298,7 +230,7 @@ def _round_tick_price_payload(out: Dict[str, Any], digits: int) -> None:
             if key in last_quote:
                 last_quote[key] = _round_price_value(last_quote[key], digits)
     if isinstance(stats, dict):
-        for volume_key in ("tick_volume", "real_volume"):
+        for volume_key in ("volume", "volume_real"):
             volume_stats = stats.get(volume_key)
             if isinstance(volume_stats, dict):
                 for key in ("vwap_mid", "vwap_last"):
@@ -329,12 +261,6 @@ def _tick_spread_pct(spread: Any, mid: Any) -> Optional[float]:
     if spread_value is None or mid_value is None or mid_value <= 0.0:
         return None
     return round((spread_value / mid_value) * 100.0, 6)
-
-
-def _attach_tick_volume_semantics(payload: Dict[str, Any]) -> None:
-    units = payload.get("units")
-    if isinstance(units, dict) and units.get("tick_volume") == "broker_tick_count":
-        payload["volume_semantics"] = TICK_VOLUME_SEMANTICS
 
 
 def _describe_rate_fetch_error(symbol: str, *, info_before: Any = None) -> str:
@@ -557,23 +483,21 @@ def _relax_live_completed_bar_freshness(
         item="bar",
         data_age_seconds=freshness_meta.get("data_freshness_seconds"),
     )
+    if not closed_session or not bool(
+        closed_session.get("freshness_policy_relaxed")
+    ):
+        return False
     freshness_meta["freshness_policy_relaxed"] = True
-    if closed_session:
-        freshness_meta["market_session_status"] = closed_session.get(
-            "market_status"
-        )
-        freshness_meta["market_session_reason"] = closed_session.get(
-            "market_status_reason"
-        )
-        freshness_meta["market_session_source"] = closed_session.get(
-            "market_status_source"
-        )
-        freshness_meta["freshness_note"] = closed_session.get("note")
-    else:
-        freshness_meta["market_session_status"] = "closed_or_idle"
-        freshness_meta["freshness_note"] = (
-            "Market appears closed or idle; showing the latest completed bar."
-        )
+    freshness_meta["market_session_status"] = closed_session.get(
+        "market_status"
+    )
+    freshness_meta["market_session_reason"] = closed_session.get(
+        "market_status_reason"
+    )
+    freshness_meta["market_session_source"] = closed_session.get(
+        "market_status_source"
+    )
+    freshness_meta["freshness_note"] = closed_session.get("note")
     return True
 
 
@@ -595,14 +519,6 @@ def _fetch_rates_with_warmup(  # noqa: C901
     extra_bars = 0 if include_incomplete else 1
     if diagnostics is not None:
         diagnostics.pop("freshness", None)
-    auto_shift_seconds = _resolve_live_rate_auto_shift_seconds(
-        symbol=symbol,
-        timeframe=timeframe,
-        start_datetime=start_datetime,
-        end_datetime=end_datetime,
-    )
-    if diagnostics is not None and auto_shift_seconds:
-        diagnostics["auto_shift_seconds"] = int(auto_shift_seconds)
     if start_datetime and end_datetime:
         seconds_per_bar, timeframe_error = _resolve_fetch_timeframe_seconds(timeframe)
         if timeframe_error:
@@ -672,8 +588,6 @@ def _fetch_rates_with_warmup(  # noqa: C901
     for idx in range(attempts):
         rates = _fetch()
         if rates is not None and len(rates) > 0:
-            if auto_shift_seconds:
-                rates = _shift_rate_times(rates, auto_shift_seconds)
             last_t = rates[-1]["time"]
             freshness_cutoff = expected_end_ts - seconds_per_bar * (SANITY_BARS_TOLERANCE + extra_bars)
             freshness_meta = _build_candle_freshness_diagnostics(
@@ -765,105 +679,6 @@ def _resolve_fetch_timeframe_seconds(timeframe: TimeframeLiteral) -> tuple[Optio
     if not seconds_per_bar:
         return None, f"Unable to determine timeframe seconds for {timeframe}"
     return int(seconds_per_bar), None
-
-
-def _resolve_live_rate_auto_shift_seconds(
-    *,
-    symbol: str,
-    timeframe: TimeframeLiteral,
-    start_datetime: Optional[str],
-    end_datetime: Optional[str],
-) -> int:
-    if start_datetime or end_datetime:
-        return 0
-
-    try:
-        if mt5_config.get_server_tz() is not None:
-            return 0
-    except Exception:
-        pass
-
-    try:
-        configured_offset_seconds = int(mt5_config.get_time_offset_seconds())
-    except Exception:
-        configured_offset_seconds = 0
-    if configured_offset_seconds != 0:
-        return 0
-
-    try:
-        alignment = get_cached_mt5_time_alignment(
-            symbol=symbol,
-            probe_timeframe=timeframe,
-            ttl_seconds=int(getattr(mt5_config, "broker_time_check_ttl_seconds", 60) or 60),
-        )
-    except Exception:
-        return 0
-
-    if not isinstance(alignment, dict) or not bool(alignment.get("offset_inference_reliable")):
-        return 0
-
-    try:
-        inferred_offset_seconds = int(alignment.get("inferred_offset_seconds"))
-    except Exception:
-        return 0
-
-    if not (
-        _AUTO_TIME_ALIGNMENT_MIN_SHIFT_SECONDS
-        <= abs(inferred_offset_seconds)
-        <= _AUTO_TIME_ALIGNMENT_MAX_SHIFT_SECONDS
-    ):
-        return 0
-
-    return -inferred_offset_seconds
-
-
-def _shift_rate_times(rates: Any, shift_seconds: int) -> Any:
-    if rates is None or int(shift_seconds) == 0:
-        return rates
-
-    shift_value = int(shift_seconds)
-    try:
-        names = getattr(getattr(rates, "dtype", None), "names", None)
-    except Exception:
-        names = None
-
-    if names and "time" in names:
-        try:
-            shifted_rates = rates.copy()
-            shifted_rates["time"] = shifted_rates["time"] + shift_value
-        except Exception as exc:
-            raise ValueError(
-                f"Failed to apply the {shift_value}-second time offset correction; "
-                "rate timestamps cannot be safely treated as UTC."
-            ) from exc
-        return shifted_rates
-
-    if isinstance(rates, list):
-        if not any(isinstance(row, dict) and "time" in row for row in rates):
-            return rates
-        shifted_rows = []
-        shift_failures = 0
-        for row in rates:
-            if not isinstance(row, dict):
-                shifted_rows.append(row)
-                continue
-            if "time" not in row:
-                shifted_rows.append(row)
-                continue
-            shifted_row = dict(row)
-            try:
-                shifted_row["time"] = float(shifted_row["time"]) + shift_value
-            except Exception:
-                shift_failures += 1
-            shifted_rows.append(shifted_row)
-        if shift_failures:
-            raise ValueError(
-                f"Failed to apply the {shift_value}-second time offset correction "
-                f"to {shift_failures}/{len(rates)} rate rows; mixed timestamp "
-                "alignment is unsafe."
-            )
-        return shifted_rows
-    return rates
 
 
 def _collect_candle_time_alignment(
@@ -1285,9 +1100,10 @@ def _append_denoise_application(
 
 
 def _latest_indicator_values_missing(df: pd.DataFrame, columns: List[str]) -> bool:
-    if not columns or len(df) <= 0:
+    required_columns = _indicator_columns_required_for_completeness(columns)
+    if not required_columns or len(df) <= 0:
         return False
-    for column in columns:
+    for column in required_columns:
         if column not in df.columns:
             return True
         value = df[column].iloc[-1]
@@ -1312,7 +1128,7 @@ def _apply_pre_ti_denoise(
     normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
     added_columns: List[str] = []
     if normalized and str(normalized.get('when', 'pre_ti')).lower() == 'pre_ti':
-        added_columns = _apply_denoise_util(df, normalized, default_when='pre_ti')
+        added_columns = apply_denoise_util(df, normalized, default_when='pre_ti')
         last_application = df.attrs.get("denoise_last_application")
         overwritten_columns = (
             list(last_application.get("overwrote_columns") or [])
@@ -1325,7 +1141,7 @@ def _apply_pre_ti_denoise(
             normalized,
             default_when='pre_ti',
             default_causality='causal',
-            default_keep_original=False,
+            default_keep_original=True,
             added_columns=added_columns,
             overwritten_columns=overwritten_columns,
         )
@@ -1357,9 +1173,25 @@ def _apply_indicator_stage(
             dn_ti['columns'] = list(ti_cols)
             dn_ti.setdefault('when', 'post_ti')
             dn_ti.setdefault('keep_original', False)
-            _apply_denoise_util(df, dn_ti, default_when='post_ti')
+            apply_denoise_util(df, dn_ti, default_when='post_ti')
 
     return ti_cols
+
+
+def _indicator_columns_required_for_completeness(columns: List[str]) -> List[str]:
+    """Return indicator columns that must be populated on every output row.
+
+    pandas-ta-classic's Supertrend long and short bands are regime-specific:
+    ``SUPERTl`` is null in short regimes and ``SUPERTs`` is null in long regimes.
+    Those nulls express which band is inactive, rather than a warmup failure.
+    """
+    required: List[str] = []
+    for column in columns:
+        family = str(column or "").split("_", 1)[0].lower()
+        if family in {"supertl", "superts"}:
+            continue
+        required.append(column)
+    return required
 
 
 def _indicator_columns_with_missing_values(
@@ -1367,7 +1199,7 @@ def _indicator_columns_with_missing_values(
     ti_cols: List[str],
 ) -> List[str]:
     missing_cols: List[str] = []
-    for col in ti_cols:
+    for col in _indicator_columns_required_for_completeness(ti_cols):
         if col not in df.columns:
             continue
         try:
@@ -1382,7 +1214,8 @@ def _drop_incomplete_indicator_rows(
     df: pd.DataFrame,
     ti_cols: List[str],
 ) -> Tuple[pd.DataFrame, int, List[str]]:
-    existing_cols = [col for col in ti_cols if col in df.columns]
+    required_cols = _indicator_columns_required_for_completeness(ti_cols)
+    existing_cols = [col for col in required_cols if col in df.columns]
     if not existing_cols or len(df) == 0:
         return df, 0, []
 
@@ -1412,7 +1245,7 @@ def _apply_post_ti_denoise(
     normalized = _normalize_denoise_spec(denoise, default_when='post_ti')
     added_columns: List[str] = []
     if normalized and str(normalized.get('when', 'post_ti')).lower() == 'post_ti':
-        added_columns = _apply_denoise_util(df, normalized, default_when='post_ti')
+        added_columns = apply_denoise_util(df, normalized, default_when='post_ti')
         last_application = df.attrs.get("denoise_last_application")
         overwritten_columns = (
             list(last_application.get("overwrote_columns") or [])
@@ -1424,7 +1257,7 @@ def _apply_post_ti_denoise(
             denoise_apps,
             normalized,
             default_when='post_ti',
-            default_causality='zero_phase',
+            default_causality='causal',
             default_keep_original=True,
             added_columns=added_columns,
             overwritten_columns=overwritten_columns,
@@ -1444,7 +1277,7 @@ def _rebuild_candle_indicator_window(
     if denoise:
         normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
         if normalized and str(normalized.get('when', 'pre_ti')).lower() == 'pre_ti':
-            _apply_denoise_util(df, normalized, default_when='pre_ti')
+            apply_denoise_util(df, normalized, default_when='pre_ti')
     ti_cols = _apply_indicator_stage(df, headers, ti_spec, denoise)
     return df, ti_cols
 
@@ -1680,9 +1513,7 @@ def fetch_candles(  # noqa: C901
                 diagnostics=rate_fetch_diagnostics,
             )
             freshness_diagnostics = rate_fetch_diagnostics.get("freshness")
-            time_normalization = describe_mt5_time_normalization(
-                auto_shift_seconds=int(rate_fetch_diagnostics.get("auto_shift_seconds") or 0)
-            )
+            time_normalization = describe_mt5_time_normalization(symbol=symbol)
             if rates_error:
                 error_payload: Dict[str, Any] = {"error": rates_error}
                 if isinstance(freshness_diagnostics, dict):
@@ -1744,9 +1575,9 @@ def fetch_candles(  # noqa: C901
         denoise_warnings: List[str] = []
         ti_warnings: List[str] = []
         _apply_pre_ti_denoise(df, headers, denoise, denoise_apps)
-        denoise_warnings.extend(_consume_denoise_warnings(df))
+        denoise_warnings.extend(consume_denoise_warnings(df))
         ti_cols = _apply_indicator_stage(df, headers, ti_spec, denoise)
-        denoise_warnings.extend(_consume_denoise_warnings(df))
+        denoise_warnings.extend(consume_denoise_warnings(df))
 
         # Filter out warmup region to return the intended target window only
         df = _trim_df_to_target(df, start_datetime, end_datetime, candles, copy_rows=True)
@@ -1760,7 +1591,7 @@ def fetch_candles(  # noqa: C901
         # If TI requested, check for NaNs and retry once with increased warmup
         if ti_spec and ti_cols:
             try:
-                if df[ti_cols].isna().any().any():
+                if _indicator_columns_with_missing_values(df, ti_cols):
                     # Increase warmup and refetch once
                     warmup_bars_retry = max(int(warmup_bars * TI_NAN_WARMUP_FACTOR), warmup_bars + TI_NAN_WARMUP_MIN_ADD)
                     rates_retry, rates_retry_error = _fetch_rates_with_warmup(
@@ -1796,7 +1627,7 @@ def fetch_candles(  # noqa: C901
                             ti_spec=ti_spec,
                             headers=headers,
                         )
-                        denoise_warnings.extend(_consume_denoise_warnings(df))
+                        denoise_warnings.extend(consume_denoise_warnings(df))
                         try:
                             rows_before_quality = int(len(df))
                             df, retry_ohlcv_warnings = validate_and_clean_ohlcv_frame(df, epoch_col="__epoch")
@@ -1868,7 +1699,7 @@ def fetch_candles(  # noqa: C901
 
         # Optional post-TI denoising (adds new columns by default)
         _apply_post_ti_denoise(df, headers, denoise, denoise_apps)
-        denoise_warnings.extend(_consume_denoise_warnings(df))
+        denoise_warnings.extend(consume_denoise_warnings(df))
 
         # Ensure headers are unique and exist in df
         headers = [h for h in headers if h in df.columns]
@@ -2117,9 +1948,25 @@ def fetch_candles(  # noqa: C901
         if simplify_meta is not None:
             payload["simplified"] = True
             payload["simplify"] = _public_simplify_meta(simplify_meta) or {"applied": True}
+            simplify_method = str(simplify_meta.get("method") or "").strip().lower()
+            simplify_reduced_rows = int(original_rows) > int(len(df))
+            if simplify_reduced_rows and simplify_method in {"lttb", "rdp", "pla", "apca"}:
+                payload["series_type"] = "downsampled_visualization"
+                payload["equal_interval"] = False
+                payload["analysis_compatible"] = False
+                payload.setdefault("warnings", []).append(
+                    "Simplified candle rows are visualization samples with irregular time gaps; "
+                    "do not use them as equal-interval OHLC input for indicators or forecasts."
+                )
         # Attach denoise applications metadata if any
         if denoise_apps:
             payload['denoise'] = {'applications': denoise_apps}
+            payload['denoise_status'] = 'applied'
+        elif denoise:
+            payload['denoise_status'] = 'skipped'
+            payload['denoise_applied'] = False
+            if denoise_warnings:
+                payload['denoise_status_reason'] = denoise_warnings[0]
         if denoise_apps or ti_spec:
             denoise_stages = {
                 str(app.get("when") or "").lower()
@@ -2240,6 +2087,14 @@ def fetch_candles(  # noqa: C901
                 and spread_zero_count / float(spread_value_count) >= 0.75
             )
             if not has_spread_values or spread_all_zero or spread_mostly_zero:
+                data_rows = _remove_unavailable_spread_from_candle_rows(
+                    data_rows,
+                    spread_idx=spread_idx,
+                )
+                payload["data"] = data_rows
+                payload["spread_historical_available"] = False
+                payload.pop("spread_unit", None)
+                payload.pop("spread_note", None)
                 if spread_mostly_zero and not spread_all_zero:
                     payload.setdefault("warnings", []).append(
                         "include_spread native candle spread is zero for most bars; "
@@ -2267,22 +2122,17 @@ def fetch_candles(  # noqa: C901
                                 est_mean = float(live_spread)
                                 estimate_source = "live_ticker_crosscheck"
                                 payload["spread_accuracy"] = "tick_stats_replaced_by_live"
-                        data_rows = _apply_estimated_spread_to_candle_rows(
-                            data_rows,
-                            spread_idx=spread_idx,
-                            estimated_spread=est_mean,
-                            source=estimate_source,
-                        )
-                        payload["data"] = data_rows
                         payload.setdefault("warnings", []).append(
                             "include_spread requested but per-bar spread unavailable; a single "
-                            f"estimated spread from {estimate_source} ({est_mean:g}) was applied "
-                            "uniformly to every row (not per-bar historical spread)."
+                            f"reference spread from {estimate_source} ({est_mean:g}) is returned "
+                            "at payload level and is not per-bar historical spread."
                         )
-                        payload["spread_unit"] = "price"
-                        payload["spread_estimated"] = True
-                        payload["spread_source"] = estimate_source
-                        payload["spread_estimate_basis"] = "uniform_single_estimate_not_per_bar_historical"
+                        payload["spread_reference"] = {
+                            "value": est_mean,
+                            "unit": "price",
+                            "source": estimate_source,
+                            "basis": "single_reference_not_per_bar_historical",
+                        }
                         payload.setdefault("meta", {}).setdefault("diagnostics", {}).setdefault("spread_estimate", {})["estimated_mean"] = est_mean
                         payload["meta"]["diagnostics"]["spread_estimate"]["source"] = estimate_source
                         payload["meta"]["diagnostics"]["spread_estimate"]["unit"] = "price"
@@ -2291,20 +2141,17 @@ def fetch_candles(  # noqa: C901
                         # Fallback to live ticker
                         if live_spread is not None:
                             est_mean = float(live_spread)
-                            data_rows = _apply_estimated_spread_to_candle_rows(
-                                data_rows,
-                                spread_idx=spread_idx,
-                                estimated_spread=est_mean,
-                                source="live_ticker",
-                            )
-                            payload["data"] = data_rows
                             payload.setdefault("warnings", []).append(
                                 "include_spread requested but spread unavailable; "
-                                f"estimated spread from current live ticker ({est_mean:g}) applied."
+                                f"current live ticker spread ({est_mean:g}) is returned at payload "
+                                "level and is not per-bar historical spread."
                             )
-                            payload["spread_unit"] = "price"
-                            payload["spread_estimated"] = True
-                            payload["spread_source"] = "live_ticker"
+                            payload["spread_reference"] = {
+                                "value": est_mean,
+                                "unit": "price",
+                                "source": "live_ticker",
+                                "basis": "single_reference_not_per_bar_historical",
+                            }
                             payload.setdefault("meta", {}).setdefault("diagnostics", {}).setdefault("spread_estimate", {})["estimated_mean"] = est_mean
                             payload["meta"]["diagnostics"]["spread_estimate"]["source"] = "live_ticker"
                             payload["meta"]["diagnostics"]["spread_estimate"]["unit"] = "price"
@@ -2343,23 +2190,19 @@ def _live_tick_spread(symbol: str) -> Optional[float]:
     return spread if spread > 0.0 else None
 
 
-def _apply_estimated_spread_to_candle_rows(
+def _remove_unavailable_spread_from_candle_rows(
     data_rows: list[Any],
     *,
     spread_idx: int | None,
-    estimated_spread: float,
-    source: str,
 ) -> list[Any]:
     for i, row in enumerate(data_rows):
         if isinstance(row, dict):
-            row["spread"] = estimated_spread
-            row["spread_source"] = source
+            row.pop("spread", None)
+            row.pop("spread_source", None)
         else:
             row_list = list(row)
-            if spread_idx is not None:
-                if spread_idx >= len(row_list):
-                    row_list += [None] * (spread_idx - len(row_list) + 1)
-                row_list[spread_idx] = estimated_spread
+            if spread_idx is not None and spread_idx < len(row_list):
+                row_list[spread_idx] = None
             data_rows[i] = row_list
     return data_rows
 
@@ -2376,22 +2219,22 @@ def _tick_flag_definitions() -> tuple[tuple[int, str, str], ...]:
         (
             _mt5_tick_flag_value("TICK_FLAG_BID", 2),
             "bid",
-            "Bid price changed or is present in the tick.",
+            "Bid price changed in this snapshot.",
         ),
         (
             _mt5_tick_flag_value("TICK_FLAG_ASK", 4),
             "ask",
-            "Ask price changed or is present in the tick.",
+            "Ask price changed in this snapshot.",
         ),
         (
             _mt5_tick_flag_value("TICK_FLAG_LAST", 8),
             "last",
-            "Last traded price changed or is present in the tick.",
+            "Last traded price changed in this snapshot.",
         ),
         (
             _mt5_tick_flag_value("TICK_FLAG_VOLUME", 16),
-            "tick_volume",
-            "Tick volume changed or is present in the tick.",
+            "volume",
+            "Last-trade volume changed in this snapshot.",
         ),
         (
             _mt5_tick_flag_value("TICK_FLAG_BUY", 32),
@@ -2405,8 +2248,8 @@ def _tick_flag_definitions() -> tuple[tuple[int, str, str], ...]:
         ),
         (
             _mt5_tick_flag_value("TICK_FLAG_VOLUME_REAL", 1024),
-            "real_volume",
-            "Real volume changed or is present in the tick.",
+            "volume_real",
+            "Last-trade real volume changed in this snapshot.",
         ),
     )
 
@@ -2433,24 +2276,6 @@ def _observed_tick_flags_decoded(flags: List[int]) -> Dict[str, List[str]]:
         str(flag): _decode_tick_flags(flag)
         for flag in sorted(set(int(value) for value in flags if int(value) != 0))
     }
-
-
-def _tick_quote_presence_from_flags(flag_value: int) -> tuple[bool, bool]:
-    labels = set(_decode_tick_flags(flag_value))
-    return "bid" in labels, "ask" in labels
-
-
-def _one_sided_zero_spread_missing_side(bid: float, ask: float, flag_value: int) -> Optional[str]:
-    if not (math.isfinite(bid) and math.isfinite(ask)):
-        return None
-    if bid != ask:
-        return None
-    has_bid, has_ask = _tick_quote_presence_from_flags(flag_value)
-    if has_ask and not has_bid:
-        return "bid"
-    if has_bid and not has_ask:
-        return "ask"
-    return None
 
 
 def _finite_or_none(value: Any) -> Optional[float]:
@@ -2510,6 +2335,9 @@ def _compact_tick_summary(out: Dict[str, Any]) -> Dict[str, Any]:
         "end": out.get("end"),
         "duration_seconds": out.get("duration_seconds"),
         "tick_rate_per_second": out.get("tick_rate_per_second"),
+        "tick_count": out.get("tick_count", out.get("count")),
+        "trade_event_count": out.get("trade_event_count"),
+        "quote_update_count": out.get("quote_update_count"),
         "timezone": out.get("timezone"),
         "stats": {"spread": compact_spread},
     }
@@ -2524,8 +2352,7 @@ def _compact_tick_summary(out: Dict[str, Any]) -> Dict[str, Any]:
         "raw_time_basis",
         "time_normalization",
         "broker_server_tz",
-        "broker_utc_offset_seconds",
-        "auto_shift_seconds",
+        "session_utc_offset_seconds",
     ):
         if out.get(key) is not None:
             compact[key] = out.get(key)
@@ -2594,7 +2421,7 @@ def fetch_ticks(  # noqa: C901
                 if price_point is not None
                 else None
             )
-            time_normalization = describe_mt5_time_normalization()
+            time_normalization = describe_mt5_time_normalization(symbol=symbol)
 
             # Normalized params only. This is an output shape selector, not the
             # shared compact/full detail enum.
@@ -2669,6 +2496,7 @@ def fetch_ticks(  # noqa: C901
         flags: List[int] = []
         volumes: List[float] = []
         volumes_real: List[float] = []
+        trade_events: List[bool] = []
         quote_types: List[str] = []
         for tick in ticks:
             _epochs.append(_tick_epoch_seconds(tick))
@@ -2686,25 +2514,37 @@ def fetch_ticks(  # noqa: C901
                 else last_value
             )
             flags.append(flag_value)
-            missing_side = _one_sided_zero_spread_missing_side(bid, ask, flag_value)
-            effective_bids.append(None if bid_value is None or missing_side == "bid" else bid)
-            effective_asks.append(None if ask_value is None or missing_side == "ask" else ask)
-            if missing_side == "bid" or (bid_value is None and ask_value is not None):
+            effective_bids.append(None if bid_value is None else bid)
+            effective_asks.append(None if ask_value is None else ask)
+            if bid_value is None and ask_value is not None:
                 quote_types.append("ask_only")
-            elif missing_side == "ask" or (ask_value is None and bid_value is not None):
+            elif ask_value is None and bid_value is not None:
                 quote_types.append("bid_only")
             elif bid_value is None and ask_value is None:
                 quote_types.append("no_quote")
             else:
                 quote_types.append("bid_ask")
             try:
-                volumes.append(float(_tick_field_value(tick, "volume")))
+                volume_value = float(_tick_field_value(tick, "volume"))
             except (TypeError, ValueError):
-                volumes.append(float("nan"))
+                volume_value = float("nan")
             try:
-                volumes_real.append(float(_tick_field_value(tick, "volume_real")))
+                volume_real_value = float(_tick_field_value(tick, "volume_real"))
             except (TypeError, ValueError):
-                volumes_real.append(float("nan"))
+                volume_real_value = float("nan")
+            volumes.append(volume_value)
+            volumes_real.append(volume_real_value)
+            trade_events.append(
+                is_mt5_trade_event(flag_value, mt5)
+                and (
+                    (last_value is not None and last_value > 0.0)
+                    or (math.isfinite(volume_value) and volume_value > 0.0)
+                    or (
+                        math.isfinite(volume_real_value)
+                        and volume_real_value > 0.0
+                    )
+                )
+            )
 
         has_last = any(math.isfinite(value) for value in lasts)
         finite_volumes = [v for v in volumes if math.isfinite(v)]
@@ -2713,10 +2553,52 @@ def fetch_ticks(  # noqa: C901
         )
         has_flags = len(set(flags)) > 1 or any(v != 0 for v in flags)
         has_real_volume = any(math.isfinite(v) and v != 0.0 for v in volumes_real)
-        one_sided_zero_spread_count = sum(
+        incomplete_quote_count = sum(
             1
             for bid, ask in zip(effective_bids, effective_asks, strict=False)
             if bid is None or ask is None
+        )
+        bid_update_flag = _mt5_tick_flag_value("TICK_FLAG_BID", 2)
+        ask_update_flag = _mt5_tick_flag_value("TICK_FLAG_ASK", 4)
+        quote_update_mask = bid_update_flag | ask_update_flag
+        has_quote_update_flags = any(flag & quote_update_mask for flag in flags)
+        quote_update_types: List[str] = []
+        spread_valid_flags: List[bool] = []
+        for flag, quote_type in zip(flags, quote_types, strict=False):
+            bid_updated = bool(flag & bid_update_flag)
+            ask_updated = bool(flag & ask_update_flag)
+            if bid_updated and ask_updated:
+                update_type = "bid_ask_update"
+            elif bid_updated:
+                update_type = "bid_only_update"
+            elif ask_updated:
+                update_type = "ask_only_update"
+            else:
+                update_type = "update_flags_unavailable"
+            quote_update_types.append(update_type)
+            spread_valid_flags.append(
+                quote_type == "bid_ask"
+                and (
+                    (bid_updated and ask_updated)
+                    if has_quote_update_flags
+                    else True
+                )
+            )
+        one_sided_update_count = sum(
+            update_type in {"bid_only_update", "ask_only_update"}
+            for update_type in quote_update_types
+        )
+        zero_spread_count = sum(
+            bool(valid)
+            and bid is not None
+            and ask is not None
+            and float(ask) == float(bid)
+            for valid, bid, ask in zip(
+                spread_valid_flags,
+                effective_bids,
+                effective_asks,
+                strict=False,
+            )
         )
 
         full_rows = output_mode == "full_rows"
@@ -2730,16 +2612,17 @@ def fetch_ticks(  # noqa: C901
         if include_quote_type:
             headers.append("quote_type")
         if full_rows:
+            headers.extend(["quote_update_type", "spread_valid"])
             headers.extend(["mid", "spread"])
             if price_point is not None:
                 headers.append("spread_points")
             if points_per_pip is not None:
                 headers.append("spread_pips")
             headers.extend(["spread_pct", "tick_gap_ms"])
-        headers.extend(["last", "tick_volume", "real_volume", "flags", "flags_decoded"])
+        headers.extend(["last", "volume", "volume_real", "flags", "flags_decoded"])
 
         # Choose a consistent millisecond time format for tick rows.
-        # Low-level tick fetch helpers already normalize MT5 times to UTC.
+        # Low-level tick fetch helpers have already normalized epochs to UTC.
         client_tz = _resolve_client_tz()
         _use_ctz = client_tz is not None
 
@@ -2800,9 +2683,12 @@ def fetch_ticks(  # noqa: C901
             df_ticks["spread_pct"] = (df_ticks["spread"] / df_ticks["mid"]) * 100.0
             df_ticks["tick_gap_ms"] = tick_gap_ms
         df_ticks["last"] = lasts
-        df_ticks["tick_volume"] = volumes
-        df_ticks["real_volume"] = volumes_real
+        df_ticks["volume"] = volumes
+        df_ticks["volume_real"] = volumes_real
         df_ticks["flags"] = flags
+        df_ticks["trade_event"] = trade_events
+        df_ticks["spread_valid"] = spread_valid_flags
+        df_ticks["quote_update_type"] = quote_update_types
         if include_quote_type:
             df_ticks["quote_type"] = quote_types
         df_ticks["flags_decoded"] = [
@@ -2811,9 +2697,13 @@ def fetch_ticks(  # noqa: C901
         df_ticks["time"] = [_format_tick_time(e) for e in _epochs]
 
         def _add_tick_data_quality(payload: Dict[str, Any]) -> None:
-            if one_sided_zero_spread_count <= 0:
+            if (
+                incomplete_quote_count <= 0
+                and one_sided_update_count <= 0
+                and zero_spread_count <= 0
+            ):
                 return
-            one_sided_ratio = one_sided_zero_spread_count / max(1, original_count)
+            incomplete_ratio = incomplete_quote_count / max(1, original_count)
             quote_type_counts = {
                 kind: quote_types.count(kind)
                 for kind in sorted(set(quote_types))
@@ -2821,25 +2711,32 @@ def fetch_ticks(  # noqa: C901
             complete_ticks = int(quote_type_counts.get("bid_ask", 0))
             incomplete_ticks = int(original_count - complete_ticks)
             payload["data_quality"] = {
-                "one_sided_zero_spread_ticks": int(one_sided_zero_spread_count),
+                "incomplete_quote_ticks": int(incomplete_quote_count),
                 "complete_ticks": complete_ticks,
                 "incomplete_ticks": incomplete_ticks,
                 "total_ticks": int(original_count),
-                "one_sided_zero_spread_ratio": round(one_sided_ratio, 4),
-                "spread_ticks_excluded": int(one_sided_zero_spread_count),
+                "incomplete_quote_ratio": round(incomplete_ratio, 4),
+                "spread_ticks_excluded": int(incomplete_quote_count),
+                "one_sided_updates": int(one_sided_update_count),
+                "valid_spread_ticks": int(sum(spread_valid_flags)),
+                "zero_spread_ticks": int(zero_spread_count),
                 "warning_ratio": _ONE_SIDED_TICK_WARNING_RATIO,
                 "quote_type_counts": quote_type_counts,
             }
-            if one_sided_ratio < _ONE_SIDED_TICK_WARNING_RATIO:
-                payload["data_quality"]["one_sided_zero_spread_status"] = "info"
+            if (
+                incomplete_ratio < _ONE_SIDED_TICK_WARNING_RATIO
+                and one_sided_update_count <= 0
+                and zero_spread_count <= 0
+            ):
+                payload["data_quality"]["incomplete_quote_status"] = "info"
                 return
-            payload["data_quality"]["one_sided_zero_spread_status"] = "warning"
+            payload["data_quality"]["incomplete_quote_status"] = "warning"
             warnings_list = payload.get("warnings")
             if not isinstance(warnings_list, list):
                 warnings_list = []
             warning = (
-                "Some ticks had identical bid/ask with one-sided quote flags; "
-                "the missing side was set to null and excluded from spread stats."
+                "Spread statistics exclude incomplete and one-sided quote updates; "
+                "zero-spread counts include only coherent two-sided updates."
             )
             if warning not in warnings_list:
                 warnings_list.append(warning)
@@ -2886,7 +2783,6 @@ def fetch_ticks(  # noqa: C901
                 item="tick",
                 age_rounder=lambda value: round(value, 3),
             )
-            freshness_context.pop("freshness_state", None)
             payload.update(freshness_context)
 
         def _compact_summary_from_ticks() -> Dict[str, Any]:
@@ -2899,7 +2795,10 @@ def fetch_ticks(  # noqa: C901
             tick_rate_per_second = (
                 float(len(df_stats) / duration_seconds) if duration_seconds > 0 else None
             )
-            spread = pd.to_numeric(df_stats["spread"], errors="coerce").dropna()
+            spread = pd.to_numeric(
+                df_stats["spread"].where(df_stats["spread_valid"]),
+                errors="coerce",
+            ).dropna()
             out: Dict[str, Any] = {
                 "success": True,
                 "symbol": symbol,
@@ -2908,6 +2807,11 @@ def fetch_ticks(  # noqa: C901
                 "end": str(df_stats["time"].iloc[-1]),
                 "duration_seconds": duration_seconds,
                 "tick_rate_per_second": tick_rate_per_second,
+                "tick_count": int(len(df_stats)),
+                "trade_event_count": int(sum(trade_events)),
+                "quote_update_count": int(
+                    sum(flag & quote_update_mask != 0 for flag in flags)
+                ),
                 "timezone": _timezone_label(use_client_tz=_use_ctz, client_tz=client_tz),
                 "stats": {
                     "spread": {
@@ -3003,7 +2907,9 @@ def fetch_ticks(  # noqa: C901
 
             df_stats = df_ticks.copy()
             df_stats["mid"] = (df_stats["bid"] + df_stats["ask"]) / 2.0
-            df_stats["spread"] = (df_stats["ask"] - df_stats["bid"])
+            df_stats["spread"] = (df_stats["ask"] - df_stats["bid"]).where(
+                df_stats["spread_valid"]
+            )
 
             start_epoch = float(df_stats["__epoch"].iloc[0])
             end_epoch = float(df_stats["__epoch"].iloc[-1])
@@ -3072,17 +2978,35 @@ def fetch_ticks(  # noqa: C901
             units = _tick_units_for_headers(headers)
             if units and detailed_stats:
                 out["units"] = units
-                _attach_tick_volume_semantics(out)
             if has_last and not small_summary_sample:
                 out["stats"]["last"] = _series_stats(df_stats["last"], total_count=len(df_stats))
 
-            volume_kind = "tick_volume"
-            vol_vals = pd.Series([1.0] * int(len(df_stats)), dtype=float)
-            if has_real_volume and len(volumes_real) == len(df_stats):
-                volume_kind = "real_volume"
-                vol_vals = pd.Series(volumes_real, dtype=float)
+            trade_event_mask = df_stats["trade_event"].astype(bool)
+            trade_event_count = int(trade_event_mask.sum())
+            out["tick_count"] = int(len(df_stats))
+            out["trade_event_count"] = trade_event_count
+            out["quote_update_count"] = int(
+                sum(flag & quote_update_mask != 0 for flag in flags)
+            )
+            if detailed_stats:
+                out["stats"]["tick_count"] = {
+                    "kind": "tick_count",
+                    "sum": int(len(df_stats)),
+                    "per_second": tick_rate_per_second,
+                }
 
-            if volume_kind == "real_volume":
+            volume_kind: Optional[str] = None
+            vol_vals = pd.Series(index=df_stats.index, dtype=float)
+            real_trade_volume = df_stats["volume_real"].where(trade_event_mask)
+            snapshot_trade_volume = df_stats["volume"].where(trade_event_mask)
+            if bool((real_trade_volume.fillna(0.0) > 0.0).any()):
+                volume_kind = "volume_real"
+                vol_vals = real_trade_volume
+            elif bool((snapshot_trade_volume.fillna(0.0) > 0.0).any()):
+                volume_kind = "volume"
+                vol_vals = snapshot_trade_volume
+
+            if volume_kind is not None:
                 vol_vals_num = pd.to_numeric(vol_vals, errors="coerce").astype(float)
                 vol_sum = float(vol_vals_num.fillna(0.0).sum())
                 vol_nonzero_count = int((vol_vals_num.fillna(0.0) != 0.0).sum())
@@ -3092,8 +3016,8 @@ def fetch_ticks(  # noqa: C901
                     "per_second": (
                         float(vol_sum / duration_seconds) if duration_seconds > 0 else None
                     ),
-                    "per_tick": float(vol_sum / float(len(df_stats) or 1)),
-                    "nonzero_share": float(vol_nonzero_count) / float(len(df_stats) or 1),
+                    "per_trade_event": float(vol_sum / float(trade_event_count or 1)),
+                    "nonzero_share": float(vol_nonzero_count) / float(trade_event_count or 1),
                 }
                 try:
                     mean_v = float(vol_vals_num.mean())
@@ -3132,7 +3056,11 @@ def fetch_ticks(  # noqa: C901
                         corr_df = pd.DataFrame(
                             {"volume": vol_vals_num, "abs_mid_change": dmid}
                         ).dropna()
-                        if int(corr_df.shape[0]) >= 3:
+                        if (
+                            int(corr_df.shape[0]) >= 3
+                            and int(corr_df["volume"].nunique()) > 1
+                            and int(corr_df["abs_mid_change"].nunique()) > 1
+                        ):
                             vol_out["corr_abs_mid_change"] = float(
                                 corr_df["volume"].corr(corr_df["abs_mid_change"])
                             )
@@ -3152,18 +3080,11 @@ def fetch_ticks(  # noqa: C901
                         pass
 
                 if detailed_stats:
-                    vol_out["dist"] = _series_stats(vol_vals_num, total_count=len(df_stats))
+                    vol_out["dist"] = _series_stats(
+                        vol_vals_num, total_count=trade_event_count
+                    )
                 if not small_summary_sample:
                     out["stats"][volume_kind] = vol_out
-            else:
-                if detailed_stats:
-                    out["stats"][volume_kind] = {
-                        "kind": volume_kind,
-                        "per_second": tick_rate_per_second,
-                        "sum": int(len(df_stats)),
-                    }
-                elif not small_summary_sample:
-                    out["stats"][volume_kind] = {"kind": volume_kind}
 
             _add_tick_data_quality(out)
             _add_tick_last_quality(out)
@@ -3198,7 +3119,11 @@ def fetch_ticks(  # noqa: C901
             units = _tick_units_for_headers(headers)
             if units:
                 payload["units"] = units
-                _attach_tick_volume_semantics(payload)
+            payload["tick_count"] = int(original_count)
+            payload["trade_event_count"] = int(sum(trade_events))
+            payload["quote_update_count"] = int(
+                sum(flag & quote_update_mask != 0 for flag in flags)
+            )
             _add_tick_summary_fields(payload)
             if has_flags:
                 payload["flags_legend"] = _observed_tick_flags_decoded(flags)
@@ -3209,8 +3134,8 @@ def fetch_ticks(  # noqa: C901
                     c
                     for c in ["bid", "ask"]
                     + (["last"] if has_last else [])
-                    + (["tick_volume"] if has_volume else [])
-                    + (["real_volume"] if has_real_volume else [])
+                    + (["volume"] if has_volume else [])
+                    + (["volume_real"] if has_real_volume else [])
                 ]
                 payload["simplify"] = meta
             _add_tick_data_quality(payload)
@@ -3228,9 +3153,9 @@ def fetch_ticks(  # noqa: C901
                 if has_last:
                     cols.append('last')
                 if has_volume:
-                    cols.append('tick_volume')
+                    cols.append('volume')
                 if has_real_volume:
-                    cols.append('real_volume')
+                    cols.append('volume_real')
                 n_out = _choose_simplify_points(original_count, simplify_used)
                 per = max(3, int(round(n_out / max(1, len(cols)))))
                 idx_set: set = set([0, original_count - 1])
@@ -3240,8 +3165,8 @@ def fetch_ticks(  # noqa: C901
                     "bid": bids,
                     "ask": asks,
                     "last": lasts,
-                    "tick_volume": volumes,
-                    "real_volume": volumes_real,
+                    "volume": volumes,
+                    "volume_real": volumes_real,
                 }
                 series_by_col: Dict[str, List[float]] = {c: extracted_columns[c] for c in cols}
                 for c in cols:
@@ -3319,16 +3244,18 @@ def fetch_ticks(  # noqa: C901
             if include_quote_type:
                 values.append(quote_types[i])
             if full_rows:
+                values.extend([quote_update_types[i], spread_valid_flags[i]])
                 bid_value = effective_bids[i]
                 ask_value = effective_asks[i]
+                spread_valid = spread_valid_flags[i]
                 mid = (
                     (bid_value + ask_value) / 2.0
-                    if bid_value is not None and ask_value is not None
+                    if spread_valid and bid_value is not None and ask_value is not None
                     else None
                 )
                 spread = (
                     ask_value - bid_value
-                    if bid_value is not None and ask_value is not None
+                    if spread_valid and bid_value is not None and ask_value is not None
                     else None
                 )
                 spread_points = _tick_spread_points(spread, price_point)
@@ -3371,7 +3298,11 @@ def fetch_ticks(  # noqa: C901
         units = _tick_units_for_headers(headers)
         if units:
             payload["units"] = units
-            _attach_tick_volume_semantics(payload)
+        payload["tick_count"] = int(original_count)
+        payload["trade_event_count"] = int(sum(trade_events))
+        payload["quote_update_count"] = int(
+            sum(flag & quote_update_mask != 0 for flag in flags)
+        )
         _add_tick_summary_fields(payload)
         if has_flags:
             payload["flags_legend"] = _observed_tick_flags_decoded(flags)
@@ -3388,8 +3319,8 @@ def fetch_ticks(  # noqa: C901
                     c
                     for c in ["bid", "ask"]
                     + (["last"] if has_last else [])
-                    + (["tick_volume"] if has_volume else [])
-                    + (["real_volume"] if has_real_volume else [])
+                    + (["volume"] if has_volume else [])
+                    + (["volume_real"] if has_real_volume else [])
                 ],
             }
             try:
@@ -3406,3 +3337,4 @@ def fetch_ticks(  # noqa: C901
         return _json_safe_payload(payload)
     except Exception as e:
         return {"error": f"Error getting ticks: {str(e)}"}
+

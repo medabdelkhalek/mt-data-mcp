@@ -197,6 +197,7 @@ def test_run_trade_place_logs_finish_event(caplog):
         volume=0.1,
         order_type="BUY",
         require_sl_tp=False,
+        dry_run=False,
     )
 
     with caplog.at_level("DEBUG", logger="mtdata.core.trading.use_cases"):
@@ -225,6 +226,7 @@ def test_run_trade_place_ignores_gtc_for_market_buy_sell_without_price():
         order_type="BUY",
         expiration="GTC",
         require_sl_tp=False,
+        dry_run=False,
     )
     place_market_order = MagicMock(return_value={"success": True, "path": "market"})
     place_pending_order = MagicMock(return_value={"success": True, "path": "pending"})
@@ -384,7 +386,7 @@ def test_build_trade_place_dry_run_preview_uses_live_quote_and_margin():
         volume_min=0.01,
         volume_max=100.0,
         volume_step=0.01,
-        point=0.0001,
+        point=0.00001,
         digits=5,
         trade_stops_level=10,
         trade_freeze_level=0,
@@ -406,7 +408,8 @@ def test_build_trade_place_dry_run_preview_uses_live_quote_and_margin():
     assert result["bid"] == 1.0999
     assert result["ask"] == 1.1001
     assert result["estimated_fill_price"] == 1.1001
-    assert result["spread_points"] == 2.0
+    assert result["spread_points"] == 20.0
+    assert result["spread_pips"] == 2.0
     assert result["sl_distance_pct"] > 0
     assert result["tp_distance_pct"] > 0
     assert result["sl_tp_valid"] is True
@@ -453,7 +456,7 @@ def test_build_trade_place_dry_run_preview_preserves_zero_symbol_digits():
     assert result["estimated_fill_price"] == 12345.0
 
 
-def test_run_trade_place_uses_candidate_tickets_when_position_ticket_is_missing():
+def test_run_trade_place_rejects_contradictory_sl_tp_safety_settings():
     request = TradePlaceRequest(
         symbol="EURUSD",
         volume=0.1,
@@ -461,26 +464,27 @@ def test_run_trade_place_uses_candidate_tickets_when_position_ticket_is_missing(
         stop_loss=1.08,
         take_profit=1.12,
         auto_close_on_sl_tp_fail=False,
+        dry_run=False,
     )
 
+    place_market_order = MagicMock()
+    close_positions = MagicMock()
     result = run_trade_place(
         request,
         normalize_order_type_input=lambda value: ("BUY", None),
         normalize_pending_expiration=lambda value: (value, False),
         prevalidate_trade_place_market_input=lambda symbol, volume: None,
-        place_market_order=lambda **kwargs: {
-            "retcode": 10009,
-            "sl_tp_result": {"status": "failed", "requested": {"sl": 1.08, "tp": 1.12}},
-            "position_ticket_candidates": [111, 222],
-        },
+        place_market_order=place_market_order,
         place_pending_order=lambda **kwargs: {"success": True, "path": "pending"},
-        close_positions=lambda **kwargs: {"closed_count": 1},
+        close_positions=close_positions,
         safe_int_ticket=lambda value: value,
     )
 
-    assert result["protection_status"] == "auto_closed_after_sl_tp_fail"
-    assert any("trade_modify 111" in str(w) for w in result.get("warnings", []))
-    assert any("trade_get_open" in str(w) for w in result.get("warnings", []))
+    assert result["error_code"] == "conflicting_sl_tp_safety_settings"
+    assert result["require_sl_tp"] is True
+    assert result["auto_close_on_sl_tp_fail"] is False
+    place_market_order.assert_not_called()
+    close_positions.assert_not_called()
 
 
 def test_run_trade_place_auto_close_uses_candidate_ticket_when_primary_is_missing():
@@ -491,6 +495,7 @@ def test_run_trade_place_auto_close_uses_candidate_ticket_when_primary_is_missin
         stop_loss=1.08,
         take_profit=1.12,
         auto_close_on_sl_tp_fail=True,
+        dry_run=False,
     )
     close_calls = []
 
@@ -526,6 +531,7 @@ def test_run_trade_place_without_any_ticket_guides_to_trade_get_open():
         order_type="BUY",
         stop_loss=1.08,
         take_profit=1.12,
+        dry_run=False,
     )
 
     result = run_trade_place(

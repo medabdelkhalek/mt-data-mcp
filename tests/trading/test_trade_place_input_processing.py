@@ -51,10 +51,10 @@ def test_trading_order_requests_expose_canonical_detail_field() -> None:
 
 
 def test_execution_request_dry_run_defaults() -> None:
-    # All trade tools execute by default; pass dry_run=true to preview.
-    assert TradePlaceRequest().dry_run is False
-    assert TradeModifyRequest(ticket=100).dry_run is False
-    assert TradeCloseRequest(ticket=100).dry_run is False
+    # All trade mutators preview by default; pass dry_run=false to execute live.
+    assert TradePlaceRequest().dry_run is True
+    assert TradeModifyRequest(ticket=100).dry_run is True
+    assert TradeCloseRequest(ticket=100).dry_run is True
 
 
 def test_normalize_order_type_rejects_mt5_integer() -> None:
@@ -85,6 +85,9 @@ def test_trade_place_rejects_prefixed_order_type() -> None:
         out = trade_place(symbol="BTCUSD", volume=0.03, order_type="ORDER_TYPE_BUY_STOP", price=70650, __cli_raw=True)
 
     assert "Unsupported order_type" in out["error"]
+    assert out["error_code"] == "invalid_order_type"
+    assert "BUY_STOP" in out["valid_values"]["order_type"]
+    assert out["example"].startswith("mtdata-cli trade_place")
     mock_pending.assert_not_called()
 
 
@@ -234,11 +237,14 @@ def test_trade_place_dry_run_market_preview_skips_order_send() -> None:
     assert out.get("would_send_order") is False
     assert out.get("pending") is False
     assert out.get("action") == "place_market_order"
-    assert "actionability" not in out
+    assert out["actionability"] == "preview_only"
     assert "preview_scope_summary" not in out
     assert "validation_not_performed" not in out
     assert "warnings" not in out
-    assert "validation_scope" not in out
+    assert out["validation_scope"] == "local_preview_plus_estimates"
+    assert out["validation_passed"] is True
+    assert out["preview_ok"] is True
+    assert "broker_acceptance" in out["broker_validation_not_performed"]
     assert "trade_gate_passed" not in out
     assert out.get("message") == "Dry run only. No order was sent to MT5."
     assert out.get("bid") == 64999.0
@@ -248,7 +254,7 @@ def test_trade_place_dry_run_market_preview_skips_order_send() -> None:
     mock_market.assert_not_called()
 
 
-def test_trade_place_dry_run_market_preview_allows_missing_sl_tp() -> None:
+def test_trade_place_dry_run_market_preview_rejects_missing_sl_tp() -> None:
     with patch("mtdata.core.trading._place_market_order") as mock_market, patch(
         "mtdata.core.trading.build_trade_place_dry_run_preview",
         return_value={"bid": 64999.0, "ask": 65001.0, "estimated_fill_price": 65001.0},
@@ -261,7 +267,10 @@ def test_trade_place_dry_run_market_preview_allows_missing_sl_tp() -> None:
             __cli_raw=True,
         )
 
-    assert out.get("success") is True
+    assert out.get("success") is False
+    assert out.get("error_code") == "trade_preview_validation_failed"
+    assert "missing_stop_loss, missing_take_profit" in out.get("error", "")
+    assert out.get("no_action_reason") == "dry_run_validation_failed"
     assert out.get("dry_run") is True
     assert out.get("require_sl_tp") is True
     assert "live submission with require_sl_tp=true would be rejected" in out.get(
@@ -274,6 +283,8 @@ def test_trade_place_dry_run_market_preview_allows_missing_sl_tp() -> None:
         "broker_validation_performed": False,
     }
     assert out.get("would_send_order") is False
+    assert out["preview_ok"] is False
+    assert out["validation_passed"] is False
     assert out.get("action") == "place_market_order"
     assert "requested_sl" not in out
     assert "requested_tp" not in out
@@ -302,12 +313,15 @@ def test_trade_place_dry_run_preview_detail_omits_safety_lists() -> None:
     assert out.get("success") is True
     assert out.get("dry_run") is True
     assert out.get("would_send_order") is False
-    assert "actionability" not in out
+    assert out["actionability"] == "preview_only"
     assert "preview_scope_summary" not in out
     assert "warnings" not in out
     assert "validation_not_performed" not in out
     assert "guardrails_preview" not in out
-    assert "validation_scope" not in out
+    assert out["guardrails_enabled"] is False
+    assert out["validation_scope"] == "local_preview_plus_estimates"
+    assert out["preview_ok"] is True
+    assert out["validation_passed"] is True
     assert "trade_gate_passed" not in out
     mock_market.assert_not_called()
 
@@ -334,7 +348,8 @@ def test_trade_place_dry_run_standard_detail_keeps_validation_context() -> None:
     assert "preview_scope_summary" in out
     assert "warnings" in out
     assert "guardrails_preview" in out
-    assert "validation_scope" not in out
+    assert out["guardrails_enabled"] is False
+    assert out["validation_scope"] == "local_preview_plus_estimates"
     assert "trade_gate_passed" not in out
     mock_market.assert_not_called()
 
@@ -355,6 +370,7 @@ def test_trade_place_dry_run_preview_error_uses_standard_error_shape() -> None:
         )
 
     assert out.get("success") is False
+    assert out.get("preview_ok") is False
     assert out.get("error") == "Failed to get current price for BTCUSD"
     assert out.get("error_code") == "trade_preview_error"
     assert out.get("operation") == "trade_place"
@@ -387,12 +403,65 @@ def test_trade_place_dry_run_rejects_invalid_live_protection_preview() -> None:
         )
 
     assert out.get("success") is False
+    assert out.get("preview_ok") is False
     assert out.get("dry_run") is True
     assert out.get("no_action") is True
     assert out.get("error_code") == "invalid_protection_levels"
     assert out.get("error") == out.get("sl_tp_error")
     assert "stop_loss must be below the live bid" in out.get("error", "")
     assert out.get("no_action_reason") == "dry_run_preview_error"
+    mock_market.assert_not_called()
+
+
+def test_trade_place_dry_run_rejects_identical_protection_before_mt5() -> None:
+    with patch("mtdata.core.trading._place_market_order") as mock_market, patch(
+        "mtdata.core.trading.build_trade_place_dry_run_preview"
+    ) as mock_preview:
+        out = trade_place(
+            symbol="EURUSD",
+            volume=0.01,
+            order_type="BUY",
+            stop_loss=1.0,
+            take_profit=1.0,
+            dry_run=True,
+            detail="standard",
+            __cli_raw=True,
+        )
+
+    assert out["success"] is False
+    assert out["error_code"] == "invalid_protection_levels"
+    assert out["error"] == "stop_loss and take_profit must be different prices."
+    assert out["validation"]["local_requirements_passed"] is False
+    assert out["validation"]["live_submission_eligible"] is False
+    assert "invalid_protection_levels" in out["validation"]["blockers"]
+    mock_preview.assert_not_called()
+    mock_market.assert_not_called()
+
+
+def test_trade_place_dry_run_preserves_mt5_connection_error() -> None:
+    with patch("mtdata.core.trading._place_market_order") as mock_market, patch(
+        "mtdata.core.trading.build_trade_place_dry_run_preview",
+        return_value={
+            "preview_error": "Failed to connect to MetaTrader5.",
+            "preview_error_code": "mt5_connection_error",
+        },
+    ):
+        out = trade_place(
+            symbol="EURUSD",
+            volume=0.01,
+            order_type="BUY",
+            stop_loss=1.08,
+            take_profit=1.12,
+            dry_run=True,
+            detail="standard",
+            __cli_raw=True,
+        )
+
+    assert out["success"] is False
+    assert out["error_code"] == "mt5_connection_error"
+    assert out["validation"]["local_requirements_passed"] is True
+    assert out["validation"]["live_submission_eligible"] is False
+    assert "mt5_connection_error" in out["validation"]["blockers"]
     mock_market.assert_not_called()
 
 
@@ -419,6 +488,7 @@ def test_trade_place_dry_run_rejects_bool_like_invalid_protection_preview() -> N
         )
 
     assert out.get("success") is False
+    assert out.get("preview_ok") is False
     assert out.get("dry_run") is True
     assert out.get("no_action") is True
     assert out.get("error_code") == "invalid_protection_levels"
@@ -446,7 +516,9 @@ def test_trade_place_dry_run_pending_preview_skips_order_send() -> None:
     assert out.get("no_action") is True
     assert out.get("pending") is True
     assert out.get("action") == "place_pending_order"
-    assert "actionability" not in out
+    assert out["actionability"] == "preview_only"
+    assert out["preview_ok"] is True
+    assert out["validation_passed"] is True
     assert "preview_scope_summary" not in out
     assert "warnings" not in out
     assert "trade_gate_passed" not in out

@@ -15,7 +15,7 @@ from ..utils.mt5 import MT5ConnectionError
 from ..utils.support_resistance import compact_support_resistance_payload
 from .error_envelope import build_error_payload
 from .mt5_gateway import create_mt5_gateway
-from .output_contract import ensure_common_meta, output_extras_shape_detail
+from .output_contract import apply_output_verbosity, ensure_common_meta, output_extras_shape_detail
 from .pivot import compute_support_resistance_payload
 from .tool_calling import resolve_sync_tool_result
 from .web_api_models import BacktestBody, ForecastPriceBody, ForecastVolBody
@@ -29,6 +29,10 @@ def _shape_detail_from_extras(extras: Any) -> str:
         return output_extras_shape_detail(extras)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _shape_detail(detail: str, extras: Any) -> str:
+    return _shape_detail_from_extras(extras) if extras is not None else detail
 
 
 def _http_error(
@@ -206,7 +210,7 @@ def get_instruments_response(
                 haystack = " ".join([name, desc, group]).lower()
                 if query not in haystack:
                     continue
-            items.append({"name": name, "group": group, "description": desc})
+            items.append({"symbol": name, "group": group, "description": desc})
         except Exception:
             continue
     if limit and limit > 0:
@@ -408,6 +412,8 @@ def get_history_response(  # noqa: C901
     allow_stale: bool,
     indicators: Optional[str],
     timestamp_format: str,
+    detail: str,
+    extras: Any,
     denoise_method: Optional[str],
     denoise_params: Optional[str],
     fetch_candles_impl: Callable[..., Any],
@@ -565,8 +571,27 @@ def get_history_response(  # noqa: C901
     if result.get("error"):
         raise _http_error(400, str(result["error"]), code="history_tool_error", operation="get_history")
 
-    return ensure_common_meta(
+    payload = ensure_common_meta(
         result,
+        tool_name="data_fetch_candles",
+        mt5_config=mt5_config,
+    )
+    timestamp_mode = str(timestamp_format).strip().lower()
+    payload["timestamp_format"] = timestamp_mode
+    if timestamp_mode == "epoch":
+        payload["timestamp_unit"] = "unix_seconds_utc"
+    shape_detail = _shape_detail(detail, extras)
+    if shape_detail != "full":
+        meta = payload.get("meta")
+        if isinstance(meta, dict):
+            runtime = meta.get("runtime")
+            timezone_meta = runtime.get("timezone") if isinstance(runtime, dict) else None
+            server_meta = timezone_meta.get("server") if isinstance(timezone_meta, dict) else None
+            if isinstance(server_meta, dict) and server_meta.get("offset_seconds") is not None:
+                payload["server_utc_offset_seconds"] = server_meta["offset_seconds"]
+    return apply_output_verbosity(
+        payload,
+        detail=shape_detail,
         tool_name="data_fetch_candles",
         mt5_config=mt5_config,
     )
@@ -577,6 +602,7 @@ def get_pivots_response(
     symbol: str,
     timeframe: str,
     method: str,
+    detail: str,
     pivot_tool: Any,
     call_tool_raw: Callable[[Any], Any],
 ) -> Dict[str, Any]:
@@ -588,7 +614,7 @@ def get_pivots_response(
                 symbol=symbol,
                 timeframe=timeframe,
                 method=method_key,
-                detail="compact",
+                detail=detail,
             )
         )
     except TypeError:
@@ -597,7 +623,7 @@ def get_pivots_response(
                 symbol=symbol,
                 timeframe=timeframe,
                 method=method_key,
-                detail="compact",
+                detail=detail,
             )
         )
     except Exception as exc:
@@ -661,13 +687,15 @@ def get_pivots_response(
             code="pivot_levels_missing",
             operation="get_pivots",
         )
-    return {
+    payload = dict(result)
+    payload.update({
         "levels": levels,
         "period": result.get("period"),
         "symbol": result.get("symbol", symbol),
         "timeframe": result.get("timeframe", timeframe),
         "method": method_key,
-    }
+    })
+    return apply_output_verbosity(payload, detail=detail, tool_name="pivot_compute_points")
 
 
 def get_support_resistance_response(
@@ -683,6 +711,7 @@ def get_support_resistance_response(
     reaction_bars: int,
     adx_period: int,
     decay_half_life_bars: Optional[int],
+    detail: str,
     extras: Any,
     fetch_history_impl: Callable[..., Any],
 ) -> Dict[str, Any]:
@@ -720,39 +749,58 @@ def get_support_resistance_response(
             code="support_resistance_levels_missing",
             operation="get_support_resistance",
         )
-    if _shape_detail_from_extras(extras) == "compact":
-        return compact_support_resistance_payload(result)
-    return result
+    shape_detail = _shape_detail(detail, extras)
+    payload = compact_support_resistance_payload(result) if shape_detail == "compact" else result
+    return apply_output_verbosity(
+        payload,
+        detail=shape_detail,
+        tool_name="support_resistance_levels",
+    )
 
 
 def get_tick_response(
     *,
     symbol: str,
-    mt5: Any,
-    ensure_symbol_ready: Callable[[str], Any],
+    detail: str,
+    market_ticker_tool: Any,
+    call_tool_raw: Callable[[Any], Any],
 ) -> Dict[str, Any]:
-    _require_mt5_connection()
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        err = ensure_symbol_ready(symbol)
-        if err:
-            info = mt5.symbol_info(symbol)
-            if info is None:
-                raise _http_error(404, f"Unknown symbol {symbol}", code="unknown_symbol", operation="get_tick")
-            # Transient broker/session activation failure — align with other
-            # service-unavailable paths (503), not an internal 500.
-            raise _http_error(503, str(err), code="tick_symbol_ready_failed", operation="get_tick")
-        tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        raise _http_error(404, f"No tick data for {symbol}", code="tick_data_missing", operation="get_tick")
-    return {
-        "symbol": symbol,
-        "time": float(tick.time),
-        "bid": float(tick.bid),
-        "ask": float(tick.ask),
-        "last": float(tick.last),
-        "volume": float(tick.volume),
-    }
+    tool = call_tool_raw(market_ticker_tool)
+    try:
+        result = resolve_sync_tool_result(tool(symbol=symbol, detail=detail))
+    except Exception as exc:
+        raise _http_error(
+            500,
+            f"Tick lookup failed: {exc}",
+            code="tick_lookup_failed",
+            operation="get_tick",
+        ) from exc
+    if not isinstance(result, dict):
+        raise _http_error(
+            500,
+            "Unexpected tick payload",
+            code="tick_payload_invalid",
+            operation="get_tick",
+        )
+    if result.get("error"):
+        error_code = str(result.get("error_code") or "tick_data_missing")
+        if error_code == "symbol_not_found":
+            status_code = 404
+        elif error_code in {
+            "market_ticker_mt5_connection",
+            "market_ticker_tick_unavailable",
+            "market_ticker_quote_unavailable",
+        }:
+            status_code = 503
+        else:
+            status_code = 400
+        raise _http_error(
+            status_code,
+            result["error"],
+            code=error_code,
+            operation="get_tick",
+        )
+    return apply_output_verbosity(result, detail=detail, tool_name="market_ticker")
 
 
 def post_forecast_price_response(*, body: ForecastPriceBody, forecast_generate_use_case: Callable[..., Any]) -> Dict[str, Any]:

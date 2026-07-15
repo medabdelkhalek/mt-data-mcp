@@ -18,13 +18,13 @@ from ..shared.validators import (
     unsupported_timeframe_seconds_error,
 )
 from ..utils.denoise import (
-    _apply_denoise,
-    _consume_denoise_warnings,
+    apply_denoise,
+    consume_denoise_warnings,
 )
 from ..utils.denoise import (
     normalize_denoise_spec as _normalize_denoise_spec,
 )
-from ..utils.freshness import closed_session_context
+from ..utils.freshness import closed_session_context, format_age_seconds
 from ..utils.mt5 import get_cached_mt5_time_alignment, get_symbol_info_cached
 from ..utils.time import (
     _format_time_minimal,
@@ -299,7 +299,7 @@ def _resolve_history_context(
                 normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
             except Exception:
                 normalized = None
-            added = _apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
+            added = apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
             dn_spec_used = normalized
             if len(added) > 0 and base_col == 'close' and f"{base_col}_dn" in added:
                 base_col = f"{base_col}_dn"
@@ -321,7 +321,7 @@ def _resolve_history_context(
             normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
         except Exception:
             normalized = None
-        added = _apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
+        added = apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
         dn_spec_used = normalized
         if len(added) > 0 and f"{base_col}_dn" in added:
             base_col = f"{base_col}_dn"
@@ -688,6 +688,27 @@ def _training_context_fingerprint(
     }
 
 
+def _params_hash_from_model_id(
+    model_id: str,
+    *,
+    method: str,
+    data_scope: str,
+) -> str:
+    parts = str(model_id).split("/")
+    if len(parts) != 3 or any(not part for part in parts):
+        raise ValueError(
+            "model_id must use the canonical method/data_scope/params_hash format "
+            "returned by forecast_train or forecast_models_list."
+        )
+    stored_method, stored_scope, params_hash = parts
+    if stored_method != method or stored_scope != data_scope:
+        raise ValueError(
+            f"model_id '{model_id}' does not match requested method '{method}' "
+            f"and data scope '{data_scope}'."
+        )
+    return params_hash
+
+
 def _try_predict_with_stored_model(
     forecaster: "ForecastMethod",
     method_l: str,
@@ -792,7 +813,6 @@ def _submit_async_training(
         seasonality=seasonality,
         params=params,
         data_scope=data_scope,
-        params_hash=params_hash,
         exog=exog,
         timeframe=timeframe,
     )
@@ -903,9 +923,17 @@ def _run_registered_forecast_method(
             target_spec=target_spec,
             exog=X,
         )
-        params_hash = requested_model_id or _compute_model_key(
-            forecaster, method_l, horizon, seasonality,
-            training_params, str(timeframe), has_exog,
+        params_hash = (
+            _params_hash_from_model_id(
+                requested_model_id,
+                method=method_l,
+                data_scope=data_scope,
+            )
+            if requested_model_id
+            else _compute_model_key(
+                forecaster, method_l, horizon, seasonality,
+                training_params, str(timeframe), has_exog,
+            )
         )
 
         stored_result = _try_predict_with_stored_model(
@@ -918,7 +946,7 @@ def _run_registered_forecast_method(
             return stored_result
         if requested_model_id:
             raise ValueError(
-                f"Model with ID or params_hash '{requested_model_id}' was not found "
+                f"Model with ID '{requested_model_id}' was not found "
                 "in the model store or could not be loaded. Use forecast_models_list "
                 "to see available models, or omit model_id for an on-the-fly forecast."
             )
@@ -974,23 +1002,6 @@ def _forecast_timezone_label(*, use_client_tz: bool, client_tz: Any) -> str:
     )
 
 
-def _format_age_seconds(seconds: Any) -> Optional[str]:
-    try:
-        value = max(0, int(round(float(seconds))))
-    except Exception:
-        return None
-    days, remainder = divmod(value, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
-
-
 def _last_price_freshness_fields(
     *,
     last_epoch: float,
@@ -1017,7 +1028,7 @@ def _last_price_freshness_fields(
         "freshness_basis": "bar_policy",
         "stale_after_seconds": stale_after,
     }
-    age_text = _format_age_seconds(rounded_age)
+    age_text = format_age_seconds(rounded_age)
     if age_text:
         out["last_price_age"] = age_text
     closed_session = closed_session_context(
@@ -1028,7 +1039,8 @@ def _last_price_freshness_fields(
     )
     if closed_session:
         out.update(closed_session)
-    out["usable_for_live_trading"] = not out["last_price_stale"] and not bool(closed_session)
+    history_policy_ok = not out["last_price_stale"] and not bool(closed_session)
+    out["history_policy_ok"] = history_policy_ok
     if out["last_price_stale"]:
         out["stale_warning"] = (
             "Last forecast anchor is older than the bar freshness policy; "
@@ -1335,7 +1347,7 @@ def forecast_engine(  # noqa: C901
             return {"error": str(ex)}
         if p.get("seasonality") is None and "time" in df.columns:
             seasonality = default_seasonality(timeframe, df["time"])
-        denoise_warnings = _consume_denoise_warnings(df)
+        denoise_warnings = consume_denoise_warnings(df)
 
         # Prepare target series, honoring target_spec if provided
         try:
@@ -1578,3 +1590,4 @@ def forecast_engine(  # noqa: C901
 
     except Exception as e:
         return {"error": f"Forecast engine failed: {str(e)}"}
+

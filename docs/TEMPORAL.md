@@ -1,15 +1,12 @@
-# Temporal Analysis
+# Temporal analysis
 
-The `temporal_analyze` command computes grouped statistics (returns, volatility, volume) by time period—day of week, hour of day, or calendar month. Use it to discover session effects, optimal trading windows, and seasonal patterns.
+Does this market behave differently on **Monday vs Friday**, at the **London open**, or in **certain months**? `temporal_analyze` groups returns, volatility, and volume by calendar bucket so you can spot session effects and seasonality before you lock a strategy.
 
-**Related:**
-- [CLI.md](CLI.md) — Command usage and output formats
-- [GLOSSARY.md](GLOSSARY.md) — Term definitions
-- [forecast/VOLATILITY.md](forecast/VOLATILITY.md) — Volatility estimation
+**Related:** [CLI](CLI.md) · [Glossary](GLOSSARY.md) · [Volatility](forecast/VOLATILITY.md) · [Diagnostics](TIME_SERIES_DIAGNOSTICS.md)
 
 ---
 
-## Quick Start
+## Quick start
 
 ```bash
 # Average returns by day of week
@@ -54,7 +51,7 @@ mtdata-cli temporal_analyze EURUSD --group-by dow --lookback 2000 --json
 
 **Example output (simplified):**
 ```
-group  bars  avg_return  volatility  win_rate  avg_volume
+group  bars  avg_return_pct  volatility_pct  win_rate_pct  avg_volume
 Mon     400   -0.012%     0.065%      48.2%     1250
 Tue     400    0.008%     0.071%      51.0%     1380
 Wed     400    0.015%     0.078%      52.5%     1420
@@ -113,10 +110,11 @@ Each group includes these statistics:
 | `group_key` | Numeric group identifier |
 | `bars` | Number of bars in group |
 | `returns` | Count of return observations |
-| `avg_return` | Average return (%) |
-| `median_return` | Median return (%) |
+| `avg_return_pct` | Average return in percentage points (1.0 = 1%) |
+| `median_return_pct` | Median return in percentage points (1.0 = 1%) |
 | `volatility` | Standard deviation of returns |
-| `avg_abs_return` | Average absolute return |
+| `avg_abs_return_pct` | Average absolute return in percentage points |
+| `volatility_pct` | Per-bar return standard deviation in percentage points |
 | `win_rate` | Percentage of bars with positive return |
 | `avg_range` | Average high-low range |
 | `avg_range_pct` | Average range as percentage of close |
@@ -151,7 +149,7 @@ mtdata-cli temporal_analyze EURUSD --group-by dow --time-range "08:00-16:00" --j
 ### Find Best Trading Days
 ```bash
 mtdata-cli temporal_analyze EURUSD --group-by dow --lookback 5000 --json
-# Look for days with highest win_rate and positive avg_return
+# Look for days with highest win_rate_pct and positive avg_return_pct
 ```
 
 ### Find Active Trading Hours
@@ -163,7 +161,7 @@ mtdata-cli temporal_analyze EURUSD --group-by hour --lookback 5000 --json
 ### Seasonal Patterns
 ```bash
 mtdata-cli temporal_analyze SPX500 --timeframe D1 --group-by month --lookback 3000 --json
-# Compare monthly avg_return and volatility
+# Compare monthly avg_return_pct and volatility_pct
 ```
 
 ---

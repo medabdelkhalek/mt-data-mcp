@@ -15,16 +15,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mtdata.core.report import _report_error_payload
+from mtdata.utils.coercion import safe_float as _safe_float
 from mtdata.core.report_templates.basic import (
+    _bars_since_latest_pivot,
     _compute_compact_trend,
-    _wilder_rma,
     _compute_tr,
     _ema,
     _get_raw_result,
     _linreg_slope_r2,
     _percentile_rank,
-    _bars_since_latest_pivot,
-    _safe_float,
+    _wilder_rma,
 )
 
 # ---------------------------------------------------------------------------
@@ -42,41 +42,37 @@ def _make_rows(n=30, base=100.0, step=0.1):
 # ===== _safe_float ==========================================================
 
 class TestSafeFloat:
-    def test_int(self):
-        assert _safe_float(42) == 42.0
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (42, 42.0),
+            (3.14, 3.14),
+            ("2.71", 2.71),
+            (0, 0.0),
+            (-5.5, -5.5),
+            (True, 1.0),
+            (False, 0.0),
+            (1e300, 1e300),
+        ],
+    )
+    def test_coerces_numeric_values(self, value, expected):
+        assert _safe_float(value) == expected
 
-    def test_float(self):
-        assert _safe_float(3.14) == 3.14
-
-    def test_string_number(self):
-        assert _safe_float("2.71") == 2.71
-
-    def test_nan_returns_default(self):
-        assert _safe_float(float("nan")) is None
-
-    def test_nan_returns_custom_default(self):
-        assert _safe_float(float("nan"), default=0.0) == 0.0
-
-    def test_inf_returns_default(self):
-        assert _safe_float(float("inf")) is None
-
-    def test_neg_inf_returns_default(self):
-        assert _safe_float(float("-inf"), default=-1.0) == -1.0
-
-    def test_none_returns_default(self):
-        assert _safe_float(None) is None
-
-    def test_non_numeric_string(self):
-        assert _safe_float("abc") is None
-
-    def test_empty_string(self):
-        assert _safe_float("") is None
-
-    def test_zero(self):
-        assert _safe_float(0) == 0.0
-
-    def test_negative(self):
-        assert _safe_float(-5.5) == -5.5
+    @pytest.mark.parametrize(
+        ("value", "default", "expected"),
+        [
+            (float("nan"), None, None),
+            (float("nan"), 0.0, 0.0),
+            (float("inf"), None, None),
+            (float("-inf"), -1.0, -1.0),
+            (None, None, None),
+            ("abc", None, None),
+            ("", None, None),
+            ([1, 2], None, None),
+        ],
+    )
+    def test_rejects_or_defaults_uncoercible_values(self, value, default, expected):
+        assert _safe_float(value, default=default) == expected
 
 
 # ===== _ema =================================================================
@@ -634,6 +630,41 @@ class TestTemplateBasic:
 
     @patch(f"{_BASIC_MODULE}._get_raw_result")
     @patch(f"{_BASIC_MODULE}.now_utc_iso", return_value="2024-01-15T00:00:00Z")
+    @patch(f"{_BASIC_MODULE}.parse_table_tail", return_value=_mock_candle_data()["rows"])
+    @patch(f"{_BASIC_MODULE}.pick_best_forecast_method", return_value=None)
+    @patch(f"{_BASIC_MODULE}.attach_multi_timeframes")
+    def test_bounded_basic_report_omits_current_only_sections(
+        self, mock_mtf, mock_pick, mock_tail, mock_now, mock_raw,
+    ):
+        def raw_side_effect(func, *args, **kwargs):
+            name = getattr(func, "__name__", "")
+            assert "pivot" not in name.lower()
+            assert "barrier" not in name.lower()
+            if "candle" in name.lower() or "data_fetch" in name.lower():
+                return _mock_candle_data()
+            if "volatility" in name.lower():
+                return _mock_vol_data()
+            if "backtest" in name.lower():
+                return {"results": {}}
+            if "pattern" in name.lower():
+                return _mock_patterns_data()
+            return {"data": "ok"}
+
+        mock_raw.side_effect = raw_side_effect
+
+        from mtdata.core.report_templates.basic import template_basic
+
+        report = template_basic(
+            "EURUSD", 12, None, {"start": "2024-01-01", "end": "2024-01-31"}
+        )
+
+        for section in ("pivot", "pivot_multi", "barriers"):
+            assert report["sections"][section]["status"] == "omitted"
+            assert report["sections"][section]["reason"] == "current_only_section_omitted"
+        assert mock_mtf.call_args.kwargs["pivot_timeframes"] == []
+
+    @patch(f"{_BASIC_MODULE}._get_raw_result")
+    @patch(f"{_BASIC_MODULE}.now_utc_iso", return_value="2024-01-15T00:00:00Z")
     @patch(f"{_BASIC_MODULE}._compute_compact_trend", return_value={"slope_atr_scores": [12], "volatility_bps": 45, "squeeze_percentile": 60})
     @patch(f"{_BASIC_MODULE}.pick_best_forecast_method", return_value=None)
     @patch(f"{_BASIC_MODULE}.summarize_barrier_grid", return_value={"best": {}})
@@ -872,7 +903,7 @@ class TestTemplateBasic:
     @patch(f"{_BASIC_MODULE}.pick_best_forecast_method", return_value=None)
     @patch(f"{_BASIC_MODULE}.summarize_barrier_grid")
     @patch(f"{_BASIC_MODULE}.attach_multi_timeframes")
-    def test_basic_backtest_spacing_is_clamped_to_horizon(
+    def test_basic_backtest_spacing_is_clamped_above_horizon(
         self, mock_mtf, mock_sum_bar, mock_pick, mock_tail,
         mock_now, mock_raw,
     ):
@@ -904,7 +935,7 @@ class TestTemplateBasic:
         _ = template_basic("EURUSD", 12, None, {})
 
         assert backtest_calls[0]["steps"] == 25
-        assert backtest_calls[0]["spacing"] == 12
+        assert backtest_calls[0]["spacing"] == 13
 
     @patch(f"{_BASIC_MODULE}._get_raw_result")
     @patch(f"{_BASIC_MODULE}.now_utc_iso", return_value="2024-01-15T00:00:00Z")
@@ -1381,6 +1412,29 @@ class TestTemplateAdvanced:
 
     @patch(f"{_ADV_MODULE}.template_basic")
     @patch(f"{_ADV_MODULE}._get_raw_result")
+    def test_bounded_advanced_report_omits_conformal(self, mock_raw, mock_basic):
+        mock_basic.return_value = {
+            "meta": {"symbol": "EURUSD", "template": "basic"},
+            "sections": {"backtest": {"best_method": {"method": "ema"}}},
+        }
+        mock_raw.return_value = {"summary": "ok"}
+
+        from mtdata.core.report_templates.advanced import template_advanced
+
+        report = template_advanced(
+            "EURUSD", 12, None, {"end": "2024-01-31"}
+        )
+
+        conformal = report["sections"]["forecast_conformal"]
+        assert conformal["status"] == "omitted"
+        assert conformal["reason"] == "current_only_section_omitted"
+        assert all(
+            "conformal" not in getattr(call.args[0], "__name__", "").lower()
+            for call in mock_raw.call_args_list
+        )
+
+    @patch(f"{_ADV_MODULE}.template_basic")
+    @patch(f"{_ADV_MODULE}._get_raw_result")
     def test_advanced_handles_basic_string_error(self, mock_raw, mock_basic):
         mock_basic.return_value = "some error string"
 
@@ -1542,21 +1596,6 @@ class TestTemplateScalping:
 
 
 # ===== Edge cases and additional coverage ====================================
-
-class TestSafeFloatEdge:
-    def test_bool_true(self):
-        # bool is subclass of int: float(True) == 1.0
-        assert _safe_float(True) == 1.0
-
-    def test_bool_false(self):
-        assert _safe_float(False) == 0.0
-
-    def test_list_returns_default(self):
-        assert _safe_float([1, 2]) is None
-
-    def test_very_large_number(self):
-        assert _safe_float(1e300) == 1e300
-
 
 class TestEmaEdge:
     def test_two_values(self):

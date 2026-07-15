@@ -10,8 +10,9 @@ from ..shared.schema import DetailLiteral, DenoiseSpec, TimeframeLiteral
 from ..shared.validators import invalid_timeframe_error
 from ..utils.denoise import normalize_denoise_spec as _normalize_denoise_spec
 from ..utils.time import _format_time_minimal
+from ..utils.mt5 import mt5
 from .common import (
-    bars_per_year as _bars_per_year,
+    annualization_context as _annualization_context,
 )
 from .common import (
     fetch_history as _fetch_history,
@@ -128,6 +129,14 @@ def _compact_strategy_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
     out.pop("detail", None)
     out.pop("parameters", None)
     out.pop("warning", None)
+    last_signal = out.pop("last_signal", None)
+    if isinstance(last_signal, dict):
+        historical = dict(last_signal)
+        direction = historical.pop("signal", None)
+        if direction is not None:
+            historical["direction"] = direction
+        out["signal_status"] = "not_actionable"
+        out["last_historical_signal"] = historical
 
     summary = out.get("summary")
     if isinstance(summary, dict):
@@ -348,19 +357,25 @@ def _compute_performance_metrics(
     slippage_bps: float,
     trade_spacing_bars: Optional[int] = None,
     symbol: Optional[str] = None,
+    observed_times: Any = None,
 ) -> Dict[str, Any]:
     """Compute portfolio-level performance statistics from per-trade returns."""
 
+    annualization_bars, annualization_basis = _annualization_context(
+        timeframe,
+        symbol,
+        observed_times=observed_times,
+    )
+
     def _empty_metrics() -> Dict[str, Any]:
-        bars_per_year = _bars_per_year(timeframe, symbol)
         cadence = (
             max(1, int(trade_spacing_bars))
             if trade_spacing_bars is not None
             else max(1, int(horizon))
         )
         trades_per_year = (
-            float(bars_per_year / cadence)
-            if math.isfinite(bars_per_year)
+            float(annualization_bars / cadence)
+            if math.isfinite(annualization_bars)
             else float("nan")
         )
         return {
@@ -382,6 +397,8 @@ def _compute_performance_metrics(
             "calmar_ratio": None,
             "annual_return": None,
             "trades_per_year": trades_per_year,
+            "bars_per_year": annualization_bars,
+            "annualization_basis": annualization_basis,
             "trades_observed": 0,
             "winning_trades": 0,
             "losing_trades": 0,
@@ -407,9 +424,8 @@ def _compute_performance_metrics(
 
     metrics: Dict[str, Any] = {}
 
-    bars_per_year = _bars_per_year(timeframe, symbol)
     cadence = max(1, int(trade_spacing_bars)) if trade_spacing_bars is not None else max(1, int(horizon))
-    trades_per_year = float(bars_per_year / cadence) if math.isfinite(bars_per_year) else float('nan')
+    trades_per_year = float(annualization_bars / cadence) if math.isfinite(annualization_bars) else float('nan')
 
     avg_return = float(np.mean(arr))
     winning_trades = int(np.sum(arr > 0.0))
@@ -451,7 +467,7 @@ def _compute_performance_metrics(
     drawdowns = equity / np.where(peak == 0.0, 1.0, peak) - 1.0
     max_drawdown = float(abs(np.min(drawdowns))) if drawdowns.size > 0 else float('nan')
 
-    downside = arr[arr < 0.0]
+    downside = np.minimum(arr, 0.0)
     downside_dev = float(np.sqrt(np.mean(downside ** 2))) if downside.size > 0 else 0.0
     sortino = float('nan')
     if enough_trades and downside_dev > 1e-12 and math.isfinite(trades_per_year) and trades_per_year > 0:
@@ -509,6 +525,8 @@ def _compute_performance_metrics(
         "calmar_ratio": _finite_or_none(calmar),
         "annual_return": _finite_or_none(annual_return),
         "trades_per_year": trades_per_year,
+        "bars_per_year": annualization_bars,
+        "annualization_basis": annualization_basis,
         "trades_observed": int(arr.size),
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
@@ -862,12 +880,13 @@ def _build_strategy_trade(
     entry_price: float,
     exit_price: float,
     slippage_bps: float,
+    spread_bps: float,
 ) -> Dict[str, Any]:
     gross_return = float(direction) * ((float(exit_price) - float(entry_price)) / float(entry_price))
     if gross_return <= -0.999:
         gross_return = -0.999
     slip = float(abs(slippage_bps) or 0.0) / 10000.0
-    net_return = gross_return - (2.0 * slip)
+    net_return = gross_return - (float(abs(spread_bps) or 0.0) / 10000.0) - (2.0 * slip)
     if net_return <= -0.999:
         net_return = -0.999
     return {
@@ -897,7 +916,9 @@ def strategy_backtest(  # noqa: C901
     oversold: float = 30.0,
     overbought: float = 70.0,
     max_hold_bars: Optional[int] = None,
-    slippage_bps: float = 0.0,
+    cost_model: Literal["mt5_observed", "fixed"] = "mt5_observed",
+    spread_bps: Optional[float] = None,
+    slippage_bps: float = 1.0,
 ) -> Dict[str, Any]:
     try:
         request_payload = {
@@ -915,6 +936,8 @@ def strategy_backtest(  # noqa: C901
             "oversold": oversold,
             "overbought": overbought,
             "max_hold_bars": max_hold_bars,
+            "cost_model": cost_model,
+            "spread_bps": spread_bps,
             "slippage_bps": slippage_bps,
         }
         strategy_value = str(strategy or "sma_cross").strip().lower()
@@ -932,6 +955,22 @@ def strategy_backtest(  # noqa: C901
             return {"error": "fast_period must be less than slow_period"}
         if float(oversold) >= float(overbought):
             return {"error": "oversold must be less than overbought"}
+        cost_model_value = str(cost_model or "mt5_observed").strip().lower()
+        if cost_model_value not in {"mt5_observed", "fixed"}:
+            return {"error": "cost_model must be 'mt5_observed' or 'fixed'"}
+        resolved_spread_bps = float(spread_bps or 0.0)
+        spread_source = "explicit" if spread_bps is not None else "unavailable"
+        if spread_bps is None and cost_model_value == "mt5_observed":
+            try:
+                tick = mt5.symbol_info_tick(symbol)
+                bid = float(getattr(tick, "bid", 0.0) or 0.0)
+                ask = float(getattr(tick, "ask", 0.0) or 0.0)
+                mid = (bid + ask) / 2.0
+                if ask > bid > 0.0 and mid > 0.0:
+                    resolved_spread_bps = (ask - bid) / mid * 10000.0
+                    spread_source = "mt5_current_quote"
+            except Exception:
+                pass
 
         if strategy_value in {"sma_cross", "ema_cross"}:
             warmup_bars = max(int(slow_period), 5)
@@ -1020,6 +1059,7 @@ def strategy_backtest(  # noqa: C901
                     entry_price=float(entry_price),
                     exit_price=float(action_price),
                     slippage_bps=float(slippage_bps),
+                    spread_bps=resolved_spread_bps,
                 )
             )
             current_direction = 0
@@ -1048,6 +1088,7 @@ def strategy_backtest(  # noqa: C901
                     entry_price=float(entry_price),
                     exit_price=float(final_exit_price),
                     slippage_bps=float(slippage_bps),
+                    spread_bps=resolved_spread_bps,
                 )
             )
 
@@ -1072,6 +1113,7 @@ def strategy_backtest(  # noqa: C901
             float(slippage_bps),
             trade_spacing_bars=trade_spacing,
             symbol=symbol,
+            observed_times=times,
         ) if trade_returns else {}
         if detail_mode == "compact" and metrics:
             metrics = _compact_metrics_payload(metrics)
@@ -1109,6 +1151,8 @@ def strategy_backtest(  # noqa: C901
         _params: Dict[str, Any] = {
             "lookback": int(lookback),
             "slippage_bps": float(slippage_bps),
+            "cost_model": cost_model_value,
+            "spread_bps": resolved_spread_bps,
             **_strategy_params,
         }
         if start is not None:
@@ -1121,11 +1165,22 @@ def strategy_backtest(  # noqa: C901
 
         result: Dict[str, Any] = {
             "success": True,
+            "is_signal": False,
+            "usage": "research_only",
             "symbol": symbol,
             "timeframe": timeframe,
             "strategy": strategy_value,
             "detail": detail_mode,
             "position_mode": position_mode_value,
+            "price_basis": "mt5_bid_ohlc",
+            "cost_model": {
+                "type": cost_model_value,
+                "spread_bps_round_trip": resolved_spread_bps,
+                "spread_source": spread_source,
+                "slippage_bps_per_side": float(slippage_bps),
+                "round_trip_cost_bps": resolved_spread_bps + float(slippage_bps) * 2.0,
+                "complete": spread_source != "unavailable",
+            },
             "units": _backtest_units(),
             "parameters": _params,
             "summary": {
@@ -1146,6 +1201,7 @@ def strategy_backtest(  # noqa: C901
             },
             "metrics": metrics,
             "last_signal": {
+                "signal_status": "historical_observation_only",
                 "signal": _strategy_signal_label(last_signal_value),
                 "close": float(closes[last_idx]),
                 "fast_ma": float(diagnostics["fast_ma"].iloc[last_idx]) if diagnostics.get("fast_ma") is not None and np.isfinite(float(diagnostics["fast_ma"].iloc[last_idx])) else None,
@@ -1608,7 +1664,7 @@ def forecast_backtest(  # noqa: C901
                         else float('nan')
                     )
                     pred_sigma = float(
-                        r.get('volatility_horizon', r.get('horizon_sigma_return', float('nan')))
+                        r.get('volatility_horizon', float('nan'))
                     )
                     mae = float(abs(pred_sigma - realized_sigma)) if np.isfinite(pred_sigma) and np.isfinite(realized_sigma) else float('nan')
                     rmse = mae
@@ -1617,6 +1673,7 @@ def forecast_backtest(  # noqa: C901
                         "success": np.isfinite(pred_sigma) and np.isfinite(realized_sigma),
                         "mae": mae,
                         "rmse": rmse,
+                        "_absolute_error_sum": float(abs(pred_sigma - realized_sigma)),
                         "_squared_error_sum": float((pred_sigma - realized_sigma) ** 2),
                         "_error_count": 1,
                         "forecast_sigma": pred_sigma,
@@ -1756,6 +1813,9 @@ def forecast_backtest(  # noqa: C901
                         "success": True,
                         "mae": mae,
                         "rmse": rmse,
+                        "_absolute_error_sum": float(
+                            np.sum(np.abs(fcv[:m] - act[:m]))
+                        ),
                         "_squared_error_sum": float(
                             np.sum((fcv[:m] - act[:m]) ** 2)
                         ),
@@ -1786,13 +1846,18 @@ def forecast_backtest(  # noqa: C901
             # Aggregate
             ok = [x for x in per_anchor if x.get('success')]
             if ok:
+                absolute_error_sum = float(
+                    sum(float(x.get('_absolute_error_sum', 0.0)) for x in ok)
+                )
                 squared_error_sum = float(
                     sum(float(x.get('_squared_error_sum', 0.0)) for x in ok)
                 )
                 error_count = int(sum(int(x.get('_error_count', 0)) for x in ok))
                 agg = {
                     "success": True,
-                    "avg_mae": float(np.mean([x['mae'] for x in ok])),
+                    "avg_mae": float(
+                        absolute_error_sum / error_count
+                    ) if error_count > 0 else float('nan'),
                     "avg_rmse": float(
                         math.sqrt(squared_error_sum / error_count)
                     ) if error_count > 0 else float('nan'),
@@ -1801,6 +1866,7 @@ def forecast_backtest(  # noqa: C901
                     "details": per_anchor,
                 }
                 for detail_row in per_anchor:
+                    detail_row.pop('_absolute_error_sum', None)
                     detail_row.pop('_squared_error_sum', None)
                     detail_row.pop('_error_count', None)
                 if quantity != 'volatility':
@@ -1830,6 +1896,7 @@ def forecast_backtest(  # noqa: C901
                         trade_returns, timeframe, int(horizon), float(slippage_bps),
                         trade_spacing_bars=_spacing,
                         symbol=symbol,
+                        observed_times=times,
                     ) if trade_returns else {}
                     if metrics:
                         if detail_mode == "compact":

@@ -78,6 +78,47 @@ def test_weekend_tick_keeps_absolute_stale_flag() -> None:
     assert result["freshness_basis"] == "absolute_300s"
 
 
+def test_future_tick_is_not_accepted_as_fresh() -> None:
+    result = build_tick_freshness_context(
+        "TSLA.NAS-24",
+        tick_epoch=10_800.0,
+        now_epoch=0.0,
+        stale_after_seconds=300,
+    )
+
+    assert result["data_age_seconds"] == 0.0
+    assert result["data_stale"] is True
+    assert result["usable_for_live_trading"] is False
+    assert result["timestamp_in_future"] is True
+    assert result["timestamp_skew_seconds"] == 10_800.0
+
+
+def test_quote_at_shared_execution_threshold_is_live() -> None:
+    result = build_tick_freshness_context(
+        "EURUSD",
+        tick_epoch=970.0,
+        now_epoch=1_000.0,
+    )
+
+    assert result["data_stale"] is False
+    assert result["freshness_state"] == "live"
+    assert result["freshness"] == "fresh, tick 30s ago"
+    assert result["live_max_age_seconds"] == 30
+    assert result["usable_for_live_trading"] is True
+    assert result["usable_for_live_trading_basis"] == "quote_age_and_market_session"
+
+
+def test_live_tick_is_usable_for_execution() -> None:
+    result = build_tick_freshness_context(
+        "EURUSD",
+        tick_epoch=995.0,
+        now_epoch=1_000.0,
+    )
+
+    assert result["freshness_state"] == "live"
+    assert result["usable_for_live_trading"] is True
+
+
 class _FalseLike:
     def __bool__(self):
         return False

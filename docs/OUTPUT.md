@@ -1,8 +1,8 @@
-# Response & Output Contract
+# Response and output contract
 
-Every mtdata tool returns the **same canonical payload** regardless of channel (CLI, MCP, or Web API). The transport only adapts presentation — it never changes the meaning of the data. This page is the reference for that payload: the success/error envelope, the `detail` verbosity levels, the `extras` richer sections, field selection, and pagination.
+One of mtdata’s strengths: **CLI, [MCP](GLOSSARY.md#mcp-model-context-protocol), and Web API share the same payload meaning**. Transports only change presentation ([TOON](GLOSSARY.md#toon) vs JSON, HTTP status), not the underlying data model. This page is the reference for that model — success/error envelope, `detail`, `extras`, field selection, and pagination.
 
-For the presentation layer (TOON vs JSON, `--precision`, exit codes), see [CLI.md](CLI.md#output-contract).
+Presentation flags and exit codes: [CLI.md](CLI.md#output-contract).
 
 ---
 
@@ -133,7 +133,7 @@ Failures return a **structured** payload (not just a string) so callers can reac
 {
   "success": false,
   "error": "Symbol NOTAREALPAIR not found.",
-  "error_code": "SYMBOL_NOT_FOUND",
+  "error_code": "symbol_not_found",
   "request_id": "b0f3…",
   "operation": "symbols_describe",
   "remediation": "Use symbols_list to browse available broker symbols.",
@@ -149,7 +149,7 @@ Failures return a **structured** payload (not just a string) so callers can reac
 |-------|:---:|---------|
 | `success` | ✅ | Always `false` on errors |
 | `error` | ✅ | Human-readable message |
-| `error_code` | ✅ | Stable machine-readable code (e.g. `SYMBOL_NOT_FOUND`, `MT5_CONNECTION`) |
+| `error_code` | ✅ | Stable lowercase machine-readable code (e.g. `symbol_not_found`, `mt5_connection_error`) |
 | `request_id` | ✅ | Correlation id for logs |
 | `operation` | | The tool that failed |
 | `remediation` | | Suggested fix |
@@ -160,6 +160,22 @@ Failures return a **structured** payload (not just a string) so callers can reac
 | `details` | | Structured, tool-specific context |
 
 Prefer `error_code` over string-matching `error` when you need to branch on failure type. On the CLI, tool/provider failures share [exit code `1`](CLI.md#exit-codes), so parse `error_code` to distinguish them.
+
+---
+
+## Freshness and execution readiness
+
+`usable_for_live_trading` is reserved for execution-oriented quote and session
+outputs and is accompanied by `usable_for_live_trading_basis`:
+
+- `quote_age_and_market_session` is an execution-quote check. Its default age
+  threshold is 30 seconds, matching pre-trade validation.
+- Historical bars, forecasts, volatility estimates, and research backtests do
+  not publish this execution-sounding boolean. Use `history_policy_ok`,
+  `signal_status`, and `usage` for their respective contracts, then obtain a
+  current quote before execution.
+- Combined forecast outputs may require both model-history and reference-quote
+  readiness and expose `execution_blockers` when either input fails.
 
 ---
 

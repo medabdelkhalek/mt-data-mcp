@@ -66,7 +66,12 @@ from .base import get_filter, list_filters
 _logger = logging.getLogger(__name__)
 
 # Default parameters for each method
-_DENOISE_BASE_DEFAULTS = {"columns": ["close"], "keep_original": False, "suffix": "_dn"}
+_DENOISE_BASE_DEFAULTS = {
+    "columns": ["close"],
+    "causality": "causal",
+    "keep_original": True,
+    "suffix": "_dn",
+}
 _DENOISE_SPEC_KEYS = {
     "method",
     "params",
@@ -210,7 +215,7 @@ def _append_denoise_warning(df: pd.DataFrame, message: str) -> None:
     _logger.warning("%s", warning_text)
 
 
-def _consume_denoise_warnings(df: pd.DataFrame) -> List[str]:
+def consume_denoise_warnings(df: pd.DataFrame) -> List[str]:
     warnings_out = df.attrs.get("denoise_warnings")
     if not isinstance(warnings_out, list):
         return []
@@ -299,7 +304,7 @@ def _run_denoise_handler(
     return result
 
 
-def _denoise_series(
+def denoise_series(
     s: pd.Series,
     method: str = 'none',
     params: Optional[Dict[str, Any]] = None,
@@ -319,7 +324,7 @@ def _denoise_series(
     return _run_denoise_handler(s, handler, params, causality)
 
 
-def _apply_denoise(
+def apply_denoise(
     df: pd.DataFrame,
     spec: Optional[Dict[str, Any]],
     default_when: str = 'post_ti',
@@ -363,7 +368,7 @@ def _apply_denoise(
             parts = [p.strip() for p in cols.replace(',', ' ').split() if p.strip()]
             cols = parts if parts else ['close']
     when = str(spec.get('when') or default_when)
-    causality = str(spec.get('causality') or ('causal' if when == 'pre_ti' else 'zero_phase'))
+    causality = str(spec.get('causality') or 'causal')
     keep_original = bool(spec.get('keep_original')) if 'keep_original' in spec else (when != 'pre_ti')
     suffix = str(spec.get('suffix') or '_dn')
     try:
@@ -437,7 +442,7 @@ def _apply_denoise(
     return added_cols
 
 
-def _resolve_denoise_base_col(
+def resolve_denoise_base_col(
     df: pd.DataFrame,
     denoise: Optional[Dict[str, Any]],
     *,
@@ -448,7 +453,7 @@ def _resolve_denoise_base_col(
     if not denoise:
         return base_col
     try:
-        added = _apply_denoise(df, denoise, default_when=default_when)
+        added = apply_denoise(df, denoise, default_when=default_when)
         if f"{base_col}_dn" in added:
             return f"{base_col}_dn"
     except Exception as ex:
@@ -489,6 +494,9 @@ def normalize_denoise_spec(spec: Any, default_when: str = 'pre_ti') -> Optional[
             }
         )
         method = str(out.get('method') or 'none').strip().lower()
+        if "causality" not in spec:
+            supported = _supported_denoise_causality(method)
+            out["causality"] = "causal" if "causal" in supported else supported[0]
         params = deepcopy(_DENOISE_METHOD_DEFAULT_PARAMS.get(method, {}))
         params.update(top_level_params)
         supplied_params = out.get('params')
@@ -511,6 +519,8 @@ def normalize_denoise_spec(spec: Any, default_when: str = 'pre_ti') -> Optional[
     params = deepcopy(_DENOISE_METHOD_DEFAULT_PARAMS.get(method, {}))
     out = dict(base)
     out.update({"method": method, "params": params})
+    supported = _supported_denoise_causality(method)
+    out["causality"] = "causal" if "causal" in supported else supported[0]
     return out
 
 
@@ -567,6 +577,11 @@ def get_denoise_methods_data() -> Dict[str, Any]:
     for method_name in sorted(registry.keys()):
         available, requires = _denoise_availability(method_name)
         default_params = _DENOISE_METHOD_DEFAULT_PARAMS.get(method_name, {})
+        method_defaults = deepcopy(base_defaults)
+        supported_causality = _supported_denoise_causality(method_name)
+        method_defaults["causality"] = (
+            "causal" if "causal" in supported_causality else supported_causality[0]
+        )
         methods.append({
             "method": method_name,
             "available": bool(available),
@@ -579,7 +594,7 @@ def get_denoise_methods_data() -> Dict[str, Any]:
             "supports": {"causality": _supported_denoise_causality(method_name)},
             "supports_causal": "causal" in _supported_denoise_causality(method_name),
             "has_auto_params": any(_has_auto_param(value) for value in default_params.values()),
-            "defaults": base_defaults,
+            "defaults": method_defaults,
         })
 
     return {"success": True, "schema_version": 1, "methods": methods}
@@ -594,11 +609,12 @@ def denoise_list_methods() -> Dict[str, Any]:
 
 
 __all__ = [
-    "_denoise_series",
-    "_apply_denoise",
-    "_consume_denoise_warnings",
-    "_resolve_denoise_base_col",
+    "denoise_series",
+    "apply_denoise",
+    "consume_denoise_warnings",
+    "resolve_denoise_base_col",
     "normalize_denoise_spec",
     "get_denoise_methods_data",
     "denoise_list_methods",
 ]
+

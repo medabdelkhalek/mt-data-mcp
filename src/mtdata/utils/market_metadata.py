@@ -4,8 +4,11 @@ import math
 from typing import Any, Callable, Dict
 
 from .freshness import (
+    QUOTE_LIVE_SECONDS,
+    QUOTE_RECENT_SECONDS,
     QUOTE_STALE_SECONDS,
     closed_session_context,
+    format_age_seconds,
     format_freshness_label,
 )
 
@@ -17,6 +20,7 @@ FRESHNESS_ANCHOR_WALL_CLOCK = "wall_clock"
 FRESHNESS_METRIC_LAST_COMPLETED_BAR_AGE = "last_completed_bar_age_seconds"
 FRESHNESS_METRIC_LAST_TICK_AGE = "last_tick_age_seconds"
 FRESHNESS_METRIC_REQUESTED_RANGE_END_GAP = "requested_range_end_gap_seconds"
+TICK_FUTURE_TOLERANCE_SECONDS = 5.0
 
 
 def attach_candle_volume_semantics(payload: Dict[str, Any]) -> None:
@@ -42,6 +46,7 @@ def tick_freshness_state(
     market_status: Any = None,
     market_status_reason: Any = None,
     freshness_policy_relaxed: Any = None,
+    age_seconds: Any = None,
 ) -> str:
     if normalize_policy_relaxed(freshness_policy_relaxed):
         status = str(market_status or "closed_or_idle").strip().lower()
@@ -51,7 +56,17 @@ def tick_freshness_state(
             parts.append(reason.replace(" ", "_"))
         parts.append("snapshot")
         return "_".join(part for part in parts if part)
-    return "stale" if bool(data_stale) else "fresh"
+    if bool(data_stale):
+        return "stale"
+    try:
+        age = max(0.0, float(age_seconds))
+    except (TypeError, ValueError):
+        return "unknown"
+    if age <= float(QUOTE_LIVE_SECONDS):
+        return "live"
+    if age <= float(QUOTE_RECENT_SECONDS):
+        return "recent"
+    return "delayed"
 
 
 def build_tick_freshness_context(
@@ -71,7 +86,10 @@ def build_tick_freshness_context(
     if not math.isfinite(current_epoch) or not math.isfinite(latest_tick_epoch):
         return {}
 
-    age_seconds = max(0.0, current_epoch - latest_tick_epoch)
+    signed_age_seconds = current_epoch - latest_tick_epoch
+    age_seconds = max(0.0, signed_age_seconds)
+    future_skew_seconds = max(0.0, -signed_age_seconds)
+    timestamp_in_future = future_skew_seconds > TICK_FUTURE_TOLERANCE_SECONDS
     try:
         threshold = max(0.0, float(stale_after_seconds))
     except Exception:
@@ -83,7 +101,7 @@ def build_tick_freshness_context(
         item=item,
         data_age_seconds=age_seconds,
     )
-    data_stale = age_seconds > threshold
+    data_stale = age_seconds > threshold or timestamp_in_future
 
     rounded_age = age_rounder(age_seconds) if age_rounder is not None else round(age_seconds, 3)
     stale_after: int | float
@@ -98,11 +116,25 @@ def build_tick_freshness_context(
         "data_age_metric": FRESHNESS_METRIC_LAST_TICK_AGE,
         "stale_after_seconds": stale_after,
         "data_stale": data_stale,
+        "live_max_age_seconds": QUOTE_LIVE_SECONDS,
     }
+    if timestamp_in_future:
+        out["timestamp_in_future"] = True
+        out["timestamp_skew_seconds"] = round(future_skew_seconds, 3)
+        out["timestamp_warning"] = (
+            "Latest tick timestamp is ahead of the wall clock; the quote is not "
+            "safe for live decisions until MT5 time alignment is corrected."
+        )
     if closed_session:
         out.update(closed_session)
     out["freshness_basis"] = f"absolute_{stale_after}s"
-    out["usable_for_live_trading"] = not data_stale and not bool(closed_session)
+    execution_fresh = (
+        age_seconds <= float(QUOTE_LIVE_SECONDS)
+        and not data_stale
+        and not timestamp_in_future
+    )
+    out["usable_for_live_trading"] = execution_fresh and not bool(closed_session)
+    out["usable_for_live_trading_basis"] = "quote_age_and_market_session"
 
     freshness = format_freshness_label(
         data_stale=data_stale,
@@ -118,5 +150,12 @@ def build_tick_freshness_context(
         market_status=out.get("market_status"),
         market_status_reason=out.get("market_status_reason"),
         freshness_policy_relaxed=out.get("freshness_policy_relaxed"),
+        age_seconds=age_seconds,
     )
+    if not closed_session and out["freshness_state"] in {"recent", "delayed"}:
+        age_text = format_age_seconds(age_seconds)
+        item_label = str(item or "tick").strip() or "tick"
+        out["freshness"] = (
+            f"{out['freshness_state']}, {item_label} {age_text} ago"
+        )
     return out

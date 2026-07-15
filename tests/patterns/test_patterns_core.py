@@ -603,8 +603,8 @@ def test_build_pattern_response_compact_detail_returns_summary():
 
     assert compact["n_patterns"] == 2
     assert compact["top_patterns"] == [
-        {"name": "B", "status": "forming", "confidence": 0.7},
-        {"name": "A", "status": "forming", "confidence": 0.5},
+        {"name": "B", "status": "forming", "match_score": 0.7},
+        {"name": "A", "status": "forming", "match_score": 0.5},
     ]
     assert "recent_patterns" not in compact
     assert "summary" not in compact
@@ -638,7 +638,7 @@ def test_build_pattern_response_compact_explains_neutral_high_score_patterns():
 
     assert compact["pattern_status"] == "neutral"
     assert compact["pattern_confidence"] == 0.0
-    assert compact["max_pattern_confidence"] == 0.95
+    assert compact["max_pattern_match_score"] == 0.95
     assert "aggregate confidence measures directional bias" in compact["bias_suppressed_reason"]
 
 
@@ -681,7 +681,7 @@ def test_build_pattern_response_compact_keeps_actionable_fields():
             "name": "Double Bottom",
             "direction": "bullish",
             "status": "forming",
-            "confidence": 0.85,
+            "match_score": 0.85,
             "time": "2026-03-02 00:00",
             "price": 12.0,
         }
@@ -731,7 +731,7 @@ def test_build_pattern_response_compact_keeps_elliott_candidate_context():
         {
             "name": "Elliott impulse-like candidate",
             "status": "forming",
-            "confidence": 0.1,
+            "match_score": 0.1,
             "wave_count": 6,
             "candidate_note": candidate_note,
             "validation_status": "fallback_candidate",
@@ -776,6 +776,44 @@ def test_build_pattern_response_compact_keeps_fractal_breakout_fields():
     assert compact["suggested_review"] == "short_setup"
     assert compact["top_patterns"][0]["name"] == "Bullish Fractal"
     assert "recent_patterns" not in compact
+
+
+def test_build_pattern_response_suppresses_stale_harmonic_current_bias():
+    df = pd.DataFrame({"time": list(range(150)), "close": [10.0] * 150})
+    patterns = [
+        {
+            "name": "Bearish ABCD",
+            "status": "completed",
+            "confidence": 0.64,
+            "end_index": 30,
+            "direction": "bearish",
+            "bias": "bearish",
+            "age_bars": 119,
+            "is_recent": False,
+            "signal_eligible": False,
+            "bias_scope": "historical_structure",
+        }
+    ]
+
+    compact = _build_pattern_response(
+        "EURUSD",
+        "H1",
+        150,
+        "harmonic",
+        patterns,
+        include_completed=False,
+        include_series=False,
+        series_time="string",
+        df=df,
+        detail="compact",
+    )
+
+    assert compact["pattern_status"] == "historical"
+    assert compact["review_recommended"] is False
+    assert "suggested_review" not in compact
+    assert "bias" not in compact
+    assert compact["top_patterns"][0]["age_bars"] == 119
+    assert compact["top_patterns"][0]["bias_scope"] == "historical_structure"
 
 
 def test_build_pattern_response_compact_hides_broken_fractal_rows_by_default():

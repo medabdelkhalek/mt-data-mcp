@@ -153,6 +153,15 @@ class TestPydanticModels:
         assert body.quantity == "return"
         assert body.dimred_method == "pca"
 
+    def test_forecast_bodies_accept_detail(self):
+        assert ForecastPriceBody(symbol="EURUSD", detail="summary").to_domain_request().detail == "summary"
+        assert ForecastVolBody(symbol="EURUSD", detail="standard").to_domain_request().detail == "standard"
+        assert BacktestBody(symbol="EURUSD", detail="full").to_domain_request().detail == "full"
+
+    def test_extras_still_request_full_detail(self):
+        body = ForecastPriceBody(symbol="EURUSD", detail="summary", extras="metadata")
+        assert body.to_domain_request().detail == "full"
+
     def test_forecast_price_body_rejects_removed_target(self):
         with pytest.raises(ValidationError):
             ForecastPriceBody(symbol="GBPUSD", target="return")
@@ -318,7 +327,8 @@ class TestGetInstruments:
             resp = _client.get("/api/instruments")
         res = resp.json()
         assert len(res["items"]) == 1
-        assert res["items"][0]["name"] == "EURUSD"
+        assert res["items"][0]["symbol"] == "EURUSD"
+        assert "name" not in res["items"][0]
 
     def test_search_filters(self):
         syms = [_make_symbol("EURUSD", "Euro"), _make_symbol("USDJPY", "Yen")]
@@ -329,7 +339,7 @@ class TestGetInstruments:
             resp = _client.get("/api/instruments", params={"search": "yen"})
         res = resp.json()
         assert len(res["items"]) == 1
-        assert res["items"][0]["name"] == "USDJPY"
+        assert res["items"][0]["symbol"] == "USDJPY"
 
     def test_limit(self):
         syms = [_make_symbol(f"SYM{i}", visible=True) for i in range(10)]
@@ -352,7 +362,7 @@ class TestGetInstruments:
             mock_mt5.symbols_get.return_value = [bad, good]
             resp = _client.get("/api/instruments")
         res = resp.json()
-        assert any(i["name"] == "OK" for i in res["items"])
+        assert any(i["symbol"] == "OK" for i in res["items"])
 
 
 # ===========================================================================
@@ -734,15 +744,9 @@ class TestGetHistory:
         assert "last_candle_open" not in res
         assert "count" not in res
         assert "candles" not in res
-        assert res["meta"]["tool"] == "data_fetch_candles"
-        assert res["meta"]["runtime"]["timezone"] == {
-            "utc": {"tz": "UTC"},
-            "server": {
-                "source": "MT5_SERVER_TZ",
-                "tz": "Europe/Nicosia",
-                "offset_seconds": 0,
-            },
-        }
+        assert "meta" not in res
+        assert res["timestamp_format"] == "iso"
+        assert res["server_utc_offset_seconds"] == 0
 
     def test_v1_history_uses_modern_runtime_timezone_meta(self):
         payload = {"data": [{"time": 1.0, "close": 1.1}], "has_forming_candle": False}
@@ -754,7 +758,10 @@ class TestGetHistory:
             mock_cfg.get_server_tz.return_value = ZoneInfo("Europe/Nicosia")
             mock_cfg.get_client_tz.return_value = None
             mock_cfg.get_time_offset_seconds.return_value = 0
-            resp = _client.get("/api/v1/history", params={"symbol": "EURUSD"})
+            resp = _client.get(
+                "/api/v1/history",
+                params={"symbol": "EURUSD", "extras": "metadata"},
+            )
         res = resp.json()
         assert res["data"] == [{"time": 1.0, "close": 1.1}]
         assert "last_candle_open" not in res
@@ -1105,6 +1112,24 @@ class TestGetPivots:
             detail="compact",
         )
 
+    def test_full_detail_is_forwarded_and_preserves_metadata(self):
+        payload = {
+            "levels": {"PP": 1.1},
+            "symbol": "EURUSD",
+            "timeframe": "D1",
+            "period": {"start": "2025-01-01", "end": "2025-01-02"},
+            "diagnostics": {"source": "test"},
+        }
+        raw_tool = MagicMock(return_value=payload)
+        with patch("mtdata.core.web_api._call_tool_raw", return_value=raw_tool):
+            resp = _client.get("/api/pivots", params={"symbol": "EURUSD", "detail": "full"})
+
+        assert resp.status_code == 200
+        assert resp.json()["diagnostics"] == {"source": "test"}
+        raw_tool.assert_called_once_with(
+            symbol="EURUSD", timeframe="H1", method="classic", detail="full"
+        )
+
     def test_string_result_parsed(self):
         raw_str = json.dumps(self._pivot_result())
         # Inject json module into web_api namespace for the json.loads call
@@ -1181,60 +1206,71 @@ class TestGetPivots:
 # ===========================================================================
 
 class TestGetTick:
-    def _mock_tick(self, time=100.0, bid=1.1, ask=1.2, last=1.15, volume=500.0):
-        return SimpleNamespace(time=time, bid=bid, ask=ask, last=last, volume=volume)
-
     def test_connection_failure(self):
-        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=False):
+        payload = {
+            "error": "MT5 unavailable",
+            "error_code": "market_ticker_mt5_connection",
+        }
+        with patch("mtdata.core.web_api._market_ticker_tool", new=lambda **_: payload):
             resp = _client.get("/api/tick", params={"symbol": "EURUSD"})
         assert resp.status_code == 503
 
     def test_success(self):
-        tick = self._mock_tick()
-        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), \
-             patch("mtdata.core.web_api.mt5") as mock_mt5:
-            mock_mt5.symbol_info_tick.return_value = tick
+        payload = {
+            "success": True,
+            "symbol": "EURUSD",
+            "type": "quote",
+            "bid": 1.1,
+            "ask": 1.2,
+            "mid": 1.15,
+            "spread_pips": 1000.0,
+            "time": "1970-01-01T00:01:40Z",
+            "time_epoch": 100.0,
+            "timezone": "UTC",
+            "freshness_state": "stale",
+            "data_age_seconds": 10.0,
+            "usable_for_live_trading": False,
+        }
+        with patch("mtdata.core.web_api._market_ticker_tool", new=lambda **_: payload):
             resp = _client.get("/api/tick", params={"symbol": "EURUSD"})
         res = resp.json()
+        assert res["success"] is True
         assert res["bid"] == 1.1
         assert res["ask"] == 1.2
+        assert res["mid"] == 1.15
         assert res["symbol"] == "EURUSD"
+        assert res["time"] == "1970-01-01T00:01:40Z"
+        assert res["time_epoch"] == 100.0
+        assert res["freshness_state"] == "stale"
+        assert res["usable_for_live_trading"] is False
 
-    def test_tick_none_retry_success(self):
-        tick = self._mock_tick()
-        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), \
-             patch("mtdata.core.web_api.mt5") as mock_mt5, \
-             patch("mtdata.core.web_api._ensure_symbol_ready", return_value=None):
-            mock_mt5.symbol_info_tick.side_effect = [None, tick]
-            resp = _client.get("/api/tick", params={"symbol": "EURUSD"})
-        assert resp.json()["bid"] == 1.1
+    def test_detail_is_forwarded_and_shared_compaction_applies(self):
+        tool = MagicMock(return_value={"success": True, "symbol": "EURUSD", "diagnostics": {"x": 1}})
+        with patch("mtdata.core.web_api._market_ticker_tool", new=tool):
+            resp = _client.get("/api/tick", params={"symbol": "EURUSD", "detail": "compact"})
+        assert resp.status_code == 200
+        assert "diagnostics" not in resp.json()
+        tool.assert_called_once_with(symbol="EURUSD", detail="compact")
 
-    def test_tick_none_symbol_unknown(self):
-        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), \
-             patch("mtdata.core.web_api.mt5") as mock_mt5, \
-             patch("mtdata.core.web_api._ensure_symbol_ready", return_value="some error"):
-            mock_mt5.symbol_info_tick.return_value = None
-            mock_mt5.symbol_info.return_value = None
+    def test_symbol_unknown(self):
+        payload = {"error": "Unknown symbol FAKE", "error_code": "symbol_not_found"}
+        with patch("mtdata.core.web_api._market_ticker_tool", new=lambda **_: payload):
             resp = _client.get("/api/tick", params={"symbol": "FAKE"})
         assert resp.status_code == 404
 
-    def test_tick_none_ensure_error_known_symbol(self):
-        info = SimpleNamespace(name="EURUSD")
-        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), \
-             patch("mtdata.core.web_api.mt5") as mock_mt5, \
-             patch("mtdata.core.web_api._ensure_symbol_ready", return_value="error"):
-            mock_mt5.symbol_info_tick.return_value = None
-            mock_mt5.symbol_info.return_value = info
+    def test_tick_unavailable(self):
+        payload = {
+            "error": "No tick data",
+            "error_code": "market_ticker_tick_unavailable",
+        }
+        with patch("mtdata.core.web_api._market_ticker_tool", new=lambda **_: payload):
             resp = _client.get("/api/tick", params={"symbol": "EURUSD"})
         assert resp.status_code == 503
 
-    def test_tick_none_after_retry(self):
-        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), \
-             patch("mtdata.core.web_api.mt5") as mock_mt5, \
-             patch("mtdata.core.web_api._ensure_symbol_ready", return_value=None):
-            mock_mt5.symbol_info_tick.return_value = None
+    def test_invalid_tick_payload(self):
+        with patch("mtdata.core.web_api._market_ticker_tool", new=lambda **_: "bad"):
             resp = _client.get("/api/tick", params={"symbol": "EURUSD"})
-        assert resp.status_code == 404
+        assert resp.status_code == 500
 
 
 # ===========================================================================
@@ -1526,7 +1562,10 @@ class TestGetSupportResistance:
         })
 
         with patch("mtdata.core.web_api._fetch_history_impl", return_value=frame) as mock_fetch:
-            resp = _client.get("/api/support-resistance", params={"symbol": "EURUSD"})
+            resp = _client.get(
+                "/api/support-resistance",
+                params={"symbol": "EURUSD", "min_touches": 1},
+            )
 
         assert resp.status_code == 200
         body = resp.json()
@@ -1726,7 +1765,7 @@ class TestInstrumentSearchEdgeCases:
             resp = _client.get("/api/instruments", params={"search": ""})
         res = resp.json()
         assert len(res["items"]) == 1
-        assert res["items"][0]["name"] == "EURUSD"
+        assert res["items"][0]["symbol"] == "EURUSD"
 
 
 class TestMethodsAvailabilityEdgeCases:

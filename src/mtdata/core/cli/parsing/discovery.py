@@ -54,11 +54,17 @@ _COMMAND_PARAM_CHOICE_OVERRIDES: Dict[tuple[str, str], list[str]] = {
         "fractal",
         "elliott",
     ],
+    ("forecast_barrier_optimize", "search_profile"): ["fast", "medium", "long"],
+}
+
+_COMMAND_REQUIRED_OPTIONS: set[tuple[str, str]] = {
+    ("trade_place", "volume"),
+    ("trade_place", "order_type"),
 }
 
 
 _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
-    ("data_fetch_candles", "indicators"): "Technical indicators. Prefer compact CLI specs like 'rsi(14),macd(12,26,9)' or JSON arrays like '[{\"name\":\"rsi\",\"params\":[14]}]'. Bare names, rsi_14, sma=20, and named params like rsi(length=14) also work. Use params syntax, not sma,20.",
+    ("data_fetch_candles", "indicators"): "Technical indicators. On PowerShell, quote parenthesized specs such as --indicators \"rsi(14)\", or use shell-safe rsi_14 / sma=20 syntax. JSON arrays like '[{\"name\":\"rsi\",\"params\":[14]}]' and named params like rsi(length=14) also work. Use params syntax, not sma,20.",
     ("indicators_list", "trading_style"): "Filter indicators by common trading workflow: intraday, swing, or position.",
     ("trade_place", "magic"): "MT5 magic number: integer strategy/order identifier used to group EA or strategy trades. Defaults to configured order_magic when omitted.",
     ("trade_get_open", "magic"): "MT5 magic number filter for positions from one strategy or EA. Omit for all magic numbers.",
@@ -78,6 +84,32 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "to its MT5 group. Optional with --group."
     ),
     ("options_barrier_price", "option_type"): "Option side: call or put.",
+    ("options_barrier_price", "barrier"): (
+        "Option knock-in/knock-out barrier price level, in the same units as spot "
+        "and strike. This is a numeric parametric pricer; it does not fetch a symbol quote."
+    ),
+    ("strategy_validate", "candidates"): (
+        "JSON strategy candidate list. Example: "
+        "'[{\"id\":\"cross\",\"type\":\"builtin_strategy\","
+        "\"strategy\":\"ema_cross\"}]'. Candidate types are builtin_strategy "
+        "and forecast_threshold."
+    ),
+    ("strategy_validate", "barrier"): (
+        "JSON triple-barrier labeling config with horizon, tp_pct, sl_pct, and "
+        "same_bar_policy; tp_pct/sl_pct are percentage points (0.5 means 0.5%)."
+    ),
+    ("forecast_barrier_prob", "tp_pct"): (
+        "Take-profit distance in percentage points; 0.1 means 0.1%, not 10%."
+    ),
+    ("forecast_barrier_prob", "sl_pct"): (
+        "Stop-loss distance in percentage points; 0.1 means 0.1%, not 10%."
+    ),
+    ("labels_triple_barrier", "tp_pct"): (
+        "Take-profit distance in percentage points; 0.1 means 0.1%, not 10%."
+    ),
+    ("labels_triple_barrier", "sl_pct"): (
+        "Stop-loss distance in percentage points; 0.1 means 0.1%, not 10%."
+    ),
     ("options_chain", "symbol"): (
         "Underlying symbol for listed options, e.g. AAPL or SPX."
     ),
@@ -90,8 +122,8 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
     ("forecast_tune_optuna", "search_space"): "Optuna search space (JSON or k=v).",
     ("indicators_list", "detail"): "Output detail: compact table or full rows with aliases and descriptions.",
     ("market_snapshot", "sections"): (
-        "Analysis modules to include: quote, levels, patterns, regime, forecast, "
-        "or all. Defaults to quote,levels,patterns."
+        "Analysis modules to include: quote, status, levels, patterns, regime, "
+        "forecast, or all. Defaults to quote,status,levels,patterns."
     ),
     ("market_snapshot", "detail"): (
         "Field verbosity inside selected sections; full does not add sections. "
@@ -128,6 +160,12 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "Sort direction for ranked rows: auto, asc/ascending, or desc/descending. "
         "Auto keeps tight spreads and oversold RSI ascending; most other ranks descending."
     ),
+    ("outliers_detect", "score_fields"): (
+        "Comma-separated candle features to score: return, volume, and/or range."
+    ),
+    ("outliers_detect", "threshold"): (
+        "Positive robust-deviation cutoff; 3.5 is a common MAD threshold."
+    ),
     ("labels_triple_barrier", "detail"): (
         "Detail level: compact (small outcome sample), standard (recent lookback rows), "
         "summary, or full."
@@ -155,7 +193,7 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "Report template: minimal fast context+forecast, basic balanced default, "
         "advanced regimes/HAR/conformal, scalping M5, intraday H1, swing H4/D1, "
         "or position D1/W1. Runtime cost: minimal is the quick path; "
-        "basic/advanced and style templates may invoke multiple MT5 fetches plus "
+        "basic, advanced, and specialized templates may invoke multiple MT5 fetches plus "
         "pivots, patterns, backtests, barriers, and regime checks."
     ),
     ("temporal_analyze", "lookback"): (
@@ -192,7 +230,12 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "Preview the modification without sending it to the broker."
     ),
     ("trade_modify", "idempotency_key"): (
-        "Optional in-process dedupe key; replays the prior matching modify result."
+        "Durable dedupe key shared by CLI and server processes. Reusing the same "
+        "key and payload within the retention window replays the prior outcome."
+    ),
+    ("trade_place", "idempotency_key"): (
+        "Durable dedupe key shared by CLI and server processes. Reusing the same "
+        "key and payload within the retention window replays the prior outcome."
     ),
     ("trade_place", "dry_run"): (
         "Preview the order without sending it to the broker."
@@ -634,6 +677,10 @@ def add_dynamic_arguments(
             cmd_name=cmd_name,
             param_names=param_names,
         )
+        if (str(cmd_name or ""), str(param["name"])) in _COMMAND_REQUIRED_OPTIONS:
+            kwargs["required"] = True
+            kwargs["default"] = argparse.SUPPRESS
+            kwargs["help"] = f"{kwargs.get('help') or param['name']} (required)"
 
         is_optional_bool = param.get("type") is bool and not param.get("required", False)
         allow_optional_first_positional = (
@@ -645,7 +692,9 @@ def add_dynamic_arguments(
             positional_kwargs = {k: v for k, v in kwargs.items() if k in ("help", "type", "choices", "metavar")}
             positional_kwargs["nargs"] = "?"
             positional_kwargs["default"] = argparse.SUPPRESS
-            parser.add_argument(param["name"], **positional_kwargs)
+            positional_kwargs["help"] = f"{positional_kwargs.get('help') or param['name']} (required)"
+            positional_action = parser.add_argument(param["name"], **positional_kwargs)
+            positional_action._cli_logically_required = True
             hidden_alias_kwargs = dict(kwargs)
             hidden_alias_kwargs["help"] = argparse.SUPPRESS
             if option_flags:
@@ -716,6 +765,7 @@ def add_dynamic_arguments(
                 if hidden_option_flags:
                     hidden_kwargs = dict(kwargs)
                     hidden_kwargs["help"] = argparse.SUPPRESS
+                    hidden_kwargs["required"] = False
                     parser.add_argument(*hidden_option_flags, **hidden_kwargs)
         if str(param["name"]) == "minutes_back" and str(cmd_name or "").startswith("trade_"):
             parser.add_argument(

@@ -53,6 +53,25 @@ def _finite_metric(metrics: Dict[str, Any], key: str) -> Optional[float]:
     return value if math.isfinite(value) else None
 
 
+def _extract_method_backtest_metrics(
+    backtest_res: Dict[str, Any],
+    method_name: str,
+) -> Dict[str, Any]:
+    """Return one canonical metric map across nested and aggregate layouts."""
+    if not isinstance(backtest_res, dict):
+        return {}
+    method_results = backtest_res.get("results", {}).get(method_name, {})
+    if not isinstance(method_results, dict):
+        return {}
+    nested = method_results.get("metrics")
+    merged = dict(nested) if isinstance(nested, dict) else {}
+    for key, value in method_results.items():
+        if key == "metrics" or isinstance(value, (dict, list, tuple, set)):
+            continue
+        merged.setdefault(str(key), value)
+    return merged
+
+
 def _has_trading_fitness_metrics(metrics: Dict[str, Any]) -> bool:
     return any(
         _finite_metric(metrics, key) is not None
@@ -314,7 +333,7 @@ def _eval_candidate(
     # Allow method gene inside candidate
     sel_method = str(candidate_params.get('method')) if candidate_params.get('method') else (str(method) if method else None)
     if not sel_method:
-        return (math.inf if mode == 'min' else -math.inf, {"error": "No method provided"})
+        return math.inf, {"error": "No method provided"}
     cand_only = {k: v for k, v in candidate_params.items() if k != 'method'}
     res = _forecast_backtest(
         symbol=symbol,
@@ -333,17 +352,17 @@ def _eval_candidate(
     # Pull method aggregate
     r = res.get('results', {}).get(sel_method) if isinstance(res, dict) else None
     if not isinstance(r, dict) or not r.get('success'):
-        return (math.inf if mode == 'min' else -math.inf, res)
-    val = r.get(metric)
-    try:
-        score = float(val)
-    except Exception:
-        # Fallback to rmse/mae if metric missing
-        val2 = r.get('avg_rmse', r.get('avg_mae'))
-        try:
-            score = float(val2)
-        except Exception:
-            score = math.inf if mode == 'min' else -math.inf
+        return math.inf, res
+    metrics = _extract_method_backtest_metrics(res, sel_method)
+    score = _finite_metric(metrics, str(metric))
+    if score is None:
+        result = {'_sel_method': sel_method, **(res or {})}
+        result['tuning_error'] = (
+            f"Requested metric '{metric}' is missing or non-finite for method "
+            f"'{sel_method}'."
+        )
+        result['metric_requested'] = str(metric)
+        return math.inf, result
     return (score if mode == 'min' else -score, {'_sel_method': sel_method, **(res or {})})
 
 
@@ -581,16 +600,15 @@ def optuna_search_forecast_params(  # noqa: C901
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     history: List[Dict[str, Any]] = []
-    trial_results: Dict[int, Dict[str, Any]] = {}
-    trial_candidates: Dict[int, Dict[str, Any]] = {}
     lock = threading.Lock()
 
     best_score = math.inf if mode_val == 'min' else -math.inf
     best_params: Dict[str, Any] = {}
     best_result: Optional[Dict[str, Any]] = None
+    successful_evaluations = 0
 
     def _objective(trial: Any) -> float:
-        nonlocal best_score, best_params, best_result
+        nonlocal best_score, best_params, best_result, successful_evaluations
         cand: Dict[str, Any] = {}
 
         sel_method = None
@@ -640,11 +658,9 @@ def optuna_search_forecast_params(  # noqa: C901
             if isinstance(res, dict) and res.get('_sel_method'):
                 hist_row['method'] = res.get('_sel_method')
             history.append(hist_row)
-            if isinstance(res, dict):
-                trial_results[int(trial.number)] = res
-            trial_candidates[int(trial.number)] = dict(cand)
 
             if finite_score is not None:
+                successful_evaluations += 1
                 better = (
                     (mode_val == 'min' and finite_score < best_score)
                     or (mode_val != 'min' and finite_score > best_score)
@@ -667,15 +683,17 @@ def optuna_search_forecast_params(  # noqa: C901
     n_trials_val = max(1, int(n_trials))
     study.optimize(_objective, n_trials=n_trials_val, timeout=timeout_val, n_jobs=n_jobs_val)
 
-    if not best_params and len(study.trials) > 0:
-        try:
-            bt = study.best_trial
-            best_params = dict(trial_candidates.get(int(bt.number), bt.params))
-            best_score = float(bt.value)
-            br = trial_results.get(int(bt.number))
-            best_result = br if isinstance(br, dict) else None
-        except Exception:
-            pass
+    if successful_evaluations == 0:
+        return {
+            "success": False,
+            "error": "No candidate produced a finite requested metric.",
+            "error_code": "no_successful_trials",
+            "metric": metric,
+            "mode": mode_val,
+            "optimizer": "optuna",
+            "n_trials": int(n_trials_val),
+            "history_count": len(history),
+        }
 
     payload: Dict[str, Any] = {
         "success": True,
@@ -837,6 +855,7 @@ def genetic_search_forecast_params(  # noqa: C901
     best_score = math.inf if mode == 'min' else -math.inf
     best_params: Dict[str, Any] = {}
     best_result: Optional[Dict[str, Any]] = None
+    successful_evaluations = 0
 
     for gen in range(max(1, int(generations))):
         scored: List[Tuple[float, Dict[str, Any]]] = []
@@ -864,7 +883,12 @@ def genetic_search_forecast_params(  # noqa: C901
             history.append(hist_entry)
             # Keep global best in true metric direction
             true_score = score if mode == 'min' else -score
-            if (mode == 'min' and true_score < best_score) or (mode != 'min' and true_score > best_score):
+            if math.isfinite(true_score):
+                successful_evaluations += 1
+            if math.isfinite(true_score) and (
+                (mode == 'min' and true_score < best_score)
+                or (mode != 'min' and true_score > best_score)
+            ):
                 best_score = true_score
                 best_params = dict(cand)
                 best_result = res if isinstance(res, dict) else None
@@ -902,6 +926,18 @@ def genetic_search_forecast_params(  # noqa: C901
                     child[k] = _mutate_value(child.get(k), spec or {}, rng)
             new_pop.append(child)
         pop = new_pop[: len(pop)]
+
+    if successful_evaluations == 0:
+        return {
+            "success": False,
+            "error": "No candidate produced a finite requested metric.",
+            "error_code": "no_successful_trials",
+            "metric": metric,
+            "mode": mode,
+            "population": int(population),
+            "generations": int(generations),
+            "history_count": len(history),
+        }
 
     payload: Dict[str, Any] = {
         "success": True,
@@ -1066,31 +1102,6 @@ def genetic_search_optimize_hints(  # noqa: C901
                 mutant[param_name] = _mutate_value(mutant.get(param_name), param_spec or {}, rng)
         return mutant
 
-    # Helper: evaluate candidate
-    def _extract_method_backtest_metrics(backtest_res: Dict[str, Any], method_name: str) -> Dict[str, Any]:
-        if not isinstance(backtest_res, dict):
-            return {}
-        method_results = backtest_res.get('results', {}).get(method_name, {})
-        if not isinstance(method_results, dict):
-            return {}
-        metrics = method_results.get('metrics')
-        if isinstance(metrics, dict):
-            merged = dict(metrics)
-            for key in (
-                'avg_mae',
-                'avg_rmse',
-                'avg_directional_accuracy',
-                'successful_tests',
-                'num_tests',
-                'metrics_available',
-                'metrics_reason',
-                'trade_status',
-            ):
-                if key in method_results and key not in merged:
-                    merged[key] = method_results.get(key)
-            return merged
-        return method_results
-
     def _evaluate(individual: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
         tf = str(individual.get('timeframe', 'H1'))
         method = str(individual.get('method', 'theta'))
@@ -1113,6 +1124,9 @@ def genetic_search_optimize_hints(  # noqa: C901
             dimred_params=dimred_params,
             trade_threshold=0.0,
         )
+
+        if not math.isfinite(float(score)):
+            return math.inf, res
 
         # Compute fitness
         if fitness_metric == 'composite':
@@ -1223,11 +1237,25 @@ def genetic_search_optimize_hints(  # noqa: C901
 
     # Extract top-N candidates
     pop.sort(key=lambda t: t[1])
+    finite_pop = [item for item in pop if math.isfinite(float(item[1]))]
+    if not finite_pop:
+        return {
+            'success': False,
+            'error': 'No candidate produced a finite requested metric.',
+            'error_code': 'no_successful_trials',
+            'hints': [],
+            'search_summary': {
+                'symbol': symbol,
+                'population': int(population),
+                'generations': int(generations),
+                'fitness_metric': fitness_metric,
+            },
+        }
     top_configs: List[Dict[str, Any]] = []
 
     seen_configs = set()
     duplicate_results_filtered = 0
-    for individual, fitness, backtest_res in pop:
+    for individual, fitness, backtest_res in finite_pop:
         if len(top_configs) >= int(top_n):
             break
         tf, method, params = _extract_params(individual, search_space)

@@ -80,11 +80,10 @@ class TradePlaceRequest(BaseModel):
         description="Maximum allowed execution slippage in points.",
     )
     dry_run: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Preview the order without sending it to the broker. Defaults to "
-            "false, so trade_place places a live order; set dry_run=true to "
-            "preview only."
+            "true; set dry_run=false explicitly to place a live order."
         ),
     )
     detail: DetailLiteral = Field(
@@ -99,23 +98,25 @@ class TradePlaceRequest(BaseModel):
         default=True,
         description=(
             "Require both stop_loss and take_profit for market orders and fail "
-            "if protection cannot be attached."
+            "if protection cannot be attached. Market orders using this guarantee "
+            "must keep auto_close_on_sl_tp_fail enabled."
         ),
     )
     auto_close_on_sl_tp_fail: bool = Field(
         default=True,
         description=(
             "If a filled market order cannot attach TP/SL, immediately try to "
-            "close the unprotected position."
+            "close the unprotected position. Set false only when require_sl_tp is "
+            "also false; contradictory market-order safety settings are rejected."
         ),
     )
     idempotency_key: Optional[str] = Field(
         default=None,
         description=(
-            "Optional in-process dedupe key with an in-memory ~5-minute TTL. "
+            "Optional durable dedupe key with a configurable 24-hour TTL. "
             "Reusing the same key with the same payload replays the prior "
-            "result instead of sending another order. It is not broker-side "
-            "idempotency and does not survive restarts."
+            "result instead of sending another order. The SQLite store is shared "
+            "across processes and restarts; this is not broker-side idempotency."
         ),
     )
 
@@ -140,20 +141,20 @@ class TradeModifyRequest(BaseModel):
     expiration: Optional[ExpirationValue] = None
     comment: Optional[str] = None
     dry_run: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Preview the modification without sending it to the broker. Defaults "
-            "to false, so trade_modify changes the live order or position; set "
-            "dry_run=true to preview only."
+            "to true; set dry_run=false explicitly to modify a live order or "
+            "position."
         ),
     )
     idempotency_key: Optional[str] = Field(
         default=None,
         description=(
-            "Optional in-process dedupe key with an in-memory ~5-minute TTL. "
+            "Optional durable dedupe key with a configurable 24-hour TTL. "
             "Reusing the same key with the same payload replays the prior "
-            "result instead of sending another modify request. It is not "
-            "broker-side idempotency and does not survive restarts."
+            "result instead of sending another modify request. The SQLite store "
+            "is shared across processes and restarts; this is not broker-side idempotency."
         ),
     )
 
@@ -175,11 +176,11 @@ class TradeCloseRequest(BaseModel):
         description="Partial close volume in lots. Requires ticket.",
     )
     dry_run: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Preview the close request without sending it to the broker. Defaults "
-            "to false, so trade_close closes the live position or order; set "
-            "dry_run=true to preview only."
+            "to true; set dry_run=false explicitly to close a live position or "
+            "order."
         ),
     )
     confirm_close_all: bool = Field(
@@ -246,6 +247,10 @@ class TradeHistoryRequest(_SideNormalizedRequest):
     limit: Optional[int] = 100
     offset: int = 0
     page: Optional[int] = None
+    order: Literal["desc", "asc"] = Field(
+        default="desc",
+        description="History time order. desc returns newest activity first.",
+    )
 
 
 class TradeJournalAnalyzeRequest(_SideNormalizedRequest):

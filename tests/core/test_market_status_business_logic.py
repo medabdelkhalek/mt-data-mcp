@@ -36,7 +36,9 @@ def test_market_status_timezone_display_utc_converts_market_times(monkeypatch) -
     result = raw(region="us", timezone_display="utc", detail="full")
 
     assert result["success"] is True
-    assert result["mode"] == "global"
+    assert result["mode"] == "equity_exchanges"
+    assert result["market_scope"] == "major_equity_exchanges"
+    assert "pass a broker symbol" in result["scope_note"].lower()
     assert result["timezone"] == "UTC"
     assert {market["symbol"] for market in result["markets"]} == {"NYSE", "NASDAQ"}
     for market in result["markets"]:
@@ -67,7 +69,8 @@ def test_market_status_uses_utc_weekend_for_closed_reason(monkeypatch) -> None:
     result = raw(region="all", detail="full")
 
     assert result["success"] is True
-    assert result["mode"] == "global"
+    assert result["mode"] == "equity_exchanges"
+    assert result["market_scope"] == "major_equity_exchanges"
     assert result["data_fetched_at"] == "2026-04-25T03:18:00Z"
     assert result["global_status"] == "weekend"
     assert result["closed_reason_counts"] == {"weekend": 9}
@@ -152,7 +155,7 @@ def test_market_status_symbol_mode_reports_heuristic_status(monkeypatch) -> None
     ]
     assert result["can_open_new_positions"] is True
     assert result["trade_mode_allows_opening"] is True
-    assert result["tick_freshness"] == "fresh"
+    assert result["tick_freshness"] == "live"
     assert result["tick_available"] is True
     assert result["data_fetched_at"] == "2024-01-02T12:00:00Z"
     assert result["last_tick_time"] == "2024-01-02T12:00:00Z"
@@ -435,7 +438,7 @@ def test_market_status_symbol_mode_allows_crypto_on_weekend(monkeypatch) -> None
     assert result["can_open_new_positions"] is True
     assert result["trade_mode_allows_opening"] is True
     assert "reason" not in result
-    assert result["tick_freshness"] == "fresh"
+    assert result["tick_freshness"] == "recent"
     assert "FX weekly sessions" not in result["heuristic_note"]
 
 
@@ -527,6 +530,24 @@ def test_market_status_symbol_mode_uses_recent_candles_for_weekend_session(
         "saturday": ["03:00-04:00"]
     }
     assert "reason" not in result
+
+
+def test_recent_sunday_reopen_is_not_classified_as_weekend_trading() -> None:
+    sunday_open = datetime(2026, 7, 12, 21, 0, tzinfo=timezone.utc)
+    gateway = SimpleNamespace(
+        TIMEFRAME_M1=1,
+        copy_rates_range=lambda *args: [{"time": sunday_open.timestamp()}],
+    )
+
+    result = market_status_mod._infer_symbol_schedule_from_recent_candles(
+        "EURUSD",
+        gateway,
+        now_utc=datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert result["trades_on_weekends"] is False
+    assert result["saturday_candles"] == 0
+    assert result["sunday_candles"] == 1
 
 
 def test_market_status_symbol_mode_marks_weekend_snapshot_freshness(monkeypatch) -> None:

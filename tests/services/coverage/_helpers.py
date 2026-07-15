@@ -12,6 +12,13 @@ import numpy as np
 
 # Mock mt5 module before importing data_service
 _mt5_mock = MagicMock()
+_mt5_mock.TICK_FLAG_BID = 2
+_mt5_mock.TICK_FLAG_ASK = 4
+_mt5_mock.TICK_FLAG_LAST = 8
+_mt5_mock.TICK_FLAG_VOLUME = 16
+_mt5_mock.TICK_FLAG_BUY = 32
+_mt5_mock.TICK_FLAG_SELL = 64
+_mt5_mock.TICK_FLAG_VOLUME_REAL = 1024
 sys.modules['MetaTrader5'] = _mt5_mock
 
 import pandas as pd  # noqa: E402
@@ -99,7 +106,7 @@ def _make_ticks(n: int, *, base_ts: float = _NOW_TS, step: float = 1.0) -> list:
             'last': 1.1001 + i * 0.0001,
             'volume': 1.0,
             'time_msc': (base_ts - (n - 1 - i) * step) * 1000,
-            'flags': 0,
+            'flags': 30,
             'volume_real': 0.0,
         })
     return ticks

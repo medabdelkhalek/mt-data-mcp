@@ -54,7 +54,7 @@ def test_run_data_fetch_candles_passes_allow_stale_to_service():
     [
         (
             "Symbol 'EURUSD.bad' was not found or is not available in MT5.",
-            "data_fetch_candles_symbol_unavailable",
+            "symbol_not_found",
         ),
         (
             "start_datetime must be before end_datetime",
@@ -379,8 +379,8 @@ def test_run_data_fetch_candles_compact_keeps_staleness_without_meta():
     assert "meta" not in result
     assert result["freshness"] == "fresh, bar 1m 0s ago"
     assert result["data_stale"] is False
-    assert result["data_age_anchor"] == "wall_clock"
-    assert result["data_age_metric"] == "last_completed_bar_age_seconds"
+    assert "data_age_anchor" not in result
+    assert "data_age_metric" not in result
     assert "freshness_basis" not in result
     assert "data_freshness_seconds" not in result
     assert result["data_age_seconds"] == 60.0
@@ -414,8 +414,8 @@ def test_run_data_fetch_candles_compact_flags_stale_latest_data():
     assert result["freshness"] == "stale, bar 1h 1m ago"
     assert result["query_type"] == "latest"
     assert result["data_stale"] is True
-    assert result["data_age_anchor"] == "wall_clock"
-    assert result["data_age_metric"] == "last_completed_bar_age_seconds"
+    assert "data_age_anchor" not in result
+    assert "data_age_metric" not in result
     assert "freshness_basis" not in result
     assert result["data_age_seconds"] == 3661.0
     assert "data_age" not in result
@@ -455,16 +455,57 @@ def test_run_data_fetch_candles_closed_market_keeps_absolute_staleness():
     assert result["freshness"].startswith("closed or idle, bar ")
     assert result["query_type"] == "latest"
     assert result["data_stale"] is True
-    assert result["usable_for_live_trading"] is False
+    assert result["history_policy_ok"] is False
+    assert "usable_for_live_trading" not in result
     assert result["data_age_seconds"] == 149668.6
-    assert result["data_age_anchor"] == "wall_clock"
-    assert result["data_age_metric"] == "last_completed_bar_age_seconds"
+    assert "data_age_anchor" not in result
+    assert "data_age_metric" not in result
     assert result["freshness_policy_relaxed"] is True
     assert result["market_status"] == "closed_or_idle"
     assert result["note"] == (
         "Market appears closed or idle; showing the latest completed bar."
     )
     assert "stale_warning" not in result
+
+
+def test_run_data_fetch_candles_forming_bar_uses_last_tick_freshness(monkeypatch):
+    monkeypatch.setattr("mtdata.core.data.use_cases.time.time", lambda: 1_700_000_100.0)
+    request = DataFetchCandlesRequest(
+        symbol="EURUSD",
+        timeframe="H1",
+        include_incomplete=True,
+    )
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        symbol_info_tick=lambda _symbol: SimpleNamespace(time=1_700_000_095),
+    )
+
+    result = run_data_fetch_candles(
+        request,
+        gateway=gateway,
+        fetch_candles_impl=lambda **_kwargs: {
+            "success": True,
+            "data": [{"time": "2026-01-01T12:00:00Z", "close": 1.2}],
+            "data_window": {
+                "latest_bar_complete": False,
+                "latest_bar_age_seconds": 900.0,
+            },
+            "meta": {
+                "diagnostics": {
+                    "freshness": {
+                        "data_freshness_seconds": 900.0,
+                        "last_bar_within_policy_window": True,
+                    }
+                }
+            },
+        },
+    )
+
+    assert result["bar_open_age_seconds"] == 900.0
+    assert result["last_update_age_seconds"] == 5.0
+    assert result["data_age_seconds"] == 5.0
+    assert result["data_age_metric"] == "last_tick_age_seconds"
+    assert result["freshness"] == "forming bar open 15m 0s ago; last update 5s ago"
 
 
 def test_run_data_fetch_candles_range_applies_limit_cap():
@@ -504,6 +545,36 @@ def test_run_data_fetch_candles_range_applies_limit_cap():
         "Set limit>=5 to return the full range."
     ]
     assert result["query_type"] == "historical"
+
+
+def test_run_data_fetch_candles_range_does_not_use_latest_default_limit():
+    rows = [{"time": f"t{i}", "close": i} for i in range(25)]
+    observed = {}
+    request = DataFetchCandlesRequest(
+        symbol="EURUSD",
+        timeframe="H1",
+        start="2026-01-01",
+        end="2026-01-02",
+    )
+
+    def _fetch(**kwargs):
+        observed.update(kwargs)
+        return {
+            "success": True,
+            "data": rows,
+            "meta": {"diagnostics": {"query": {"mode": "range"}}},
+        }
+
+    result = run_data_fetch_candles(
+        request,
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_candles_impl=_fetch,
+    )
+
+    assert observed["limit"] == 100_000
+    assert result["data"] == rows
+    assert result["count"] == 25
+    assert "truncated" not in result
 
 
 def test_run_data_fetch_candles_normalizes_count_metadata():
@@ -607,8 +678,8 @@ def test_run_data_fetch_candles_compact_exposes_range_gap_metadata():
     assert "data_freshness_seconds" not in result
     assert "data_age_seconds" not in result
     assert result["query_end_gap_seconds"] == 0.0
-    assert result["query_end_gap_anchor"] == "query_expected_end"
-    assert result["query_end_gap_metric"] == "requested_range_end_gap_seconds"
+    assert "query_end_gap_anchor" not in result
+    assert "query_end_gap_metric" not in result
     assert result["query_end_gap"] == "0s"
 
 
@@ -730,7 +801,7 @@ def test_run_data_fetch_candles_standard_surfaces_mt5_time_alignment_warning():
                     "mt5_time_alignment": {
                         "status": "stale",
                         "reason": "market_data_stale",
-                        "warning": "MT5 broker-time sanity check could not confirm live alignment: market is closed",
+                        "warning": "MT5 UTC freshness check found stale data: market is closed",
                         "probe_timeframe": "M1",
                     },
                 },
@@ -741,7 +812,7 @@ def test_run_data_fetch_candles_standard_surfaces_mt5_time_alignment_warning():
     assert result["mt5_time_alignment"] == {
         "status": "stale",
         "reason": "market_data_stale",
-        "warning": "MT5 broker-time sanity check could not confirm live alignment: market is closed",
+        "warning": "MT5 UTC freshness check found stale data: market is closed",
         "probe_timeframe": "M1",
     }
 
@@ -1011,7 +1082,7 @@ def test_run_data_fetch_candles_compact_preserves_requested_rows():
     assert result["data"][0]["close"] == 0.0
     assert "data_truncated" not in result
     assert result["timestamp_format"] == "epoch_seconds"
-    assert "timestamp_format=iso" in result["timestamp_format_hint"]
+    assert "timestamp_format_hint" not in result
 
 
 def test_run_data_fetch_candles_standard_keeps_forming_booleans():
@@ -1220,19 +1291,23 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
                     "time": "2026-05-29 20:56",
                     "bid": 1.1659,
                     "ask": 1.16596,
-                    "tick_volume": 3.0,
-                    "real_volume": 1.25,
+                    "volume": 3.0,
+                    "volume_real": 1.25,
                     "flags": 1026,
                     "flags_decoded": ["bid", "volume_real"],
+                    "quote_update_type": "bid_only_update",
+                    "spread_valid": False,
                 },
                 {
                     "time": "2026-05-29 20:57",
                     "bid": 1.16591,
                     "ask": 1.16599,
-                    "tick_volume": 4.0,
-                    "real_volume": 0.0,
+                    "volume": 4.0,
+                    "volume_real": 0.0,
                     "flags": 1030,
                     "flags_decoded": ["bid", "ask", "volume_real"],
+                    "quote_update_type": "bid_ask_update",
+                    "spread_valid": True,
                 },
             ],
             "timezone": "UTC",
@@ -1241,8 +1316,8 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             "data_stale": True,
             "price_point": 0.00001,
             "units": {
-                "tick_volume": "broker_tick_count",
-                "real_volume": "traded_volume",
+                "volume": "last_trade_volume",
+                "volume_real": "last_trade_volume_real",
             },
             "stats": {"spread": {"low": 0.00006, "high": 0.00008}},
             "last_quote": {"bid": 1.16591, "ask": 1.16599},
@@ -1251,19 +1326,19 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             "tick_rate_per_second": 2,
             "price_precision": 5,
             "data_quality": {
-                "one_sided_zero_spread_ticks": 1,
+                "incomplete_quote_ticks": 1,
                 "complete_ticks": 1,
                 "incomplete_ticks": 1,
                 "total_ticks": 2,
-                "one_sided_zero_spread_ratio": 0.5,
+                "incomplete_quote_ratio": 0.5,
                 "spread_ticks_excluded": 1,
                 "warning_ratio": 0.5,
                 "quote_type_counts": {"bid_ask": 1, "bid_only": 1},
-                "one_sided_zero_spread_status": "warning",
+                "incomplete_quote_status": "warning",
             },
             "last_unavailable": True,
             "warnings": [
-                "Some ticks had identical bid/ask with one-sided quote flags.",
+                "Some tick snapshots omitted a bid or ask value.",
                 "Broker tick data did not provide a usable last price; last is null.",
             ],
         },
@@ -1277,13 +1352,14 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             {
                 "time": "2026-05-29 20:56",
                 "bid": 1.1659,
-                "ask": 1.16596,
-                "spread": 0.00006,
-                "mid": 1.16593,
-                "spread_points": 6.0,
-                "spread_pct": 0.005146,
-                "tick_volume": 3.0,
-                "real_volume": 1.25,
+                "ask": None,
+                "spread": None,
+                "volume": 3.0,
+                "volume_real": 1.25,
+                "flags": 1026,
+                "flags_decoded": ["bid", "volume_real"],
+                "quote_update_type": "bid_only_update",
+                "spread_valid": False,
             },
             {
                 "time": "2026-05-29 20:57",
@@ -1293,7 +1369,11 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
                 "mid": 1.16595,
                 "spread_points": 8.0,
                 "spread_pct": 0.006861,
-                "tick_volume": 4.0,
+                "volume": 4.0,
+                "flags": 1030,
+                "flags_decoded": ["bid", "ask", "volume_real"],
+                "quote_update_type": "bid_ask_update",
+                "spread_valid": True,
             },
         ],
         "timezone": "UTC",
@@ -1311,10 +1391,10 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             "mid": "absolute_price",
             "spread_points": "broker_points",
             "spread_pct": "percentage_points (1.0 = 1%)",
-            "tick_volume": "broker_tick_count",
-            "real_volume": "traded_volume",
+            "volume": "last_trade_volume",
+            "volume_real": "last_trade_volume_real",
         },
-        "volume_fields": ["tick_volume", "real_volume"],
+        "volume_fields": ["volume", "volume_real"],
         "quote_completeness_pct": 50.0,
         "quality": "partial_quotes=1/2; last=unavailable",
         "requested_limit": 2,
@@ -1338,19 +1418,19 @@ def test_run_data_fetch_ticks_compact_summarizes_quality_without_verbose_warning
                 {"time": "t5", "bid": 1.10002, "ask": None, "quote_type": "bid_only"},
             ],
             "data_quality": {
-                "one_sided_zero_spread_ticks": 3,
+                "incomplete_quote_ticks": 3,
                 "complete_ticks": 2,
                 "incomplete_ticks": 3,
                 "total_ticks": 5,
-                "one_sided_zero_spread_ratio": 0.6,
+                "incomplete_quote_ratio": 0.6,
                 "spread_ticks_excluded": 3,
                 "warning_ratio": 0.5,
                 "quote_type_counts": {"ask_only": 1, "bid_ask": 2, "bid_only": 2},
-                "one_sided_zero_spread_status": "warning",
+                "incomplete_quote_status": "warning",
             },
             "last_unavailable": True,
             "warnings": [
-                "Some ticks had identical bid/ask with one-sided quote flags.",
+                "Some tick snapshots omitted a bid or ask value.",
                 "Broker tick data did not provide a usable last price; last is null.",
             ],
         },

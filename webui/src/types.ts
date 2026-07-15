@@ -5,7 +5,7 @@
 export type Timeframe = string
 
 export type Instrument = {
-  name: string
+  symbol: string
   group?: string
   description?: string
 }
@@ -48,6 +48,7 @@ export type HistoryResponse = {
   forming_candle_included?: boolean
   forming_candle_skipped?: boolean
   incomplete_candles_skipped?: number
+  server_utc_offset_seconds?: number
   meta?: {
     runtime?: {
       timezone?: RuntimeTimezoneMeta
@@ -389,10 +390,20 @@ export type AnchorMetrics = {
 }
 
 export type Tick = {
+  success: boolean
   symbol: string
-  time: number
+  time: string
+  time_epoch: number
+  timezone: string
   bid: number
   ask: number
-  last: number
-  volume: number
+  mid?: number
+  last?: number | null
+  spread?: number
+  spread_pips?: number
+  spread_points?: number
+  freshness?: string
+  freshness_state?: string
+  data_age_seconds?: number
+  usable_for_live_trading?: boolean
 }

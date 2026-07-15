@@ -84,6 +84,13 @@ def _news_time_utc_text(value: datetime) -> str:
     return published_at.strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _news_iso_utc(value: Any) -> Any:
+    published_at = _news_datetime_utc(value)
+    if published_at is None:
+        return value
+    return published_at.isoformat().replace("+00:00", "Z")
+
+
 def _news_data_fetched_at() -> str:
     return (
         datetime.now(timezone.utc)
@@ -109,7 +116,11 @@ def _news_compact_time_field(
     return "time_utc", _news_time_utc_text(published_at)
 
 
-def _strip_news_compact_item_fields(value: Any) -> Any:
+def _strip_news_compact_item_fields(
+    value: Any,
+    *,
+    include_relevance: bool = False,
+) -> Any:
     if not isinstance(value, dict):
         return value
 
@@ -146,9 +157,22 @@ def _strip_news_compact_item_fields(value: Any) -> Any:
         out["kind"] = kind
     published_at = value.get("published_at")
     if published_at not in (None, ""):
-        out["published_at"] = published_at
+        out["published_at"] = _news_iso_utc(published_at)
     if time_field_name and time_field_value:
         out[time_field_name] = time_field_value
+    if include_relevance and value.get("relevance_score") is not None:
+        out["relevance_score"] = value["relevance_score"]
+        metadata = value.get("metadata")
+        matched_terms = metadata.get("matched_terms") if isinstance(metadata, dict) else None
+        if isinstance(matched_terms, list) and matched_terms:
+            out["match_reason"] = {
+                "basis": "matched_terms",
+                "terms": [str(term) for term in matched_terms],
+            }
+        elif str(value.get("kind") or "").strip().lower() == "direct_symbol":
+            out["match_reason"] = {"basis": "direct_symbol_provider"}
+        else:
+            out["match_reason"] = {"basis": "symbol_relevance_gate"}
     for key, subvalue in value.items():
         key_text = str(key)
         if key_text in {
@@ -178,7 +202,21 @@ def normalize_news_output(
 
     detail_mode = normalize_output_verbosity_detail(detail)
     if detail_mode == "full":
-        return dict(result)
+        out = dict(result)
+        for bucket in _NEWS_BUCKET_KEYS:
+            rows = out.get(bucket)
+            if not isinstance(rows, list):
+                continue
+            out[bucket] = [
+                {
+                    **item,
+                    "published_at": _news_iso_utc(item.get("published_at")),
+                }
+                if isinstance(item, dict) and item.get("published_at") not in (None, "")
+                else item
+                for item in rows
+            ]
+        return out
 
     out: Dict[str, Any] = {}
     for key, subvalue in result.items():
@@ -191,7 +229,10 @@ def normalize_news_output(
             if not subvalue:
                 continue
             out[key] = [
-                _strip_news_compact_item_fields(item)
+                _strip_news_compact_item_fields(
+                    item,
+                    include_relevance=key_text == "related_news",
+                )
                 for item in subvalue
             ]
             continue

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from mtdata.analytics.engines import (
+    _barrier_returns,
+    _filtered_historical_returns,
+    _tick_frame,
     analyze_execution_quality,
     analyze_microstructure,
     decompose_portfolio_risk,
@@ -41,7 +46,7 @@ def _ticks(count: int = 200, *, start: int | None = None, real_volume: bool = Fa
                 "last": mid if real_volume else 0.0,
                 "volume": 1,
                 "volume_real": 2.0 if real_volume else 0.0,
-                "flags": 6,
+                "flags": 1054 if real_volume else 6,
             }
         )
     return rows
@@ -113,6 +118,9 @@ class FakeGateway:
     def symbol_info_tick(self, symbol):
         return SimpleNamespace(bid=1.0999, ask=1.1001)
 
+    def symbol_info(self, symbol):
+        return SimpleNamespace(point=0.00001, digits=5)
+
     def order_calc_profit(self, action, symbol, volume, opened, closed):
         sign = 1.0 if action == self.ORDER_TYPE_BUY else -1.0
         return sign * (closed - opened) * 100_000 * volume
@@ -134,7 +142,81 @@ def test_microstructure_distinguishes_trade_volume_from_quote_proxy() -> None:
     assert "kyle_lambda" not in result["summary"]
     assert "amihud_impact" not in result["summary"]
     assert result["estimator_scope"]["market_scope"] == "connected_broker_tick_feed"
+    assert result["timezone"] == "UTC"
+    assert result["summary"]["spread_points"]["median"] == pytest.approx(10.0)
+    assert result["summary"]["spread_pips"]["median"] == pytest.approx(1.0)
+    assert result["units"]["spread_points"] == "broker_points"
+    assert all("start" in item and "end" in item for item in result["liquidity_events"])
+    assert all("start_epoch" not in item for item in result["liquidity_events"])
     assert any("broker's tick feed" in warning for warning in result["warnings"])
+
+
+def test_microstructure_does_not_recount_last_trade_snapshots() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = _ticks(real_volume=True)
+    for row in gateway.tick_rows:
+        row["last"] = 1.101
+        row["volume_real"] = 5.0
+        row["flags"] = 6
+    gateway.tick_rows[0]["flags"] = 1032
+
+    result = analyze_microstructure(
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60), gateway
+    )
+
+    assert result["success"] is True
+    assert result["summary"]["trade_count"] == 1
+    assert result["data_quality"]["trade_tick_coverage"] == pytest.approx(1 / 200)
+
+
+def test_tick_frame_keeps_distinct_same_timestamp_events() -> None:
+    gateway = FakeGateway()
+    epoch = _now() - 10
+    gateway.tick_rows = [
+        {
+            "time": epoch,
+            "time_msc": epoch * 1000,
+            "bid": 1.1,
+            "ask": 1.2,
+            "last": 1.15,
+            "volume": 5,
+            "volume_real": 5.0,
+            "flags": 1032,
+        },
+        {
+            "time": epoch,
+            "time_msc": epoch * 1000,
+            "bid": 1.1,
+            "ask": 1.2,
+            "last": 1.15,
+            "volume": 5,
+            "volume_real": 5.0,
+            "flags": 6,
+        },
+    ]
+
+    frame, truncated = _tick_frame(
+        gateway,
+        "EURUSD",
+        datetime.fromtimestamp(epoch - 1, tz=timezone.utc),
+        datetime.fromtimestamp(epoch + 1, tz=timezone.utc),
+        10,
+    )
+
+    assert truncated is False
+    assert len(frame) == 2
+
+
+def test_tick_frame_empty_result_retains_analysis_schema() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = []
+    now = datetime.now(timezone.utc)
+
+    frame, truncated = _tick_frame(gateway, "EURUSD", now, now, 10)
+
+    assert truncated is False
+    assert frame.empty
+    assert {"epoch", "bid", "ask", "mid", "spread"}.issubset(frame.columns)
 
 
 def test_microstructure_reports_closed_session_for_short_tick_stream(monkeypatch) -> None:
@@ -158,12 +240,32 @@ def test_microstructure_reports_closed_session_for_short_tick_stream(monkeypatch
     assert "reopen" in result["remediation"]
 
 
+def test_tick_frame_nulls_derived_quotes_for_one_sided_updates() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = [
+        {"time": 1, "bid": 1.1, "ask": 1.1, "flags": 2},
+        {"time": 2, "bid": 1.1, "ask": 1.1002, "flags": 6},
+    ]
+
+    frame, _ = _tick_frame(
+        gateway,
+        "EURUSD",
+        datetime.fromtimestamp(0, tz=timezone.utc),
+        datetime.fromtimestamp(3, tz=timezone.utc),
+        100,
+    )
+
+    assert np.isnan(frame.iloc[0]["mid"])
+    assert np.isnan(frame.iloc[0]["spread"])
+    assert frame.iloc[1]["spread"] == pytest.approx(0.0002)
+
+
 def test_execution_quality_matches_order_and_computes_markout() -> None:
     gateway = FakeGateway()
     start = _now() - 100
     gateway.tick_rows = _ticks(100, start=start)
     gateway.orders = [
-        {"ticket": 10, "price_open": 1.10005, "volume_initial": 1.0, "time_setup_msc": (start + 9) * 1000}
+        {"ticket": 10, "type": 0, "price_open": 1.10005, "volume_initial": 1.0, "time_setup_msc": (start + 9) * 1000}
     ]
     gateway.deals = [
         {"ticket": 20, "order": 10, "position_id": 30, "symbol": "EURUSD", "type": 0, "volume": 1.0, "price": 1.10008, "time": start + 10, "time_msc": (start + 10) * 1000}
@@ -174,8 +276,41 @@ def test_execution_quality_matches_order_and_computes_markout() -> None:
     )
     assert result["summary"]["fills"] == 1
     assert result["items"][0]["benchmark_source"] == "arrival_quote"
-    assert result["items"][0]["latency_ms"] == 1000.0
+    assert result["items"][0]["order_to_fill_ms"] == 1000.0
+    assert result["summary"]["market_order_latency_ms"]["mean"] == 1000.0
+    assert result["latency_definition"]["order_to_fill_ms"].endswith(
+        "including_pending_wait"
+    )
     assert result["items"][0]["markout_bps"]["5"] is not None
+
+
+def test_execution_quality_handles_empty_tick_history() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = []
+    fill_epoch = _now() - 10
+    gateway.orders = [{"ticket": 10, "price_open": 1.1, "volume_initial": 1.0}]
+    gateway.deals = [
+        {
+            "ticket": 20,
+            "order": 10,
+            "position_id": 30,
+            "symbol": "EURUSD",
+            "type": 0,
+            "volume": 1.0,
+            "price": 1.1001,
+            "time": fill_epoch,
+            "time_msc": fill_epoch * 1000,
+        }
+    ]
+
+    result = analyze_execution_quality(
+        TradeExecutionQualityRequest(minutes_back=60, markout_seconds=[1, 5]),
+        gateway,
+    )
+
+    assert result["success"] is True
+    assert result["summary"]["fills"] == 1
+    assert result["data_quality"]["skipped"]["missing_markout"] == 2
 
 
 def test_strategy_validation_returns_walk_forward_oos_metrics() -> None:
@@ -198,6 +333,7 @@ def test_strategy_validation_returns_walk_forward_oos_metrics() -> None:
     assert result["validation"]["outcome_horizon_bars"] == 5
     assert result["validation"]["extra_purge_bars"] == 0
     assert result["validation"]["protocol"] == "anchored_expanding_fixed_candidate_oos"
+    assert result["validation"]["execution_timing"] == "next_bar_open"
     assert result["rankings"][0]["id"] == "cross"
     assert result["rankings"][0]["trades"] > 0
     assert result["rankings"][0]["evaluation_status"] == "complete"
@@ -206,6 +342,29 @@ def test_strategy_validation_returns_walk_forward_oos_metrics() -> None:
     }
     for fold in result["rankings"][0]["folds"]:
         assert fold["test_end_bar"] + request.barrier.horizon <= fold["test_window_end_bar"]
+
+
+def test_strategy_barrier_entry_uses_next_bar_open_after_gap() -> None:
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 110.0, 110.0],
+            "high": [101.0, 111.0, 111.0],
+            "low": [99.0, 109.0, 109.0],
+            "close": [100.0, 110.0, 110.0],
+        }
+    )
+    signal = pd.Series([1.0, np.nan, np.nan])
+
+    indices, outcomes = _barrier_returns(
+        frame,
+        signal,
+        horizon=1,
+        tp_pct=5.0,
+        sl_pct=5.0,
+    )
+
+    assert indices.tolist() == [0]
+    assert outcomes.tolist() == pytest.approx([0.0])
 
 
 def test_forecast_strategy_folds_cover_computed_signal_window(monkeypatch) -> None:
@@ -273,6 +432,21 @@ def test_portfolio_risk_reconciles_component_expected_shortfall() -> None:
     assert component_total == pytest.approx(row["expected_shortfall"])
     assert "correlation_to_one_loss_proxy" not in result["stresses"]
     assert result["stresses"]["perfect_positive_correlation_1sigma"][0]["horizon_bars"] == 1
+
+
+def test_filtered_historical_shock_uses_pre_shock_volatility() -> None:
+    baseline = np.tile(np.array([-0.01, 0.01]), 60)
+    values = np.concatenate([baseline, np.array([0.20])])
+    returns = pd.DataFrame({"EURUSD": values})
+    alpha = 0.1
+
+    standardized, _ = _filtered_historical_returns(returns, alpha=alpha)
+    concurrent_vol = returns.ewm(alpha=alpha, adjust=False).std().iloc[-1, 0]
+
+    assert standardized.iloc[-1, 0] == pytest.approx(
+        values[-1] / returns.ewm(alpha=alpha, adjust=False).std().shift(1).iloc[-1, 0]
+    )
+    assert standardized.iloc[-1, 0] > values[-1] / concurrent_vol * 2.0
 
 
 def test_portfolio_risk_fails_closed_when_symbol_history_is_missing() -> None:
@@ -344,6 +518,14 @@ def test_relative_strength_ranks_and_reports_breadth() -> None:
     )
     result = rank_relative_strength(request, gateway)
     assert result["success"] is True
-    assert len(result["leaders"]) == 3
+    assert len(result["leaders"]) == 2
+    assert len(result["laggards"]) == 1
+    assert {
+        row["symbol"] for row in result["leaders"]
+    }.isdisjoint(row["symbol"] for row in result["laggards"])
     assert result["leaders"][0]["score"] >= result["leaders"][-1]["score"]
     assert set(result["breadth"]["positive_by_horizon"]) == {"5", "20"}
+    assert result["universe_size"] == 3
+    assert result["rank_quality"] == "illustrative_small_universe"
+    assert result["score_definition"]["weights"] == [0.4, 0.6]
+    assert all("rank_percentile" not in row for row in result["leaders"])

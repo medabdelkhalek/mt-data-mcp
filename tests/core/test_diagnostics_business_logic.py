@@ -92,6 +92,8 @@ def test_seasonality_detect_finds_known_period(monkeypatch):
     assert result["dominant_period_bars"] == 12
     assert result["signal_quality"] in {"moderate", "strong"}
     assert "signal_quality" in result["items"][0]
+    assert result["items"][0]["period_duration"] == "12 hours"
+    assert result["items"][0]["period_duration_seconds"] == 43_200
 
 
 def test_seasonality_detect_does_not_inflate_noise_spectral_score(monkeypatch):
@@ -131,7 +133,7 @@ def test_outliers_detect_flags_price_and_volume_spike(monkeypatch):
 
     result = _raw(diagnostics.outliers_detect)(
         symbol="TEST",
-        fields="return,volume",
+        score_fields="return,volume",
         detail="full",
     )
 
@@ -155,6 +157,10 @@ def test_volatility_term_structure_returns_requested_horizons(monkeypatch):
     assert result["success"] is True
     assert [row["horizon_bars"] for row in result["items"]] == [1, 5, 20]
     assert all("p50" in row["cone"] for row in result["items"])
+    assert result["items"][0]["stability"] == "very_low"
+    assert all("per_bar_volatility" in row for row in result["items"])
+    assert result["comparable_to_options_iv"] is False
+    assert result["analysis_kind"] == "historical_realized_volatility_cones"
     assert result["unit"] == "annualized_decimal_volatility"
     assert "0.01 means 1%" in result["unit_note"]
     assert result["units"]["current_volatility"] == "decimal_return_fraction"

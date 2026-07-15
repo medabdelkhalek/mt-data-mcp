@@ -13,6 +13,7 @@ from ..shared.constants import (
 )
 from ..shared.market_units import forex_points_per_pip
 from ..shared.schema import DetailLiteral, TimeframeLiteral
+from ..shared.symbols import FIAT_CURRENCY_CODES as _FOREX_CURRENCY_CODES
 from ..shared.validators import invalid_timeframe_error
 from ..utils.freshness import (
     QUOTE_STALE_SECONDS,
@@ -39,6 +40,7 @@ from ..utils.symbol import (
 )
 from ..utils.symbol import (
     _normalize_group_path_query,
+    match_symbol_infos,
 )
 from ..utils.time import (
     _format_time_explicit,
@@ -63,16 +65,6 @@ from .output_contract import (
 logger = logging.getLogger(__name__)
 _MARKET_SCAN_STALE_BAR_SECONDS = 7 * 24 * 60 * 60
 _MARKET_SCAN_STALE_QUOTE_SECONDS = QUOTE_STALE_SECONDS
-_FOREX_CURRENCY_CODES = {
-    "AUD",
-    "CAD",
-    "CHF",
-    "EUR",
-    "GBP",
-    "JPY",
-    "NZD",
-    "USD",
-}
 _FOREX_SEARCH_PAIR_PRIORITY = {
     pair: idx
     for idx, pair in enumerate(
@@ -209,8 +201,6 @@ _SYMBOL_DESCRIBE_COMPACT_DIRECT_FIELDS: tuple[str, ...] = (
     "trade_contract_size",
     "trade_tick_size",
     "trade_tick_value",
-    "margin_initial",
-    "margin_maintenance",
     "trade_stops_level",
     "trade_freeze_level",
     "volume_min",
@@ -686,6 +676,20 @@ def _compact_symbol_describe_payload(symbol_data: Dict[str, Any]) -> Dict[str, A
     for field in _SYMBOL_DESCRIBE_COMPACT_DIRECT_FIELDS:
         _copy_symbol_describe_field(compact, symbol_data, field)
 
+    raw_margin_fields = {
+        "margin_initial": "broker_margin_initial_raw",
+        "margin_maintenance": "broker_margin_maintenance_raw",
+    }
+    for source, target in raw_margin_fields.items():
+        if source in symbol_data:
+            compact[target] = symbol_data[source]
+    if any(target in compact for target in raw_margin_fields.values()):
+        compact["margin_fields_note"] = (
+            "Raw broker symbol template values, not cash required for an order. "
+            "Actual margin depends on account leverage and instrument rules; use "
+            "trade_place dry-run for an order-specific margin estimate."
+        )
+
     _apply_symbol_currency_diagnostics(compact)
 
     if "time_epoch" in symbol_data:
@@ -776,21 +780,17 @@ def _find_symbol_suggestions(
         symbols = list(mt5_gateway.symbols_get() or [])
     except Exception:
         return []
-    matches = []
-    for symbol_info in symbols:
-        name = str(getattr(symbol_info, "name", "") or "")
-        description = str(getattr(symbol_info, "description", "") or "")
-        group = str(_extract_group_path_util(symbol_info) or "")
-        searchable = f"{name} {description} {group}".upper()
-        if query_upper in searchable:
-            matches.append(symbol_info)
-    matches.sort(
-        key=lambda info: (
+    matches = match_symbol_infos(
+        symbols,
+        text,
+        limit=limit,
+        group_of=_extract_group_path_util,
+        sort_key=lambda info: (
             not str(getattr(info, "name", "") or "").upper().startswith(query_upper),
             *_case_insensitive_sort_key(getattr(info, "name", "")),
-        )
+        ),
     )
-    return [_symbol_suggestion_from_info(symbol) for symbol in matches[: max(1, int(limit))]]
+    return [_symbol_suggestion_from_info(symbol) for symbol in matches]
 
 
 @mcp.tool()
@@ -1553,7 +1553,9 @@ def _market_scan_freshness_fields(
         "stale_after_seconds": stale_after_seconds,
         "bar_age_hours": _market_scan_round(age_seconds / 3600.0, digits=3),
         "data_stale": data_stale,
+        "history_policy_ok": not data_stale and not bool(closed_session),
         "usable_for_live_trading": not data_stale and not bool(closed_session),
+        "usable_for_live_trading_basis": "ranking_bar_policy_not_execution_quote",
         "freshness": format_freshness_label(
             data_stale=data_stale,
             age_seconds=age_seconds,
@@ -1572,6 +1574,9 @@ def _market_scan_freshness_fields(
             age_seconds=age_seconds,
             item="bar",
         )
+    elif not data_stale:
+        age_text = format_age_seconds(age_seconds)
+        fields["freshness"] = f"current closed bar, {age_text} ago"
     if fields["data_stale"]:
         fields["stale_warning"] = (
             "Completed bar data may be stale; latest bar is "
@@ -3068,7 +3073,7 @@ def symbols_top_markets(  # noqa: C901
 _MARKET_SCAN_PRESETS: Dict[str, Dict[str, Any]] = {
     "oversold": {"rsi_below": 30.0, "min_tick_volume": 1000, "rank_by": "rsi"},
     "overbought": {"rsi_above": 70.0, "min_tick_volume": 1000, "rank_by": "rsi"},
-    "high_volume": {"min_price_change_pct": 1.0, "rank_by": "tick_volume"},
+    "high_volume": {"rank_by": "tick_volume"},
     "tight_spread": {"max_spread_pct": 0.01, "min_tick_volume": 500, "rank_by": "spread_pct"},
     "gap_up": {"min_price_change_pct": 2.0, "rank_by": "price_change_pct"},
     "gap_down": {"max_price_change_pct": -2.0, "rank_by": "price_change_pct"},
@@ -3507,6 +3512,17 @@ def market_scan(  # noqa: C901
                 compact_headers.append("rsi")
             if include_sma:
                 compact_headers.append("sma_distance_pct")
+            optional_compact_headers = {
+                "market_status",
+                "market_status_reason",
+                "freshness_policy_relaxed",
+            }
+            compact_headers = [
+                header
+                for header in compact_headers
+                if header not in optional_compact_headers
+                or any(row.get(header) is not None for row in limited_rows)
+            ]
             headers = compact_headers if detail_mode == "compact" else full_headers
             output_rows = (
                 _project_market_scan_rows(headers, limited_rows)
@@ -3551,11 +3567,19 @@ def market_scan(  # noqa: C901
                 include_stale_symbols=detail_mode == "full",
             )
             stale_rows = int(freshness_summary.get("stale_rows") or 0)
-            message = (
-                f"{int(total_matches)} symbol(s) matched the requested market scan filters."
-                if total_matches > 0
-                else "No symbols matched the requested market scan filters."
-            )
+            returned_count = int(table_payload["row_count"])
+            if total_matches > returned_count:
+                message = (
+                    f"Showing {returned_count} of {int(total_matches)} symbols matching "
+                    "the requested market scan filters."
+                )
+            elif total_matches > 0:
+                message = (
+                    f"Returned all {returned_count} symbol(s) matching the requested "
+                    "market scan filters."
+                )
+            else:
+                message = "No symbols matched the requested market scan filters."
             if stale_rows:
                 message = (
                     f"{message} Returned rows: "
@@ -3590,6 +3614,14 @@ def market_scan(  # noqa: C901
                 },
                 "meta": _market_scan_contract_meta(request=request, stats=stats),
             }
+            if preset_value:
+                out["preset"] = preset_value
+                out["preset_filters"] = {
+                    key: value
+                    for key, value in dict(preset_config or {}).items()
+                    if key != "rank_by"
+                }
+                out["preset_rank_by"] = rank_by_value
             if detail_mode == "full":
                 out["returned_count"] = int(table_payload["row_count"])
                 out["summary"]["counts"]["matched_symbols"] = int(

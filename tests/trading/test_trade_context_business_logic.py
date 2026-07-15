@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from mtdata.core.trading.context import trade_session_context
+from mtdata.core.trading.context import _build_trade_ready, trade_session_context
 from mtdata.core.trading.requests import TradeSessionContextRequest
 
 
@@ -19,6 +19,44 @@ def _raw_trade_session_context(
     )
 
 
+def test_trade_ready_does_not_claim_portfolio_risk_approval() -> None:
+    readiness = _build_trade_ready(
+        {
+            "execution_ready": True,
+            "equity": 384.28,
+            "margin": 318.97,
+            "margin_free": 65.31,
+            "margin_level": 120.48,
+        },
+        {"usable_for_live_trading": True, "data_stale": False},
+        {"can_open_new_positions": True},
+    )
+
+    assert readiness["execution_preconditions_met"] is True
+    assert readiness["portfolio_risk_assessed"] is False
+    assert readiness["margin_level"] == 120.48
+    assert readiness["margin_utilization_pct"] == 83.0
+    assert "not_portfolio_risk_approval" in readiness["readiness_scope"]
+
+
+def test_trade_ready_blocks_critical_margin_stress() -> None:
+    readiness = _build_trade_ready(
+        {
+            "execution_ready": True,
+            "equity": 384.44,
+            "margin": 348.96,
+            "margin_free": 35.48,
+            "margin_level": 110.17,
+        },
+        {"usable_for_live_trading": True, "data_stale": False},
+        {"can_open_new_positions": True},
+    )
+
+    assert readiness["execution_preconditions_met"] is False
+    assert "critical_margin_stress" in readiness["blockers"]
+    assert readiness["margin_stress"]["status"] == "critical"
+
+
 def test_trade_session_context_compacts_nested_sections_by_default() -> None:
     timezone_meta = {"used": {"tz": "UTC"}}
     ticker_compact = {
@@ -30,6 +68,10 @@ def test_trade_session_context_compacts_nested_sections_by_default() -> None:
         "price_currency": "USD",
         "spread": 0.0002,
         "spread_pips": 2.0,
+        "freshness_state": "live",
+        "usable_for_live_trading": True,
+        "usable_for_live_trading_basis": "quote_age_and_market_session",
+        "live_max_age_seconds": 30,
         "time": "2023-11-14 22:13",
         "timezone": "UTC",
     }
@@ -46,6 +88,7 @@ def test_trade_session_context_compacts_nested_sections_by_default() -> None:
                 "volume": 0.1,
                 "price_open": 1.1,
                 "price_current": 1.1004,
+                "price_current_basis": "bid",
                 "sl": 1.095,
                 "tp": 1.11,
                 "profit": 4.2,
@@ -103,7 +146,9 @@ def test_trade_session_context_compacts_nested_sections_by_default() -> None:
     assert "pnl_basis" not in out["account"]
     assert "equity_balance_delta" not in out["account"]
     assert "login" not in out["account"]
-    assert "account_type" not in out["account"]
+    assert out["account"]["account_type"] == "demo"
+    assert out["account"]["is_demo"] is True
+    assert out["account"]["is_live"] is False
     assert "execution_ready" not in out["account"]
     assert out["quote"] == {
         "bid": 1.1,
@@ -112,6 +157,10 @@ def test_trade_session_context_compacts_nested_sections_by_default() -> None:
         "price_currency": "USD",
         "spread": 0.0002,
         "spread_pips": 2.0,
+        "freshness_state": "live",
+        "usable_for_live_trading": True,
+        "usable_for_live_trading_basis": "quote_age_and_market_session",
+        "live_max_age_seconds": 30,
         "time": "2023-11-14 22:13",
         "timezone": "UTC",
     }
@@ -124,6 +173,7 @@ def test_trade_session_context_compacts_nested_sections_by_default() -> None:
             "volume": 0.1,
             "price_open": 1.1,
             "price_current": 1.1004,
+            "price_current_basis": "bid",
             "sl": 1.095,
             "tp": 1.11,
             "profit": 4.2,
@@ -190,7 +240,7 @@ def test_trade_session_context_surfaces_closed_market_tradability() -> None:
     assert out["market_status_reason"] == "weekend"
     assert out["is_tradable"] is False
     assert out["can_open_new_positions"] is False
-    assert out["trade_ready"]["can_trade"] is False
+    assert out["trade_ready"]["execution_preconditions_met"] is False
     assert "market_not_open_for_new_positions" in out["trade_ready"]["blockers"]
 
 

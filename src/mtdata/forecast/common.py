@@ -10,13 +10,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from ..services.data_service import (
-    _is_last_bar_forming,
-    _resolve_live_rate_auto_shift_seconds,
-    _shift_rate_times,
-)
+from ..services.data_service import _is_last_bar_forming
 from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
-from ..shared.symbols import is_probably_crypto_symbol, is_probably_forex_symbol
+from ..shared.symbols import (
+    FOREX_CURRENCY_CODES,
+    is_probably_crypto_symbol,
+    is_probably_forex_symbol,
+)
+from ..utils.freshness import is_standard_weekend_closure
 from ..utils.mt5 import (
     _ensure_symbol_ready,
     _mt5_copy_rates_from,
@@ -25,7 +26,6 @@ from ..utils.mt5 import (
     get_symbol_info_cached,
     mt5,
 )
-from ..utils.freshness import is_standard_weekend_closure
 from ..utils.utils import _parse_start_datetime, _utc_epoch_seconds
 
 _FORECAST_RESERVED_COLUMNS = {"unique_id", "ds", "y"}
@@ -35,24 +35,6 @@ _FORECAST_AUXILIARY_COLUMN_RE = re.compile(
     re.IGNORECASE,
 )
 _NF_ENV_LOCK = threading.RLock()
-
-_FOREX_CURRENCY_CODES = frozenset(
-    {
-        "AUD",
-        "CAD",
-        "CHF",
-        "CNH",
-        "EUR",
-        "GBP",
-        "JPY",
-        "NOK",
-        "NZD",
-        "SEK",
-        "SGD",
-        "USD",
-        "ZAR",
-    }
-)
 
 
 def edge_pad_to_length(values: np.ndarray, length: int) -> np.ndarray:
@@ -387,6 +369,41 @@ def bars_per_year(
         return float("nan")
 
 
+def annualization_context(
+    timeframe: str,
+    symbol: Optional[str] = None,
+    *,
+    observed_times: Any = None,
+    observed_timeframe: Optional[str] = None,
+) -> Tuple[float, str]:
+    """Return bars per year and an explicit annualization basis."""
+    tf = str(timeframe or "").strip().upper()
+    if is_probably_crypto_symbol(symbol):
+        return bars_per_year(tf, symbol), "365_calendar_days_24h_crypto"
+    if is_probably_forex_symbol(symbol):
+        return bars_per_year(tf, symbol), "260_fx_weekdays_24h"
+
+    target_seconds = TIMEFRAME_SECONDS.get(tf)
+    if target_seconds and float(target_seconds) >= 86400.0:
+        return bars_per_year(tf, symbol), "252_trading_days_calendar"
+
+    observed_per_session = observed_bars_per_session(observed_times)
+    if observed_per_session is not None:
+        source_tf = str(observed_timeframe or tf).strip().upper()
+        source_seconds = TIMEFRAME_SECONDS.get(source_tf)
+        if source_seconds and target_seconds:
+            target_bars_per_session = (
+                observed_per_session * float(source_seconds) / float(target_seconds)
+            )
+            if math.isfinite(target_bars_per_session) and target_bars_per_session > 0:
+                return (
+                    float(252.0 * target_bars_per_session),
+                    "252_trading_days_observed_session",
+                )
+
+    return bars_per_year(tf, symbol), "252_trading_days_assumed_24h"
+
+
 def quantity_to_target(quantity: str) -> str:
     """Map a forecast quantity to the corresponding price/return target mode."""
     return "return" if str(quantity).strip().lower() == "return" else "price"
@@ -402,14 +419,8 @@ def is_standard_weekend_closed_epoch(epoch: Any) -> bool:
 
 def uses_standard_weekend_projection(symbol: Optional[str], tf_secs: int) -> bool:
     """Return whether intraday forecasts should skip the standard FX weekend."""
-    text = "".join(ch for ch in str(symbol or "").upper() if ch.isalpha())
-    if len(text) < 6:
-        return False
-    base = text[:3]
-    quote = text[3:6]
     return (
-        base in _FOREX_CURRENCY_CODES
-        and quote in _FOREX_CURRENCY_CODES
+        is_probably_forex_symbol(symbol, currency_codes=FOREX_CURRENCY_CODES)
         and int(tf_secs) < TIMEFRAME_SECONDS.get("D1", 86400)
     )
 
@@ -471,7 +482,7 @@ def pd_freq_from_timeframe(tf: str) -> str:
     }
     return mapping.get(t, 'D')
 
-
+
 # ------------------------------------------------------------------
 # Composable NeuralForecast building blocks (used by train/predict)
 # ------------------------------------------------------------------
@@ -1018,7 +1029,7 @@ def fetch_history(
     end: Optional[str] = None,
     drop_last_live: bool = True,
 ) -> pd.DataFrame:
-    """Fetch last `need` bars for symbol/timeframe, normalize times to UTC seconds.
+    """Fetch the last `need` bars with MT5's native UTC epoch seconds.
 
     - as_of: optional date/time string. If provided, fetch bars ending at that time. Else uses server time.
     - start/end: optional date/time range. If start is provided, returns the full range.
@@ -1060,14 +1071,6 @@ def fetch_history(
             # start_pos=0 includes the current forming bar
             fetch_count = int(need) + (1 if drop_last_live else 0)
             rates = _mt5_copy_rates_from_pos(symbol, mt5_tf, 0, max(fetch_count, 1))
-            auto_shift_seconds = _resolve_live_rate_auto_shift_seconds(
-                symbol=symbol,
-                timeframe=timeframe,
-                start_datetime=None,
-                end_datetime=None,
-            )
-            if auto_shift_seconds:
-                rates = _shift_rate_times(rates, auto_shift_seconds)
     finally:
         if was_visible is False:
             try:
@@ -1077,9 +1080,8 @@ def fetch_history(
     if rates is None or len(rates) < 1:
         raise RuntimeError(f"Failed to get rates for {symbol}: {mt5.last_error()}")
     df = pd.DataFrame(rates)
-    # Times are already normalized to UTC by _mt5_copy_rates_from_pos via _normalize_times_in_struct
-    # DO NOT normalize again.
-    
+    # MT5 rate epochs are already UTC.
+
     # Manual truncation if an upper bound was provided.
     if (as_of or end) and not df.empty and 'time' in df.columns:
         to_dt = _parse_start_datetime(as_of or end or "")

@@ -1,4 +1,6 @@
 """Tests for utils/regime.py — BOCPD and Student-t helpers."""
+import warnings
+
 import numpy as np
 import pytest
 
@@ -76,6 +78,14 @@ class TestBocpdGaussian:
         baseline = np.mean(cp[20:80])
         assert np.max(peak_region) > baseline
 
+    def test_change_probability_is_data_responsive(self):
+        x = np.concatenate([np.zeros(80), np.full(20, 10.0)])
+        cp = bocpd_gaussian(x, hazard_lambda=100)["cp_prob"]
+
+        baseline = float(np.mean(cp[30:70]))
+        assert np.ptp(cp) > 0.1
+        assert float(np.max(cp[80:85])) > baseline * 10.0
+
     def test_nan_filtered(self):
         x = np.array([1.0, np.nan, 2.0, np.inf, 3.0])
         result = bocpd_gaussian(x)
@@ -109,3 +119,14 @@ class TestBocpdGaussian:
         assert result["cp_prob"].shape == (5,)
         assert np.all(np.isfinite(result["cp_prob"]))
         assert np.all(np.isfinite(result["run_length_map"]))
+
+    def test_extreme_outlier_resets_and_recovers_without_warnings(self):
+        x = np.array([1.0, 1.1, 0.9, 1e300, 1.0, 1.2])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            result = bocpd_gaussian(x)
+
+        assert np.all(np.isfinite(result["cp_prob"]))
+        assert np.all(np.isfinite(result["run_length_map"]))
+        assert result["cp_prob"][3] == pytest.approx(1.0)

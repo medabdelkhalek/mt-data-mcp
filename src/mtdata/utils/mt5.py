@@ -1,33 +1,8 @@
-"""MT5 connectivity, time alignment, and low-level data helpers.
+"""MT5 connectivity, UTC timestamp, and low-level data helpers.
 
-Time Alignment Contract
------------------------
-All MT5 timestamps pass through a single normalisation chain:
-
-1. **Outbound** (UTC → server-local): ``_to_server_naive_dt()`` converts
-   UTC datetimes to the broker's server-local representation before each
-   MT5 API call.  It uses either a ``pytz`` timezone (``MT5_SERVER_TZ``)
-   or a static offset (``MT5_TIME_OFFSET_MINUTES``).
-
-2. **Inbound** (server-local → UTC): ``_normalize_times_in_struct()``
-   converts every ``time`` field in the returned structured arrays back
-   to UTC.  When a server timezone is configured it uses vectorized
-   DST-aware conversion and falls back to ``_mt5_epoch_to_utc()`` when
-   needed; otherwise it subtracts the static offset in bulk (fast path).
-
-3. **Diagnostic** (optional): ``inspect_mt5_time_alignment()`` samples
-   the latest tick and bar to infer the actual broker offset, compares it
-   to the configured offset, and reports ``ok | misaligned | stale``.
-   Results are TTL-cached via ``get_cached_mt5_time_alignment()``.
-
-Configuration priority (``MT5Config.get_time_offset_seconds``):
-  static ``MT5_TIME_OFFSET_MINUTES`` > dynamic ``MT5_SERVER_TZ`` > 0
-
-Every ``_mt5_copy_*`` wrapper in this module applies steps 1 + 2 so
-callers always receive UTC-normalised data.  The higher-level data
-service may apply an additional auto-correction shift
-(``_shift_rate_times``) for live data when diagnostic alignment detects
-a mismatch, bounded to [30 min, 18 h].
+Most MetaTrader5 terminals use native UTC epochs. A minority expose history
+on a Unix-shaped broker server-clock axis; the adapter detects that behavior
+from the live tick and normalizes requests and returned epochs at the boundary.
 """
 
 import importlib
@@ -38,26 +13,22 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any, Dict, Iterator, Optional, Tuple
-
-import numpy as np
 
 from ..bootstrap.settings import mt5_config
 
 logger = logging.getLogger(__name__)
 
-try:
-    from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
-except Exception:  # pragma: no cover - pytz is optional at import time
-    class AmbiguousTimeError(Exception):
-        """Fallback when pytz is unavailable."""
-
-    class NonExistentTimeError(Exception):
-        """Fallback when pytz is unavailable."""
-
 _SYMBOL_INFO_TTL_SECONDS = 5
 _SYMBOL_INFO_TTL_MAX_SECONDS = 3600.0
 _MT5_CONNECTION_FAILURE_MESSAGE = "Failed to connect to MetaTrader5. Ensure MT5 terminal is running."
+_MT5_TIMESTAMP_MODE_NATIVE = "native_utc"
+_MT5_TIMESTAMP_MODE_SERVER = "server_clock"
+_MT5_TIMESTAMP_MODE_TTL_SECONDS = 60.0
+_MT5_TIMESTAMP_MODE_FRESH_TOLERANCE_SECONDS = 15 * 60.0
+_mt5_timestamp_mode_cache: Dict[str, Tuple[str, float, int]] = {}
+_mt5_terminal_timestamp_mode: Optional[Tuple[str, float, int]] = None
 
 
 class MT5ConnectionError(RuntimeError):
@@ -116,7 +87,10 @@ class MT5Adapter:
 
     def shutdown(self):
         with _mt5_lock:
-            return self._module().shutdown()
+            try:
+                return self._module().shutdown()
+            finally:
+                clear_mt5_timestamp_mode_cache()
 
     def last_error(self):
         with _mt5_lock:
@@ -124,7 +98,10 @@ class MT5Adapter:
 
     def symbol_info(self, symbol):
         with _mt5_lock:
-            return self._module().symbol_info(symbol)
+            module = self._module()
+            raw_info = module.symbol_info(symbol)
+            mode = _timestamp_mode_for_symbol(module, symbol)
+            return _normalize_object_times(raw_info, mode=mode)
 
     def symbol_select(self, symbol, visible=True):
         with _mt5_lock:
@@ -132,7 +109,9 @@ class MT5Adapter:
 
     def symbol_info_tick(self, symbol):
         with _mt5_lock:
-            return _normalize_object_times(self._module().symbol_info_tick(symbol))
+            raw_tick = self._module().symbol_info_tick(symbol)
+            mode = _timestamp_mode_from_tick(raw_tick, symbol=symbol)
+            return _normalize_object_times(raw_tick, mode=mode)
 
     def order_send(self, request):
         with _mt5_lock:
@@ -140,22 +119,52 @@ class MT5Adapter:
 
     def positions_get(self, **kwargs):
         with _mt5_lock:
-            return _normalize_object_time_rows(self._module().positions_get(**kwargs))
+            module = self._module()
+            rows = module.positions_get(**kwargs)
+            return _normalize_object_time_rows(
+                rows,
+                mode=_timestamp_mode_for_object_rows(
+                    module,
+                    rows,
+                    symbol=kwargs.get("symbol"),
+                ),
+            )
 
     def orders_get(self, **kwargs):
         with _mt5_lock:
-            return _normalize_object_time_rows(self._module().orders_get(**kwargs))
+            module = self._module()
+            rows = module.orders_get(**kwargs)
+            return _normalize_object_time_rows(
+                rows,
+                mode=_timestamp_mode_for_object_rows(
+                    module,
+                    rows,
+                    symbol=kwargs.get("symbol"),
+                ),
+            )
 
     def history_orders_get(self, dt_from, dt_to, **kwargs):
         with _mt5_lock:
+            mode = _cached_timestamp_mode()
             return _normalize_object_time_rows(
-                self._module().history_orders_get(dt_from, dt_to, **kwargs)
+                self._module().history_orders_get(
+                    _to_server_query_dt(dt_from, mode=mode),
+                    _to_server_query_dt(dt_to, mode=mode),
+                    **kwargs,
+                ),
+                mode=mode,
             )
 
     def history_deals_get(self, dt_from, dt_to, **kwargs):
         with _mt5_lock:
+            mode = _cached_timestamp_mode()
             return _normalize_object_time_rows(
-                self._module().history_deals_get(dt_from, dt_to, **kwargs)
+                self._module().history_deals_get(
+                    _to_server_query_dt(dt_from, mode=mode),
+                    _to_server_query_dt(dt_to, mode=mode),
+                    **kwargs,
+                ),
+                mode=mode,
             )
 
     def account_info(self):
@@ -168,23 +177,58 @@ class MT5Adapter:
 
     def copy_rates_from(self, symbol, timeframe, dt_from, count):
         with _mt5_lock:
-            return self._module().copy_rates_from(symbol, timeframe, dt_from, count)
+            module = self._module()
+            mode = _timestamp_mode_for_symbol(module, symbol)
+            rows = module.copy_rates_from(
+                symbol,
+                timeframe,
+                _to_server_query_dt(dt_from, mode=mode),
+                count,
+            )
+            return _normalize_times_in_struct(rows, mode=mode)
 
     def copy_rates_range(self, symbol, timeframe, dt_from, dt_to):
         with _mt5_lock:
-            return self._module().copy_rates_range(symbol, timeframe, dt_from, dt_to)
+            module = self._module()
+            mode = _timestamp_mode_for_symbol(module, symbol)
+            rows = module.copy_rates_range(
+                symbol,
+                timeframe,
+                _to_server_query_dt(dt_from, mode=mode),
+                _to_server_query_dt(dt_to, mode=mode),
+            )
+            return _normalize_times_in_struct(rows, mode=mode)
 
     def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
         with _mt5_lock:
-            return self._module().copy_rates_from_pos(symbol, timeframe, start_pos, count)
+            module = self._module()
+            mode = _timestamp_mode_for_symbol(module, symbol)
+            rows = module.copy_rates_from_pos(symbol, timeframe, start_pos, count)
+            return _normalize_times_in_struct(rows, mode=mode)
 
     def copy_ticks_from(self, symbol, dt_from, count, flags):
         with _mt5_lock:
-            return self._module().copy_ticks_from(symbol, dt_from, count, flags)
+            module = self._module()
+            mode = _timestamp_mode_for_symbol(module, symbol)
+            rows = module.copy_ticks_from(
+                symbol,
+                _to_server_query_dt(dt_from, mode=mode),
+                count,
+                flags,
+            )
+            return _normalize_times_in_struct(rows, mode=mode)
 
     def copy_ticks_range(self, symbol, dt_from, dt_to, flags):
         with _mt5_lock:
-            return self._module().copy_ticks_range(symbol, dt_from, dt_to, flags)
+            module = self._module()
+            mode = _timestamp_mode_for_symbol(module, symbol)
+            rows = module.copy_ticks_range(
+                symbol,
+                _to_server_query_dt(dt_from, mode=mode),
+                _to_server_query_dt(dt_to, mode=mode),
+                flags,
+            )
+            return _normalize_times_in_struct(rows, mode=mode)
 
     def market_book_add(self, symbol):
         with _mt5_lock:
@@ -220,6 +264,10 @@ def _raw_mt5_module() -> Any:
 
 def _raw_symbol_info_tick(symbol: str) -> Any:
     with _mt5_lock:
+        if isinstance(mt5, MT5Adapter):
+            override = vars(mt5).get("symbol_info_tick")
+            if callable(override):
+                return override(symbol)
         return _raw_mt5_module().symbol_info_tick(symbol)
 
 
@@ -253,60 +301,285 @@ def clear_symbol_info_cache() -> None:
     _cached_symbol_info.cache_clear()
 
 
-def _mt5_epoch_to_utc(epoch_seconds: float) -> float:
-    """Convert MT5-reported epoch seconds to UTC.
+def symbol_price_digits(*infos: Any, default: int = 0) -> int:
+    """Return the first valid MT5 ``digits`` value from symbol info objects."""
+    for info in infos:
+        try:
+            digits_raw = getattr(info, "digits", None)
+        except Exception:
+            digits_raw = None
+        if isinstance(digits_raw, (int, float)) and not isinstance(digits_raw, bool):
+            return max(0, int(digits_raw))
+    return int(default)
 
-    A non-zero static offset takes precedence over MT5_SERVER_TZ. Otherwise,
-    interpret the epoch as server-local with DST awareness when a timezone is set.
-    """
+
+def symbol_price_digits_optional(info: Any, *, max_digits: int = 15) -> Optional[int]:
+    """Return digits when in a plausible broker range, else None."""
     try:
-        static_offset = _configured_static_offset_seconds(mt5_config)
-        if static_offset:
-            return float(epoch_seconds) - float(static_offset)
-        tz = mt5_config.get_server_tz()
-        if tz is not None:
-            base = datetime(1970, 1, 1)
-            dt_local_naive = base + timedelta(seconds=float(epoch_seconds))
+        digits = int(info.digits)
+    except Exception:
+        return None
+    if digits < 0 or digits > int(max_digits):
+        return None
+    return digits
+
+
+def symbol_price_currency(*infos: Any) -> Optional[str]:
+    """Return profit/margin currency from the first symbol info that has one."""
+    for info in infos:
+        for attr in ("currency_profit", "currency_margin"):
             try:
-                dt_local = tz.localize(dt_local_naive, is_dst=None)
-            except AmbiguousTimeError:
-                logger.warning(
-                    "Ambiguous MT5 server-local time %s in %s; resolving with standard-time offset.",
-                    dt_local_naive,
-                    getattr(tz, "zone", tz),
-                )
-                dt_local = tz.localize(dt_local_naive, is_dst=False)
-            except NonExistentTimeError:
-                logger.warning(
-                    "Non-existent MT5 server-local time %s in %s; shifting to the next valid local instant.",
-                    dt_local_naive,
-                    getattr(tz, "zone", tz),
-                )
-                dt_local = tz.localize(dt_local_naive + timedelta(hours=1), is_dst=False)
-            return dt_local.astimezone(timezone.utc).timestamp()
-        off = int(mt5_config.get_time_offset_seconds())
-        return float(epoch_seconds) - float(off)
-    except Exception as exc:
-        logger.warning(
-            "Failed to convert MT5 epoch %s to UTC; leaving raw value unchanged: %s",
-            epoch_seconds,
-            exc,
-        )
-        return float(epoch_seconds)
+                value = getattr(info, attr, None)
+            except Exception:
+                value = None
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
 
 
-_DEFAULT_MT5_EPOCH_TO_UTC = _mt5_epoch_to_utc
-
-
-def _configured_static_offset_seconds(config: Any) -> int:
-    """Return the explicitly configured fixed offset, excluding TZ-derived values."""
-    value = getattr(config, "time_offset_minutes", 0)
-    if not isinstance(value, (int, float, str)):
-        return 0
+def symbol_price_currency_for(symbol: Any) -> Optional[str]:
+    """Look up price currency via cached symbol info for a symbol name."""
+    symbol_text = str(symbol or "").strip()
+    if not symbol_text:
+        return None
     try:
-        return int(value or 0) * 60
-    except (TypeError, ValueError):
+        info = get_symbol_info_cached(symbol_text)
+    except Exception:
+        return None
+    return symbol_price_currency(info)
+
+
+def symbol_price_point(*infos: Any) -> Optional[float]:
+    """Return the first positive finite MT5 ``point`` value."""
+    for info in infos:
+        try:
+            point_raw = getattr(info, "point", None)
+        except Exception:
+            point_raw = None
+        if isinstance(point_raw, (int, float)) and not isinstance(point_raw, bool):
+            point = float(point_raw)
+            if math.isfinite(point) and point > 0.0:
+                return point
+    return None
+
+
+def symbol_path(*infos: Any) -> str:
+    """Return the first non-empty MT5 symbol path string."""
+    for info in infos:
+        try:
+            path = getattr(info, "path", None)
+        except Exception:
+            path = None
+        if isinstance(path, str) and path.strip():
+            return path.strip()
+    return ""
+
+
+def symbol_candle_price_basis(*infos: Any) -> str:
+    """Infer candle price basis from MT5 chart mode when available."""
+    for info in infos:
+        try:
+            chart_mode = getattr(info, "chart_mode", None)
+        except Exception:
+            chart_mode = None
+        if isinstance(chart_mode, str):
+            normalized = chart_mode.strip().lower()
+            if "bid" in normalized:
+                return "bid"
+            if "last" in normalized:
+                return "last_trade"
+        if isinstance(chart_mode, (int, float)) and not isinstance(chart_mode, bool):
+            if int(chart_mode) == 0:
+                return "bid"
+            if int(chart_mode) == 1:
+                return "last_trade"
+    return "broker_chart_price"
+
+
+def clear_mt5_timestamp_mode_cache() -> None:
+    """Forget auto-detected MT5 timestamp modes after reconnect/config changes."""
+    global _mt5_terminal_timestamp_mode
+    _mt5_timestamp_mode_cache.clear()
+    _mt5_terminal_timestamp_mode = None
+
+
+def _tick_epoch_seconds(tick: Any) -> Optional[float]:
+    if tick is None:
+        return None
+    for name, divisor in (("time", 1.0), ("time_msc", 1000.0)):
+        try:
+            value = getattr(tick, name)
+        except Exception:
+            try:
+                value = tick[name]
+            except Exception:
+                continue
+        try:
+            epoch = float(value) / divisor
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(epoch) and epoch > 0.0:
+            return epoch
+    return None
+
+
+def _configured_server_offset_seconds(at_epoch: float) -> int:
+    try:
+        at_time = datetime.fromtimestamp(float(at_epoch), tz=timezone.utc)
+        return int(mt5_config.get_time_offset_seconds(at_time))
+    except Exception:
         return 0
+
+
+def _cache_timestamp_mode(symbol: str, mode: str, *, offset_seconds: int) -> str:
+    global _mt5_terminal_timestamp_mode
+    expires_at = time.monotonic() + _MT5_TIMESTAMP_MODE_TTL_SECONDS
+    cached = (str(mode), expires_at, int(offset_seconds))
+    _mt5_timestamp_mode_cache[str(symbol or "").upper()] = cached
+    _mt5_terminal_timestamp_mode = cached
+    return str(mode)
+
+
+def _valid_cached_timestamp_mode(symbol: Optional[str] = None) -> Optional[str]:
+    now_monotonic = time.monotonic()
+    cache_key = str(symbol or "").upper()
+    candidates = []
+    if cache_key:
+        candidates.append(_mt5_timestamp_mode_cache.get(cache_key))
+    candidates.append(_mt5_terminal_timestamp_mode)
+    for cached in candidates:
+        if cached is None:
+            continue
+        mode, expires_at, offset_seconds = cached
+        if float(expires_at) < now_monotonic:
+            continue
+        current_offset = _configured_server_offset_seconds(time.time())
+        if int(offset_seconds) != int(current_offset):
+            continue
+        return str(mode)
+    return None
+
+
+def _cached_timestamp_mode() -> str:
+    return _valid_cached_timestamp_mode() or _MT5_TIMESTAMP_MODE_NATIVE
+
+
+def _timestamp_mode_from_tick(
+    tick: Any,
+    *,
+    symbol: str,
+    now_epoch: Optional[float] = None,
+) -> str:
+    """Detect whether an MT5 terminal exposes UTC or server-clock epochs.
+
+    Some terminals encode the broker's local wall clock into Unix-shaped
+    numeric fields. A live tick then appears almost exactly one configured
+    broker offset in the future. Detection is deliberately conservative and
+    falls back to the last confident mode (or native UTC) for stale markets.
+    """
+    observed_now = float(time.time() if now_epoch is None else now_epoch)
+    offset_seconds = _configured_server_offset_seconds(observed_now)
+    tick_epoch = _tick_epoch_seconds(tick)
+    if tick_epoch is None:
+        return _valid_cached_timestamp_mode(symbol) or _MT5_TIMESTAMP_MODE_NATIVE
+    if offset_seconds == 0:
+        return _cache_timestamp_mode(
+            symbol,
+            _MT5_TIMESTAMP_MODE_NATIVE,
+            offset_seconds=offset_seconds,
+        )
+
+    native_distance = abs(float(tick_epoch) - observed_now)
+    server_distance = abs((float(tick_epoch) - float(offset_seconds)) - observed_now)
+    tolerance = _MT5_TIMESTAMP_MODE_FRESH_TOLERANCE_SECONDS
+    if (
+        server_distance <= tolerance
+        and native_distance >= max(tolerance, abs(float(offset_seconds)) * 0.5)
+    ):
+        return _cache_timestamp_mode(
+            symbol,
+            _MT5_TIMESTAMP_MODE_SERVER,
+            offset_seconds=offset_seconds,
+        )
+    if native_distance <= tolerance:
+        return _cache_timestamp_mode(
+            symbol,
+            _MT5_TIMESTAMP_MODE_NATIVE,
+            offset_seconds=offset_seconds,
+        )
+    return _valid_cached_timestamp_mode(symbol) or _MT5_TIMESTAMP_MODE_NATIVE
+
+
+def _timestamp_mode_for_symbol(module: Any, symbol: str) -> str:
+    try:
+        tick = module.symbol_info_tick(symbol)
+    except Exception:
+        tick = None
+    return _timestamp_mode_from_tick(tick, symbol=symbol)
+
+
+def _timestamp_mode_for_object_rows(
+    module: Any,
+    rows: Any,
+    *,
+    symbol: Optional[str] = None,
+) -> str:
+    """Detect the terminal clock before normalizing position/order rows."""
+    probe_symbol = str(symbol or "").strip()
+    if not probe_symbol and rows:
+        try:
+            probe_symbol = str(getattr(rows[0], "symbol", "") or "").strip()
+        except Exception:
+            probe_symbol = ""
+    if probe_symbol:
+        return _timestamp_mode_for_symbol(module, probe_symbol)
+    return _cached_timestamp_mode()
+
+
+def get_mt5_timestamp_mode(symbol: Optional[str] = None) -> str:
+    """Return the currently detected terminal timestamp mode."""
+    return _valid_cached_timestamp_mode(symbol) or _MT5_TIMESTAMP_MODE_NATIVE
+
+
+def _server_epoch_to_utc(epoch_seconds: float) -> float:
+    try:
+        static_offset_minutes = int(getattr(mt5_config, "time_offset_minutes", 0) or 0)
+    except Exception:
+        static_offset_minutes = 0
+    if static_offset_minutes:
+        return float(epoch_seconds) - float(static_offset_minutes * 60)
+
+    try:
+        server_tz = mt5_config.get_server_tz()
+    except Exception:
+        server_tz = None
+    if server_tz is None:
+        return float(epoch_seconds) - float(
+            _configured_server_offset_seconds(float(epoch_seconds))
+        )
+
+    local_naive = datetime(1970, 1, 1) + timedelta(seconds=float(epoch_seconds))
+    try:
+        localize = getattr(server_tz, "localize", None)
+        if callable(localize):
+            local_aware = localize(local_naive, is_dst=False)
+        else:
+            local_aware = local_naive.replace(tzinfo=server_tz, fold=1)
+        return local_aware.astimezone(timezone.utc).timestamp()
+    except Exception:
+        offset_seconds = _configured_server_offset_seconds(float(epoch_seconds))
+        return float(epoch_seconds) - float(offset_seconds)
+
+
+def _mt5_epoch_to_utc(
+    epoch_seconds: float,
+    *,
+    mode: str = _MT5_TIMESTAMP_MODE_NATIVE,
+) -> float:
+    """Convert an MT5 epoch to UTC according to the detected terminal mode."""
+    if str(mode) != _MT5_TIMESTAMP_MODE_SERVER:
+        return float(epoch_seconds)
+    return _server_epoch_to_utc(float(epoch_seconds))
 
 
 def _broker_timezone_note(
@@ -314,380 +587,252 @@ def _broker_timezone_note(
     server_tz_name: Optional[str],
     offset_seconds: Optional[int] = None,
 ) -> str:
-    if offset_seconds is not None:
-        return (
-            "MT5 timestamps are normalized to UTC using configured broker offset "
-            f"{offset_seconds} seconds; candle/session boundaries follow broker server time."
-        )
-    if server_tz_name:
-        return (
-            "MT5 timestamps are normalized to UTC using broker server timezone "
-            f"{server_tz_name}; candle/session boundaries follow broker server time."
-        )
+    session_config = server_tz_name or (
+        f"UTC offset {offset_seconds} seconds" if offset_seconds is not None else "UTC"
+    )
     return (
-        "MT5 timestamps use raw broker server epoch values because no broker timezone "
-        "or offset is configured."
+        "MT5 request bounds and returned epochs use native UTC; broker session/calendar "
+        f"calculations use {session_config}."
     )
 
 
-def describe_mt5_time_normalization(*, auto_shift_seconds: int = 0) -> Dict[str, Any]:
-    """Describe how MT5 timestamps are interpreted before public output."""
-    metadata: Dict[str, Any] = {"raw_time_basis": "mt5_server_epoch"}
+def describe_mt5_time_normalization(
+    *,
+    symbol: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Describe the detected MT5 timestamp contract and UTC normalization."""
+    timestamp_mode = get_mt5_timestamp_mode(symbol)
+    server_clock_mode = timestamp_mode == _MT5_TIMESTAMP_MODE_SERVER
+    metadata: Dict[str, Any] = {
+        "raw_time_basis": (
+            "mt5_server_clock_epoch" if server_clock_mode else "mt5_utc_epoch"
+        ),
+        "time_basis": "utc",
+        "time_normalization": (
+            "server_clock_to_utc" if server_clock_mode else "mt5_utc_native"
+        ),
+        "timestamp_mode": timestamp_mode,
+    }
     server_tz_name = str(getattr(mt5_config, "server_tz_name", "") or "").strip() or None
     try:
         static_offset_minutes = int(getattr(mt5_config, "time_offset_minutes", 0) or 0)
     except Exception:
         static_offset_minutes = 0
 
-    if static_offset_minutes:
-        metadata["time_basis"] = "utc_normalized"
-        metadata["time_normalization"] = "static_utc_offset"
-        metadata["broker_utc_offset_seconds"] = static_offset_minutes * 60
-        if server_tz_name:
-            metadata["broker_server_tz"] = server_tz_name
+    if server_tz_name:
+        metadata["broker_server_tz"] = server_tz_name
+    elif static_offset_minutes:
+        metadata["session_utc_offset_seconds"] = static_offset_minutes * 60
+    if server_clock_mode:
+        metadata["broker_utc_offset_seconds"] = _configured_server_offset_seconds(
+            time.time()
+        )
+        metadata["timezone_note"] = (
+            "MT5 history bounds are converted from UTC to the detected broker "
+            "server-clock axis and returned epochs are normalized back to UTC."
+        )
+    else:
         metadata["timezone_note"] = _broker_timezone_note(
             server_tz_name=server_tz_name,
-            offset_seconds=static_offset_minutes * 60,
+            offset_seconds=(
+                static_offset_minutes * 60 if static_offset_minutes else None
+            ),
         )
-        return metadata
-
-    if server_tz_name:
-        metadata["time_basis"] = "utc_normalized"
-        metadata["time_normalization"] = "dst_aware_server_timezone"
-        metadata["broker_server_tz"] = server_tz_name
-        metadata["timezone_note"] = _broker_timezone_note(server_tz_name=server_tz_name)
-        return metadata
-
-    if int(auto_shift_seconds):
-        metadata["time_basis"] = "utc_normalized"
-        metadata["time_normalization"] = "live_auto_alignment"
-        metadata["auto_shift_seconds"] = int(auto_shift_seconds)
-        metadata["timezone_note"] = (
-            "MT5 timestamps were live-shifted to UTC from broker server time; "
-            "candle/session boundaries still follow broker server time."
-        )
-        return metadata
-
-    metadata["time_basis"] = "raw_mt5_server_epoch"
-    metadata["time_normalization"] = "unconfigured"
-    metadata["timezone_note"] = _broker_timezone_note(server_tz_name=None)
     return metadata
 
 
 def _rates_to_df(rates: Any):
     """Convert MT5 rates into a DataFrame.
 
-    Low-level MT5 copy helpers already normalize timestamps to UTC before
-    returning structured arrays, so this function should avoid re-normalizing
-    the same values a second time.
+    Low-level MT5 copy helpers already normalize their timestamp fields to UTC,
+    so this function must not apply another broker timezone offset.
     """
     import pandas as pd
 
     return pd.DataFrame(rates)
 
 
-def _to_server_naive_dt(dt: datetime) -> datetime:
-    """Convert a UTC-naive datetime to server-local naive datetime."""
-    try:
-        static_offset = _configured_static_offset_seconds(mt5_config)
-        if static_offset:
-            return dt + timedelta(seconds=static_offset)
-        tz = mt5_config.get_server_tz()
-        if tz is None:
-            offset_seconds = int(mt5_config.get_time_offset_seconds())
-            if offset_seconds:
-                return dt + timedelta(seconds=offset_seconds)
-            return dt
-        aware_utc = dt.replace(tzinfo=timezone.utc)
-        aware_srv = aware_utc.astimezone(tz)
-        return aware_srv.replace(tzinfo=None)
-    except Exception as exc:
-        logger.warning(
-            "Failed to convert UTC datetime %s to MT5 server-local time; using original datetime: %s",
-            dt,
-            exc,
-        )
-        return dt
+def _to_server_query_dt(
+    dt: Any,
+    *,
+    mode: str = _MT5_TIMESTAMP_MODE_NATIVE,
+) -> Any:
+    """Return an MT5 query bound on the terminal's detected clock axis."""
+    if isinstance(dt, (int, float)) and not isinstance(dt, bool):
+        epoch = float(dt)
+        if str(mode) == _MT5_TIMESTAMP_MODE_SERVER:
+            epoch += float(_configured_server_offset_seconds(epoch))
+        return epoch
+    utc_dt = _to_utc_history_query_dt(dt)
+    if str(mode) != _MT5_TIMESTAMP_MODE_SERVER:
+        return utc_dt
+    offset_seconds = _configured_server_offset_seconds(utc_dt.timestamp())
+    return datetime.fromtimestamp(
+        utc_dt.timestamp() + float(offset_seconds),
+        tz=timezone.utc,
+    )
 
 
-def _to_server_query_dt(dt: datetime) -> datetime:
-    """Server-local query datetime tagged UTC for MT5 ``copy_*`` calls.
-
-    The MetaTrader5 package converts *naive* datetimes to epoch seconds using
-    the local machine timezone, which silently shifts historical range/from
-    queries by the PC's UTC offset on any non-UTC machine. Tagging the
-    server-local wall clock as UTC makes the resulting epoch deterministic and
-    independent of the PC timezone, symmetric with the inbound
-    ``_mt5_epoch_to_utc`` axis (raw MT5 epochs are server-local seconds).
-    """
-    return _to_server_naive_dt(dt).replace(tzinfo=timezone.utc)
-
-
-def _to_utc_history_query_dt(dt: datetime) -> datetime:
+def _to_utc_history_query_dt(dt: Any) -> datetime:
     """Convert a datetime to a UTC-aware instant for MT5 history_* queries."""
-    from .utils import _utc_epoch_seconds
-
-    return datetime.fromtimestamp(_utc_epoch_seconds(dt), tz=timezone.utc)
+    if isinstance(dt, (int, float)) and not isinstance(dt, bool):
+        return datetime.fromtimestamp(float(dt), tz=timezone.utc)
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _to_mt5_history_epoch_seconds(dt: datetime, *, config: Any = None) -> float:
-    """Convert an absolute UTC instant to MT5's numeric history time axis.
-
-    MT5 history rows encode timestamps as server-local epoch seconds. Passing
-    numeric query bounds on that same axis avoids Python datetime timezone
-    interpretation while preserving an absolute elapsed-time window.
-    """
+    """Convert an absolute UTC instant to MT5's native UTC epoch axis."""
     from .utils import _utc_epoch_seconds
 
-    utc_epoch = float(_utc_epoch_seconds(dt))
-    cfg = config if config is not None else mt5_config
+    return float(_utc_epoch_seconds(dt))
+
+
+_MT5_TIME_FIELDS = (
+    "time",
+    "time_msc",
+    "time_setup",
+    "time_setup_msc",
+    "time_done",
+    "time_done_msc",
+    "time_update",
+    "time_update_msc",
+    "time_expiration",
+    "expiration",
+)
+
+
+def _normalize_times_in_struct(
+    arr: Any,
+    *,
+    mode: str = _MT5_TIMESTAMP_MODE_NATIVE,
+):
+    """Normalize structured MT5 time fields when the terminal uses server time."""
+    if arr is None or str(mode) != _MT5_TIMESTAMP_MODE_SERVER:
+        return arr
+    names = getattr(getattr(arr, "dtype", None), "names", None)
+    if not names:
+        return arr
+    time_fields = [field for field in _MT5_TIME_FIELDS if field in names]
+    if not time_fields:
+        return arr
+
+    out = arr
+    flags = getattr(arr, "flags", None)
+    if flags is not None and not bool(getattr(flags, "writeable", True)):
+        out = arr.copy()
     try:
-        utc_dt = datetime.fromtimestamp(utc_epoch, tz=timezone.utc)
-        offset_seconds = int(cfg.get_time_offset_seconds(utc_dt))
-    except Exception as exc:
-        logger.warning(
-            "Failed to convert UTC datetime %s to MT5 history epoch; using UTC epoch: %s",
-            dt,
-            exc,
+        import numpy as np
+        import pandas as pd
+
+        server_tz = mt5_config.get_server_tz()
+        static_offset_minutes = int(
+            getattr(mt5_config, "time_offset_minutes", 0) or 0
         )
-        offset_seconds = 0
-    return utc_epoch + float(offset_seconds)
-
-
-def _vectorized_mt5_epoch_to_utc(values: Any, *, milliseconds: bool, tz: Any) -> np.ndarray:
-    """Convert MT5 server-local epoch values to UTC in bulk."""
-    import pandas as pd
-
-    numeric = np.asarray(values, dtype=float)
-    mask = np.isfinite(numeric) & (numeric > 0.0)
-    if not bool(mask.any()):
-        return numeric
-
-    scale = 1000.0 if milliseconds else 1.0
-    local_dt = pd.to_datetime(numeric[mask] / scale, unit="s", errors="raise")
-    utc_dt = local_dt.tz_localize(
-        tz,
-        ambiguous=False,
-        nonexistent=timedelta(hours=1),
-    ).tz_convert(timezone.utc)
-
-    normalized = numeric.copy()
-    normalized[mask] = (utc_dt.asi8.astype(np.float64) / 1_000_000_000.0) * scale
-    return normalized
-
-
-def _normalize_times_in_struct_elementwise(out: Any, time_fields: list[str]) -> Any:
-    for i in range(len(out)):
         for field in time_fields:
-            try:
-                val = float(out[i][field])
-                if val <= 0:
-                    continue
-                if field.endswith("_msc"):
-                    out[i][field] = _mt5_epoch_to_utc(val / 1000.0) * 1000.0
-                else:
-                    out[i][field] = _mt5_epoch_to_utc(val)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to normalize MT5 timestamp at index %s field %s; leaving raw value unchanged: %s",
-                    i,
-                    field,
-                    exc,
-                )
+            values = np.asarray(out[field], dtype=float)
+            valid = np.isfinite(values) & (values > 0.0)
+            if not bool(valid.any()):
                 continue
-    return out
-
-
-def _normalize_times_in_struct(arr: Any):
-    """Convert all time fields in a structured array to UTC."""
-    try:
-        if arr is None:
-            return arr
-        names = getattr(getattr(arr, "dtype", None), "names", None)
-        if not names:
-            return arr
-
-        # Identify all fields that look like timestamps
-        time_fields = [
-            n
-            for n in names
-            if n
-            in (
-                "time",
-                "time_msc",
-                "time_setup",
-                "time_setup_msc",
-                "time_done",
-                "time_done_msc",
-                "time_update",
-                "time_update_msc",
-                "time_expiration",
-                "expiration",
-            )
-        ]
-        if not time_fields:
-            return arr
-
-        out = arr
-        flags = getattr(arr, "flags", None)
-        if flags is not None and not bool(getattr(flags, "writeable", True)):
-            out = arr.copy()
-
-        # Optimization: apply an explicit static offset before considering TZ.
-        if _mt5_epoch_to_utc is _DEFAULT_MT5_EPOCH_TO_UTC:
-            offset_seconds = _configured_static_offset_seconds(mt5_config)
-            tz = None if offset_seconds else mt5_config.get_server_tz()
-            if tz is None:
-                if not offset_seconds:
-                    offset_seconds = int(mt5_config.get_time_offset_seconds())
-                if offset_seconds:
-                    for field in time_fields:
-                        try:
-                            shift = (
-                                float(offset_seconds) * 1000.0
-                                if field.endswith("_msc")
-                                else float(offset_seconds)
-                            )
-                            values = out[field]
-                            try:
-                                mask = values > 0
-                                out[field][mask] = values[mask] - shift
-                            except Exception:
-                                mask = values > 0
-                                out[field] = np.where(mask, values - shift, values)
-                        except Exception as exc:
-                            logger.warning(
-                                "Failed to normalize MT5 timestamp field %s with static offset; leaving raw values unchanged: %s",
-                                field,
-                                exc,
-                            )
-                            continue
-                return out
-            try:
-                normalized_fields = {
-                    field: _vectorized_mt5_epoch_to_utc(
-                        out[field],
-                        milliseconds=field.endswith("_msc"),
-                        tz=tz,
-                    )
-                    for field in time_fields
-                }
-                for field, values in normalized_fields.items():
-                    out[field] = values
-                return out
-            except Exception as exc:
-                logger.warning(
-                    "Failed to vectorize MT5 timestamp normalization; falling back to per-element conversion: %s",
-                    exc,
+            scale = 1000.0 if field.endswith("_msc") else 1.0
+            normalized = values.copy()
+            if static_offset_minutes:
+                normalized[valid] = values[valid] - float(
+                    static_offset_minutes * 60
+                ) * scale
+            elif server_tz is not None:
+                local_times = pd.to_datetime(
+                    values[valid] / scale,
+                    unit="s",
+                    errors="raise",
                 )
-
-        return _normalize_times_in_struct_elementwise(out, time_fields)
+                utc_times = local_times.tz_localize(
+                    server_tz,
+                    ambiguous=False,
+                    nonexistent="shift_forward",
+                ).tz_convert(timezone.utc)
+                normalized[valid] = (
+                    utc_times.asi8.astype(float) / 1_000_000_000.0
+                ) * scale
+            else:
+                normalized[valid] = [
+                    _server_epoch_to_utc(value / scale) * scale
+                    for value in values[valid]
+                ]
+            out[field] = normalized
+        return out
     except Exception as exc:
         logger.warning(
-            "Failed to normalize MT5 timestamps in structured array; leaving values unchanged: %s",
+            "Failed to normalize MT5 server-clock rows; preserving raw epochs: %s",
             exc,
         )
         return arr
 
 
-def _normalize_object_times(obj: Any) -> Any:
-    """Normalize timestamp attributes on an MT5 object to UTC.
-    Returns a copy when the original was likely immutable.
-    """
-    if obj is None:
-        return None
-
-    time_attrs = (
-        "time",
-        "time_msc",
-        "time_setup",
-        "time_setup_msc",
-        "time_done",
-        "time_done_msc",
-        "time_update",
-        "time_update_msc",
-        "time_expiration",
-        "expiration",
-    )
-
-    from types import SimpleNamespace
-
+def _normalize_object_times(
+    obj: Any,
+    *,
+    mode: str = _MT5_TIMESTAMP_MODE_NATIVE,
+) -> Any:
+    """Normalize timestamp attributes while preserving namedtuple-like shapes."""
+    if obj is None or str(mode) != _MT5_TIMESTAMP_MODE_SERVER:
+        return obj
     try:
         if hasattr(obj, "_asdict"):
-            data = obj._asdict()
-            if hasattr(obj, "__dict__"):
-                for attr, value in vars(obj).items():
-                    if attr.startswith("_") or callable(value):
-                        continue
-                    data.setdefault(attr, value)
+            data = dict(obj._asdict())
         elif hasattr(obj, "__dict__"):
             data = {
-                attr: value
-                for attr, value in vars(obj).items()
-                if not attr.startswith("_") and not callable(value)
+                key: value
+                for key, value in vars(obj).items()
+                if not key.startswith("_") and not callable(value)
             }
         else:
-            data = {
-                attr: getattr(obj, attr)
-                for attr in dir(obj)
-                if not attr.startswith("_")
-                and not callable(getattr(obj, attr, None))
-            }
-
-        if not any(attr in data for attr in time_attrs):
             return obj
-
-        modified = False
-        updates = {}
-        for attr in time_attrs:
-            if attr in data:
-                try:
-                    if data[attr].__class__.__module__.startswith("unittest.mock"):
-                        continue
-                    val = float(data[attr])
-                    if not math.isfinite(val) or val <= 0.0:
-                        continue
-                    normalized = (
-                        _mt5_epoch_to_utc(val / 1000.0) * 1000.0
-                        if attr.endswith("_msc")
-                        else _mt5_epoch_to_utc(val)
-                    )
-                    data[attr] = normalized
-                    updates[attr] = normalized
-                    modified = True
-                except Exception:
-                    continue
-
-        if not modified:
-            return obj
-
-        if updates and hasattr(obj, "_replace"):
+        updates: Dict[str, Any] = {}
+        for field in _MT5_TIME_FIELDS:
+            if field not in data:
+                continue
             try:
-                return obj._replace(**updates)
+                value = float(data[field])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                continue
+            scale = 1000.0 if field.endswith("_msc") else 1.0
+            normalized = _server_epoch_to_utc(value / scale) * scale
+            data[field] = normalized
+            updates[field] = normalized
+        if not updates:
+            return obj
+        replace = getattr(obj, "_replace", None)
+        if callable(replace):
+            try:
+                return replace(**updates)
             except Exception:
                 pass
-
         return SimpleNamespace(**data)
     except Exception as exc:
-        logger.debug("Failed to normalize object timestamps: %s", exc)
+        logger.debug("Failed to normalize MT5 object timestamps: %s", exc)
         return obj
 
 
-def _normalize_object_time_rows(rows: Any) -> Any:
+def _normalize_object_time_rows(
+    rows: Any,
+    *,
+    mode: str = _MT5_TIMESTAMP_MODE_NATIVE,
+) -> Any:
     """Normalize timestamp attributes in MT5 object-row collections."""
-    if rows is None:
-        return None
+    if rows is None or str(mode) != _MT5_TIMESTAMP_MODE_SERVER:
+        return rows
     if isinstance(rows, tuple):
-        return tuple(_normalize_object_times(row) for row in rows)
+        return tuple(_normalize_object_times(row, mode=mode) for row in rows)
     if isinstance(rows, list):
-        return [_normalize_object_times(row) for row in rows]
+        return [_normalize_object_times(row, mode=mode) for row in rows]
     try:
-        return type(rows)(_normalize_object_times(row) for row in rows)
+        return type(rows)(_normalize_object_times(row, mode=mode) for row in rows)
     except Exception:
-        try:
-            return [_normalize_object_times(row) for row in rows]
-        except Exception:
-            return rows
+        return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1044,89 +1189,29 @@ def _symbol_ready_guard(
                 pass
 
 
-def estimate_server_offset(symbol: str = "EURUSD", samples: int = 5) -> int:
-    """Estimate server offset from UTC in seconds by comparing tick time to local UTC time.
-    
-    Returns 0 if failed.
-    """
-    try:
-        ensure_mt5_connection_or_raise()
-        
-        # Ensure symbol is ready
-        if not mt5.symbol_select(symbol, True):
-            # Try a fallback if EURUSD not found
-            for s in ["GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"]:
-                if mt5.symbol_select(s, True):
-                    symbol = s
-                    break
-        
-        deltas = []
-        for _ in range(samples):
-            tick = _raw_symbol_info_tick(symbol)
-            if tick:
-                # MT5 tick.time is epoch seconds (server time)
-                # We compare to time.time() (system local epoch -> UTC)
-                # If server is UTC+2, tick.time will be ~ (now + 7200)
-                diff = float(tick.time) - time.time()
-                deltas.append(diff)
-            time.sleep(0.2)
-            
-        if not deltas:
-            return 0
-            
-        # Median
-        deltas.sort()
-        med = deltas[len(deltas) // 2]
-        
-        # Round to nearest 15 minutes (900s) to be safe/clean
-        offset = int(round(med / 900.0) * 900)
-        return offset
-    except Exception as e:
-        logger.error(f"Failed to estimate server offset: {e}")
-        return 0
-
-
-def _epoch_to_utc_iso(epoch_seconds: Optional[float]) -> Optional[str]:
-    try:
-        if epoch_seconds is None:
-            return None
-        return datetime.fromtimestamp(float(epoch_seconds), tz=timezone.utc).isoformat()
-    except Exception:
-        return None
-
-
-def _round_seconds(value: float, bucket_seconds: int = 900) -> int:
-    try:
-        bucket = int(bucket_seconds)
-        if bucket <= 0:
-            return int(round(float(value)))
-        return int(round(float(value) / float(bucket)) * float(bucket))
-    except Exception:
-        return int(round(float(value)))
-
-
 def inspect_mt5_time_alignment(
     symbol: str = "EURUSD",
     probe_timeframe: str = "M1",
     *,
-    tick_offset_bucket_seconds: int = 900,
-    max_plausible_offset_seconds: int = 18 * 3600,
     max_future_seconds: int = 90,
     max_tick_age_seconds: int = 180,
     stale_bar_tolerance: int = 3,
 ) -> Dict[str, Any]:
-    """Inspect broker time alignment using raw ticks and the latest converted bar times.
+    """Inspect freshness and plausibility of normalized MT5 ticks and bars.
 
     The check is intentionally best-effort:
-    - infer the broker offset from the raw latest tick time
-    - compare that inferred offset to the configured server offset/TZ
-    - fetch the latest bars for ``probe_timeframe`` and verify the converted bar open
+    - detect the terminal timestamp mode from the latest raw tick
+    - compare the normalized tick epoch to the current UTC instant
+    - fetch the latest bars for ``probe_timeframe`` and verify the bar open
       is not in the future relative to UTC and is not implausibly stale
     """
+    from .time import format_epoch_utc
+
     out: Dict[str, Any] = {
         "symbol": str(symbol),
         "probe_timeframe": str(probe_timeframe),
         "status": "unavailable",
+        "timestamp_contract": "mt5_utc_native",
     }
 
     try:
@@ -1164,44 +1249,37 @@ def inspect_mt5_time_alignment(
 
     now_utc_epoch = float(time.time())
     out["now_utc_epoch"] = now_utc_epoch
-    out["now_utc_time"] = _epoch_to_utc_iso(now_utc_epoch)
-
-    try:
-        configured_offset_seconds = int(mt5_config.get_time_offset_seconds())
-    except Exception:
-        configured_offset_seconds = 0
-    out["configured_offset_seconds"] = configured_offset_seconds
-    if getattr(mt5_config, "server_tz_name", None):
-        out["configured_server_tz"] = str(mt5_config.server_tz_name)
+    out["now_utc_time"] = format_epoch_utc(now_utc_epoch)
 
     raw_tick_epoch: Optional[float] = None
+    timestamp_mode = _MT5_TIMESTAMP_MODE_NATIVE
     try:
         tick = _raw_symbol_info_tick(symbol)
-        if tick is not None:
-            raw_tick_epoch = float(getattr(tick, "time", 0.0) or 0.0)
+        timestamp_mode = _timestamp_mode_from_tick(
+            tick,
+            symbol=symbol,
+            now_epoch=now_utc_epoch,
+        )
+        raw_tick_epoch = _tick_epoch_seconds(tick)
     except Exception:
         raw_tick_epoch = None
 
-    inferred_offset_seconds: Optional[int] = None
-    raw_tick_delta_seconds: Optional[float] = None
-    tick_utc_epoch: Optional[float] = None
+    out.update(describe_mt5_time_normalization(symbol=symbol))
+    if timestamp_mode == _MT5_TIMESTAMP_MODE_SERVER:
+        out["timestamp_contract"] = "mt5_server_clock_normalized"
+
     tick_age_seconds: Optional[float] = None
-    offset_inference_reliable = False
     if raw_tick_epoch and raw_tick_epoch > 0:
-        raw_tick_delta_seconds = float(raw_tick_epoch - now_utc_epoch)
-        inferred_offset_seconds = _round_seconds(raw_tick_delta_seconds, tick_offset_bucket_seconds)
-        tick_utc_epoch = float(_mt5_epoch_to_utc(raw_tick_epoch))
-        tick_age_seconds = float(now_utc_epoch - tick_utc_epoch)
-        offset_inference_reliable = abs(float(raw_tick_delta_seconds)) <= float(max_plausible_offset_seconds)
+        normalized_tick_epoch = _mt5_epoch_to_utc(
+            raw_tick_epoch,
+            mode=timestamp_mode,
+        )
+        tick_age_seconds = float(now_utc_epoch - normalized_tick_epoch)
         out["raw_tick_epoch"] = raw_tick_epoch
-        out["raw_tick_time"] = _epoch_to_utc_iso(raw_tick_epoch)
-        out["raw_tick_delta_seconds"] = raw_tick_delta_seconds
-        out["inferred_offset_seconds"] = inferred_offset_seconds
-        out["tick_utc_epoch"] = tick_utc_epoch
-        out["tick_utc_time"] = _epoch_to_utc_iso(tick_utc_epoch)
+        out["raw_tick_time"] = format_epoch_utc(raw_tick_epoch)
+        out["normalized_tick_epoch"] = normalized_tick_epoch
+        out["normalized_tick_time"] = format_epoch_utc(normalized_tick_epoch)
         out["tick_age_seconds"] = tick_age_seconds
-        out["offset_inference_reliable"] = offset_inference_reliable
-        out["offset_mismatch_seconds"] = int(inferred_offset_seconds - configured_offset_seconds)
 
     current_bar_open_epoch: Optional[float] = None
     last_closed_bar_open_epoch: Optional[float] = None
@@ -1209,11 +1287,11 @@ def inspect_mt5_time_alignment(
         rates = _mt5_copy_rates_from_pos(symbol, mt5_tf, 0, 3)
         if rates is None or len(rates) < 2:
             out["reason"] = "insufficient_bar_samples"
-            out["error"] = f"Not enough {tf_name} bars returned for broker-time sanity check"
+            out["error"] = f"Not enough {tf_name} bars returned for MT5 UTC freshness check"
             return out
         import pandas as pd
 
-        # _mt5_copy_rates_from_pos() already normalizes MT5 epochs to UTC.
+        # The adapter normalizes MT5 rate epochs to UTC.
         df = pd.DataFrame(rates)
         if "time" not in df.columns or len(df) < 2:
             out["reason"] = "missing_bar_times"
@@ -1235,59 +1313,48 @@ def inspect_mt5_time_alignment(
     out.update(
         {
             "current_bar_open_utc_epoch": current_bar_open_epoch,
-            "current_bar_open_utc_time": _epoch_to_utc_iso(current_bar_open_epoch),
+            "current_bar_open_utc_time": format_epoch_utc(current_bar_open_epoch),
             "expected_current_bar_open_utc_epoch": expected_current_bar_open_epoch,
-            "expected_current_bar_open_utc_time": _epoch_to_utc_iso(expected_current_bar_open_epoch),
+            "expected_current_bar_open_utc_time": format_epoch_utc(expected_current_bar_open_epoch),
             "current_bar_delta_seconds": current_bar_delta_seconds,
             "last_closed_bar_open_utc_epoch": last_closed_bar_open_epoch,
-            "last_closed_bar_open_utc_time": _epoch_to_utc_iso(last_closed_bar_open_epoch),
+            "last_closed_bar_open_utc_time": format_epoch_utc(last_closed_bar_open_epoch),
             "expected_last_closed_bar_open_utc_epoch": expected_last_closed_bar_open_epoch,
-            "expected_last_closed_bar_open_utc_time": _epoch_to_utc_iso(expected_last_closed_bar_open_epoch),
+            "expected_last_closed_bar_open_utc_time": format_epoch_utc(expected_last_closed_bar_open_epoch),
             "last_closed_bar_delta_seconds": last_closed_bar_delta_seconds,
         }
     )
 
     stale_threshold_seconds = max(int(stale_bar_tolerance) * int(tf_secs), int(max_future_seconds))
     tick_stale = tick_age_seconds is not None and tick_age_seconds > float(max_tick_age_seconds)
+    tick_future = tick_age_seconds is not None and tick_age_seconds < -float(max_future_seconds)
     future_bar = current_bar_delta_seconds > float(max_future_seconds)
     stale_bar = current_bar_delta_seconds < -float(stale_threshold_seconds)
-    offset_mismatch = (
-        offset_inference_reliable
-        and inferred_offset_seconds is not None
-        and abs(int(inferred_offset_seconds) - int(configured_offset_seconds)) >= int(tick_offset_bucket_seconds)
-    )
-    tick_not_live_like = raw_tick_delta_seconds is not None and not offset_inference_reliable
 
-    if future_bar or offset_mismatch:
+    if future_bar or tick_future:
         parts = []
-        if offset_mismatch and inferred_offset_seconds is not None:
-            parts.append(
-                f"inferred broker offset is {inferred_offset_seconds}s but configuration resolves to {configured_offset_seconds}s"
-            )
+        if tick_future and tick_age_seconds is not None:
+            parts.append(f"latest tick is {int(round(-tick_age_seconds))}s in the future")
         if future_bar:
             parts.append(
-                f"latest converted {tf_name} bar opens {int(round(current_bar_delta_seconds))}s in the future"
+                f"latest {tf_name} bar opens {int(round(current_bar_delta_seconds))}s in the future"
             )
         out["status"] = "misaligned"
-        out["reason"] = "timezone_mismatch"
-        out["warning"] = "MT5 broker-time sanity check failed: " + "; ".join(parts)
+        out["reason"] = "timestamp_in_future"
+        out["warning"] = "MT5 UTC timestamp sanity check failed: " + "; ".join(parts)
         return out
 
-    if tick_not_live_like or tick_stale or stale_bar:
+    if tick_stale or stale_bar:
         parts = []
-        if tick_not_live_like and raw_tick_delta_seconds is not None:
-            parts.append(
-                f"latest tick delta vs UTC is {int(round(raw_tick_delta_seconds))}s, which is not a plausible live broker offset"
-            )
         if tick_stale and tick_age_seconds is not None:
-            parts.append(f"latest tick is {int(round(tick_age_seconds))}s old after UTC normalization")
+            parts.append(f"latest tick is {int(round(tick_age_seconds))}s old")
         if stale_bar:
             parts.append(
-                f"latest converted {tf_name} bar lags expected current bar by {int(round(-current_bar_delta_seconds))}s"
+                f"latest {tf_name} bar lags expected current bar by {int(round(-current_bar_delta_seconds))}s"
             )
         out["status"] = "stale"
         out["reason"] = "market_data_stale"
-        out["warning"] = "MT5 broker-time sanity check could not confirm live alignment: " + "; ".join(parts)
+        out["warning"] = "MT5 UTC freshness check found stale data: " + "; ".join(parts)
         return out
 
     out["status"] = "ok"
@@ -1300,8 +1367,6 @@ def _cached_mt5_time_alignment(
     symbol: str,
     probe_timeframe: str,
     ttl_bucket: int,
-    tick_offset_bucket_seconds: int,
-    max_plausible_offset_seconds: int,
     max_future_seconds: int,
     max_tick_age_seconds: int,
     stale_bar_tolerance: int,
@@ -1309,8 +1374,6 @@ def _cached_mt5_time_alignment(
     return inspect_mt5_time_alignment(
         symbol=symbol,
         probe_timeframe=probe_timeframe,
-        tick_offset_bucket_seconds=tick_offset_bucket_seconds,
-        max_plausible_offset_seconds=max_plausible_offset_seconds,
         max_future_seconds=max_future_seconds,
         max_tick_age_seconds=max_tick_age_seconds,
         stale_bar_tolerance=stale_bar_tolerance,
@@ -1327,8 +1390,6 @@ def get_cached_mt5_time_alignment(
     probe_timeframe: str = "M1",
     *,
     ttl_seconds: int = 60,
-    tick_offset_bucket_seconds: int = 900,
-    max_plausible_offset_seconds: int = 18 * 3600,
     max_future_seconds: int = 90,
     max_tick_age_seconds: int = 180,
     stale_bar_tolerance: int = 3,
@@ -1342,8 +1403,6 @@ def get_cached_mt5_time_alignment(
         return inspect_mt5_time_alignment(
             symbol=symbol,
             probe_timeframe=probe_timeframe,
-            tick_offset_bucket_seconds=tick_offset_bucket_seconds,
-            max_plausible_offset_seconds=max_plausible_offset_seconds,
             max_future_seconds=max_future_seconds,
             max_tick_age_seconds=max_tick_age_seconds,
             stale_bar_tolerance=stale_bar_tolerance,
@@ -1353,8 +1412,6 @@ def get_cached_mt5_time_alignment(
         str(symbol),
         str(probe_timeframe),
         bucket,
-        int(tick_offset_bucket_seconds),
-        int(max_plausible_offset_seconds),
         int(max_future_seconds),
         int(max_tick_age_seconds),
         int(stale_bar_tolerance),

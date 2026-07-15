@@ -19,7 +19,9 @@ from ..core.execution_logging import (
     log_operation_start,
 )
 from ..core.output_contract import attach_collection_contract
+from ..utils.coercion import coerce_finite_float as _finite_float
 from ..utils.coercion import is_explicit_false as _is_explicit_false
+from ..utils.coercion import round_finite
 from ..utils.freshness import format_age_seconds as _format_age_seconds
 from ..utils.freshness import format_freshness_label
 from .backtest import execute_forecast_backtest as _forecast_backtest_impl
@@ -69,14 +71,6 @@ _VOLATILITY_PROXY_METHODS = {"arima", "sarima", "ets", "theta"}
 _PRETRAINED_FORECAST_METHODS = ("chronos2", "chronos_bolt", "timesfm")
 _DEFAULT_VOLATILITY_PROXY = "squared_return"
 _FORECAST_DIRECTION_NEUTRAL_THRESHOLD_PCT = 0.01
-_VOLATILITY_LEGACY_ALIASES = (
-    ("sigma_bar_return", "volatility_per_bar"),
-    ("sigma_annual_return", "volatility_annualized"),
-    ("horizon_sigma_return", "volatility_horizon"),
-    ("horizon_sigma_annual", "volatility_horizon_annualized"),
-)
-
-
 def _format_forecast_time_utc(value: Any) -> Any:
     if value in (None, ""):
         return value
@@ -145,23 +139,9 @@ def _requested_detail_label(value: Any, *, default: str = "compact") -> str:
 
 
 def _symbol_price_currency(symbol: Any) -> Optional[str]:
-    symbol_text = str(symbol or "").strip()
-    if not symbol_text:
-        return None
-    try:
-        from ..utils.mt5 import get_symbol_info_cached
+    from ..utils.mt5 import symbol_price_currency_for
 
-        info = get_symbol_info_cached(symbol_text)
-    except Exception:
-        return None
-    for attr in ("currency_profit", "currency_margin"):
-        try:
-            value = getattr(info, attr, None)
-        except Exception:
-            value = None
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
+    return symbol_price_currency_for(symbol)
 
 
 def _annotate_price_currency(payload: Dict[str, Any], symbol: Any) -> Dict[str, Any]:
@@ -275,27 +255,6 @@ def _forecast_compact_ci(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return out
 
 
-def _canonicalize_volatility_output(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        return payload
-    out = dict(payload)
-    for legacy_key, trader_key in _VOLATILITY_LEGACY_ALIASES:
-        legacy_value = out.get(legacy_key)
-        trader_value = out.get(trader_key)
-        if trader_value is None and legacy_value is not None:
-            out[trader_key] = legacy_value
-        out.pop(legacy_key, None)
-    return out
-
-
-def _finite_float(value: Any) -> Optional[float]:
-    try:
-        out = float(value)
-    except Exception:
-        return None
-    return out if math.isfinite(out) else None
-
-
 def _forecast_price_digits(payload: Dict[str, Any]) -> Optional[int]:
     for key in ("digits", "price_precision"):
         value = payload.get(key)
@@ -308,10 +267,8 @@ def _forecast_price_digits(payload: Dict[str, Any]) -> Optional[int]:
 
 
 def _round_forecast_number(value: Any, *, digits: int) -> Any:
-    numeric = _finite_float(value)
-    if numeric is None:
-        return value
-    return float(round(numeric, max(0, int(digits))))
+    rounded = round_finite(value, digits, on_invalid="passthrough")
+    return float(rounded) if isinstance(rounded, (int, float)) and not isinstance(rounded, bool) else rounded
 
 
 def _round_forecast_list(values: Any, *, digits: int) -> Any:
@@ -600,7 +557,7 @@ def _forecast_path_flatness(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 def _forecast_point_mode(payload: Dict[str, Any]) -> Optional[str]:
-    return "flat_anchor" if _forecast_path_flatness(payload) else None
+    return "flat_model_path" if _forecast_path_flatness(payload) else None
 
 
 _FORECAST_FLAT_PATH_WARNING = (
@@ -630,7 +587,9 @@ def _annotate_forecast_generate_quality(payload: Dict[str, Any]) -> Dict[str, An
         out.setdefault("forecast_vs_last_price", price_context)
     if path_flatness:
         out.update(path_flatness)
-        out.setdefault("point_forecast_mode", "flat_anchor")
+        out.setdefault("point_forecast_mode", "flat_model_path")
+        out["forecast_status"] = "non_informative"
+        out["signal_status"] = "not_actionable"
         _append_forecast_warning(out, _FORECAST_FLAT_PATH_WARNING)
     return out
 
@@ -664,6 +623,16 @@ def _forecast_generate_data_window(payload: Dict[str, Any]) -> Optional[Dict[str
         "last_bar_complete": True,
         "input_bar_policy": "closed_bars_only",
     }
+    diagnostics = payload.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        for source_key, target_key in (
+            ("history_start_time", "history_start"),
+            ("history_end_time", "history_end"),
+            ("history_bars_used", "history_bars_used"),
+        ):
+            value = diagnostics.get(source_key)
+            if value not in (None, "", [], {}):
+                out[target_key] = value
     for source_key, target_key in (
         ("forecast_start_time", "forecast_start"),
         ("forecast_start_gap_bars", "forecast_start_gap_bars"),
@@ -798,7 +767,6 @@ def _apply_forecast_generate_detail(
     payload = _round_forecast_generate_payload(payload)
     payload = _normalize_forecast_time_fields(payload)
     if str(payload.get("quantity") or request.quantity or "").strip().lower() == "volatility":
-        payload = _canonicalize_volatility_output(payload)
         payload = _round_forecast_volatility_payload(payload)
     payload = _annotate_forecast_generate_quality(payload)
     training_period = _forecast_training_period(payload)
@@ -906,7 +874,7 @@ def _apply_forecast_generate_detail(
         compact["forecast_vs_last_price"] = price_context
     if path_flatness:
         compact.update(path_flatness)
-        compact.setdefault("point_forecast_mode", "flat_anchor")
+        compact.setdefault("point_forecast_mode", "flat_model_path")
     if str(compact.get("quantity") or "").strip().lower() == "volatility":
         for key in (
             "volatility_per_bar",
@@ -1326,63 +1294,22 @@ def _apply_barrier_prob_detail(
         "prob_sl_first",
         "prob_no_hit",
         "probability_edge",
+        "n_sims",
+        "as_of",
+        "data_as_of",
+        "usable_for_live_trading",
+        "verdict",
+        "status",
+        "status_reason",
+        "barrier_unit",
+        "tp_pct",
+        "sl_pct",
+        "tp_ticks",
+        "sl_ticks",
     ):
         _set_if_present(compact, key, payload.get(key))
-    confidence: Dict[str, Any] = {}
-    for key in (
-        "prob_tp_first_ci95",
-        "prob_sl_first_ci95",
-        "prob_no_hit_ci95",
-        "prob_tp_first_se",
-        "prob_sl_first_se",
-        "prob_no_hit_se",
-    ):
-        value = payload.get(key)
-        if value not in (None, "", [], {}):
-            confidence[key] = value
-    if confidence:
-        compact["confidence"] = confidence
-    timing: Dict[str, Any] = {}
-    for source_key, target_key in (
-        ("time_to_tp_bars", "tp"),
-        ("time_to_sl_bars", "sl"),
-    ):
-        value = payload.get(source_key)
-        if isinstance(value, dict) and any(val not in (None, "") for val in value.values()):
-            timing[target_key] = {
-                key: value.get(key)
-                for key in ("mean", "median")
-                if value.get(key) not in (None, "")
-            }
-    if timing:
-        compact["timing_bars"] = timing
     if payload.get("warnings") not in (None, "", [], {}):
         compact["warnings"] = payload.get("warnings")
-    for key, value in payload.items():
-        if key in compact:
-            continue
-        if key in {
-            "prob_tp_first_ci95",
-            "prob_tp_first_se",
-            "prob_sl_first_ci95",
-            "prob_sl_first_se",
-            "prob_no_hit_ci95",
-            "prob_same_bar",
-            "prob_same_bar_se",
-            "prob_no_hit_se",
-            "prob_same_bar_ci95",
-            "last_price",
-            "last_price_close",
-            "last_price_source",
-            "tp_hit_prob_by_t",
-            "sl_hit_prob_by_t",
-            "time_to_tp_bars",
-            "time_to_sl_bars",
-            "sim_meta",
-            "model_summary",
-        }:
-            continue
-        compact[key] = value
     if set(compact) == {"success", "detail"}:
         return dict(payload)
     return compact
@@ -1434,7 +1361,12 @@ def _annotate_barrier_prob_context(
         out.setdefault("units", units)
     verdict = _barrier_prob_verdict(out)
     if verdict:
-        out.setdefault("verdict", verdict)
+        if out.get("usable_for_live_trading") is False:
+            out.setdefault("verdict", f"Research only — {verdict}")
+        else:
+            out.setdefault("verdict", verdict)
+    if out.get("usable_for_live_trading") is False:
+        out.setdefault("signal_status", "not_actionable")
     return out
 
 
@@ -1544,24 +1476,6 @@ def _request_has_barrier_inputs(request: ForecastBarrierProbRequest) -> bool:
             "sl_ticks",
         )
     )
-
-
-def _append_default_barrier_warning(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(payload, dict) or payload.get("error"):
-        return payload
-    warning = (
-        "Default 1% symmetrical barriers applied; pass tp_pct/sl_pct, "
-        "tp_abs/sl_abs, or tp_ticks/sl_ticks to customize."
-    )
-    warnings = payload.get("warnings")
-    if isinstance(warnings, list):
-        if warning not in warnings:
-            warnings.append(warning)
-    elif warnings in (None, "", [], {}):
-        payload["warnings"] = [warning]
-    else:
-        payload["warnings"] = [warnings, warning]
-    return payload
 
 
 def _closed_form_barrier_input_error(request: ForecastBarrierProbRequest) -> Optional[str]:
@@ -1767,6 +1681,8 @@ def _compact_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
     compact_out.pop("request", None)
     compact_out.pop("resolved_request", None)
     compact_out.pop("detail", None)
+    if isinstance(compact_out.pop("units", None), dict):
+        compact_out["units_profile"] = "forecast_backtest_v1"
     if compact_out.get("slippage_bps") in (0, 0.0, None):
         compact_out.pop("slippage_bps", None)
     if compact_out.get("trade_threshold") in (0, 0.0, None):
@@ -1794,6 +1710,11 @@ def _compact_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
 def _discover_sktime_forecasters() -> Dict[str, Tuple[str, str]]:
     """Return mapping of forecaster class name (lower) -> (class_name, dotted path)."""
     try:
+        # sktime 1.0+ forecasting package eagerly imports torch-backed aliases.
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            pass
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings(
@@ -2236,6 +2157,8 @@ def run_strategy_backtest(
             oversold=request.oversold,
             overbought=request.overbought,
             max_hold_bars=request.max_hold_bars,
+            cost_model=request.cost_model,
+            spread_bps=request.spread_bps,
             slippage_bps=request.slippage_bps,
         )
     except Exception as exc:
@@ -2870,14 +2793,44 @@ def run_forecast_barrier_prob(
     try:
         if method_val in mc_methods:
             barrier_kwargs = build_barrier_kwargs(request.model_dump())
-            default_barriers_applied = False
-            if not _request_has_barrier_inputs(request):
-                barrier_kwargs = {
-                    **barrier_kwargs,
-                    "tp_pct": 1.0,
-                    "sl_pct": 1.0,
+            has_resolved_barriers = any(
+                barrier_kwargs.get(field_name) is not None
+                for field_name in (
+                    "tp_abs",
+                    "sl_abs",
+                    "tp_pct",
+                    "sl_pct",
+                    "tp_ticks",
+                    "sl_ticks",
+                )
+            )
+            if not has_resolved_barriers:
+                result = {
+                    "success": False,
+                    "error": (
+                        "Barrier probabilities require an explicit take-profit and "
+                        "stop-loss pair."
+                    ),
+                    "error_code": "barrier_parameters_missing",
+                    "operation": "forecast_barrier_prob",
+                    "remediation": (
+                        "Provide tp_pct/sl_pct, tp_abs/sl_abs, or tp_ticks/sl_ticks "
+                        "scaled to the symbol and forecast horizon. Use "
+                        "forecast_barrier_optimize for data-driven candidates."
+                    ),
+                    "related_tools": ["forecast_barrier_optimize", "labels_triple_barrier"],
                 }
-                default_barriers_applied = True
+                log_operation_finish(
+                    logger,
+                    operation="forecast_barrier_prob",
+                    started_at=started_at,
+                    success=False,
+                    symbol=request.symbol,
+                    timeframe=request.timeframe,
+                    method=method_val,
+                    direction=request.direction,
+                )
+                return result
             result = barrier_hit_probabilities_impl(
                 symbol=request.symbol,
                 timeframe=request.timeframe,
@@ -2889,11 +2842,6 @@ def run_forecast_barrier_prob(
                 params=request.params,
                 denoise=request.denoise,
             )
-            if default_barriers_applied:
-                result = _append_default_barrier_warning(result)
-                if isinstance(result, dict) and not result.get("error"):
-                    result.setdefault("tp_pct", 1.0)
-                    result.setdefault("sl_pct", 1.0)
             if isinstance(result, dict):
                 result = _annotate_price_currency(result, request.symbol)
             result = _apply_barrier_prob_detail(result, request)
@@ -3202,7 +3150,7 @@ def run_forecast_volatility_estimate(
         method=request.method,
         horizon=request.horizon,
     )
-    return _canonicalize_volatility_output(result)
+    return result
 
 
 def run_forecast_optimize_hints(

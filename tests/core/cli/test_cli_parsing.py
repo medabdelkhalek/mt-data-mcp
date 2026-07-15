@@ -66,13 +66,60 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
+def test_non_bar_commands_do_not_receive_global_timeframe() -> None:
+    from mtdata.core.cli import api as cli_api
+
+    assert {
+        "data_fetch_ticks",
+        "symbols_list",
+        "tools_list",
+    }.issubset(cli_api._TIMEFRAMELESS_GLOBAL_COMMANDS)
+
+
+def test_required_symbol_is_not_bracketed_in_help() -> None:
+    from mtdata.core.cli import api as cli_api
+
+    def sample_tool(symbol: str) -> None:
+        """Sample tool."""
+
+    parser = cli_api._CLIArgumentParser(
+        prog="mtdata-cli sample_tool",
+        formatter_class=cli_api._CLIHelpFormatter,
+    )
+    cli_api.add_dynamic_arguments(
+        parser,
+        cli_api.get_function_info(sample_tool),
+        cmd_name="sample_tool",
+    )
+
+    help_text = parser.format_help()
+    assert "usage: mtdata-cli sample_tool [-h] symbol" in help_text
+    assert "Trading symbol (e.g. EURUSD). (required)" in help_text
+
+
+def test_disabled_market_depth_parse_error_explains_gate(monkeypatch, capsys):
+    from mtdata.core.cli import api as cli_api
+
+    monkeypatch.delenv("MTDATA_ENABLE_MARKET_DEPTH_FETCH", raising=False)
+    monkeypatch.setattr(sys, "argv", ["mtdata-cli", "market_depth_fetch", "--json"])
+    parser = cli_api._CLIArgumentParser(prog="mtdata-cli")
+
+    with pytest.raises(SystemExit, match="2"):
+        parser.error("invalid choice: 'market_depth_fetch'")
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error_code"] == "feature_disabled"
+    assert payload["details"]["enable_env"] == "MTDATA_ENABLE_MARKET_DEPTH_FETCH"
+    assert "Level 2/DOM" in payload["error"]
+
+
 def test_dynamic_cli_help_has_no_placeholder_param_text():
     from mtdata.bootstrap.settings import load_environment
     from mtdata.core.cli import api as cli_api
 
     load_environment()
     functions = cli_api.discover_tools()
-    parser = cli_api._safe_argument_parser(prog="mtdata-cli")
+    parser = cli_api._CLIArgumentParser(prog="mtdata-cli")
     cli_api.add_global_args_to_parser(parser, exclude_params=["timeframe"])
     parser.add_argument(
         "--timeframe",
@@ -92,7 +139,7 @@ def test_dynamic_cli_help_has_no_placeholder_param_text():
             forecast_tool = (tool, func_info)
             continue
 
-        cmd_parser = cli_api._safe_add_subparser(subparsers, cmd_name)
+        cmd_parser = subparsers.add_parser(cmd_name)
         exclude_globals = [p["name"] for p in func_info["params"]]
         if cmd_name == "report_generate":
             exclude_globals.append("timeframe")
@@ -112,7 +159,7 @@ def test_dynamic_cli_help_has_no_placeholder_param_text():
         command_parsers[cmd_name] = cmd_parser
 
     if forecast_tool is not None:
-        cmd_parser = cli_api._safe_add_subparser(subparsers, "forecast_generate")
+        cmd_parser = subparsers.add_parser("forecast_generate")
         cli_api.add_global_args_to_parser(
             cmd_parser,
             exclude_params=["symbol", "timeframe"],
@@ -241,6 +288,27 @@ class TestAddDynamicArguments:
         add_dynamic_arguments(parser, func_info)
         args = parser.parse_args(["EURUSD", "--count", "20"])
         assert args.count == 20
+
+    def test_trade_place_marks_volume_and_order_type_required(self):
+        parser = argparse.ArgumentParser()
+        func_info = {
+            "params": [
+                {"name": "symbol", "type": str, "required": False, "default": None},
+                {"name": "volume", "type": float, "required": False, "default": None},
+                {"name": "order_type", "type": str, "required": False, "default": None},
+            ]
+        }
+        add_dynamic_arguments(parser, func_info, cmd_name="trade_place")
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["EURUSD"])
+        args = parser.parse_args(
+            ["EURUSD", "--volume", "0.01", "--order-type", "BUY"]
+        )
+        assert args.volume == 0.01
+        assert args.order_type == "BUY"
+        help_text = parser.format_help()
+        assert "volume" in help_text and "(required)" in help_text
 
     def test_bool_param(self):
         parser = argparse.ArgumentParser()
@@ -557,6 +625,36 @@ class TestAddDynamicArguments:
         )
         assert "--require-dom" in require_dom_action.option_strings
 
+    @pytest.mark.parametrize(
+        ("command", "parameter", "expected"),
+        [
+            ("options_barrier_price", "barrier", "knock-in/knock-out"),
+            ("strategy_validate", "candidates", "builtin_strategy"),
+            ("strategy_validate", "barrier", "triple-barrier"),
+            ("forecast_barrier_prob", "tp_pct", "0.1 means 0.1%"),
+            ("labels_triple_barrier", "sl_pct", "0.1 means 0.1%"),
+        ],
+    )
+    def test_specialized_barrier_help_is_domain_specific(
+        self, command, parameter, expected
+    ):
+        parser = argparse.ArgumentParser()
+        func_info = {
+            "params": [
+                {
+                    "name": parameter,
+                    "type": str,
+                    "required": False,
+                    "default": None,
+                }
+            ]
+        }
+
+        add_dynamic_arguments(parser, func_info, cmd_name=command)
+
+        action = next(action for action in parser._actions if action.dest == parameter)
+        assert expected in action.help
+
     def test_wait_event_exposes_symbol_without_instrument_alias(self):
         parser = argparse.ArgumentParser()
         func_info = {
@@ -634,7 +732,19 @@ class TestAddDynamicArguments:
 
     def test_trading_order_commands_expose_canonical_detail(self):
         for cmd_name, model_type, argv in (
-            ("trade_place", TradePlaceRequest, ["--detail", "summary"]),
+            (
+                "trade_place",
+                TradePlaceRequest,
+                [
+                    "EURUSD",
+                    "--volume",
+                    "0.01",
+                    "--order-type",
+                    "BUY",
+                    "--detail",
+                    "summary",
+                ],
+            ),
             ("trade_modify", TradeModifyRequest, ["123", "--detail", "summary"]),
             ("trade_close", TradeCloseRequest, ["--detail", "summary"]),
         ):
@@ -860,7 +970,7 @@ class TestResolveParamKwargs:
             cmd_name="correlation_matrix",
         )
         min_regime_kwargs, _ = _resolve_param_kwargs(
-            {"name": "min_regime_bars", "type": int, "required": False, "default": -1},
+            {"name": "min_regime_bars", "type": int, "required": False, "default": None},
             None,
             cmd_name="regime_detect",
         )
@@ -977,7 +1087,7 @@ class TestResolveParamKwargs:
 
     def test_trading_execution_flags_have_actionable_help(self):
         place_dry_run_kwargs, _ = _resolve_param_kwargs(
-            {"name": "dry_run", "type": bool, "required": False, "default": False},
+            {"name": "dry_run", "type": bool, "required": False, "default": True},
             None,
             cmd_name="trade_place",
         )
@@ -992,7 +1102,7 @@ class TestResolveParamKwargs:
             cmd_name="trade_close",
         )
         close_dry_run_kwargs, _ = _resolve_param_kwargs(
-            {"name": "dry_run", "type": bool, "required": False, "default": False},
+            {"name": "dry_run", "type": bool, "required": False, "default": True},
             None,
             cmd_name="trade_close",
         )
@@ -1011,7 +1121,7 @@ class TestResolveParamKwargs:
         assert "require_sl_tp parameter" != require_sl_tp_kwargs["help"]
         assert "stop_loss and take_profit" in require_sl_tp_kwargs["help"]
         assert "Close all matching open positions" in close_all_kwargs["help"]
-        assert close_dry_run_kwargs["default"] is False
+        assert close_dry_run_kwargs["default"] is True
         assert "dedupe key" in modify_key_kwargs["help"]
 
     def test_report_generate_format_help_is_removed_output_help(self):
@@ -1153,6 +1263,8 @@ class TestResolveParamKwargs:
         assert "rsi_14" in kwargs["help"]
         assert "sma=20" in kwargs["help"]
         assert "rsi(length=14)" in kwargs["help"]
+        assert "On PowerShell" in kwargs["help"]
+        assert '--indicators "rsi(14)"' in kwargs["help"]
 
     def test_denoise_help_mentions_json_example(self):
         param = {

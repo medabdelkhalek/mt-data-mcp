@@ -5,14 +5,14 @@ import math
 import time
 import warnings
 from collections import Counter
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 
 from ...forecast.common import fetch_history as _fetch_history
 from ...forecast.common import log_returns_from_prices as _log_returns_from_prices
 from ...shared.schema import DenoiseSpec, DetailLiteral, TimeframeLiteral
-from ...utils.denoise import _resolve_denoise_base_col
+from ...utils.denoise import resolve_denoise_base_col
 from ...utils.mt5 import MT5ConnectionError, ensure_mt5_connection_or_raise
 from ...utils.regime_heuristics import infer_market_regime
 from ...utils.time import _format_time_minimal
@@ -270,6 +270,137 @@ def _common_reliability(
     return out
 
 
+def _feature_cluster_separation(
+    features: np.ndarray,
+    labels: np.ndarray,
+) -> float:
+    """Return the share of feature-space variance explained by cluster labels."""
+    feature_array = np.asarray(features, dtype=float)
+    label_array = np.asarray(labels, dtype=int).reshape(-1)
+    if (
+        feature_array.ndim != 2
+        or feature_array.shape[0] != label_array.size
+        or feature_array.shape[0] < 2
+    ):
+        return 0.0
+
+    finite_rows = np.isfinite(feature_array).all(axis=1)
+    feature_array = feature_array[finite_rows]
+    label_array = label_array[finite_rows]
+    if feature_array.shape[0] < 2 or np.unique(label_array).size < 2:
+        return 0.0
+
+    overall_center = np.mean(feature_array, axis=0)
+    total_ss = float(np.sum((feature_array - overall_center) ** 2))
+    if total_ss <= np.finfo(float).eps:
+        return 0.0
+
+    within_ss = 0.0
+    for label in np.unique(label_array):
+        cluster = feature_array[label_array == label]
+        cluster_center = np.mean(cluster, axis=0)
+        within_ss += float(np.sum((cluster - cluster_center) ** 2))
+    return float(np.clip(1.0 - (within_ss / total_ss), 0.0, 1.0))
+
+
+def _align_states_to_return_centroids(
+    states: np.ndarray,
+    probabilities: np.ndarray,
+    target_series: np.ndarray,
+    target_centroids: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[int, int]]:
+    """Map one voter's states into shared return-centroid bins."""
+    state_array = np.asarray(states, dtype=int).reshape(-1)
+    probability_array = np.asarray(probabilities, dtype=float)
+    series_array = np.asarray(target_series, dtype=float).reshape(-1)
+    centroids = np.asarray(target_centroids, dtype=float).reshape(-1)
+    if (
+        probability_array.ndim != 2
+        or probability_array.shape[0] != state_array.size
+        or series_array.size != state_array.size
+        or probability_array.shape[1] < 1
+        or centroids.size < 2
+    ):
+        raise ValueError("State probabilities cannot be aligned to ensemble centroids.")
+
+    probability_array = np.nan_to_num(
+        probability_array,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    probability_array = np.clip(probability_array, 0.0, None)
+    row_sums = np.sum(probability_array, axis=1, keepdims=True)
+    positive_rows = row_sums[:, 0] > 0.0
+    probability_array[positive_rows] /= row_sums[positive_rows]
+
+    source_count = int(probability_array.shape[1])
+    fallback_bins = np.rint(
+        np.linspace(0, centroids.size - 1, source_count)
+    ).astype(int)
+    state_map: Dict[int, int] = {}
+    finite_series = np.isfinite(series_array)
+    for source_state in range(source_count):
+        observations = series_array[
+            (state_array == source_state) & finite_series
+        ]
+        source_centroid = (
+            float(np.mean(observations))
+            if observations.size
+            else float(centroids[fallback_bins[source_state]])
+        )
+        state_map[source_state] = int(
+            np.argmin(np.abs(centroids - source_centroid))
+        )
+
+    aligned_probabilities = np.zeros((state_array.size, centroids.size), dtype=float)
+    for source_state, target_state in state_map.items():
+        aligned_probabilities[:, target_state] += probability_array[:, source_state]
+
+    valid_mask = (
+        (state_array >= 0)
+        & (state_array < source_count)
+        & positive_rows
+    )
+    aligned_states = np.full(state_array.size, -1, dtype=int)
+    for source_state, target_state in state_map.items():
+        aligned_states[valid_mask & (state_array == source_state)] = target_state
+    aligned_probabilities[~valid_mask] = 0.0
+    return aligned_states, aligned_probabilities, valid_mask, state_map
+
+
+def _wavelet_detail_bands(
+    series: np.ndarray,
+    wavelet_name: str,
+    level: int,
+    *,
+    boundary_mode: str = "symmetric",
+    pywt_module: Any = None,
+) -> List[np.ndarray]:
+    """Reconstruct DWT detail bands without circular window coupling."""
+    if pywt_module is None:
+        import pywt as pywt_module
+
+    values = np.asarray(series, dtype=float).reshape(-1)
+    coeffs = pywt_module.wavedec(
+        values,
+        wavelet_name,
+        mode=boundary_mode,
+        level=level,
+    )
+    bands: List[np.ndarray] = []
+    for index in range(1, len(coeffs)):
+        isolated = [np.zeros_like(coefficient) for coefficient in coeffs]
+        isolated[index] = coeffs[index]
+        band = pywt_module.waverec(
+            isolated,
+            wavelet_name,
+            mode=boundary_mode,
+        )
+        bands.append(np.asarray(band[: values.size], dtype=float))
+    return bands
+
+
 def _append_warnings(payload: Dict[str, Any], warnings_to_add: List[str]) -> None:
     if not warnings_to_add:
         return
@@ -305,6 +436,7 @@ def _bocpd_under_segmentation_warnings(
     *,
     total_bars: int,
     change_point_count: int,
+    raw_change_point_count: Optional[int] = None,
     reliability: Any,
     peak_abs_return: float,
 ) -> List[str]:
@@ -323,6 +455,12 @@ def _bocpd_under_segmentation_warnings(
         return []
 
     warnings: List[str] = []
+    if int(raw_change_point_count or 0) > 0:
+        warnings.append(
+            "BOCPD candidates crossed the probability threshold, but robustness "
+            "filters rejected all of them; the reported stable segment is uncertain. "
+            "Review confirmation, cooldown, and edge-filter settings."
+        )
     confidence_value: Optional[float] = None
     if isinstance(reliability, dict):
         raw_conf = reliability.get("confidence")
@@ -756,6 +894,16 @@ def _apply_state_output_mode(
     return payload
 
 
+def _mark_collapsed_state_confidence(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Prevent a one-state posterior from masquerading as model certainty."""
+    current = payload.get("current_regime")
+    if isinstance(current, dict):
+        current["regime_confidence"] = 0.0
+        current["label_quality"] = "unidentifiable_state_collapse"
+    payload["signal_status"] = "not_actionable"
+    return payload
+
+
 # Timeframe-based default parameters for regime detection
 _TIMEFRAME_DEFAULTS: Dict[str, Dict[str, int]] = {
     # Intraday high-frequency
@@ -911,9 +1059,9 @@ def regime_detect(  # noqa: C901
     denoise: Optional[DenoiseSpec] = None,
     threshold: Optional[float] = None,
     detail: DetailLiteral = "compact",
-    lookback: int = -1,  # -1 means use timeframe-based default
+    lookback: Optional[int] = None,
     include_series: bool = False,
-    min_regime_bars: int = -1,  # -1 means use timeframe-based default
+    min_regime_bars: Optional[int] = None,
     max_regimes: int = 10,  # Maximum regimes to show in compact mode
 ) -> Dict[str, Any]:
     """Detect regimes and/or change-points over a bounded history window.
@@ -945,11 +1093,11 @@ def regime_detect(  # noqa: C901
         `cp_confirm_bars` (default `1`, live-oriented),
         `min_cp_distance_bars`, `cp_edge_multiplier`.
     - include_series: If True, include raw time series data (probs, states) in output. Default False.
-    - lookback: Number of recent bars to include in summary/compact detail. Default -1 uses timeframe-based defaults:
+    - lookback: Number of recent bars to include in summary/compact detail. Omit for timeframe-based defaults:
         M1: 3000, M5: 2000, M15: 1000, M30: 800, H1: 500, H2: 400, H4: 300, H6-H12: 200-150, D1: 200, W1: 100, MN1: 48
     - min_regime_bars: Confirm a new state only after it persists for this many
         consecutive bars. Confirmation is causal and never rewrites earlier labels.
-        Default -1 uses timeframe-based defaults: M1: 30, M5: 12, M15-M30: 6-8, H1-H4: 3-4, D1+: 2
+        Omit for timeframe-based defaults: M1: 30, M5: 12, M15-M30: 6-8, H1-H4: 3-4, D1+: 2
     - max_regimes: Maximum number of regime windows to show in compact mode (default 10).
         Most recent regimes are shown. Full mode shows all available windows.
     - extras:
@@ -1065,22 +1213,38 @@ def regime_detect(  # noqa: C901
 
     output = normalize_output_detail(detail)
     verbosity_output = normalize_output_verbosity_detail(detail)
+    try:
+        lookback = None if lookback is None else int(lookback)
+    except (TypeError, ValueError):
+        return _finish({"error": "lookback must be an integer >= 1 when provided."})
+    try:
+        min_regime_bars = (
+            None if min_regime_bars is None else int(min_regime_bars)
+        )
+    except (TypeError, ValueError):
+        return _finish({"error": "min_regime_bars must be an integer >= 1 when provided."})
+    if lookback is not None and lookback < 1:
+        return _finish({"error": "lookback must be >= 1 when provided."})
+    if min_regime_bars is not None and min_regime_bars < 1:
+        return _finish({"error": "min_regime_bars must be >= 1 when provided."})
     connection_error = _regime_connection_error()
     if connection_error is not None:
         return _finish(connection_error)
     try:
         p = dict(params or {})
-        requested_lookback = lookback
-        requested_min_regime_bars = min_regime_bars
+        requested_lookback = -1 if lookback is None else int(lookback)
+        requested_min_regime_bars = -1 if min_regime_bars is None else int(min_regime_bars)
 
         # Apply timeframe-based defaults if not explicitly provided
         tf_defaults = _get_timeframe_defaults(timeframe)
-        effective_lookback = lookback if lookback >= 0 else tf_defaults["lookback"]
+        effective_lookback = int(lookback) if lookback is not None else tf_defaults["lookback"]
         effective_min_regime_bars = (
-            min_regime_bars if min_regime_bars >= 0 else tf_defaults["min_regime_bars"]
+            int(min_regime_bars)
+            if min_regime_bars is not None
+            else tf_defaults["min_regime_bars"]
         )
         lookback_mapped_to_window = (
-            method == "rule_based" and requested_lookback >= 0 and "window_bars" not in p
+            method == "rule_based" and lookback is not None and "window_bars" not in p
         )
         if lookback_mapped_to_window:
             p["window_bars"] = int(effective_lookback)
@@ -1185,7 +1349,7 @@ def regime_detect(  # noqa: C901
                 )
         if len(df) < 10:
             return _finish({"error": "Insufficient history"})
-        base_col = _resolve_denoise_base_col(
+        base_col = resolve_denoise_base_col(
             df, denoise, base_col="close", default_when="pre_ti"
         )
         y = df[base_col].astype(float).to_numpy()
@@ -1507,7 +1671,8 @@ def regime_detect(  # noqa: C901
                 payload,
                 _bocpd_under_segmentation_warnings(
                     total_bars=int(x.size),
-                    change_point_count=len(raw_cp_idx),
+                    change_point_count=len(cp_idx),
+                    raw_change_point_count=len(raw_cp_idx),
                     reliability=payload.get("reliability"),
                     peak_abs_return=_peak_abs_return(x),
                 ),
@@ -2018,6 +2183,9 @@ def regime_detect(  # noqa: C901
                     ),
                 },
             }
+            effective_n_states = int(len(mu))
+            payload["requested_n_states"] = int(n_states)
+            payload["effective_n_states"] = effective_n_states
             if method == "hmm":
                 payload["params_used"].update({
                     "converged": bool(hmm_fit.get("converged", False)),
@@ -2027,12 +2195,12 @@ def regime_detect(  # noqa: C901
                 payload["params_used"]["label_mapping"] = canon_meta["mapping"]
             _append_warnings(payload, state_count_warnings)
             _append_warnings(payload, _smoothing_warnings(method, smoothing_meta))
-            if method == "hmm" and len(mu) < n_states:
+            if effective_n_states < n_states:
                 _append_warnings(
                     payload,
                     [
-                        "HMM state collapse: requested "
-                        f"{int(n_states)} states but fitted {int(len(mu))}; "
+                        f"{method.upper()} state collapse: requested "
+                        f"{int(n_states)} states but fitted {effective_n_states}; "
                         "regime output uses the reduced-state model."
                     ],
                 )
@@ -2046,6 +2214,17 @@ def regime_detect(  # noqa: C901
                     else "gmm_component_responsibilities"
                 ),
             )
+            if effective_n_states < n_states:
+                payload["reliability"].update(
+                    {
+                        "confidence": 0.0,
+                        "reliability_label": "low",
+                        "confidence_note": (
+                            "Requested states collapsed during fitting; classification "
+                            "confidence is not identifiable from the reduced-state result."
+                        ),
+                    }
+                )
 
             if output in ("summary", "compact"):
                 n = _summary_window_size(lookback, len(state))
@@ -2083,15 +2262,16 @@ def regime_detect(  # noqa: C901
                 if output == "summary":
                     return _finish(payload)
 
-            return _finish(
-                _consolidate_payload(
-                    payload,
-                    method,
-                    output,
-                    include_series=include_series,
-                    max_regimes=max_regimes,
-                )
+            consolidated = _consolidate_payload(
+                payload,
+                method,
+                output,
+                include_series=include_series,
+                max_regimes=max_regimes,
             )
+            if effective_n_states < n_states:
+                consolidated = _mark_collapsed_state_confidence(consolidated)
+            return _finish(consolidated)
 
         elif method == "clustering":
             try:
@@ -2317,35 +2497,20 @@ def regime_detect(  # noqa: C901
                 if output == "summary":
                     return _finish(payload)
 
-            # Add reliability based on cluster separation
-            # Compute variance ratio: between-cluster variance / total variance
-            total_var = float(np.var(x)) if len(x) > 1 else 0.0
-            if total_var > 1e-9:
-                between_var = 0.0
-                overall_mean = float(np.mean(x))
-                for s in range(n_states_cluster):
-                    mask = full_states == s
-                    if mask.any():
-                        cluster_mean = float(np.mean(x[mask]))
-                        cluster_size = int(mask.sum())
-                        between_var += cluster_size * (cluster_mean - overall_mean) ** 2
-                between_var /= len(x)
-                variance_ratio = between_var / total_var
-                reliability_score = min(
-                    1.0, variance_ratio * 2
-                )  # Scale for interpretability
-            else:
-                variance_ratio = 0.0
-                reliability_score = 0.0
+            # Score the final labels in the feature space used to fit them.
+            feature_variance_ratio = _feature_cluster_separation(X_final, labels)
+            reliability_score = min(
+                1.0, feature_variance_ratio * 2
+            )  # Scale for interpretability
 
             payload["reliability"] = {
                 "confidence": round(reliability_score, 4),
-                "variance_ratio": round(variance_ratio, 4),
-                "source": "cluster_separation",
+                "feature_variance_ratio": round(feature_variance_ratio, 4),
+                "source": "feature_cluster_separation",
             }
             payload["reliability"] = _common_reliability(
                 payload["reliability"],
-                source="cluster_separation",
+                source="feature_cluster_separation",
             )
 
             return _finish(
@@ -2968,18 +3133,15 @@ def regime_detect(  # noqa: C901
             else:
                 level = max(1, min(4, max_level))
 
-            # DWT decomposition
-            coeffs = _pywt.wavedec(x, wavelet_name, mode="periodization", level=level)
-            # coeffs[0] = approx (low-freq trend), coeffs[1..level] = details (high→low freq)
-
-            # Reconstruct each detail band at full length
-            bands: List[np.ndarray] = []
-            for i in range(1, len(coeffs)):
-                # Zero out all coefficients except band i
-                zeroed = [np.zeros_like(c) for c in coeffs]
-                zeroed[i] = coeffs[i]
-                band = _pywt.waverec(zeroed, wavelet_name, mode="periodization")
-                bands.append(np.asarray(band[: len(x)], dtype=float))
+            # Symmetric extension avoids coupling the window head into its tail.
+            boundary_mode = "symmetric"
+            bands = _wavelet_detail_bands(
+                x,
+                wavelet_name,
+                level,
+                boundary_mode=boundary_mode,
+                pywt_module=_pywt,
+            )
 
             if not bands:
                 return _finish(
@@ -3107,6 +3269,7 @@ def regime_detect(  # noqa: C901
                     "state_count_param": n_states_source,
                     "energy_window": energy_window,
                     "energy_window_mode": "trailing",
+                    "boundary_mode": boundary_mode,
                     "model_fit_scope": "full_window",
                     "min_regime_bars": int(min_regime_bars_val),
                     "smoothing_applied": smoothing_meta.get("smoothing_applied", False),
@@ -3285,7 +3448,14 @@ def regime_detect(  # noqa: C901
             prob_arrays: List[np.ndarray] = []  # (n_bars, n_states) per method
             prob_valid_masks: List[np.ndarray] = []
             method_names: List[str] = []
+            sub_method_state_counts: Dict[str, int] = {}
+            sub_method_state_maps: Dict[str, Dict[str, int]] = {}
             ref_len = len(t_fmt)
+            finite_target = x[np.isfinite(x)]
+            target_quantiles = (
+                np.arange(n_states_ens, dtype=float) + 0.5
+            ) / float(n_states_ens)
+            target_centroids = np.quantile(finite_target, target_quantiles)
 
             for sr_info in sub_results:
                 sm_name = sr_info["method"]
@@ -3297,43 +3467,64 @@ def regime_detect(  # noqa: C901
                     "state_probabilities", sr.get("state_probabilities", [])
                 )
                 if raw_state is None or len(raw_state) != ref_len:
+                    sub_errors.append(
+                        f"{sm_name}: state series did not match the ensemble window"
+                    )
                     continue
 
                 st = np.asarray(raw_state, dtype=int)
                 if raw_probs is not None and len(raw_probs) == ref_len:
                     pr = np.asarray(raw_probs, dtype=float)
-                    if pr.ndim != 2:
-                        pr = np.zeros((ref_len, n_states_ens))
-                    else:
-                        pr = np.nan_to_num(pr, nan=0.0, posinf=0.0, neginf=0.0)
-                        # Pad or trim columns to n_states_ens
-                        if pr.shape[1] < n_states_ens:
-                            pr = np.pad(
-                                pr,
-                                ((0, 0), (0, n_states_ens - pr.shape[1])),
-                            )
-                        elif pr.shape[1] > n_states_ens:
-                            pr = pr[:, :n_states_ens]
-                    row_sums = np.sum(pr, axis=1, keepdims=True)
-                    positive_rows = np.isfinite(row_sums[:, 0]) & (row_sums[:, 0] > 0)
-                    if np.any(positive_rows):
-                        pr[positive_rows] = pr[positive_rows] / row_sums[positive_rows]
-                    valid_mask = (st >= 0) & (st < n_states_ens) & positive_rows
-                    pr[~valid_mask] = 0.0
+                    if pr.ndim != 2 or pr.shape[1] < 1:
+                        sub_errors.append(
+                            f"{sm_name}: state probabilities were not a usable matrix"
+                        )
+                        continue
                 else:
-                    # Hard assignment fallback
-                    pr = np.zeros((ref_len, n_states_ens))
-                    valid_mask = (st >= 0) & (st < n_states_ens)
+                    reported_params = sr.get("regime_params", {})
+                    reported_count = 0
+                    if isinstance(reported_params, dict):
+                        for key in ("mean_return", "mu", "volatility", "sigma"):
+                            values = reported_params.get(key)
+                            if isinstance(values, (list, tuple, np.ndarray)):
+                                reported_count = max(reported_count, len(values))
+                    occupied_count = int(np.max(st)) + 1 if np.any(st >= 0) else 0
+                    source_count = max(reported_count, occupied_count)
+                    if source_count < 1:
+                        sub_errors.append(
+                            f"{sm_name}: no usable states or probabilities"
+                        )
+                        continue
+                    pr = np.zeros((ref_len, source_count))
                     for i, s in enumerate(st):
-                        if bool(valid_mask[i]):
+                        if 0 <= int(s) < source_count:
                             pr[i, s] = 1.0
 
+                source_count = int(pr.shape[1])
+                sub_method_state_counts[sm_name] = source_count
+                try:
+                    st, pr, valid_mask, state_map = (
+                        _align_states_to_return_centroids(
+                            st,
+                            pr,
+                            x,
+                            target_centroids,
+                        )
+                    )
+                except ValueError as exc:
+                    sub_errors.append(f"{sm_name}: {exc}")
+                    continue
                 if not np.any(valid_mask):
+                    sub_errors.append(f"{sm_name}: no valid aligned state rows")
                     continue
                 state_arrays.append(st)
                 prob_arrays.append(pr)
                 prob_valid_masks.append(valid_mask)
                 method_names.append(sm_name)
+                sub_method_state_maps[sm_name] = {
+                    str(source): int(target)
+                    for source, target in state_map.items()
+                }
 
             if not prob_arrays:
                 return _finish({"error": "No sub-methods produced usable state data."})
@@ -3453,6 +3644,12 @@ def regime_detect(  # noqa: C901
                     "sub_methods": method_names,
                     "voting": voting,
                     "mean_agreement": mean_agreement,
+                    "alignment_mode": "return_quantile_centroids",
+                    "shared_state_centroids": [
+                        float(value) for value in target_centroids.tolist()
+                    ],
+                    "sub_method_state_counts": sub_method_state_counts,
+                    "sub_method_state_maps": sub_method_state_maps,
                 },
                 "params_used": {
                     "methods": method_names,
@@ -3477,7 +3674,7 @@ def regime_detect(  # noqa: C901
                     "confidence": mean_agreement,
                     "methods_considered": method_names,
                 },
-                source="ensemble_agreement",
+                source="ensemble_return_centroid_agreement",
             )
 
             if output in ("summary", "compact"):
@@ -3749,3 +3946,4 @@ def regime_detect(  # noqa: C901
 
     except Exception as e:
         return _finish({"error": f"Error detecting regimes: {str(e)}"})
+

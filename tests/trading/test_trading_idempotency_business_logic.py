@@ -1,7 +1,7 @@
 import threading
 from unittest.mock import MagicMock
 
-from mtdata.core.trading.idempotency import IdempotencyStore
+from mtdata.core.trading.idempotency import IdempotencyStore, SQLiteIdempotencyStore
 from mtdata.core.trading.requests import TradeModifyRequest, TradePlaceRequest
 from mtdata.core.trading.use_cases import run_trade_modify, run_trade_place
 
@@ -14,6 +14,7 @@ def test_run_trade_place_idempotency_does_not_sticky_cache_connection_errors():
         order_type="BUY",
         require_sl_tp=False,
         idempotency_key="k1",
+        dry_run=False,
     )
     place_market_order = MagicMock(
         side_effect=[
@@ -60,6 +61,7 @@ def test_run_trade_place_replays_duplicate_result_without_resending():
         order_type="BUY",
         require_sl_tp=False,
         idempotency_key="place-1",
+        dry_run=False,
     )
 
     first = run_trade_place(
@@ -85,9 +87,54 @@ def test_run_trade_place_replays_duplicate_result_without_resending():
         idempotency_store=store,
     )
 
-    assert first == {"success": True, "order_id": 7}
+    assert first == {
+        "success": True,
+        "order_id": 7,
+        "idempotency_key": "place-1",
+        "idempotency_scope": "process_memory",
+        "idempotency_durable": False,
+    }
     assert second["duplicate"] is True
     assert second["success"] is True
+    assert second["original_outcome"] == first
+    place_market_order.assert_called_once()
+
+
+def test_run_trade_place_replays_result_after_store_restart(tmp_path):
+    database = tmp_path / "idempotency.sqlite3"
+    place_market_order = MagicMock(return_value={"success": True, "order_id": 7})
+    request = TradePlaceRequest(
+        symbol="EURUSD",
+        volume=0.1,
+        order_type="BUY",
+        require_sl_tp=False,
+        idempotency_key="place-restart-1",
+        dry_run=False,
+    )
+    kwargs = {
+        "normalize_order_type_input": lambda value: ("BUY", None),
+        "normalize_pending_expiration": lambda value: (value, False),
+        "prevalidate_trade_place_market_input": lambda symbol, volume: None,
+        "place_market_order": place_market_order,
+        "place_pending_order": MagicMock(),
+        "close_positions": lambda **values: {"closed_count": 1},
+        "safe_int_ticket": lambda value: value,
+    }
+
+    first = run_trade_place(
+        request,
+        idempotency_store=SQLiteIdempotencyStore(database),
+        **kwargs,
+    )
+    second = run_trade_place(
+        request,
+        idempotency_store=SQLiteIdempotencyStore(database),
+        **kwargs,
+    )
+
+    assert first["idempotency_scope"] == "sqlite"
+    assert first["idempotency_durable"] is True
+    assert second["duplicate"] is True
     assert second["original_outcome"] == first
     place_market_order.assert_called_once()
 
@@ -102,6 +149,7 @@ def test_run_trade_place_rejects_idempotency_key_reuse_for_different_payload():
         order_type="BUY",
         require_sl_tp=False,
         idempotency_key="place-1",
+        dry_run=False,
     )
     second_request = TradePlaceRequest(
         symbol="EURUSD",
@@ -109,6 +157,7 @@ def test_run_trade_place_rejects_idempotency_key_reuse_for_different_payload():
         order_type="BUY",
         require_sl_tp=False,
         idempotency_key="place-1",
+        dry_run=False,
     )
 
     first = run_trade_place(
@@ -134,7 +183,9 @@ def test_run_trade_place_rejects_idempotency_key_reuse_for_different_payload():
         idempotency_store=store,
     )
 
-    assert first == {"success": True, "order_id": 7}
+    assert first["order_id"] == 7
+    assert first["idempotency_scope"] == "process_memory"
+    assert first["idempotency_durable"] is False
     assert "error" in second
     assert second["idempotency_conflict"] is True
     assert "different trade request" in second["error"]
@@ -149,6 +200,7 @@ def test_run_trade_modify_replays_duplicate_result_without_resending():
         ticket=123,
         stop_loss=1.0,
         idempotency_key="modify-1",
+        dry_run=False,
     )
 
     first = run_trade_modify(
@@ -166,7 +218,13 @@ def test_run_trade_modify_replays_duplicate_result_without_resending():
         idempotency_store=store,
     )
 
-    assert first == {"success": True, "ticket": 123}
+    assert first == {
+        "success": True,
+        "ticket": 123,
+        "idempotency_key": "modify-1",
+        "idempotency_scope": "process_memory",
+        "idempotency_durable": False,
+    }
     assert second["duplicate"] is True
     assert second["success"] is True
     assert second["original_outcome"] == first
@@ -197,6 +255,7 @@ def test_run_trade_place_replays_inflight_duplicate_after_first_request_finishes
         order_type="BUY",
         require_sl_tp=False,
         idempotency_key="place-1",
+        dry_run=False,
     )
     results = [None, None]
 
@@ -223,7 +282,8 @@ def test_run_trade_place_replays_inflight_duplicate_after_first_request_finishes
     first_thread.join(timeout=1.0)
     second_thread.join(timeout=1.0)
 
-    assert results[0] == {"success": True, "order_id": 7}
+    assert results[0]["order_id"] == 7
+    assert results[0]["idempotency_scope"] == "process_memory"
     assert results[1]["duplicate"] is True
     assert results[1]["original_outcome"] == results[0]
     assert call_count == 1
@@ -252,6 +312,7 @@ def test_run_trade_place_rejects_inflight_key_reuse_for_different_payload():
         order_type="BUY",
         require_sl_tp=False,
         idempotency_key="place-1",
+        dry_run=False,
     )
     second_request = TradePlaceRequest(
         symbol="EURUSD",
@@ -259,6 +320,7 @@ def test_run_trade_place_rejects_inflight_key_reuse_for_different_payload():
         order_type="BUY",
         require_sl_tp=False,
         idempotency_key="place-1",
+        dry_run=False,
     )
     results = [None, None]
 
@@ -285,7 +347,8 @@ def test_run_trade_place_rejects_inflight_key_reuse_for_different_payload():
     release_first_call.set()
     first_thread.join(timeout=1.0)
 
-    assert results[0] == {"success": True, "order_id": 7}
+    assert results[0]["order_id"] == 7
+    assert results[0]["idempotency_scope"] == "process_memory"
     assert "error" in results[1]
     assert results[1]["idempotency_conflict"] is True
     assert call_count == 1

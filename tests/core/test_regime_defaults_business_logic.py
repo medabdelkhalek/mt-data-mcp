@@ -10,6 +10,8 @@ import pytest
 from mtdata.core.regime import api as regime_mod
 from mtdata.core.regime.api import _auto_calibrate_bocpd_params, regime_detect
 from mtdata.core.regime.methods.bocpd.core import (
+    _bocpd_reliability_score,
+    _filter_bocpd_change_points,
     _walkforward_quantile_threshold_calibration,
 )
 from mtdata.utils.mt5 import MT5ConnectionError
@@ -40,7 +42,7 @@ def test_regime_detect_defaults_to_compact_output() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -75,7 +77,7 @@ def test_regime_detect_accepts_standard_detail_as_compact() -> None:
 
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
-        patch("mtdata.core.regime.api._resolve_denoise_base_col", return_value="close"),
+        patch("mtdata.core.regime.api.resolve_denoise_base_col", return_value="close"),
         patch("mtdata.core.regime.api._format_time_minimal", side_effect=lambda x: f"T{x}"),
         patch("mtdata.utils.bocpd.bocpd_gaussian", return_value={"cp_prob": cp}),
     ):
@@ -125,7 +127,7 @@ def test_bocpd_uses_crypto_sensitive_auto_hazard_default() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -172,7 +174,7 @@ def test_bocpd_hazard_lambda_param_override_is_preserved() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -207,7 +209,7 @@ def test_bocpd_cp_threshold_param_override_is_preserved() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -241,7 +243,7 @@ def test_bocpd_hazard_mode_auto_calibrated_sets_sources_and_diagnostics() -> Non
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -279,7 +281,7 @@ def test_bocpd_hazard_lambda_override_beats_auto_calibrated_mode() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -313,7 +315,7 @@ def test_bocpd_explicit_half_threshold_is_not_auto_calibrated() -> None:
 
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
-        patch("mtdata.core.regime.api._resolve_denoise_base_col", return_value="close"),
+        patch("mtdata.core.regime.api.resolve_denoise_base_col", return_value="close"),
         patch("mtdata.core.regime.api._format_time_minimal", side_effect=lambda x: f"T{x}"),
         patch("mtdata.utils.bocpd.bocpd_gaussian", return_value={"cp_prob": cp}),
     ):
@@ -355,7 +357,7 @@ def test_regime_detect_rejects_invalid_min_regime_bars() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
     ):
@@ -367,15 +369,15 @@ def test_regime_detect_rejects_invalid_min_regime_bars() -> None:
 
 
 def test_regime_detect_default_min_regime_bars_is_dynamic() -> None:
-    """min_regime_bars defaults to -1 which triggers timeframe-based defaults."""
+    """Omitted min_regime_bars triggers timeframe-based defaults."""
     raw = _unwrap(regime_detect)
     default_val = inspect.signature(raw).parameters["min_regime_bars"].default
-    assert int(default_val) == -1  # -1 means "use timeframe-based default"
+    assert default_val is None
 
     # Verify that effective defaults are applied based on timeframe
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(800)),
-        patch("mtdata.core.regime.api._resolve_denoise_base_col", return_value="close"),
+        patch("mtdata.core.regime.api.resolve_denoise_base_col", return_value="close"),
     ):
         # M1 should get higher defaults
         out_m1 = raw(symbol="TEST", timeframe="M1", method="hmm", detail="full")
@@ -401,7 +403,7 @@ def test_regime_detect_default_fetch_limit_tracks_timeframe_lookback() -> None:
 
     with (
         patch("mtdata.core.regime.api._fetch_history", side_effect=fake_fetch_history),
-        patch("mtdata.core.regime.api._resolve_denoise_base_col", return_value="close"),
+        patch("mtdata.core.regime.api.resolve_denoise_base_col", return_value="close"),
         patch("mtdata.core.regime.api._format_time_minimal", side_effect=lambda x: f"T{x}"),
     ):
         out = raw(symbol="TEST", timeframe="H1", method="rule_based")
@@ -420,7 +422,7 @@ def test_regime_detect_explicit_limit_still_caps_fetch_history() -> None:
 
     with (
         patch("mtdata.core.regime.api._fetch_history", side_effect=fake_fetch_history),
-        patch("mtdata.core.regime.api._resolve_denoise_base_col", return_value="close"),
+        patch("mtdata.core.regime.api.resolve_denoise_base_col", return_value="close"),
         patch("mtdata.core.regime.api._format_time_minimal", side_effect=lambda x: f"T{x}"),
     ):
         out = raw(
@@ -442,7 +444,7 @@ def test_bocpd_zero_change_points_includes_tuning_hint() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(80)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -482,7 +484,7 @@ def test_bocpd_filters_last_bar_spike_with_strict_confirmation() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(220)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -511,6 +513,42 @@ def test_bocpd_filters_last_bar_spike_with_strict_confirmation() -> None:
     cp_filter = params_used.get("cp_filter", {})
     assert int(cp_filter.get("confirm_bars", 0)) == 2
     assert int(cp_filter.get("filtered_count", 0)) >= 1
+    assert float(out.get("reliability", {}).get("confidence", 1.0)) < 0.55
+    assert any(
+        "filters rejected all" in warning for warning in out.get("warnings", [])
+    )
+
+
+def test_bocpd_reliability_distinguishes_stability_from_filtered_peak() -> None:
+    stable = np.full(200, 0.05, dtype=float)
+    filtered_peak = stable.copy()
+    filtered_peak[150] = 0.85
+    accepted, _ = _filter_bocpd_change_points(
+        filtered_peak,
+        0.5,
+        min_distance_bars=5,
+        min_regime_bars=5,
+        confirm_bars=3,
+        confirm_relaxed_mult=0.9,
+        edge_multiplier=1.08,
+    )
+
+    common = {
+        "threshold": 0.5,
+        "lookback": 100,
+        "min_regime_bars": 4,
+        "expected_false_alarm_rate": 0.02,
+        "calibration_age_bars": 200,
+        "threshold_calibrated": True,
+    }
+    stable_score = _bocpd_reliability_score(stable, [], **common)
+    filtered_score = _bocpd_reliability_score(filtered_peak, accepted, **common)
+
+    assert accepted == []
+    assert stable_score["confidence"] >= 0.8
+    assert stable_score["decision"] == "stable"
+    assert filtered_score["confidence"] < 0.55
+    assert filtered_score["decision"] == "all_candidates_filtered"
 
 
 def test_bocpd_walkforward_threshold_calibration_metadata_is_exposed() -> None:
@@ -523,7 +561,7 @@ def test_bocpd_walkforward_threshold_calibration_metadata_is_exposed() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(220)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -553,7 +591,7 @@ def test_bocpd_summary_contains_reliability_fields() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(220)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -612,7 +650,7 @@ def test_bocpd_calibrated_threshold_does_not_overreject_at_edge_by_default() -> 
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(220)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -677,7 +715,7 @@ def test_bocpd_default_cp_confirm_bars_is_live_mode_one() -> None:
     with (
         patch("mtdata.core.regime.api._fetch_history", return_value=_sample_df(220)),
         patch(
-            "mtdata.core.regime.api._resolve_denoise_base_col",
+            "mtdata.core.regime.api.resolve_denoise_base_col",
             return_value="close",
         ),
         patch(
@@ -711,3 +749,4 @@ def test_bocpd_walkforward_calibration_defaults_collect_larger_null_sample() -> 
     sig = inspect.signature(_walkforward_quantile_threshold_calibration)
     assert int(sig.parameters["max_windows"].default) == 10
     assert int(sig.parameters["bootstrap_runs"].default) == 20
+

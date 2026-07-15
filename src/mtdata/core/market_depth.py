@@ -7,6 +7,7 @@ from typing import Any, Dict, Literal, Optional
 
 from ..shared.market_units import forex_points_per_pip
 from ..shared.schema import DetailLiteral
+from ..utils.coercion import round_finite
 from ..utils.freshness import (
     QUOTE_STALE_SECONDS,
     format_age_seconds,
@@ -19,13 +20,18 @@ from ..utils.market_metadata import (
 )
 from ..utils.mt5 import (
     MT5ConnectionError,
+    describe_mt5_time_normalization,
     ensure_mt5_connection_or_raise,
     mt5,
     resolve_broker_symbol_name,
+    symbol_price_currency,
+    symbol_price_digits,
+    symbol_price_point,
 )
+from ..utils.symbol import match_symbol_infos
 from ..utils.time import (
-    _format_time_explicit,
-    _format_time_explicit_local,
+    _format_time_second_explicit,
+    _format_time_second_explicit_local,
     _resolve_client_tz,
     _use_client_tz,
 )
@@ -48,12 +54,7 @@ _MARKET_DEPTH_BOOK_UNITS = {
 }
 _MARKET_DEPTH_TICK_UNITS = {"volume": "mt5_tick_volume"}
 def _round_market_ticker_value(value: Any, *, digits: int) -> Any:
-    if value is None:
-        return None
-    try:
-        return round(float(value), max(0, int(digits)))
-    except Exception:
-        return value
+    return round_finite(value, digits, on_invalid="passthrough")
 
 
 def _market_ticker_age_seconds(value: Any) -> Optional[float]:
@@ -78,6 +79,15 @@ def _market_ticker_freshness_label(payload: Dict[str, Any]) -> Optional[str]:
         age_seconds=payload.get("data_age_seconds"),
         age_text=payload.get("data_age"),
         item="tick",
+    )
+
+
+def _market_ticker_stale_warning(payload: Dict[str, Any], tick_time: Any) -> str:
+    if payload.get("timestamp_in_future"):
+        return str(payload.get("timestamp_warning"))
+    return (
+        "Tick data may be stale; last tick time is "
+        f"{payload.get('time_display') or tick_time}."
     )
 
 
@@ -139,6 +149,10 @@ def _compact_market_ticker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "mid",
         "market_status",
         "freshness",
+        "freshness_state",
+        "data_age_seconds",
+        "usable_for_live_trading",
+        "live_max_age_seconds",
         "stale_after_seconds",
         "market_status_reason",
         "contract_size",
@@ -146,6 +160,7 @@ def _compact_market_ticker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "pricing_basis",
         "pricing_basis_units",
         "time",
+        "time_epoch",
         "timezone",
     ):
         if key == "freshness":
@@ -157,11 +172,6 @@ def _compact_market_ticker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if value is not None:
             out[key] = value
     market_state = out.pop("market_status", None)
-    if market_state is None:
-        if payload.get("data_stale") is True:
-            market_state = "unknown"
-        elif payload.get("data_stale") is False:
-            market_state = "open"
     if market_state is not None:
         out["market_state"] = market_state
     if primary_spread_key is not None:
@@ -222,15 +232,44 @@ def _market_ticker_error(
     *,
     code: str,
     remediation: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = build_error_payload(
         message,
         code=code,
         operation="market_ticker",
+        details=details,
     )
     if remediation:
         payload["remediation"] = remediation
     return payload
+
+
+def _market_ticker_symbol_suggestions(
+    mt5_gateway: Any,
+    query: str,
+    *,
+    limit: int = 5,
+) -> list[Dict[str, str]]:
+    text = str(query or "").strip()
+    if not text:
+        return []
+    try:
+        symbols = list(mt5_gateway.symbols_get() or [])
+    except Exception:
+        return []
+    matches = match_symbol_infos(symbols, text, limit=limit)
+    suggestions: list[Dict[str, str]] = []
+    for info in matches:
+        suggestion = {"symbol": str(getattr(info, "name", "") or "")}
+        description = str(getattr(info, "description", "") or "").strip()
+        path = str(getattr(info, "path", "") or "").strip()
+        if description:
+            suggestion["description"] = description
+        if path:
+            suggestion["group"] = path
+        suggestions.append(suggestion)
+    return suggestions
 
 
 def _market_depth_disabled_payload() -> Dict[str, Any]:
@@ -269,15 +308,11 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
             if symbol_info is None:
                 return {"error": f"Symbol {symbol} not found"}
 
-            digits = max(0, int(getattr(symbol_info, "digits", 0) or 0))
-            point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+            digits = symbol_price_digits(symbol_info)
+            point = symbol_price_point(symbol_info) or 0.0
             tick_size = float(getattr(symbol_info, "trade_tick_size", 0.0) or 0.0)
             tick_value = float(getattr(symbol_info, "trade_tick_value", 0.0) or 0.0)
-            price_currency = str(
-                getattr(symbol_info, "currency_profit", None)
-                or getattr(symbol_info, "currency_margin", None)
-                or ""
-            ).strip() or None
+            price_currency = symbol_price_currency(symbol_info)
 
             def _compute_spread_metrics(bid: Any, ask: Any) -> Dict[str, Any] | None:
                 try:
@@ -459,10 +494,10 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                     out["capabilities"]["spread_overlay_applied"] = True
             _use_ctz = _use_client_tz()
             if tick.time and _use_ctz:
-                out["data"]["time"] = _format_time_explicit_local(float(tick.time))
+                out["data"]["time"] = _format_time_second_explicit_local(float(tick.time))
                 out["data"]["time_epoch"] = int(float(tick.time))
             elif tick.time:
-                out["data"]["time"] = _format_time_explicit(float(tick.time))
+                out["data"]["time"] = _format_time_second_explicit(float(tick.time))
                 out["data"]["time_epoch"] = int(float(tick.time))
             out["timezone"] = display_timezone_label(
                 use_client_tz=_use_ctz,
@@ -512,7 +547,7 @@ else:
 
 
 @mcp.tool()
-def market_ticker(
+def market_ticker(  # noqa: C901
     symbol: str,
     detail: DetailLiteral = "compact",
     price_field: Optional[Literal["bid", "ask", "mid", "last", "spread"]] = None,
@@ -525,7 +560,7 @@ def market_ticker(
     """
     detail_mode = normalize_output_verbosity_detail(detail, default="compact")
 
-    def _run() -> Dict[str, Any]:
+    def _run() -> Dict[str, Any]:  # noqa: C901
         def _finalize(payload: Dict[str, Any]) -> Dict[str, Any]:
             return ensure_common_meta(payload, tool_name="market_ticker")
 
@@ -538,27 +573,31 @@ def market_ticker(
             resolved_symbol = resolve_broker_symbol_name(symbol)
             started = time.perf_counter()
             if not mt5_gateway.symbol_select(resolved_symbol, True):
+                suggestions = _market_ticker_symbol_suggestions(mt5_gateway, symbol)
                 return _finalize(
                     _market_ticker_error(
                         _describe_symbol_select_error(resolved_symbol, mt5_gateway.last_error()),
-                        code="market_ticker_symbol_unavailable",
+                        code="symbol_not_found",
                         remediation=(
                             f"Verify the broker symbol name with symbols_list(search_term='{symbol}') "
                             "or symbols_top_markets, then retry with an available MT5 symbol."
                         ),
+                        details={"symbol": symbol, "did_you_mean": suggestions},
                     )
                 )
 
             symbol_info = mt5_gateway.symbol_info(resolved_symbol)
             if symbol_info is None:
+                suggestions = _market_ticker_symbol_suggestions(mt5_gateway, symbol)
                 return _finalize(
                     _market_ticker_error(
                         f"Symbol {resolved_symbol} not found",
-                        code="market_ticker_symbol_unavailable",
+                        code="symbol_not_found",
                         remediation=(
                             f"Verify the broker symbol name with symbols_list(search_term='{symbol}') "
                             "or symbols_describe."
                         ),
+                        details={"symbol": symbol, "did_you_mean": suggestions},
                     )
                 )
 
@@ -575,15 +614,11 @@ def market_ticker(
                     )
                 )
 
-            digits = max(0, int(getattr(symbol_info, "digits", 0) or 0))
-            point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+            digits = symbol_price_digits(symbol_info)
+            point = symbol_price_point(symbol_info) or 0.0
             tick_size = float(getattr(symbol_info, "trade_tick_size", 0.0) or 0.0)
             tick_value = float(getattr(symbol_info, "trade_tick_value", 0.0) or 0.0)
-            spread_cost_currency = str(
-                getattr(symbol_info, "currency_profit", None)
-                or getattr(symbol_info, "currency_margin", None)
-                or ""
-            ).strip() or None
+            spread_cost_currency = symbol_price_currency(symbol_info)
             price_currency = spread_cost_currency
             contract_size = _positive_market_ticker_float(
                 getattr(symbol_info, "trade_contract_size", None)
@@ -668,7 +703,6 @@ def market_ticker(
                 "spread_pct": spread_pct,
                 "spread_cost_per_lot": spread_cost_per_lot,
                 "pricing_basis": pricing_basis,
-                "time": tick_time,
                 "units": {
                     "bid": "price",
                     "ask": "price",
@@ -680,6 +714,10 @@ def market_ticker(
                     "spread_cost_per_lot": "currency_per_lot_estimate",
                 },
             }
+            time_normalization = describe_mt5_time_normalization(
+                symbol=resolved_symbol
+            )
+            out.update(time_normalization)
             if contract_size is not None:
                 out["contract_size"] = _round_market_ticker_value(contract_size, digits=6)
                 out["lot_definition"] = "1 broker lot equals contract_size contract units."
@@ -694,10 +732,11 @@ def market_ticker(
             if spread_cost_per_lot is not None and spread_cost_currency:
                 out["spread_cost_currency"] = spread_cost_currency
             if tick_time is not None:
+                out["time_epoch"] = float(tick_time)
                 if _use_ctz:
-                    out["time_display"] = _format_time_explicit_local(float(tick_time))
+                    out["time"] = _format_time_second_explicit_local(float(tick_time))
                 else:
-                    out["time_display"] = _format_time_explicit(float(tick_time))
+                    out["time"] = _format_time_second_explicit(float(tick_time))
             age_seconds = None
             now_epoch = None
             if tick_time is not None:
@@ -716,27 +755,20 @@ def market_ticker(
                     age_rounder=_market_ticker_age_seconds,
                 )
                 rounded_age_seconds = freshness_context.get("data_age_seconds")
-                out.update(
-                    {
-                        key: value
-                        for key, value in freshness_context.items()
-                        if key != "freshness_state"
-                    }
-                )
+                out.update(freshness_context)
                 age_display = _market_ticker_age_display(rounded_age_seconds)
                 if age_display is not None:
                     out["data_age"] = age_display
                 if out["data_stale"]:
-                    out["warning"] = (
-                        "Tick data may be stale; last tick time is "
-                        f"{out.get('time_display') or tick_time}."
-                    )
+                    out["warning"] = _market_ticker_stale_warning(out, tick_time)
             diagnostics = {
                 "source": "mt5.symbol_info_tick",
                 "cache_used": False,
                 "data_freshness_seconds": _market_ticker_age_seconds(age_seconds),
                 "data_freshness_anchor": FRESHNESS_ANCHOR_WALL_CLOCK,
                 "data_freshness_metric": FRESHNESS_METRIC_LAST_TICK_AGE,
+                "timestamp_mode": time_normalization.get("timestamp_mode"),
+                "time_normalization": time_normalization.get("time_normalization"),
                 "query_latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             }
             meta = out.get("meta")
@@ -790,7 +822,7 @@ def market_ticker(
                 }
                 for key in (
                     "time",
-                    "time_display",
+                    "time_epoch",
                     "timezone",
                     "data_age_seconds",
                     "data_age_anchor",

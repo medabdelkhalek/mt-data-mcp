@@ -385,8 +385,8 @@ class DataFetchCandlesRequest(_DetailNormalizedRequest):
         description=(
             "Number of most-recent completed bars to return (default "
             f"{DATA_FETCH_CANDLES_DEFAULT_LIMIT}, kept small for compact output). "
-            "The limit also caps start/end range queries; raise it to return more "
-            "bars from the requested range. "
+            "For start/end range queries, an omitted limit uses a 100,000-bar "
+            "safety cap; set limit explicitly to request a smaller range page. "
             "Requested indicators automatically fetch extra warmup bars, so the "
             "returned window has valid indicator values without raising the limit."
         ),
@@ -430,7 +430,13 @@ class DataFetchCandlesRequest(_DetailNormalizedRequest):
         ),
     )
     include_incomplete: bool = False
-    allow_stale: bool = False
+    allow_stale: bool = Field(
+        False,
+        description=(
+            "Allow stale closed bars for unbounded latest-N queries. Bounded start/end "
+            "ranges are historical and do not run the live-feed freshness check."
+        ),
+    )
     explain_indicators: bool = Field(
         False,
         description=(
@@ -815,7 +821,7 @@ class WaitEventRequest(BaseModel):
     side: Optional[Literal["buy", "sell"]] = None
     buffer_seconds: float = 1.0
     poll_interval_seconds: float = 0.5
-    max_wait_seconds: Optional[float] = 86400.0
+    max_wait_seconds: Optional[float] = 15.0
     accept_preexisting: bool = False
 
     @field_validator("order_ticket")

@@ -404,9 +404,6 @@ def test_forecast_generate_compact_volatility_uses_summary_row(monkeypatch):
             "volatility_per_bar": 0.012345,
             "volatility_annualized": 0.194444,
             "volatility_horizon": 0.021234,
-            "sigma_bar_return": 0.012345,
-            "sigma_annual_return": 0.194444,
-            "horizon_sigma_return": 0.021234,
             "forecast_time": ["t1", "t2", "t3"],
         },
     )
@@ -423,9 +420,6 @@ def test_forecast_generate_compact_volatility_uses_summary_row(monkeypatch):
 
     assert out["volatility_per_bar"] == pytest.approx(0.012345)
     assert out["volatility_horizon"] == pytest.approx(0.021234)
-    assert "sigma_bar_return" not in out
-    assert "sigma_annual_return" not in out
-    assert "horizon_sigma_return" not in out
     assert out["forecast_summary_mode"] == "scalar_volatility_estimate"
     assert "no distinct per-step path is implied" in out["quantity_note"]
     assert "forecast_time" not in out
@@ -518,6 +512,7 @@ def test_forecast_generate_compact_omits_training_period(monkeypatch):
             "method": kwargs["method"],
             "horizon": kwargs["horizon"],
             "quantity": kwargs["quantity"],
+            "last_observation_time": "2026-01-10 00:00",
             "forecast_time": ["t1"],
             "forecast_price": [1.0],
             "diagnostics": {
@@ -550,6 +545,9 @@ def test_forecast_generate_compact_omits_training_period(monkeypatch):
     )
     assert "training_period" not in out
     assert "diagnostics" not in out
+    assert out["data_window"]["history_start"] == "2026-01-01 00:00"
+    assert out["data_window"]["history_end"] == "2026-01-10 00:00"
+    assert out["data_window"]["history_bars_used"] == 200
 
     standard = raw(
         request=ForecastGenerateRequest(
@@ -631,7 +629,10 @@ def test_forecast_generate_compact_flags_flat_theta_display(monkeypatch):
     assert "params_used" not in out
     assert out["path_flat"] is True
     assert out["path_range"] == 0.0
-    assert out["point_forecast_mode"] == "flat_anchor"
+    assert out["point_forecast_mode"] == "flat_model_path"
+    assert out["forecast_status"] == "non_informative"
+    assert out["signal_status"] == "not_actionable"
+    assert "usable_for_live_trading" not in out
     assert out["forecast_vs_last_price"]["direction"] == "neutral"
     assert out["forecast_vs_last_price"]["direction_basis"] == "flat_path"
     assert out["forecast_vs_last_price"]["direction_suppressed_reason"] == "flat_path"
@@ -660,6 +661,9 @@ def test_forecast_generate_compact_flags_one_tick_flat_path(monkeypatch):
 
     assert out["path_flat"] is True
     assert out["path_range"] == 0.00001
+    assert out["forecast_status"] == "non_informative"
+    assert out["signal_status"] == "not_actionable"
+    assert "usable_for_live_trading" not in out
     assert out["forecast_vs_last_price"]["direction"] == "neutral"
     assert out["forecast_vs_last_price"]["direction_basis"] == "flat_path"
     assert out["forecast_vs_last_price"]["direction_suppressed_reason"] == "flat_path"
@@ -746,7 +750,7 @@ def test_forecast_generate_full_flags_flat_theta_display(monkeypatch):
 
     assert out["path_flat"] is True
     assert out["path_range"] == 0.0
-    assert out["point_forecast_mode"] == "flat_anchor"
+    assert out["point_forecast_mode"] == "flat_model_path"
     assert out["forecast_vs_last_price"]["direction"] == "neutral"
     assert out["forecast_vs_last_price"]["direction_basis"] == "flat_path"
     assert any("near-flat at displayed price precision" in item for item in out["warnings"])
@@ -919,8 +923,8 @@ def test_run_forecast_backtest_strips_per_anchor_details_in_compact_mode():
     assert "request" not in result
     assert "resolved_request" not in result
     assert "results" not in result
-    assert result["units"]["returns"] == "return_fraction"
-    assert result["units"]["forecast_error"] == "price"
+    assert "units" not in result
+    assert result["units_profile"] == "forecast_backtest_v1"
     assert result["ranked_methods"][0]["method"] == "theta"
     assert result["ranked_methods"][0]["details_count"] == 1
     assert "metrics" not in result["ranked_methods"][0]
@@ -1109,7 +1113,7 @@ def test_run_forecast_generate_routes_date_range_to_impl(monkeypatch):
         return {
             "success": True,
             "forecast_price": [1.0, 1.1],
-            "sigma_bar_return": 0.01,
+            "volatility_per_bar": 0.01,
             "quantity": "volatility",
         }
 
@@ -1126,7 +1130,6 @@ def test_run_forecast_generate_routes_date_range_to_impl(monkeypatch):
 
     assert result["success"] is True
     assert result["volatility_per_bar"] == pytest.approx(0.01)
-    assert "sigma_bar_return" not in result
     assert captured["start"] == "2023-01-01"
     assert captured["end"] == "2023-03-31"
 
@@ -1581,7 +1584,7 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
             ],
         },
     )
-    compact = _unwrap(cf.forecast_list_methods)()
+    compact = _unwrap(cf.forecast_list_methods)(profile="quickstart")
     assert "detail" not in compact
     assert compact["total"] == 2
     assert compact["available"] == 1
@@ -1611,7 +1614,7 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
     assert "note" not in compact
     assert "volatility_methods" not in compact
 
-    standard = _unwrap(cf.forecast_list_methods)(detail="standard")
+    standard = _unwrap(cf.forecast_list_methods)(detail="standard", profile="quickstart")
     assert standard["detail"] == "standard"
     assert standard["methods"][0]["description"] == "Theta model."
     assert standard["methods"][0]["params_count"] == 1
@@ -2331,7 +2334,7 @@ def test_forecast_conformal_intervals_compact_marks_flat_point_forecast():
         {"time": "2026-06-02T20:00Z", "value": 1.23456, "lower": 1.23, "upper": 1.24},
         {"time": "2026-06-02T21:00Z", "value": 1.23456, "lower": 1.23, "upper": 1.24},
     ]
-    assert out["point_forecast_mode"] == "flat_anchor"
+    assert out["point_forecast_mode"] == "flat_model_path"
 
 
 def test_run_forecast_conformal_intervals_rewrites_interval_unavailable_guidance():
@@ -2499,20 +2502,13 @@ def test_forecast_barrier_methods_reject_legacy_aliases():
     )
 
 
-def test_forecast_barrier_prob_applies_default_pct_barriers_when_missing(monkeypatch):
-    monkeypatch.setattr(forecast_use_cases, "_symbol_price_currency", lambda _symbol: "USD")
-    called: dict[str, float] = {}
+def test_forecast_barrier_prob_requires_explicit_barriers(monkeypatch):
+    called = False
 
     def fake_barrier_hit(**kwargs):
-        called["tp_pct"] = kwargs["tp_pct"]
-        called["sl_pct"] = kwargs["sl_pct"]
-        return {
-            "success": True,
-            "symbol": "EURUSD",
-            "prob_tp_first": 0.5,
-            "prob_sl_first": 0.4,
-            "prob_no_hit": 0.1,
-        }
+        nonlocal called
+        called = True
+        return {"success": True}
 
     out = forecast_use_cases.run_forecast_barrier_prob(
         ForecastBarrierProbRequest(symbol="EURUSD"),
@@ -2522,26 +2518,10 @@ def test_forecast_barrier_prob_applies_default_pct_barriers_when_missing(monkeyp
         barrier_closed_form_impl=lambda **_kwargs: {"unused": True},
     )
 
-    assert out["success"] is True
-    assert out["price_currency"] == "USD"
-    assert called == {"tp_pct": 1.0, "sl_pct": 1.0}
-    assert out["warnings"] == [
-        "Default 1% symmetrical barriers applied; pass tp_pct/sl_pct, "
-        "tp_abs/sl_abs, or tp_ticks/sl_ticks to customize."
-    ]
-    assert out["tp_pct"] == 1.0
-    assert out["sl_pct"] == 1.0
-    assert out["barrier_unit"] == "percent"
-    assert out["barrier_mode"] == "pct"
-    assert out["probability_unit"] == "fraction"
-    assert out["probability_edge"] == 0.1
-    assert out["probability_edge_definition"] == "prob_tp_first - prob_sl_first"
-    assert "edge" not in out
-    assert out["units"]["horizon"] == "bars"
-    assert out["units"]["tp_pct"] == "percentage_points"
-    assert out["units"]["prob_tp_first"] == "probability_fraction"
-    assert out["units"]["probability_edge"] == "probability_difference"
-    assert out["verdict"] == "TP-first probability bias"
+    assert called is False
+    assert out["success"] is False
+    assert out["error_code"] == "barrier_parameters_missing"
+    assert "forecast_barrier_optimize" in out["remediation"]
 
 
 def test_forecast_barrier_prob_keeps_partial_barrier_inputs_strict():
@@ -2830,7 +2810,7 @@ def test_forecast_barrier_prob_standard_hides_curves_only(monkeypatch):
     assert "prob_tp_first_ci95" in out
 
 
-def test_forecast_barrier_prob_compact_nests_confidence_intervals_once():
+def test_forecast_barrier_prob_compact_omits_confidence_diagnostics():
     payload = {
         "success": True,
         "symbol": "EURUSD",
@@ -2852,16 +2832,9 @@ def test_forecast_barrier_prob_compact_nests_confidence_intervals_once():
         ForecastBarrierProbRequest(symbol="EURUSD", detail="compact"),
     )
 
-    assert out["confidence"] == {
-        "prob_tp_first_ci95": {"low": 0.5, "high": 0.6},
-        "prob_sl_first_ci95": {"low": 0.25, "high": 0.35},
-        "prob_no_hit_ci95": {"low": 0.1, "high": 0.2},
-        "prob_tp_first_se": 0.0111,
-        "prob_sl_first_se": 0.0102,
-        "prob_no_hit_se": 0.008,
-    }
     assert out["n_sims"] == 2000
-    assert out["seed"] == 42
+    assert "seed" not in out
+    assert "confidence" not in out
     assert "prob_tp_first_ci95" not in out
     assert "prob_sl_first_ci95" not in out
     assert "prob_no_hit_ci95" not in out
@@ -2958,6 +2931,25 @@ def test_forecast_barrier_prob_detail_rounds_display_values():
     assert out["probability_edge_definition"] == "prob_tp_first - prob_sl_first"
     assert "edge" not in out
     assert out["confidence"]["prob_tp_first_ci95"] == {"low": 0.5, "high": 0.6}
+
+
+def test_forecast_barrier_prob_marks_stale_reference_verdict_research_only():
+    out = forecast_use_cases._annotate_barrier_prob_context(
+        {
+            "prob_tp_first": 0.4,
+            "prob_sl_first": 0.6,
+            "usable_for_live_trading": False,
+            "execution_blockers": ["reference_quote_not_live"],
+        },
+        ForecastBarrierProbRequest(
+            symbol="EURUSD",
+            tp_ticks=200,
+            sl_ticks=150,
+        ),
+    )
+
+    assert out["signal_status"] == "not_actionable"
+    assert out["verdict"] == "Research only — SL-first probability bias"
 
 
 def test_forecast_barrier_optimize_uses_reference_price_context():

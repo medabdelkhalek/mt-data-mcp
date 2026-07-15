@@ -69,6 +69,10 @@ class TestFetchCandlesAdvanced(unittest.TestCase):
         result = fetch_candles('EURUSD', limit=10, simplify={'mode': 'select', 'points': 3})
         self.assertTrue(result.get('success'))
         self.assertTrue(result.get('simplified'))
+        self.assertEqual(result['series_type'], 'downsampled_visualization')
+        self.assertFalse(result['equal_interval'])
+        self.assertFalse(result['analysis_compatible'])
+        self.assertIn('irregular time gaps', result['warnings'][0])
 
     @patch(_MT5_CONFIG)
     @patch(_SIMPLIFY_EXT)
@@ -91,7 +95,7 @@ class TestFetchCandlesAdvanced(unittest.TestCase):
 
     @patch(_MT5_CONFIG)
     @patch(f'{_DS}._normalize_denoise_spec')
-    @patch(f'{_DS}._apply_denoise_util', return_value=[])
+    @patch(f'{_DS}.apply_denoise_util', return_value=[])
     @patch(_SIMPLIFY_EXT, side_effect=lambda df, h, s: (df, None))
     @patch(_RATES_FROM)
     @patch(_CACHED_INFO, return_value=MagicMock())
@@ -108,7 +112,7 @@ class TestFetchCandlesAdvanced(unittest.TestCase):
 
     @patch(_MT5_CONFIG)
     @patch(f'{_DS}._normalize_denoise_spec')
-    @patch(f'{_DS}._apply_denoise_util', return_value=['close_dn'])
+    @patch(f'{_DS}.apply_denoise_util', return_value=['close_dn'])
     @patch(_SIMPLIFY_EXT, side_effect=lambda df, h, s: (df, None))
     @patch(_RATES_FROM)
     @patch(_CACHED_INFO, return_value=MagicMock())
@@ -127,6 +131,10 @@ class TestFetchCandlesAdvanced(unittest.TestCase):
         self.assertTrue(result.get('success'))
         if result.get('denoise'):
             self.assertTrue(result['denoise']['applications'])
+            self.assertEqual(
+                result['denoise']['applications'][0]['causality'],
+                'causal',
+            )
 
     @patch(_MT5_CONFIG)
     @patch(f'{_DS}._normalize_denoise_spec')
@@ -148,7 +156,7 @@ class TestFetchCandlesAdvanced(unittest.TestCase):
             ]
             return []
 
-        with patch(f'{_DS}._apply_denoise_util', side_effect=add_warning):
+        with patch(f'{_DS}.apply_denoise_util', side_effect=add_warning):
             result = fetch_candles('EURUSD', limit=5, denoise={'method': 'wavelet'})
 
         self.assertTrue(result.get('success'))
@@ -158,3 +166,4 @@ class TestFetchCandlesAdvanced(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

@@ -115,15 +115,24 @@ def test_trade_history_supports_offset_pagination() -> None:
 
     with patch("mtdata.core.trading.account._use_client_tz", lambda: False):
         out = trade_history(history_kind="deals", limit=2, offset=1, __cli_raw=True)
-    if prev is not None:
-        sys.modules["MetaTrader5"] = prev
 
     assert out["success"] is True
-    assert [item["ticket"] for item in out["items"]] == [2, 3]
+    assert [item["ticket"] for item in out["items"]] == [3, 2]
     assert out["total_count"] == 4
     assert out["offset"] == 1
     assert out["limit"] == 2
     assert out["has_more"] is True
+
+    with patch("mtdata.core.trading.account._use_client_tz", lambda: False):
+        ascending = trade_history(
+            history_kind="deals",
+            limit=2,
+            order="asc",
+            __cli_raw=True,
+        )
+    if prev is not None:
+        sys.modules["MetaTrader5"] = prev
+    assert [item["ticket"] for item in ascending["items"]] == [1, 2]
 
 
 def test_trade_history_rounds_money_fields_for_display() -> None:
@@ -267,10 +276,10 @@ def test_trade_history_compact_omits_parallel_normalized_rows() -> None:
         "fill_time": "2024-01-01 12:00:00",
         "ticket": 11,
         "symbol": "EURUSD",
-        "type": "Buy",
-        "action": "close",
+        "fill_side": "Buy",
         "deal_effect": "close",
         "position_side": "short",
+        "position_action": "close_short",
         "volume": 0.5,
         "price": 1.2345,
         "profit": -1.0,
@@ -318,7 +327,7 @@ def test_trade_history_full_detail_uses_normalized_deal_items() -> None:
     ]
     assert out["request_echo"]["history_kind"] == "deals"
     assert out["request_echo"]["column_style"] == "snake_case"
-    assert out["units"] == {"volume": "lots"}
+    assert out["units"] == {"volume": "broker_lot"}
 
 
 def test_trade_history_full_detail_uses_top_level_timezone_only() -> None:
@@ -406,7 +415,10 @@ def test_trade_history_full_detail_uses_normalized_order_items() -> None:
         }
     ]
     assert "state_code" not in out["items"][0]["order_details"]
-    assert out["units"] == {"volume": "lots", "volume_initial": "lots"}
+    assert out["units"] == {
+        "volume": "broker_lot",
+        "volume_initial": "broker_lot",
+    }
 
 
 def test_trade_history_normalizes_price_and_millisecond_artifacts() -> None:
@@ -555,10 +567,12 @@ def test_trade_history_deals_decodes_enum_codes_to_labels() -> None:
         sys.modules["MetaTrader5"] = prev
 
     row = out["items"][0]
-    assert row["type"] == "Buy"
-    assert row["action"] == "open"
+    assert row["fill_side"] == "Buy"
+    assert "type" not in row
+    assert "action" not in row
     assert row["deal_effect"] == "open"
     assert row["position_side"] == "long"
+    assert row["position_action"] == "open_long"
     assert "entry" not in row
     assert "reason" not in row
     assert "type_code" not in row
@@ -581,10 +595,12 @@ def test_trade_history_deals_reports_closed_position_side() -> None:
         sys.modules["MetaTrader5"] = prev
 
     row = out["items"][0]
-    assert row["type"] == "Sell"
-    assert row["action"] == "close"
+    assert row["fill_side"] == "Sell"
+    assert "type" not in row
+    assert "action" not in row
     assert row["deal_effect"] == "close"
     assert row["position_side"] == "long"
+    assert row["position_action"] == "close_long"
 
 
 def test_trade_history_deals_extracts_exit_trigger_from_comment() -> None:
@@ -613,7 +629,7 @@ def test_trade_history_deals_extracts_exit_trigger_from_comment() -> None:
     row = out["items"][0]
     assert row["exit_trigger"] == "SL"
     assert row["exit_trigger_price"] == 64654.92
-    assert row["action"] == "close"
+    assert row["deal_effect"] == "close"
     assert "exit_trigger_source" not in row
 
 
@@ -1008,10 +1024,10 @@ def test_trade_history_queries_minutes_back_as_absolute_mt5_epoch_window() -> No
     )
 
     assert captured["from_dt"] == datetime(
-        2026, 3, 1, 13, 0, 0, tzinfo=timezone.utc
+        2026, 3, 1, 10, 0, 0, tzinfo=timezone.utc
     ).timestamp()
     assert captured["to_dt"] == datetime(
-        2026, 3, 1, 14, 0, 0, tzinfo=timezone.utc
+        2026, 3, 1, 11, 0, 0, tzinfo=timezone.utc
     ).timestamp()
     assert float(captured["to_dt"]) - float(captured["from_dt"]) == 60 * 60
     assert captured["symbol"] == "BTCUSD"

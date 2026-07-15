@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...utils.time import (
-    _format_datetime_second_explicit,
-    format_epoch_utc,
-)
+from ...shared.constants import BROKER_VOLUME_UNIT
 from ...utils.market_metadata import build_tick_freshness_context
-from ...utils.utils import (
-    _normalize_limit,
-    _parse_start_datetime,
-)
+from ...utils.time import format_epoch_utc
+from ...utils.utils import _normalize_limit
 from .._mcp_instance import mcp
 from ..execution_logging import run_logged_operation
 from ..output_contract import resolve_output_contract
@@ -47,6 +42,7 @@ def _attach_open_position_quote_context(
     )
     stale_count = 0
     enriched_count = 0
+    live_usable_count = 0
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -76,6 +72,32 @@ def _attach_open_position_quote_context(
         side = str(item.get("side") or "").strip().upper()
         item["price_current_basis"] = "ask" if side == "SELL" else "bid" if side == "BUY" else "broker_mark"
         item["quote_time"] = format_epoch_utc(tick_epoch)
+        symbol_info_fn = getattr(gateway, "symbol_info", None)
+        if callable(symbol_info_fn):
+            try:
+                symbol_info = symbol_info_fn(symbol)
+            except Exception:
+                symbol_info = None
+            contract_size = getattr(symbol_info, "trade_contract_size", None)
+            try:
+                contract_size_value = float(contract_size)
+                volume_value = float(item.get("volume"))
+                mark_value = float(item.get("price_current"))
+            except (TypeError, ValueError):
+                contract_size_value = volume_value = mark_value = 0.0
+            if contract_size_value > 0.0 and volume_value > 0.0:
+                item["contract_size"] = contract_size_value
+                item["contract_units"] = round(volume_value * contract_size_value, 6)
+                if mark_value > 0.0:
+                    item["notional_estimate"] = round(
+                        volume_value * contract_size_value * mark_value,
+                        2,
+                    )
+                    notional_currency = str(
+                        getattr(symbol_info, "currency_profit", "") or ""
+                    ).strip()
+                    if notional_currency:
+                        item["notional_currency"] = notional_currency
         for key in (
             "data_age_seconds",
             "data_stale",
@@ -88,22 +110,24 @@ def _attach_open_position_quote_context(
                 item[key] = freshness[key]
         enriched_count += 1
         stale_count += int(freshness.get("data_stale") is True)
+        live_usable_count += int(freshness.get("usable_for_live_trading") is True)
     if enriched_count:
         payload["quote_freshness_summary"] = {
             "positions_enriched": enriched_count,
             "stale_quotes": stale_count,
-            "live_usable_quotes": enriched_count - stale_count,
+            "live_usable_quotes": live_usable_count,
+            "recent_or_delayed_quotes": enriched_count - stale_count - live_usable_count,
         }
 
 _TRADE_VOLUME_UNITS = {
-    "volume": "lots",
-    "volume_initial": "lots",
-    "volume_current": "lots",
-    "requested_volume": "lots",
-    "remaining_volume": "lots",
-    "Volume": "lots",
-    "Initial Volume": "lots",
-    "Current Volume": "lots",
+    "volume": BROKER_VOLUME_UNIT,
+    "volume_initial": BROKER_VOLUME_UNIT,
+    "volume_current": BROKER_VOLUME_UNIT,
+    "requested_volume": BROKER_VOLUME_UNIT,
+    "remaining_volume": BROKER_VOLUME_UNIT,
+    "Volume": BROKER_VOLUME_UNIT,
+    "Initial Volume": BROKER_VOLUME_UNIT,
+    "Current Volume": BROKER_VOLUME_UNIT,
 }
 
 
@@ -571,10 +595,10 @@ _TRADE_HISTORY_COMPACT_DEAL_FIELDS = (
     "order_ticket",
     "position_ticket",
     "symbol",
-    "type",
-    "action",
+    "fill_side",
     "deal_effect",
     "position_side",
+    "position_action",
     "volume",
     "price",
     "profit",
@@ -593,7 +617,7 @@ _TRADE_HISTORY_COMPACT_ORDER_FIELDS = (
     "order_ticket",
     "position_ticket",
     "symbol",
-    "type",
+    "order_type",
     "state",
     "volume_initial",
     "volume_current",
@@ -712,14 +736,19 @@ def _compact_trade_history_row(
             compact["placed_time"] = compact["time_setup"]
         if "time_done" in compact:
             compact["done_time"] = compact["time_done"]
+        raw_order_type = _first_present(compact, "type_label", "type")
+        if raw_order_type is not None:
+            compact["order_type"] = raw_order_type
         fields = _TRADE_HISTORY_COMPACT_ORDER_FIELDS
     else:
         if "time" in compact:
             compact["fill_time"] = compact["time"]
         action = _trade_history_action(compact, history_kind=history_kind)
         if action is not None:
-            compact["action"] = action
             compact["deal_effect"] = action
+        raw_deal_type = _first_present(compact, "type_label", "type")
+        if raw_deal_type is not None:
+            compact["fill_side"] = raw_deal_type
         position_side = _trade_history_position_side(
             compact,
             action=action,
@@ -727,6 +756,8 @@ def _compact_trade_history_row(
         )
         if position_side is not None:
             compact["position_side"] = position_side
+        if action is not None and position_side is not None:
+            compact["position_action"] = f"{action}_{position_side}"
         if compact.get("comment_may_be_truncated") is True:
             compact["comment_truncated"] = True
         fields = _TRADE_HISTORY_COMPACT_DEAL_FIELDS
@@ -908,56 +939,16 @@ def _style_trade_history_items(items: List[Any], *, column_style: Any) -> List[A
 
 
 def _trade_history_period_context(request: Any) -> Dict[str, Any]:
-    def _format_period_dt(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        else:
-            value = value.astimezone(timezone.utc)
-        return _format_datetime_second_explicit(value)
+    from .common import resolve_trade_period_context
 
-    end_value = getattr(request, "end", None)
-    to_dt = _parse_start_datetime(end_value) if end_value else None
-    if to_dt is None:
-        to_dt = datetime.now(timezone.utc).replace(tzinfo=None)
-
-    minutes_back_value, minutes_back_error = validation._normalize_minutes_back(
-        getattr(request, "minutes_back", None)
+    return resolve_trade_period_context(
+        start=getattr(request, "start", None),
+        end=getattr(request, "end", None),
+        minutes_back=getattr(request, "minutes_back", None),
+        default_lookback_days=_DEFAULT_TRADE_HISTORY_LOOKBACK_DAYS,
+        include_timezone_alias=False,
+        default_lookback_style="defaults_applied",
     )
-    if minutes_back_error:
-        minutes_back_value = None
-
-    start_value = getattr(request, "start", None)
-    if minutes_back_value is not None:
-        from_dt = to_dt - timedelta(minutes=minutes_back_value)
-    elif start_value:
-        from_dt = _parse_start_datetime(start_value)
-    else:
-        minutes_back_value = int(_DEFAULT_TRADE_HISTORY_LOOKBACK_DAYS * 24 * 60)
-        from_dt = to_dt - timedelta(minutes=minutes_back_value)
-
-    out: Dict[str, Any] = {
-        "period_start": _format_period_dt(from_dt),
-        "period_end": _format_period_dt(to_dt),
-        "period_timezone": "UTC",
-    }
-    if minutes_back_value is not None:
-        out["minutes_back_effective"] = int(minutes_back_value)
-        if getattr(request, "minutes_back", None) is not None:
-            out["period_source"] = "minutes_back"
-            out["minutes_back_requested"] = int(minutes_back_value)
-        else:
-            out["period_source"] = "default_lookback"
-            out["defaults_applied"] = {"lookback_minutes": int(minutes_back_value)}
-            out["note"] = (
-                f"Period limited to default {int(minutes_back_value)}-minute "
-                f"({_DEFAULT_TRADE_HISTORY_LOOKBACK_DAYS}-day) lookback. "
-                "Set minutes_back or start/end to change."
-            )
-    elif start_value or end_value:
-        out["period_source"] = "explicit_range"
-    return out
 
 
 def _insert_trade_history_period_context(

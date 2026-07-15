@@ -164,7 +164,10 @@ PARAM_HINTS = {
         "trading context, and 0.70+ for stricter high-conviction detections."
     ),
     "min_gap": "Minimum bars between detected patterns.",
-    "robust_only": "Only return high-confidence patterns when true.",
+    "robust_only": (
+        "Restrict candlestick detection to a curated subset of established "
+        "multi-bar pattern types; does not change min_strength."
+    ),
     "whitelist": "Comma-separated pattern names to include.",
     "universe": "Symbol scan universe: visible (fast default) or all (includes hidden tradable symbols and may be slower).",
     "series_time": "Series timestamp format (string or epoch).",
@@ -175,8 +178,8 @@ PARAM_HINTS = {
     "top_n": "Return the top N rows or candidates.",
     "tp_abs": "Take-profit absolute price level.",
     "sl_abs": "Stop-loss absolute price level.",
-    "tp_pct": "Take-profit percent move (e.g. 2.0 for 2%).",
-    "sl_pct": "Stop-loss percent move (e.g. 1.0 for 1%).",
+    "tp_pct": "Take-profit distance in percentage points (e.g. 0.5 means 0.5%, not 50%).",
+    "sl_pct": "Stop-loss distance in percentage points (e.g. 0.5 means 0.5%, not 50%).",
     "tp_ticks": "Take-profit barrier distance in ticks.",
     "sl_ticks": "Stop-loss barrier distance in ticks.",
     "label_on": "Barrier evaluation basis: close or high_low.",
@@ -216,18 +219,18 @@ PARAM_HINTS = {
     "mutation_rate": "Genetic mutation probability (0-1).",
     "seed": "Random seed for reproducibility.",
     "trade_threshold": "Trade threshold for backtests.",
-    "slippage_bps": "Backtest slippage in basis points.",
+    "slippage_bps": "Backtest slippage per fill side in basis points (strategy default: 1.0).",
     "objective": "Optimization objective.",
     "return_grid": "Include full grid results in output.",
     "viable_only": "Only return viable barrier candidates when true.",
     "concise": "Return a shorter barrier-optimization payload when true.",
     "grid_style": "TP/SL grid style.",
     "preset": "TP/SL grid preset. Common examples: volatility, conservative, aggressive.",
-    "tp_min": "Minimum TP level for grid (pct or tick-size units depending on mode).",
-    "tp_max": "Maximum TP level for grid (pct or tick-size units depending on mode).",
+    "tp_min": "Minimum TP grid distance: percentage points in pct mode (0.5 means 0.5%) or ticks in ticks mode.",
+    "tp_max": "Maximum TP grid distance: percentage points in pct mode (0.5 means 0.5%) or ticks in ticks mode.",
     "tp_steps": "Number of TP grid steps.",
-    "sl_min": "Minimum SL level for grid (pct or tick-size units depending on mode).",
-    "sl_max": "Maximum SL level for grid (pct or tick-size units depending on mode).",
+    "sl_min": "Minimum SL grid distance: percentage points in pct mode (0.5 means 0.5%) or ticks in ticks mode.",
+    "sl_max": "Maximum SL grid distance: percentage points in pct mode (0.5 means 0.5%) or ticks in ticks mode.",
     "sl_steps": "Number of SL grid steps.",
     "vol_window": "Lookback window for volatility-based grid.",
     "vol_min_mult": "Minimum volatility multiple for grid.",
@@ -331,7 +334,6 @@ AutoTimeframeLiteral = Union[TimeframeLiteral, Literal["auto"]]
 CANONICAL_OUTPUT_SHAPE_DETAILS = ("compact", "standard", "summary", "full")
 CANONICAL_OUTPUT_DETAIL_ALIASES = types.MappingProxyType({})
 DetailLiteral = Literal["compact", "standard", "summary", "full"]
-SummaryCompactFullDetailLiteral = Literal["full", "summary", "compact"]
 
 # ---- Technical Indicators (dynamic discovery and application) ----
 def _load_indicator_doc_choices(
@@ -472,7 +474,7 @@ class SimplifySpec(TypedDict, total=False):
     scale: float
     zero_char: str
     # Segment specifics
-    algo: Literal['zigzag','zz']  # type: ignore
+    algo: Literal['zigzag']  # type: ignore
     threshold_pct: float
     value_col: str
     # Symbolic specifics
@@ -602,7 +604,7 @@ def complex_defs() -> Dict[str, Any]:
                 "alphabet": {"type": "string"},
                 "scale": {"type": "number"},
                 "zero_char": {"type": "string"},
-                "algo": {"type": "string", "enum": ["zigzag","zz"]},
+                "algo": {"type": "string", "enum": ["zigzag"]},
                 "threshold_pct": {"type": "number"},
                 "value_col": {"type": "string"},
                 "paa": {"type": "integer"},

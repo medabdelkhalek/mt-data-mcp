@@ -221,7 +221,8 @@ def test_last_price_freshness_keeps_absolute_weekend_staleness():
     )
 
     assert result["last_price_stale"] is True
-    assert result["usable_for_live_trading"] is False
+    assert result["history_policy_ok"] is False
+    assert "usable_for_live_trading" not in result
     assert result["market_status_reason"] == "weekend"
     assert "stale_warning" in result
     assert _forecast_anchor_freshness(result).startswith("closed weekend, anchor ")
@@ -652,12 +653,12 @@ def test_forecast_engine_applies_denoise_to_prefetched_raw_history(monkeypatch):
     monkeypatch.setattr(fe, "ForecastRegistry", FakeRegistry)
     monkeypatch.setattr(fe, "get_symbol_info_cached", lambda symbol: None)
 
-    def fake_apply_denoise(df, spec, default_when=None):
+    def fakeapply_denoise(df, spec, default_when=None):
         df["close_dn"] = df["close"] * 10.0
         return ["close_dn"]
 
     monkeypatch.setattr(fe, "_normalize_denoise_spec", lambda spec, default_when=None: {"method": "ema", "columns": ["close"]})
-    monkeypatch.setattr(fe, "_apply_denoise", fake_apply_denoise)
+    monkeypatch.setattr(fe, "apply_denoise", fakeapply_denoise)
 
     df = _df(20)
     out = fe.forecast_engine(
@@ -1189,8 +1190,8 @@ def test_forecast_engine_surfaces_broker_time_misalignment_warning(monkeypatch):
         "get_cached_mt5_time_alignment",
         lambda symbol, probe_timeframe, ttl_seconds: {
             "status": "misaligned",
-            "reason": "timezone_mismatch",
-            "warning": "MT5 broker-time sanity check failed: inferred broker offset is 10800s but configuration resolves to 7200s",
+            "reason": "timestamp_in_future",
+            "warning": "MT5 UTC timestamp sanity check failed: latest tick is 3600s in the future",
         },
     )
 
@@ -1205,7 +1206,7 @@ def test_forecast_engine_surfaces_broker_time_misalignment_warning(monkeypatch):
     assert out["success"] is True
     assert out["diagnostics"]["broker_time_check"]["status"] == "misaligned"
     assert out["warnings"] == [
-        "MT5 broker-time sanity check failed: inferred broker offset is 10800s but configuration resolves to 7200s"
+        "MT5 UTC timestamp sanity check failed: latest tick is 3600s in the future"
     ]
 
 
@@ -1239,7 +1240,7 @@ def test_forecast_engine_keeps_stale_broker_time_check_diagnostic_only(monkeypat
         lambda symbol, probe_timeframe, ttl_seconds: {
             "status": "stale",
             "reason": "market_data_stale",
-            "warning": "MT5 broker-time sanity check could not confirm live alignment: market is closed",
+            "warning": "MT5 UTC freshness check found stale data: market is closed",
         },
     )
 
@@ -1509,3 +1510,4 @@ def test_forecast_engine_ensemble_paths(monkeypatch):
         prefetched_df=_df(20),
     )
     assert out["error"] == "Ensemble failed: no component forecasts"
+

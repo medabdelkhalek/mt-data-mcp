@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
+from ..bootstrap.settings import mt5_config
 from ..forecast.common import fetch_history as _fetch_history
 from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
 from ..shared.schema import (
@@ -17,6 +18,7 @@ from ..shared.validators import (
     invalid_timeframe_error,
     unsupported_timeframe_seconds_error,
 )
+from ..utils.coercion import round_finite
 from ..utils.level_confluence import build_level_confluence_payload
 from ..utils.mt5 import (
     MT5ConnectionError,
@@ -24,6 +26,8 @@ from ..utils.mt5 import (
     _symbol_ready_guard,
     ensure_mt5_connection_or_raise,
     mt5,
+    symbol_price_digits,
+    symbol_price_digits_optional,
 )
 from ..utils.pivot_points import compute_pivot_method_levels, compute_pivot_methods
 from ..utils.support_resistance import (
@@ -69,25 +73,11 @@ _LEVEL_PRICE_FIELD_NAMES = frozenset(
 
 
 def _symbol_price_digits(info: Any) -> Optional[int]:
-    try:
-        digits = int(info.digits)
-    except Exception:
-        return None
-    if digits < 0 or digits > 15:
-        return None
-    return digits
+    return symbol_price_digits_optional(info)
 
 
 def _round_level_price(value: Any, *, digits: int) -> Any:
-    if isinstance(value, bool):
-        return value
-    try:
-        number = float(value)
-    except Exception:
-        return value
-    if not math.isfinite(number):
-        return value
-    return round(number, max(0, int(digits)))
+    return round_finite(value, digits, on_invalid="passthrough")
 
 
 def _round_level_payload_prices(value: Any, *, digits: Optional[int], key: Optional[str] = None) -> Any:
@@ -193,6 +183,8 @@ def compute_support_resistance_payload(
     volume_weighting: str,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    reference_price: Optional[float] = None,
+    reference_price_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     requested_timeframe, timeframes = _resolve_support_resistance_timeframes(timeframe)
     multi_timeframe = len(timeframes) > 1
@@ -229,6 +221,8 @@ def compute_support_resistance_payload(
                 decay_half_life_bars=None if decay_half_life_bars is None else int(decay_half_life_bars),
                 max_distance_pct=None if max_distance_pct is None else float(max_distance_pct),
                 volume_weighting=str(volume_weighting),
+                reference_price=reference_price,
+                reference_price_source=reference_price_source,
             )
             if (result.get("levels") or []) or not multi_timeframe:
                 results.append(result)
@@ -355,7 +349,7 @@ def pivot_compute_points(  # noqa: C901
             period_start = float(src["time"]) if _has_field(src, "time") else float("nan")
             period_end = period_start + float(tf_secs)
 
-            digits = int(getattr(_info_before, "digits", 0) or 0) if _info_before is not None else 0
+            digits = symbol_price_digits(_info_before) if _info_before is not None else 0
 
             def _round(v: float) -> float:
                 try:
@@ -566,6 +560,18 @@ def pivot_compute_points(  # noqa: C901
                 },
                 "levels": levels_table,
             }
+            if str(timeframe).upper() == "D1":
+                broker_tz = mt5_config.get_server_tz()
+                if broker_tz is not None:
+                    payload["period"]["broker_trading_day"] = datetime.fromtimestamp(
+                        period_start,
+                        tz=broker_tz,
+                    ).date().isoformat()
+                    payload["period"]["broker_timezone"] = (
+                        getattr(broker_tz, "zone", None)
+                        or getattr(broker_tz, "key", None)
+                        or str(broker_tz)
+                    )
             if period_note:
                 payload["period_note"] = period_note
             payload["timezone"] = timezone_label
@@ -737,7 +743,7 @@ def confluence_levels(  # noqa: C901
             if any(math.isnan(value) for value in (high, low, close)):
                 return {"error": "Pivot calculation requires high, low, and close prices"}
 
-            digits = int(getattr(info_before, "digits", 0) or 0) if info_before is not None else 0
+            digits = symbol_price_digits(info_before) if info_before is not None else 0
             price_increment = _positive_float_attr(info_before, "trade_tick_size", "point")
             if price_increment is None and digits >= 0:
                 price_increment = 10.0 ** (-int(digits))
@@ -833,7 +839,7 @@ def confluence_levels(  # noqa: C901
             )
             payload["reference_price_source"] = reference_price_source
             if reference_price_source == "live_tick":
-                payload["reference_price_as_of"] = (
+                payload["reference_quote_as_of"] = (
                     datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                 )
             else:
@@ -962,6 +968,22 @@ def support_resistance_levels(
             gateway.ensure_connection()
             symbol_info = gateway.symbol_info(symbol)
             digits_value = _symbol_price_digits(symbol_info)
+            reference_price = None
+            reference_price_source = None
+            reference_quote_as_of = None
+            if not start and not end:
+                tick = gateway.symbol_info_tick(symbol)
+                reference_price = _tick_reference_price(tick)
+                if reference_price is not None:
+                    reference_price_source = "live_tick_mid"
+                    tick_epoch = getattr(tick, "time_msc", None)
+                    try:
+                        tick_epoch = float(tick_epoch) / 1000.0 if tick_epoch else None
+                    except (TypeError, ValueError):
+                        tick_epoch = None
+                    if tick_epoch is None:
+                        tick_epoch = getattr(tick, "time", None)
+                    reference_quote_as_of = _format_time_minimal(tick_epoch)
             result = compute_support_resistance_payload(
                 fetch_history_impl=_fetch_history,
                 symbol=symbol,
@@ -977,7 +999,11 @@ def support_resistance_levels(
                 reaction_bars=int(reaction_bars),
                 adx_period=int(adx_period),
                 decay_half_life_bars=None if decay_half_life_bars is None else int(decay_half_life_bars),
+                reference_price=reference_price,
+                reference_price_source=reference_price_source,
             )
+            if reference_quote_as_of is not None:
+                result["reference_quote_as_of"] = reference_quote_as_of
             detail_value = str(detail).strip().lower()
             if normalize_output_extras(extras):
                 detail_value = "full"

@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
 from ...bootstrap.settings import mt5_config, trade_guardrails_config
+from ...shared.market_units import forex_points_per_pip
+from ...utils.coercion import round_finite
 from . import comments, common, time, validation
 from .gateway import MT5TradingGateway, create_trading_gateway, trading_connection_error
 from .positions import _resolve_open_position
@@ -796,9 +798,7 @@ def _attach_comment_response_metadata(
 
 
 def _round_preview_price(value: Optional[float], *, digits: int) -> Optional[float]:
-    if value is None or not math.isfinite(value):
-        return None
-    return round(float(value), max(0, int(digits)))
+    return round_finite(value, digits, on_invalid="none")
 
 
 def _order_type_constant(mt5: Any, order_type: str) -> Optional[int]:
@@ -875,7 +875,13 @@ def build_trade_place_dry_run_preview(
     mt5 = create_trading_gateway(gateway=gateway)
     connection_error = trading_connection_error(mt5)
     if connection_error is not None:
-        return {"preview_error": connection_error.get("error")}
+        return {
+            "preview_error": connection_error.get("error"),
+            "preview_error_code": connection_error.get(
+                "error_code",
+                "mt5_connection_error",
+            ),
+        }
 
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
@@ -913,6 +919,14 @@ def build_trade_place_dry_run_preview(
     if point > 0:
         spread_price = ask - bid
         out["spread_points"] = round(spread_price / point, 2)
+        points_per_pip = forex_points_per_pip(
+            symbol,
+            path=str(getattr(symbol_info, "path", "") or ""),
+            point=point,
+            digits=digits,
+        )
+        if points_per_pip:
+            out["spread_pips"] = round(out["spread_points"] / points_per_pip, 2)
         midpoint = (ask + bid) / 2.0
         if midpoint:
             out["spread_pct"] = round((spread_price / midpoint) * 100.0, 6)

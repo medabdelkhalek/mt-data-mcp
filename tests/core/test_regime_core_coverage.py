@@ -438,7 +438,7 @@ def _get_regime_detect():
 
 
 _FETCH = "mtdata.core.regime.api._fetch_history"
-_DENOISE = "mtdata.core.regime.api._resolve_denoise_base_col"
+_DENOISE = "mtdata.core.regime.api.resolve_denoise_base_col"
 _FMT = "mtdata.core.regime.api._format_time_minimal"
 
 
@@ -1054,6 +1054,17 @@ class TestRegimeDetectHMM:
         assert len(res["series"]["state_probabilities"][0]) == 1
         assert res["series"]["state_probabilities"][0] == [1.0]
         assert res["params_used"]["fitted_n_states"] == 1
+        assert res["requested_n_states"] == 3
+        assert res["effective_n_states"] == 1
+        assert res["reliability"]["confidence"] == 0.0
+        assert res["reliability"]["reliability_label"] == "low"
+        assert res["current_regime"]["regime_confidence"] == 0.0
+        assert (
+            res["current_regime"]["label_quality"]
+            == "unidentifiable_state_collapse"
+        )
+        assert res["signal_status"] == "not_actionable"
+        assert any("state collapse" in warning for warning in res["warnings"])
 
     @patch(_FMT, side_effect=_time_fmt_stub)
     @patch(_DENOISE, return_value="close")
@@ -1448,3 +1459,4 @@ class TestRegimeDetectEdgeCases:
         fn = _get_regime_detect()
         res = fn("EURUSD", limit=12, method="bocpd", target="return")
         assert res["error"] == "Insufficient finite observations after filter"
+

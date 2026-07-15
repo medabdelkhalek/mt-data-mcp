@@ -21,11 +21,11 @@ _mt5_mock.TIMEFRAME_W1 = 32769; _mt5_mock.TIMEFRAME_MN1 = 49153
 sys.modules["MetaTrader5"] = _mt5_mock
 
 from mtdata.forecast.backtest import (
-    _bars_per_year,
     _compute_performance_metrics,
     _get_forecast_methods_data_safe,
     forecast_backtest,
 )
+from mtdata.forecast.common import bars_per_year as _bars_per_year
 from mtdata.utils.time import _format_time_minimal
 
 # ── Helper to build a fake df ────────────────────────────────────────────────
@@ -567,3 +567,18 @@ def test_performance_metrics_include_sortino_and_profit_factor():
     assert m['profit_factor'] > 0
     # Sortino uses downside deviation, so it should differ from Sharpe
     assert m['sharpe_ratio'] is not None
+
+
+def test_performance_metrics_sortino_uses_full_sample_downside_deviation():
+    from mtdata.forecast.backtest import _compute_performance_metrics
+
+    returns = [-0.01, -0.02, 0.05, 0.03] * 15
+    metrics = _compute_performance_metrics(returns, "H1", 1, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(np.minimum(returns, 0.0) ** 2)))
+    expected = (
+        float(np.mean(returns))
+        / downside_deviation
+        * float(np.sqrt(metrics["trades_per_year"]))
+    )
+
+    assert metrics["sortino_ratio"] == pytest.approx(expected)

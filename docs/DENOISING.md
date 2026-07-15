@@ -1,32 +1,29 @@
-# Denoising & Smoothing
+# Denoising and smoothing
 
-Denoising removes random fluctuations ("noise") from price data to reveal the underlying trend ("signal").
+Prices are a mix of **structure** and **noise** (microstructure bounce, spreads, short bursts). Denoising smooths series so trends and indicators are easier to read — optionally as a preprocess step for forecasts.
 
-**Related:**
-- [CLI.md](CLI.md) — Command usage
-- [TECHNICAL_INDICATORS.md](TECHNICAL_INDICATORS.md) — Indicators to denoise
-- [FORECAST.md](FORECAST.md) — Using denoising in forecasts
-- [GLOSSARY.md](GLOSSARY.md) — Term definitions
+**Trade-off:** more smoothing → clearer trend, more **lag**. Prefer light filters first.
 
----
+**Dense terms:** [Denoising](GLOSSARY.md#denoising) · [Causal filters](GLOSSARY.md#causal-vs-non-causal-filters) · [Kalman](GLOSSARY.md#kalman-filter) · [Wavelet](GLOSSARY.md#wavelet-denoise--regimes) · [EMA](GLOSSARY.md#moving-average)
 
-## Why Denoise?
-
-Market data contains:
-- **Signal:** The true underlying trend or pattern
-- **Noise:** Random fluctuations from microstructure, spreads, and short-term volatility
-
-Denoising helps:
-- Reduce false indicator crossovers
-- Clarify trend direction
-- Improve model stability
-- Remove outliers and spikes
-
-**Trade-off:** More smoothing = clearer trend but more lag (delay in detecting changes).
+**Related:** [CLI](CLI.md) · [Indicators](TECHNICAL_INDICATORS.md) · [Forecasting](FORECAST.md) · [Simplification](SIMPLIFICATION.md) · [Glossary](GLOSSARY.md)
 
 ---
 
-## Quick Start
+## Why denoise?
+
+| Goal | How denoise helps |
+|------|-------------------|
+| Cleaner signals | Fewer false indicator flips |
+| Clearer trend | Underlying path is easier to see |
+| Stabler models | Less outlier-driven fit noise |
+| Spike control | Median / robust filters dampen extremes |
+
+**Simplify vs denoise:** [SIMPLIFICATION.md](SIMPLIFICATION.md) reduces *how many points* you return; denoise changes *the values*.
+
+---
+
+## Quick start
 
 **Smooth closing prices:**
 ```bash
@@ -202,6 +199,7 @@ Split into components and reconstruct smoother parts.
 |-----------|-------------|---------|
 | `columns` | Which columns to denoise | `close` |
 | `when` | `pre_ti` or `post_ti` | `pre_ti` |
+| `causality` | `causal` or explicitly opted-in `zero_phase` | `causal` |
 | `keep_original` | Keep original column (adds `_dn` suffix) | `false` |
 | `alpha` | Smoothing factor (EMA) | 0.1 |
 | `window` | Window size (filters) | 5 |
@@ -215,10 +213,13 @@ Split into components and reconstruct smoother parts.
 **Causal filters** (use only past data):
 - `ema`, `sma`, `kalman`, `lms`, `rls`
 
-**Non-causal filters** (use past and future):
-- `lowpass_fft`, `butterworth`, `hp`, `wavelet` (default mode)
+**Non-causal-only filters** (use past and future):
+- `lowpass_fft`, `hp`, `wavelet`
 
-**Recommendation:** Use causal filters for backtesting and live trading.
+All denoising stages default to causal operation. Non-causal filters and the
+zero-phase mode of filters such as Butterworth require an explicit
+`causality=zero_phase` opt-in. Use that mode only for retrospective analysis,
+not backtesting or live trading.
 
 ---
 

@@ -249,6 +249,49 @@ def test_evaluate_trade_guardrails_blocks_wallet_risk_threshold():
     assert result["guardrail_rule"] == "wallet_risk"
 
 
+def test_wallet_risk_treats_locked_profit_stop_as_zero_existing_risk():
+    config = TradeGuardrailsConfig(
+        enabled=True,
+        ignore_on_demo=False,
+        wallet_risk_limits=WalletRiskLimits(max_risk_pct_of_equity=1.0),
+    )
+    account = SimpleNamespace(
+        equity=10000.0,
+        balance=10000.0,
+        margin_free=8000.0,
+    )
+    symbol_info = SimpleNamespace(
+        trade_tick_size=1.0,
+        trade_tick_value=1.0,
+        trade_tick_value_loss=1.0,
+    )
+    existing = [
+        SimpleNamespace(
+            symbol="BTCUSD",
+            type=0,
+            volume=10.0,
+            price_open=100.0,
+            sl=110.0,
+        )
+    ]
+
+    result = evaluate_trade_guardrails(
+        config,
+        symbol="BTCUSD",
+        volume=1.0,
+        stop_loss=90.0,
+        side="BUY",
+        entry_price=100.0,
+        account_info=account,
+        existing_positions=existing,
+        symbol_info=symbol_info,
+        symbol_info_resolver=lambda _symbol: symbol_info,
+        enforce_account_risk=False,
+    )
+
+    assert result is None
+
+
 def test_wallet_risk_adds_opposite_order_risk_on_hedging_account():
     config = TradeGuardrailsConfig(
         enabled=True,
@@ -512,6 +555,7 @@ def test_run_trade_place_reduce_only_uses_open_positions(restore_trade_guardrail
                 volume=0.25,
                 order_type="SELL",
                 require_sl_tp=False,
+                dry_run=False,
             ),
             normalize_order_type_input=lambda value: ("SELL", None),
             normalize_pending_expiration=lambda value: (value, False),

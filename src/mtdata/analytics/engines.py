@@ -22,6 +22,7 @@ from ..core.analytics_requests import (
 from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
 from ..utils.barriers import normalize_same_bar_policy
 from ..utils.freshness import closed_session_context
+from ..utils.tick_flags import mt5_trade_event_mask
 from ..utils.time import format_epoch_utc
 
 
@@ -32,6 +33,23 @@ def _mapping(row: Any) -> Dict[str, Any]:
     if callable(converter):
         return dict(converter())
     return {name: getattr(row, name) for name in dir(row) if not name.startswith("_") and not callable(getattr(row, name, None))}
+
+
+def _filtered_historical_returns(
+    returns: pd.DataFrame,
+    *,
+    alpha: float,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Standardize each return by volatility known before that return."""
+    ewma_std = returns.ewm(alpha=alpha, adjust=False).std()
+    current_vol = ewma_std.iloc[-1].replace(0, np.nan)
+    conditional_vol = ewma_std.shift(1).replace(0, np.nan)
+    standardized = (
+        returns.div(conditional_vol)
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    return standardized, current_vol
 
 
 def _frame(rows: Any) -> pd.DataFrame:
@@ -122,11 +140,38 @@ def _tick_frame(gateway: Any, symbol: str, start: datetime, end: datetime, max_t
     flags = getattr(gateway, "COPY_TICKS_ALL", 0)
     df = _frame(gateway.copy_ticks_range(symbol, start, end, flags))
     if df.empty:
-        return df, False
+        return pd.DataFrame(
+            {
+                column: pd.Series(dtype=float)
+                for column in (
+                    "epoch",
+                    "bid",
+                    "ask",
+                    "last",
+                    "volume",
+                    "volume_real",
+                    "flags",
+                    "mid",
+                    "spread",
+                )
+            }
+        ), False
     time_msc = _finite(df.get("time_msc", pd.Series(index=df.index, dtype=float)))
     epoch = _finite(df.get("time", pd.Series(index=df.index, dtype=float)))
     df["epoch"] = np.where(time_msc > 0, time_msc / 1000.0, epoch)
-    df = df[np.isfinite(df["epoch"])].sort_values("epoch", kind="stable").drop_duplicates(subset=["epoch", "bid", "ask", "last"], keep="last")
+    dedupe_columns = [
+        column
+        for column in ("epoch", "bid", "ask", "last", "volume", "volume_real", "flags")
+        if column in df.columns
+    ]
+    df = (
+        df[np.isfinite(df["epoch"])]
+        .sort_values("epoch", kind="stable")
+        .drop_duplicates(
+            subset=dedupe_columns,
+            keep="last",
+        )
+    )
     truncated = len(df) > int(max_ticks)
     if truncated:
         df = df.tail(int(max_ticks)).copy()
@@ -134,7 +179,19 @@ def _tick_frame(gateway: Any, symbol: str, start: datetime, end: datetime, max_t
         if column not in df:
             df[column] = 0.0
         df[column] = _finite(df[column]).fillna(0.0)
-    df["mid"] = np.where((df["bid"] > 0) & (df["ask"] >= df["bid"]), (df["bid"] + df["ask"]) / 2.0, np.nan)
+    quote_flag_mask = (
+        getattr(gateway, "TICK_FLAG_BID", 2)
+        | getattr(gateway, "TICK_FLAG_ASK", 4)
+    )
+    observed_quote_flags = (df["flags"].astype(np.int64) & quote_flag_mask) != 0
+    complete_quote_update = (
+        (df["flags"].astype(np.int64) & quote_flag_mask) == quote_flag_mask
+    )
+    valid_quote = (df["bid"] > 0) & (df["ask"] >= df["bid"])
+    if bool(observed_quote_flags.any()):
+        valid_quote &= complete_quote_update
+    df["spread_valid"] = valid_quote
+    df["mid"] = np.where(valid_quote, (df["bid"] + df["ask"]) / 2.0, np.nan)
     df["spread"] = np.where(np.isfinite(df["mid"]), df["ask"] - df["bid"], np.nan)
     return df.reset_index(drop=True), truncated
 
@@ -171,7 +228,9 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
             }
         return {"error": "At least 20 usable ticks are required.", "error_code": "insufficient_data"}
     quote_mask = np.isfinite(df["mid"])
-    trade_mask = df["last"] > 0
+    flag_values = df["flags"].astype(np.int64)
+    trade_mask = (flag_values & mt5_trade_event_mask(gateway)) != 0
+    trade_mask &= df["last"] > 0
     real_mask = trade_mask & (df["volume_real"] > 0)
     trade_count = int(trade_mask.sum())
     real_share = float(real_mask.sum() / trade_count) if trade_count else 0.0
@@ -181,6 +240,12 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
     q["mid_return"] = np.log(q["mid"]).diff()
     q["bid_revision"] = np.sign(q["bid"].diff())
     q["ask_revision"] = np.sign(q["ask"].diff())
+    try:
+        symbol_info = gateway.symbol_info(request.symbol)
+    except Exception:
+        symbol_info = None
+    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+    digits = int(getattr(symbol_info, "digits", 0) or 0)
     revision_pressure = float(np.nanmean((q["bid_revision"] + q["ask_revision"]) / 2.0)) if len(q) > 1 else 0.0
     start_epoch = float(df["epoch"].iloc[0])
     duration = max(0.001, float(df["epoch"].iloc[-1] - start_epoch))
@@ -188,9 +253,14 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
     windows: List[Dict[str, Any]] = []
     for bucket_id, part in df.groupby(bucket):
         pq = part[np.isfinite(part["mid"])]
+        bucket_start_epoch = float(part["epoch"].iloc[0])
+        bucket_end_epoch = float(part["epoch"].iloc[-1])
         windows.append({
             "bucket": int(bucket_id),
-            "start_epoch": float(part["epoch"].iloc[0]),
+            "start": format_epoch_utc(bucket_start_epoch),
+            "end": format_epoch_utc(bucket_end_epoch),
+            "start_epoch": bucket_start_epoch,
+            "end_epoch": bucket_end_epoch,
             "ticks": int(len(part)),
             "ticks_per_second": float(len(part) / max(1.0, part["epoch"].iloc[-1] - part["epoch"].iloc[0])),
             "spread_median": float(pq["spread"].median()) if len(pq) else None,
@@ -208,6 +278,10 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
         "mid_realized_volatility": float(np.sqrt(np.nansum(np.square(q["mid_return"])))) if len(q) > 1 else None,
         "broker_quote_revision_imbalance": revision_pressure,
     }
+    if point > 0:
+        summary["spread_points"] = _percentiles(q["spread"] / point)
+        if digits in {3, 5}:
+            summary["spread_pips"] = _percentiles(q["spread"] / (point * 10.0))
     applicability = {
         "quote_metrics": bool(len(q) >= 20),
         "trade_direction_metrics": tier in {"trade_ticks", "trade_volume"},
@@ -237,7 +311,15 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
                 summary["broker_tick_abs_return_per_real_volume"] = float(np.nanmean(np.abs(y) / np.maximum(np.abs(x), 1e-12)))
                 summary["volume_impact_observations"] = int(valid.sum())
     p95 = summary["spread"].get("p95")
-    events = [item for item in windows if p95 is not None and item.get("spread_p95") is not None and item["spread_p95"] >= p95][:10]
+    event_windows = [item for item in windows if p95 is not None and item.get("spread_p95") is not None and item["spread_p95"] >= p95][:10]
+    events = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"start_epoch", "end_epoch"}
+        }
+        for item in event_windows
+    ]
     warnings = []
     if tier != "trade_volume":
         warnings.append("Real trade volume is insufficient; volume-impact metrics were omitted.")
@@ -247,6 +329,7 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
     return {
         "success": True,
         "symbol": request.symbol,
+        "timezone": "UTC",
         "summary": summary,
         "liquidity_events": events,
         **({"windows": windows} if request.detail == "full" else {}),
@@ -255,6 +338,7 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
             "quote_coverage": float(quote_mask.mean()),
             "trade_tick_coverage": float(trade_mask.mean()),
             "real_volume_trade_coverage": real_share,
+            "invalid_partial_quote_ticks": int((~df["spread_valid"]).sum()),
             "truncated": truncated,
             "requested_start": start.isoformat(),
             "requested_end": end.isoformat(),
@@ -269,7 +353,9 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
             "volume_unit": "broker_reported_real_volume" if tier == "trade_volume" else None,
         },
         "units": {
-            "spread": "price",
+            "spread": "absolute_price",
+            "spread_points": "broker_points",
+            "spread_pips": "fx_pips_when_digits_are_3_or_5",
             "quote_gap_seconds": "seconds",
             "broker_quote_revision_imbalance": "signed_fraction",
             "broker_tick_signed_volume_impact_slope": "log_return_per_broker_real_volume",
@@ -345,6 +431,21 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
                 markouts[str(horizon)] = None
                 skipped["missing_markout"] += 1
         initial_volume = float(order.get("volume_initial") or volume)
+        order_type_value = order.get("type")
+        market_order_types = {
+            getattr(gateway, "ORDER_TYPE_BUY", 0),
+            getattr(gateway, "ORDER_TYPE_SELL", 1),
+        }
+        is_market_order = order_type_value in market_order_types
+        order_to_fill_ms = (
+            max(
+                0.0,
+                float(deal.get("time_msc") or fill_epoch * 1000.0)
+                - time_setup_msc,
+            )
+            if time_setup_msc
+            else None
+        )
         item = {
             "deal_ticket": deal.get("ticket"),
             "order_ticket": deal.get("order"),
@@ -357,14 +458,15 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             "benchmark_source": benchmark_source,
             "slippage_bps": slippage_bps,
             "price_improved": slippage_bps < 0,
-            "latency_ms": max(0.0, float(deal.get("time_msc") or fill_epoch * 1000.0) - time_setup_msc) if time_setup_msc else None,
+            "order_to_fill_ms": order_to_fill_ms,
+            "is_market_order": is_market_order,
             "fill_ratio": min(1.0, volume / initial_volume) if initial_volume > 0 else None,
             "commission": float(deal.get("commission") or 0.0),
             "fee": float(deal.get("fee") or 0.0),
             "commission_fee_per_lot": (float(deal.get("commission") or 0.0) + float(deal.get("fee") or 0.0)) / volume,
             "markout_bps": markouts,
             "fill_epoch": fill_epoch,
-            "order_type": str(order.get("type") or "unknown"),
+            "order_type": str(order_type_value if order_type_value is not None else "unknown"),
             "hour_utc": datetime.fromtimestamp(fill_epoch, tz=timezone.utc).hour,
         }
         hour = int(item["hour_utc"])
@@ -387,7 +489,16 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
         "mean_slippage_ci_95": _bootstrap_mean_ci(slippages, 500),
         "price_improvement_rate": float(np.mean([item["price_improved"] for item in fills])) if fills else None,
         "partial_fill_rate": float(np.mean([(item.get("fill_ratio") or 1.0) < 0.999 for item in fills])) if fills else None,
-        "latency_ms": _percentiles(item["latency_ms"] for item in fills if item.get("latency_ms") is not None),
+        "market_order_latency_ms": _percentiles(
+            item["order_to_fill_ms"]
+            for item in fills
+            if item.get("is_market_order") and item.get("order_to_fill_ms") is not None
+        ),
+        "order_to_fill_ms": _percentiles(
+            item["order_to_fill_ms"]
+            for item in fills
+            if item.get("order_to_fill_ms") is not None
+        ),
         "commission_fee_per_lot": _percentiles(item["commission_fee_per_lot"] for item in fills),
     }
     for horizon in request.markout_seconds:
@@ -401,6 +512,8 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
                 labels = group_key if isinstance(group_key, tuple) else (group_key,)
                 row = {name: value for name, value in zip(keys, labels)}
                 row.update({"fills": len(items), "slippage_bps": _percentiles(items["slippage_bps"])})
+                if label == "by_order_type":
+                    row["order_to_fill_ms"] = _percentiles(items["order_to_fill_ms"])
                 breakdowns[label].append(row)
     return {
         "success": True,
@@ -409,7 +522,11 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
         **({"items": fills} if request.detail == "full" else {}),
         "sample_quality": {"status": "ok" if len(fills) >= request.min_sample else "insufficient", "minimum": request.min_sample, "observed": len(fills)},
         "data_quality": {"history_deals": len(deals), "history_orders": len(orders), "matched_fills": len(fills), "skipped": skipped},
-        "units": {"slippage_bps": "basis_points_positive_is_worse", "markout_bps": "basis_points_positive_is_favorable", "latency_ms": "milliseconds"},
+        "latency_definition": {
+            "market_order_latency_ms": "market_order_setup_to_fill_elapsed_time",
+            "order_to_fill_ms": "all_order_setup_to_fill_elapsed_time_including_pending_wait",
+        },
+        "units": {"slippage_bps": "basis_points_positive_is_worse", "markout_bps": "basis_points_positive_is_favorable", "market_order_latency_ms": "milliseconds", "order_to_fill_ms": "milliseconds"},
     }
 
 
@@ -544,11 +661,15 @@ def _barrier_returns(
         direction = float(signal.iloc[idx]) if pd.notna(signal.iloc[idx]) else 0.0
         if direction == 0:
             continue
-        entry = float(df["close"].iloc[idx])
+        entry_idx = idx + 1
+        entry = float(df["open"].iloc[entry_idx])
+        if not math.isfinite(entry) or entry <= 0.0:
+            entry = float(df["close"].iloc[entry_idx])
         result = None
-        for step in range(1, horizon + 1):
-            high = float(df["high"].iloc[idx + step])
-            low = float(df["low"].iloc[idx + step])
+        for step in range(horizon):
+            outcome_idx = entry_idx + step
+            high = float(df["high"].iloc[outcome_idx])
+            low = float(df["low"].iloc[outcome_idx])
             favorable = (high / entry - 1.0) if direction > 0 else (1.0 - low / entry)
             adverse = (1.0 - low / entry) if direction > 0 else (high / entry - 1.0)
             adverse_hit = adverse >= sl
@@ -843,6 +964,9 @@ def validate_strategies(  # noqa: C901
             "forecast_signal_anchor_limit": _MAX_FORECAST_SIGNAL_ANCHORS,
             "same_bar_policy": request.barrier.same_bar_policy,
             "completed_candles_only": True,
+            "signal_timing": "completed_bar_close",
+            "execution_timing": "next_bar_open",
+            "barrier_window": "entry_bar_through_horizon",
         },
         "cost_model": {"source": spread_source, "spread_bps": spread_bps, "commission_bps_per_side": request.commission_bps, "slippage_bps_per_side": request.slippage_bps, "round_trip_bps": round_trip_bps, "complete": complete},
         "data_quality": {"bars": len(df), "cost_model_complete": complete},
@@ -944,9 +1068,11 @@ def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: An
         return {"error": "At least 100 aligned returns are required.", "error_code": "insufficient_data", "aligned_rows": len(returns)}
     returns.columns = list(series)
     alpha = 1.0 - math.exp(math.log(0.5) / request.ewma_half_life)
-    ewma_vol = returns.ewm(alpha=alpha, adjust=False).std().iloc[-1].replace(0, np.nan)
-    current_vol = ewma_vol.copy()
-    standardized = returns.div(returns.ewm(alpha=alpha, adjust=False).std()).replace([np.inf, -np.inf], np.nan).dropna()
+    standardized, current_vol = _filtered_historical_returns(
+        returns,
+        alpha=alpha,
+    )
+    ewma_vol = current_vol.copy()
     if request.method == "historical":
         standardized = returns.copy()
         current_vol = pd.Series(1.0, index=returns.columns)
@@ -1179,7 +1305,10 @@ def rank_relative_strength(request: MarketRelativeStrengthRequest, gateway: Any)
     for rank, (symbol, score) in enumerate(ranked.items(), start=1):
         row_by_symbol[symbol]["score"] = float(score)
         row_by_symbol[symbol]["rank"] = rank
-        row_by_symbol[symbol]["rank_percentile"] = float(1.0 - (rank - 1) / max(1, len(ranked) - 1))
+        if len(ranked) >= 10:
+            row_by_symbol[symbol]["rank_percentile"] = float(
+                1.0 - (rank - 1) / max(1, len(ranked) - 1)
+            )
         observed_ranks = [mapping[symbol] for mapping in offset_ranks.values() if symbol in mapping]
         row_by_symbol[symbol]["rank_stability"] = float(max(0.0, 1.0 - np.std(observed_ranks) / max(1.0, len(ranked) - 1)))
     ordered = [row_by_symbol[symbol] for symbol in ranked.index]
@@ -1191,14 +1320,28 @@ def rank_relative_strength(request: MarketRelativeStrengthRequest, gateway: Any)
         "above_sma20": float(np.mean([row["above_sma20"] for row in ordered])) if ordered else None,
         "above_sma50": float(np.mean([row["above_sma50"] for row in ordered])) if ordered else None,
     }
+    leader_count = min(request.limit, (len(ordered) + 1) // 2)
+    laggard_count = min(request.limit, len(ordered) - leader_count)
     return {
         "success": True,
         "timeframe": request.timeframe,
-        "leaders": ordered[: request.limit],
-        "laggards": list(reversed(ordered[-request.limit :])),
+        "universe_size": len(ordered),
+        "rank_quality": (
+            "cross_sectional" if len(ordered) >= 10 else "illustrative_small_universe"
+        ),
+        "score_definition": {
+            "method": "weighted_robust_z_of_volatility_scaled_residual_momentum",
+            "horizons_bars": list(request.horizons),
+            "weights": list(request.weights),
+            "higher_is_stronger": True,
+        },
+        "leaders": ordered[:leader_count],
+        "laggards": (
+            list(reversed(ordered[-laggard_count:])) if laggard_count else []
+        ),
         "breadth": breadth,
         "factor": {"source": request.benchmark.upper() if request.benchmark else "equal_weight_universe"},
         "data_quality": {"selected_symbols": len(selected), "ranked_symbols": len(ordered), "skipped": skipped, "minimum_history_coverage": 0.90},
-        "units": {"raw_momentum": "log_return", "residual_momentum": "log_return", "score": "robust_z_composite", "tick_volume": "broker_tick_count"},
+        "units": {"raw_momentum": "log_return_fraction", "residual_momentum": "log_return_fraction", "volatility": "per_bar_log_return_stddev", "score": "robust_z_composite", "rank_stability": "fraction_0_to_1", "tick_volume": "broker_tick_count"},
         **({"all_rankings": ordered} if request.detail == "full" else {}),
     }

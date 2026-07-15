@@ -36,8 +36,7 @@ logger = logging.getLogger(__name__)
 def trade_place(request: TradePlaceRequest) -> dict:
     """Place a market or pending order.
 
-    Defaults to live execution. Set `dry_run=true` to preview without sending
-    an order.
+    Defaults to preview mode. Set `dry_run=false` explicitly to send an order.
     Required inputs: symbol, volume, order_type.
     - BUY/SELL: market orders; omit `price`.
     - BUY_LIMIT/BUY_STOP/SELL_LIMIT/SELL_STOP: pending (requires `price`).
@@ -48,13 +47,14 @@ def trade_place(request: TradePlaceRequest) -> dict:
       Defaults to True for safer automation behavior.
     - auto_close_on_sl_tp_fail: retained for defensive handling of legacy injected
       order helpers that report a filled market order without TP/SL protection.
+      Market orders reject auto_close_on_sl_tp_fail=false when require_sl_tp=true,
+      because those settings cannot both be guaranteed after a fill.
     - Environment guardrails can block orders before MT5 submission based on
       configured symbol policies, volume caps, or wallet/account risk limits.
-    - idempotency_key: optional in-process dedupe key with an in-memory
-      ~5-minute TTL for retry-safe clients. It is not broker-side idempotency
-      and does not survive restarts or multi-worker deployments. Reusing a key
-      with the same payload replays the prior outcome instead of sending
-      another order; changed payloads require a new key.
+    - idempotency_key: optional durable dedupe key with a configurable 24-hour
+      retention window. The SQLite store is shared across restarts and workers.
+      Reusing a key with the same payload replays the prior outcome instead of
+      sending another order; changed payloads require a new key.
     """
     return run_logged_operation(
         logger,
@@ -80,14 +80,14 @@ def trade_place(request: TradePlaceRequest) -> dict:
 def trade_modify(request: TradeModifyRequest) -> dict:
     """Modify an open position or pending order by ticket.
 
-    Defaults to live execution. Set `dry_run=true` to preview without sending a
-    live modify request.
+    Defaults to preview mode. Set `dry_run=false` explicitly to send a live
+    modify request.
     Risk-increasing pending-order and position-protection changes can be
     blocked by configured trade guardrails, while close/reduce flows remain
     allowed.
-    Optional idempotency_key values suppress duplicate in-process retries for
-    the same payload with an in-memory ~5-minute TTL. They are not persisted
-    across restarts and do not provide broker-side idempotency.
+    Optional idempotency_key values suppress duplicate retries for the same
+    payload using a durable SQLite store with a configurable 24-hour retention
+    window. This does not provide broker-side idempotency.
     """
     return run_logged_operation(
         logger,
@@ -110,7 +110,7 @@ def trade_close(request: TradeCloseRequest) -> dict:
     Any bulk close requires `close_all=true`.
     Set `volume` only to partially close a specific open position by ticket.
     `volume` is invalid without `ticket`.
-    Defaults to live execution. Set `dry_run=true` to preview without sending a
+    Defaults to preview mode. Set `dry_run=false` explicitly to send a live
     close/cancel request.
     """
     return run_logged_operation(

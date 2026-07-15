@@ -1,18 +1,22 @@
-# Trading Safety Runbook
+# Trading safety runbook
 
-The `trade_*` tools send **real requests** to the MT5 account currently logged into the terminal. This runbook is the safety-first workflow for `trade_place`, `trade_modify`, and `trade_close`: how to preview, what gets validated, how account guardrails work, and broker-specific behavior to expect.
+If you only skim one trading doc, make it this one. The `trade_*` tools send **real requests** to the MT5 account currently logged into the terminal. This runbook covers previewing orders, validation, account guardrails, and broker quirks for `trade_place`, `trade_modify`, and `trade_close`.
 
-> ⚠️ **These tools default to LIVE execution.** `dry_run` defaults to **`false`** on `trade_place`, `trade_modify`, and `trade_close`. If you do not pass `--dry-run true`, the request is sent to MT5. Use a **demo account** until you fully trust your setup — mtdata has no separate paper-trading mode.
+> **These tools default to preview mode.** `dry_run` defaults to **`true`**. A request reaches MT5 only when you explicitly set `--dry-run false`. Use a **demo account** until you trust your setup — mtdata has no separate paper-trading mode.
+
+**Dense terms:** [Dry-run](GLOSSARY.md#dry-run) · [Trade guardrails](GLOSSARY.md#trade-guardrails) · [Slippage](GLOSSARY.md#slippage) · [Lot size](GLOSSARY.md#lot-size) · [TP/SL](GLOSSARY.md#tpsl-take-profit--stop-loss)
+
+**Related:** [Risk analytics](TRADING_RISK.md) · [Env vars (guardrails)](ENV_VARS.md#trade-guardrails) · [CLI](CLI.md) · [Sample trade](SAMPLE-TRADE.md) · [Glossary](GLOSSARY.md)
 
 ---
 
 ## Golden rules
 
-1. **Preview first.** Add `--dry-run true` to every order until you have verified the request.
-2. **Trade a demo account** while learning. There is no simulated mode besides an MT5 demo.
-3. **Enable guardrails** on any account that can place orders (see [Account guardrails](#account-guardrails)).
-4. **Use exact tickets** for `trade_modify` / `trade_close`; be extremely careful with `--close-all`.
-5. **Attach protective levels.** `trade_place` requires SL **and** TP on market orders by default (`--require-sl-tp`).
+1. **Preview first** — `--dry-run true` until the request looks right.
+2. **Demo while learning** — no simulated mode except an MT5 demo.
+3. **Enable guardrails** on any account that can place orders ([Account guardrails](#account-guardrails)).
+4. **Exact tickets** for modify/close; treat `--close-all` as nuclear.
+5. **Protective levels** — market orders require SL **and** TP by default (`--require-sl-tp`).
 
 ---
 
@@ -26,12 +30,20 @@ A dry run routes and validates the request **without sending it to MT5**. The `t
   "no_action": true,
   "would_send_order": false,
   "dry_run_simulated": true,
-  "validation_scope": "request_routing_only",
+  "preview_ok": true,
+  "validation_passed": true,
+  "validation_scope": "local_preview_plus_estimates",
   "preview_checks_performed": [ /* routing, local safety/level checks, margin estimate */ ],
   "broker_validation_not_performed": [ /* broker acceptance/enforcement, margin reservation, fillability, SL/TP attachment */ ],
   "guardrails_preview": { /* which guardrails would apply */ }
 }
 ```
+
+`success` means the preview operation completed. Gate any subsequent live send
+on `preview_ok` (and the equivalent nested `validation.live_submission_eligible`),
+which is `false` when local requirements such as required SL/TP are missing.
+Compact output always retains these gate fields and the broker-validation
+limitations; `guardrails_preview` remains a standard/full-detail section.
 
 **What a dry run *does* check:** required fields, order-type validity, market-vs-pending routing, and a guardrails preview.
 
@@ -57,9 +69,14 @@ Requires `symbol`, `volume`, and `order_type`.
 | `--expiration` | — | Pending-order expiry (`dateparser`, UTC epoch seconds, or `GTC`) |
 | `--magic` | `MTDATA_ORDER_MAGIC` | Strategy identifier stamped on the order |
 | `--comment` | — | Free-text order comment |
-| `--idempotency-key` | — | In-process dedupe (~5-min TTL; not persisted/shared) |
-| `--dry-run` | `false` | **Preview only when `true`** |
+| `--idempotency-key` | — | Durable dedupe shared across processes/restarts (24-hour default retention) |
+| `--dry-run` | `true` | Set `false` explicitly for live execution |
 | `--detail` | `compact` | Use `full` for execution diagnostics |
+
+Idempotency outcomes are stored in `MTDATA_TRADE_IDEMPOTENCY_DB`. If a process
+stops after reserving a key but before recording the broker outcome, retries for
+that key fail closed. Reconcile the order or modification in MT5 before removing
+the unresolved database row; never clear it merely to make a retry proceed.
 
 ```bash
 # Preview a market buy with protective levels
@@ -93,8 +110,8 @@ Modifies an existing order/position by ticket.
 | `--take-profit` / `--tp` | — | New take-profit |
 | `--expiration` | — | New pending-order expiry |
 | `--comment` | — | Updated comment |
-| `--idempotency-key` | — | In-process dedupe |
-| `--dry-run` | `false` | **Preview only when `true`** |
+| `--idempotency-key` | — | Durable dedupe shared across processes/restarts |
+| `--dry-run` | `true` | Preview by default; set `false` explicitly for a live modification |
 
 ```bash
 mtdata-cli trade_get_open --json
@@ -120,7 +137,7 @@ Closes one position, a filtered set, or all — with an extra confirmation for b
 | `--profit-only` / `--loss-only` | `false` | Only close winners / losers |
 | `--close-priority` | — | `loss_first`, `profit_first`, or `largest_first` |
 | `--deviation` | `20` | Max slippage in points |
-| `--dry-run` | `false` | **Preview only when `true`** |
+| `--dry-run` | `true` | Preview by default; set `false` explicitly for a live close |
 
 ```bash
 # Preview a partial close of one ticket

@@ -84,6 +84,35 @@ def test_floor_volume_steps_rejects_invalid_inputs() -> None:
     assert _floor_volume_steps(float("nan"), 0.1) == 0
 
 
+def test_trade_risk_analyze_blocks_sizing_and_escalates_critical_margin() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(
+        equity=384.44,
+        currency="USD",
+        margin=348.96,
+        margin_free=35.48,
+        margin_level=110.17,
+        leverage=500,
+    )
+    mt5.positions_get.return_value = []
+    mt5.orders_get.return_value = []
+    mt5.symbol_info.return_value = _make_symbol_info()
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(
+            symbol="EURUSD",
+            detail="full",
+            desired_risk_pct=1.0,
+            entry=100.0,
+            stop_loss=90.0,
+        )
+
+    assert out["scoped_risk"]["margin_risk_level"] == "high"
+    assert out["scoped_risk"]["margin_stress"]["status"] == "critical"
+    assert out["position_sizing_error"]["code"] == "portfolio_safety_block"
+    assert "position_sizing" not in out
+
+
 def test_trade_risk_analyze_does_not_round_up_substep_boundary_volume() -> None:
     mt5 = MagicMock()
     mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
@@ -438,7 +467,8 @@ def test_trade_risk_analyze_keeps_exposure_analysis_with_partial_sizing_params()
         )
 
     assert out["success"] is True
-    assert "portfolio_risk" in out
+    assert "scoped_risk" in out
+    assert "portfolio_risk" not in out
     sizing = out["position_sizing"]
     assert sizing["status"] == "parameters_missing"
     assert set(sizing["missing"]) == {"entry", "stop_loss"}
@@ -496,8 +526,9 @@ def test_trade_risk_analyze_preserves_zero_position_risk_metrics() -> None:
     assert by_ticket[1]["reward_currency"] == 10.0
     assert by_ticket[1]["rr_ratio"] is None
     assert by_ticket[2]["risk_currency"] == 10.0
-    assert by_ticket[2]["reward_currency"] == 0.0
-    assert by_ticket[2]["rr_ratio"] == 0.0
+    assert by_ticket[2]["reward_currency"] is None
+    assert by_ticket[2]["reward_status"] == "invalid"
+    assert by_ticket[2]["rr_ratio"] is None
 
 
 def test_trade_risk_analyze_reports_symbol_scope_when_other_positions_exist() -> None:
@@ -541,7 +572,13 @@ def test_trade_risk_analyze_reports_symbol_scope_when_other_positions_exist() ->
     mt5.symbol_info.return_value = _make_symbol_info()
 
     with _patched_mt5_module(mt5):
-        out = trade_risk_analyze(symbol="EURUSD")
+        out = trade_risk_analyze(
+            symbol="EURUSD",
+            detail="full",
+            desired_risk_pct=1.0,
+            entry=100.0,
+            stop_loss=90.0,
+        )
 
     assert out["scope"] == {
         "mode": "symbol",
@@ -554,7 +591,12 @@ def test_trade_risk_analyze_reports_symbol_scope_when_other_positions_exist() ->
         out["scope_warning"]
         == "No open EURUSD positions matched; 2 open position(s) exist on other symbols."
     )
-    assert out["portfolio_risk"]["positions_count"] == 0
+    assert out["risk_visibility"] == "partial"
+    assert out["scoped_risk"]["positions_count"] == 0
+    assert out["scoped_risk"]["overall_risk_status"] == "partial"
+    assert out["scoped_risk"]["quantified_risk_level"] == "unknown"
+    assert out["position_sizing_error"]["code"] == "portfolio_safety_block"
+    assert "position_sizing" not in out
 
 
 def test_trade_risk_analyze_blocks_min_volume_risk_overshoot_by_default() -> None:
@@ -1038,11 +1080,71 @@ def test_trade_risk_analyze_uses_loss_tick_value_for_open_position_risk() -> Non
     assert out["portfolio_risk"]["total_risk_currency"] == 20.0
 
 
+def test_trade_risk_analyze_treats_locked_profit_stop_as_zero_risk() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
+    mt5.positions_get.return_value = [
+        SimpleNamespace(
+            ticket=14,
+            symbol="EURUSD",
+            type=0,
+            volume=1.0,
+            price_open=100.0,
+            sl=110.0,
+            tp=120.0,
+        )
+    ]
+    mt5.symbol_info.return_value = _make_symbol_info(
+        trade_tick_value=1.0,
+        trade_tick_value_loss=2.0,
+    )
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(__cli_raw=True)
+
+    position = out["positions"][0]
+    assert position["risk_currency"] == 0.0
+    assert position["risk_pct"] == 0.0
+    assert position["risk_status"] == "defined"
+    assert out["portfolio_risk"]["total_risk_currency"] == 0.0
+
+
+def test_trade_risk_analyze_does_not_report_wrong_side_tp_as_reward() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
+    mt5.positions_get.return_value = [
+        SimpleNamespace(
+            ticket=15,
+            symbol="EURUSD",
+            type=0,
+            volume=1.0,
+            price_open=100.0,
+            sl=90.0,
+            tp=95.0,
+        )
+    ]
+    mt5.symbol_info.return_value = _make_symbol_info(
+        trade_tick_value=1.0,
+        trade_tick_value_loss=2.0,
+    )
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(__cli_raw=True)
+
+    position = out["positions"][0]
+    assert position["reward_currency"] is None
+    assert position["reward_status"] == "invalid"
+    assert position["rr_ratio"] is None
+
+
 def test_trade_risk_analyze_converts_notional_with_broker_tick_value() -> None:
     gateway = MagicMock()
     gateway.account_info.return_value = SimpleNamespace(
         equity=100_000.0,
         currency="USD",
+        leverage=500,
+        margin=250.0,
+        margin_free=99_750.0,
     )
     gateway.positions_get.return_value = [
         SimpleNamespace(
@@ -1072,7 +1174,12 @@ def test_trade_risk_analyze_converts_notional_with_broker_tick_value() -> None:
 
     assert out["positions"][0]["contract_price_product"] == 11_000_000.0
     assert out["positions"][0]["notional_value"] == 100_100.0
+    assert out["positions"][0]["contract_size"] == 100_000.0
+    assert out["positions"][0]["volume_unit"] == "broker_lot"
     assert out["portfolio_risk"]["notional_exposure"] == 100_100.0
+    assert out["portfolio_risk"]["notional_to_equity"] == 1.001
+    assert out["portfolio_risk"]["account_leverage"] == 500.0
+    assert out["portfolio_risk"]["margin_used"] == 250.0
     assert out["portfolio_risk"]["notional_exposure_complete"] is True
     assert out["units"]["notional_value"] == "account_currency_linearized"
 

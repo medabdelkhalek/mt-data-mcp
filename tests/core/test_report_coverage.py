@@ -12,6 +12,30 @@ from pydantic import ValidationError
 
 from mtdata.utils.mt5 import MT5ConnectionError
 
+
+def test_sections_status_preserves_intentional_omissions():
+    from mtdata.core.report.use_cases import _build_sections_status
+
+    status = _build_sections_status(
+        {
+            "context": {"close": 1.2},
+            "pivot": {
+                "status": "omitted",
+                "reason": "current_only_section_omitted",
+            },
+        }
+    )
+
+    assert status["sections"] == {"context": "ok", "pivot": "omitted"}
+    assert status["summary"] == {
+        "ok": 1,
+        "partial": 0,
+        "error": 0,
+        "omitted": 1,
+        "total": 2,
+    }
+    assert status["details"]["pivot"]["reason"] == "current_only_section_omitted"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -833,9 +857,9 @@ class TestReportSummaryVolForecast:
         res = self._run_report(sec)
         assert any("sigma=" in s for s in res.get("summary", []))
 
-    def test_vol_return_sigma_fallback(self):
+    def test_vol_return_sigma_uses_canonical_field(self):
         sec = _make_full_sections()
-        sec["volatility"] = {"horizon_sigma_return": 0.003}
+        sec["volatility"] = {"volatility_horizon": 0.003}
         res = self._run_report(sec)
         assert any("sigma=" in s for s in res.get("summary", []))
 
@@ -933,7 +957,7 @@ class TestReportSummaryBarriers:
         assert "ev_edge_conflict_reason=" in long_line
         structured = res["summary_structured"]["barriers"]["long"]
         assert structured["ev"] == 0.03
-        assert structured["edge"] == -0.1
+        assert structured["probability_edge"] == -0.1
         assert structured["edge_vs_breakeven"] == -0.2
         assert structured["ev_edge_conflict"] is True
         assert structured["conflict_reason"] == "ev and edge_vs_breakeven have opposite signs"
@@ -1272,3 +1296,20 @@ def test_prioritize_report_payload_orders_as_of_near_top():
     rep = {'sections': {}, 'as_of': 'T', 'success': True, 'timezone': 'UTC'}
     keys = list(_prioritize_report_payload(rep).keys())
     assert keys.index('as_of') < keys.index('sections')
+
+
+def test_report_assessment_names_section_health_confidence_explicitly():
+    from mtdata.core.report.use_cases import _build_overall_report_assessment
+
+    assessment = _build_overall_report_assessment(
+        {
+            "sections_status": {
+                "summary": {"total": 3, "ok": 3, "partial": 0, "error": 0}
+            }
+        }
+    )
+
+    assert assessment["assembly_confidence"] == "high"
+    assert assessment["assembly_confidence_basis"] == "report_section_health"
+    assert "confidence" not in assessment
+    assert assessment["is_trade_signal"] is False

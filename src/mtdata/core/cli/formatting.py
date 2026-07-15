@@ -3,12 +3,14 @@ import os
 from typing import Any, Callable, Dict, Optional
 
 from ...shared.output_precision import resolve_output_precision
+from ...utils.coercion import round_finite
 from ...utils.minimal_output import _is_empty_value
 from ...utils.minimal_output import format_result_minimal as _shared_minimal
 from ..output_contract import apply_output_verbosity
 from ..output_serialization import json_default as _json_default
 from ..output_serialization import sanitize_json as _sanitize_json
 from ..runtime_metadata import build_runtime_timezone_meta
+from ..trading.context import _compact_trade_session_items as _shared_compact_trade_session_items
 
 CLI_FORMAT_TOON = "toon"
 CLI_FORMAT_JSON = "json"
@@ -122,12 +124,7 @@ def _prune_compact_runtime_meta(result: Any) -> Any:
 
 
 def _round_cli_float(value: Any, *, digits: int) -> Any:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return value
-    try:
-        return round(float(value), int(digits))
-    except Exception:
-        return value
+    return round_finite(value, digits, on_invalid="passthrough")
 
 
 def _price_precision_from_cli_quote(quote: Any) -> Optional[int]:
@@ -219,25 +216,11 @@ def _compact_trade_session_items(
     *,
     field_map: tuple[tuple[str, ...], ...],
 ) -> Optional[list[Dict[str, Any]]]:
-    if not isinstance(section, dict):
-        return None
-    items = section.get("items")
-    if not isinstance(items, list) or not items:
-        return None
-
-    rows: list[Dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        compact: Dict[str, Any] = {}
-        for out_key, *input_keys in field_map:
-            for input_key in input_keys:
-                if input_key in item and not _is_empty_value(item.get(input_key)):
-                    compact[out_key] = item.get(input_key)
-                    break
-        if compact:
-            rows.append(compact)
-    return rows or None
+    return _shared_compact_trade_session_items(
+        section,
+        field_map=field_map,
+        is_empty=_is_empty_value,
+    )
 
 
 def _normalize_trade_session_context_cli_payload(
@@ -251,6 +234,8 @@ def _normalize_trade_session_context_cli_payload(
         return result
 
     out = dict(result)
+    if out.get("success") is False or not _is_empty_value(out.get("error")):
+        return out
     quote_in = out.get("quote")
     if isinstance(quote_in, dict):
         quote_norm = _normalize_market_ticker_cli_payload(
@@ -266,6 +251,7 @@ def _normalize_trade_session_context_cli_payload(
                 for key in (
                     "bid",
                     "ask",
+                    "mid",
                     "last",
                     "spread",
                     "spread_points",
@@ -278,6 +264,11 @@ def _normalize_trade_session_context_cli_payload(
                     "data_age_seconds",
                     "data_age",
                     "data_stale",
+                    "freshness_state",
+                    "usable_for_live_trading",
+                    "live_max_age_seconds",
+                    "market_state",
+                    "market_status_reason",
                     "stale_warning",
                     "warning",
                 )
@@ -310,6 +301,12 @@ def _normalize_trade_session_context_cli_payload(
         "portfolio_positions_count",
         "other_positions_count",
         "partial_failure",
+        "trade_ready",
+        "quote_quality",
+        "market_status",
+        "market_status_reason",
+        "is_tradable",
+        "can_open_new_positions",
     ):
         value = out.get(key)
         if not _is_empty_value(value):
@@ -322,7 +319,19 @@ def _normalize_trade_session_context_cli_payload(
         else:
             account_out = {
                 key: account_in.get(key)
-                for key in ("balance", "equity", "profit", "margin_level")
+                for key in (
+                    "balance",
+                    "equity",
+                    "profit",
+                    "margin",
+                    "margin_free",
+                    "margin_level",
+                    "currency",
+                    "account_type",
+                    "is_demo",
+                    "is_live",
+                    "trade_allowed",
+                )
                 if key in account_in and not _is_empty_value(account_in.get(key))
             }
             execution_ready = account_in.get("execution_ready")
@@ -367,6 +376,7 @@ def _normalize_trade_session_context_cli_payload(
                         "current_price",
                         "Current Price",
                     ),
+                    ("price_current_basis", "price_current_basis"),
                     ("sl", "sl", "SL"),
                     ("tp", "tp", "TP"),
                     ("profit", "profit", "Profit"),

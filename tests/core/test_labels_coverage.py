@@ -70,7 +70,7 @@ class TestLabelsTripleBarrier:
         assert inspect.signature(raw).parameters["detail"].default == "compact"
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_basic_pct_barriers(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -102,7 +102,7 @@ class TestLabelsTripleBarrier:
         assert result == ([], [], [], [], [], [], [], [], 0)
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_compact_rows_keep_barrier_prices_structured(self, mock_hist, mock_den, mock_pip):
         del mock_den, mock_pip
@@ -154,7 +154,7 @@ class TestLabelsTripleBarrier:
         assert "sl_price" not in row
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_abs_barriers(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60, base=100.0, step=0.5)
@@ -162,7 +162,7 @@ class TestLabelsTripleBarrier:
         assert result["success"] is True
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_abs_barriers_reject_offset_like_levels(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60, base=1.1720, step=0.0001)
@@ -172,7 +172,7 @@ class TestLabelsTripleBarrier:
         assert "offset-style barriers" in result["error"]
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_tick_barriers(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -180,7 +180,7 @@ class TestLabelsTripleBarrier:
         assert result["success"] is True
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_tick_barriers_alias(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -188,7 +188,7 @@ class TestLabelsTripleBarrier:
         assert result["success"] is True
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_insufficient_history(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(5)
@@ -196,7 +196,7 @@ class TestLabelsTripleBarrier:
         assert "error" in result
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_no_barriers_gives_error(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -206,6 +206,7 @@ class TestLabelsTripleBarrier:
             "Missing barriers. Provide either tp_pct and sl_pct, "
             "tp_abs and sl_abs, or tp_ticks and sl_ticks."
         )
+        assert result["error_code"] == "barrier_parameters_missing"
         assert "forecast_barrier_optimize" in result["remediation"]
 
     def test_rejects_multiple_tp_unit_families(self):
@@ -219,7 +220,7 @@ class TestLabelsTripleBarrier:
         assert result["error"].startswith("Use one TP/SL barrier unit family")
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_rejects_mixed_tp_sl_unit_families(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -229,7 +230,7 @@ class TestLabelsTripleBarrier:
         assert result["error"].startswith("Use one TP/SL barrier unit family")
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_non_finite_barrier_gives_error(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -237,7 +238,7 @@ class TestLabelsTripleBarrier:
         assert "error" in result
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_invalid_entry_price_is_skipped_instead_of_aborting(self, mock_hist, mock_den, mock_pip):
         df = _make_df(12)
@@ -260,7 +261,7 @@ class TestLabelsTripleBarrier:
         assert any("Skipped 1 entries" in msg for msg in result["warnings"])
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_summary_output_reports_skipped_invalid_entries(self, mock_hist, mock_den, mock_pip):
         df = _make_df(12)
@@ -275,7 +276,7 @@ class TestLabelsTripleBarrier:
         assert any("Skipped 1 entries" in msg for msg in result["warnings"])
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_label_on_close(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -283,7 +284,7 @@ class TestLabelsTripleBarrier:
         assert result["success"] is True
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_label_on_high_low(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -291,7 +292,7 @@ class TestLabelsTripleBarrier:
         assert result["success"] is True
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_output_summary(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -301,7 +302,7 @@ class TestLabelsTripleBarrier:
         assert "counts" in result["summary"]
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_output_compact(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -324,7 +325,7 @@ class TestLabelsTripleBarrier:
         assert result["sample_size"] <= 10
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_limit_caps_compact_sample_without_expanding_history(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(100)
@@ -341,6 +342,18 @@ class TestLabelsTripleBarrier:
         assert result["success"] is True
         assert result["labeling_coverage"]["rows_after_labeling"] == 50
         assert result["summary"]["lookback"] == 50
+        assert 0.0 <= result["summary"]["neutral_rate"] <= 1.0
+        assert 0.0 <= result["summary"]["barrier_resolution_rate"] <= 1.0
+        assert "hit_rate" not in result["summary"]
+        assert (
+            result["summary"]["neutral_rate"]
+            + result["summary"]["barrier_resolution_rate"]
+            == 1.0
+        )
+        assert (
+            result["summary"]["tp_rate"] + result["summary"]["sl_rate"]
+            == result["summary"]["barrier_resolution_rate"]
+        )
         assert result["history_bars_requested"] == 62
         assert result["history_bars_used"] == 62
         assert result["sample_limit"] == 20
@@ -348,7 +361,7 @@ class TestLabelsTripleBarrier:
         assert result["summary"]["sample_quality"]["status"] == "ok"
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_output_compact_caps_recent_sample_but_keeps_summary_lookback(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(80)
@@ -372,7 +385,7 @@ class TestLabelsTripleBarrier:
         assert result["label_key"] == {"1": "tp_first", "-1": "sl_first", "0": "hold"}
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_lookback_controls_labeling_window(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(100)
@@ -395,7 +408,7 @@ class TestLabelsTripleBarrier:
         assert result["sample_size"] == 5
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_output_standard_returns_recent_lookback_rows(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(80)
@@ -421,7 +434,7 @@ class TestLabelsTripleBarrier:
         assert result["data_note"] == "data rows cover the recent summary lookback window."
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_output_compact_prefers_outcome_sample(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(80)
@@ -441,7 +454,7 @@ class TestLabelsTripleBarrier:
         assert {row["outcome"] for row in result["data"]} <= {"tp", "sl"}
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_output_full(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -450,7 +463,7 @@ class TestLabelsTripleBarrier:
         assert "entries" in result
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_full_output_includes_label_legend(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -461,7 +474,7 @@ class TestLabelsTripleBarrier:
         assert result["label_legend"]["0"]["label"] == "hold"
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_summary_output_uses_canonical_detail(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -469,10 +482,10 @@ class TestLabelsTripleBarrier:
         assert result["success"] is True
         assert "summary" in result
         assert "entries" not in result
-        assert "warnings" not in result
+        assert any("neutral timeouts" in warning for warning in result["warnings"])
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_standard_detail_is_accepted_as_compact(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -483,7 +496,7 @@ class TestLabelsTripleBarrier:
         assert "data" in result
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_summary_only_detail_alias_is_rejected(
         self,
@@ -504,7 +517,7 @@ class TestLabelsTripleBarrier:
         )
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_flat_price_neutral_labels(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_flat_df(60)
@@ -515,7 +528,7 @@ class TestLabelsTripleBarrier:
         assert all(l == 0 for l in result["labels"])
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_minimum_history_keeps_last_valid_entry_bar(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_flat_df(5)
@@ -528,14 +541,14 @@ class TestLabelsTripleBarrier:
         assert len(result["entries"]) == 2
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history", side_effect=Exception("MT5 down"))
     def test_exception_returns_error(self, mock_hist, mock_den, mock_pip):
         result = _get_raw_fn()("EURUSD", tp_pct=1.0, sl_pct=1.0, horizon=5)
         assert "error" in result
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_params_used_in_output(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -543,7 +556,7 @@ class TestLabelsTripleBarrier:
         assert "params_used" not in result
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_holding_bars_within_horizon(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -555,7 +568,7 @@ class TestLabelsTripleBarrier:
             assert 1 <= h <= 10
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_summary_median_holding(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_df(60)
@@ -563,7 +576,7 @@ class TestLabelsTripleBarrier:
         assert "median_holding_bars" in result["summary"]
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_all_neutral_summary_explains_timeout(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_flat_df(60)
@@ -587,7 +600,7 @@ class TestLabelsTripleBarrier:
         assert "forecast_barrier_optimize" in summary["suggestion_basis"]
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_short_direction_labels_falling_prices_as_take_profit(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = _make_down_df(60)
@@ -605,7 +618,7 @@ class TestLabelsTripleBarrier:
         assert result["labels"][0] == 1
 
     @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-    @patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+    @patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
     @patch(f"{_LABELS_MOD}._fetch_history")
     def test_same_bar_high_low_barrier_hits_resolve_conservatively_to_stop_loss(self, mock_hist, mock_den, mock_pip):
         mock_hist.return_value = pd.DataFrame({
@@ -633,7 +646,7 @@ class TestLabelsTripleBarrier:
 
 
 @patch(f"{_LABELS_MOD}._get_pip_size", return_value=0.0001)
-@patch(f"{_LABELS_MOD}._resolve_denoise_base_col", return_value="close")
+@patch(f"{_LABELS_MOD}.resolve_denoise_base_col", return_value="close")
 @patch(f"{_LABELS_MOD}._fetch_history")
 def test_labels_triple_barrier_logs_finish_event(mock_hist, mock_den, mock_pip, caplog):
     mock_hist.return_value = _make_df(60)
@@ -645,3 +658,4 @@ def test_labels_triple_barrier_logs_finish_event(mock_hist, mock_den, mock_pip, 
         "event=finish operation=labels_triple_barrier success=True" in record.message
         for record in caplog.records
     )
+

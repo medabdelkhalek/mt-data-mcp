@@ -20,11 +20,11 @@ from ..forecast.volatility import (
 )
 from ..services.data_service import fetch_candles as _fetch_candles_impl
 from ..shared.constants import TIMEFRAME_MAP
+from ..shared.schema import DetailLiteral
 from ..utils.denoise import get_denoise_methods_data as _get_denoise_methods
 from ..utils.denoise import normalize_denoise_spec as _norm_dn
 from ..utils.dimred import list_dimred_methods as _list_dimred_methods
 from ..utils.mt5 import (
-    _ensure_symbol_ready,
     ensure_mt5_connection_or_raise,
     mt5,
     mt5_connection,
@@ -42,6 +42,7 @@ from .forecast import (
 )
 from .forecast_tasks import forecast_models_list as _forecast_models_list_tool
 from .mt5_gateway import create_mt5_gateway, mt5_connection_error
+from .market_depth import market_ticker as _market_ticker_tool
 from .pivot import pivot_compute_points
 from .tool_calling import call_tool_sync_structured, unwrap_tool_callable
 from .web_api_handlers import (
@@ -348,10 +349,9 @@ def get_history(
         None,
         description="Indicator specification forwarded to data_fetch_candles.",
     ),
-    timestamp_format: Literal["epoch", "iso"] = Query(
-        "epoch",
-        description="Timestamp encoding for returned candle rows.",
-    ),
+    timestamp_format: Literal["epoch", "iso"] = "iso",
+    detail: DetailLiteral = "compact",
+    extras: Optional[str] = None,
     denoise_method: Optional[str] = Query(None, description="Denoise method name; if set, returns extra *_dn columns."),
     denoise_params: Optional[str] = Query(None, description="JSON or k=v list of denoise params."),
 ) -> Dict[str, Any]:
@@ -367,6 +367,8 @@ def get_history(
         allow_stale=allow_stale,
         indicators=indicators,
         timestamp_format=timestamp_format,
+        detail=detail,
+        extras=extras,
         denoise_method=denoise_method,
         denoise_params=denoise_params,
         fetch_candles_impl=_fetch_candles_impl,
@@ -381,11 +383,13 @@ def get_pivots(
     symbol: str = Query(...),
     timeframe: str = Query("H1"),
     method: str = Query("classic"),
+    detail: DetailLiteral = "compact",
 ) -> Dict[str, Any]:
     return _get_pivots_response(
         symbol=symbol,
         timeframe=timeframe,
         method=method,
+        detail=detail,
         pivot_tool=pivot_compute_points,
         call_tool_raw=_call_tool_raw,
     )
@@ -404,6 +408,7 @@ def get_support_resistance(
     reaction_bars: int = Query(6, ge=1),
     adx_period: int = Query(14, ge=1),
     decay_half_life_bars: Optional[int] = Query(None, ge=1),
+    detail: DetailLiteral = "compact",
     extras: Optional[str] = None,
 ) -> Dict[str, Any]:
     return _get_support_resistance_response(
@@ -418,17 +423,22 @@ def get_support_resistance(
         reaction_bars=reaction_bars,
         adx_period=adx_period,
         decay_half_life_bars=decay_half_life_bars,
+        detail=detail,
         extras=extras,
         fetch_history_impl=_fetch_history_impl,
     )
 
 
 @api_router.get("/tick")
-def get_tick(symbol: str = Query(...)) -> Dict[str, Any]:
+def get_tick(
+    symbol: str = Query(...),
+    detail: DetailLiteral = "compact",
+) -> Dict[str, Any]:
     return _get_tick_response(
         symbol=symbol,
-        mt5=_web_api_gateway(),
-        ensure_symbol_ready=_ensure_symbol_ready,
+        detail=detail,
+        market_ticker_tool=_market_ticker_tool,
+        call_tool_raw=_call_tool_raw,
     )
 
 

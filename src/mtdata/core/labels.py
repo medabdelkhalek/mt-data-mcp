@@ -25,8 +25,13 @@ from ..utils.barriers import (
 from ..utils.barriers import (
     resolve_barrier_prices as _resolve_barrier_prices,
 )
-from ..utils.denoise import _resolve_denoise_base_col
-from ..utils.mt5 import MT5ConnectionError, ensure_mt5_connection_or_raise
+from ..utils.coercion import coerce_finite_float, round_finite
+from ..utils.denoise import resolve_denoise_base_col
+from ..utils.mt5 import (
+    MT5ConnectionError,
+    ensure_mt5_connection_or_raise,
+    symbol_price_digits,
+)
 from ..utils.time import _format_time_minimal
 from ._mcp_instance import mcp
 from .execution_logging import run_logged_operation
@@ -61,15 +66,9 @@ def _neutral_barrier_pct_range(max_move_pct: Any) -> Optional[List[float]]:
 
 
 def _round_label_price(value: Any, *, digits: int) -> Optional[float]:
-    try:
-        numeric = float(value)
-    except Exception:
-        return None
-    if not math.isfinite(numeric):
-        return None
     if int(digits) <= 0:
-        return numeric
-    return round(numeric, max(0, int(digits)))
+        return coerce_finite_float(value)
+    return round_finite(value, digits, on_invalid="none")
 
 
 def _triple_barrier_sample_row(
@@ -273,11 +272,6 @@ def _build_triple_barrier_outputs(
             hold.append(sl_offset)
             tp_times.append(None)
             sl_times.append(_format_time_minimal(times[idx + sl_offset]))
-        else:
-            labels.append(0)
-            hold.append(min(tp_offset, sl_offset))
-            tp_times.append(_format_time_minimal(times[idx + tp_offset]))
-            sl_times.append(_format_time_minimal(times[idx + sl_offset]))
         entries.append(_format_time_minimal(times[idx]))
 
     return (
@@ -334,7 +328,7 @@ def labels_triple_barrier(
             )
             mt5_gateway.ensure_connection()
             symbol_info = mt5_gateway.symbol_info(symbol)
-            price_digits = max(0, int(getattr(symbol_info, "digits", 0) or 0)) if symbol_info else 0
+            price_digits = symbol_price_digits(symbol_info) if symbol_info else 0
             trade_tick_size = None
             if symbol_info is not None:
                 try:
@@ -388,7 +382,7 @@ def labels_triple_barrier(
             history_bars_used = int(len(df))
             if len(df) < horizon_bars + 2:
                 return {"error": "Insufficient history for labeling"}
-            base_col = _resolve_denoise_base_col(
+            base_col = resolve_denoise_base_col(
                 df, denoise, base_col="close", default_when="pre_ti"
             )
             closes = df[base_col].astype(float).to_numpy()
@@ -436,6 +430,7 @@ def labels_triple_barrier(
                         "Missing barriers. Provide either tp_pct and sl_pct, "
                         "tp_abs and sl_abs, or tp_ticks and sl_ticks."
                     ),
+                    "error_code": "barrier_parameters_missing",
                     "remediation": (
                         "Choose explicit TP/SL barriers scaled to the symbol's volatility. "
                         "Run forecast_volatility_estimate to read the per-bar sigma, then set "
@@ -640,9 +635,24 @@ def labels_triple_barrier(
                 summary = {
                     "lookback": int(n),
                     "counts": counts,
+                    "neutral_rate": (
+                        round(float(counts["neutral"] / n), 6) if n else None
+                    ),
+                    "barrier_resolution_rate": (
+                        round(float((counts["tp"] + counts["sl"]) / n), 6)
+                        if n
+                        else None
+                    ),
+                    "tp_rate": round(float(counts["tp"] / n), 6) if n else None,
+                    "sl_rate": round(float(counts["sl"] / n), 6) if n else None,
                     "median_holding_bars": med_hold,
                     "sample_quality": sample_quality,
                 }
+                if n and counts["neutral"] / n >= 0.8:
+                    warnings_out.append(
+                        "At least 80% of summarized labels are neutral timeouts. "
+                        "Tighten the barriers or increase horizon to produce more hits."
+                    )
                 favorable_tail = max_favorable_moves_pct[-n:] if n > 0 else max_favorable_moves_pct
                 adverse_tail = max_adverse_moves_pct[-n:] if n > 0 else max_adverse_moves_pct
                 if favorable_tail or adverse_tail:
@@ -830,3 +840,4 @@ def labels_triple_barrier(
         detail=detail,
         func=_run,
     )
+

@@ -10,9 +10,9 @@ import numpy as np
 import pandas as pd
 
 from ..shared.constants import (
-    TIME_DISPLAY_FORMAT,
     TIMEFRAME_SECONDS as _TIMEFRAME_SECONDS,
 )
+from .time import _format_time_minimal, format_epoch_utc
 
 _METHOD_NAME = "weighted_retests"
 _DEFAULT_REACTION_BARS = 6
@@ -77,28 +77,27 @@ def _format_time(timestamp: Optional[float]) -> Optional[str]:
     if isinstance(timestamp, str):
         cleaned = timestamp.strip()
         return cleaned or None
-    if timestamp is None or not math.isfinite(float(timestamp)):
+    if timestamp is None:
         return None
     try:
-        return datetime.fromtimestamp(float(timestamp), tz=timezone.utc).strftime(
-            TIME_DISPLAY_FORMAT
-        )
+        epoch = float(timestamp)
+        if not math.isfinite(epoch):
+            return None
+        return _format_time_minimal(epoch)
     except Exception:
         return None
 
 
 def _format_time_iso_utc(timestamp: Optional[float]) -> Optional[str]:
-    if timestamp is None or not math.isfinite(float(timestamp)):
+    if timestamp is None:
         return None
     try:
-        return (
-            datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        epoch = float(timestamp)
+        if not math.isfinite(epoch):
+            return None
     except Exception:
         return None
+    return format_epoch_utc(epoch)
 
 
 def _parse_output_time(value: Any) -> Optional[float]:
@@ -2191,16 +2190,6 @@ def merge_support_resistance_results(  # noqa: C901
                 cluster.setdefault("merge_signatures", []).append(merge_signature)
 
     usable_clusters = [cluster for cluster in clusters if int(cluster.get("episodes", cluster.get("touches", 0))) >= max(1, int(min_touches))]
-    if not usable_clusters and clusters:
-        usable_clusters = sorted(
-            clusters,
-            key=lambda cluster: (
-                float(cluster.get("score", 0.0)),
-                int(cluster.get("episodes", cluster.get("touches", 0))),
-                int(cluster.get("touches", 0)),
-            ),
-            reverse=True,
-        )[:1]
 
     current_price = _pick_first_current_price(results)
     formatted_levels: List[Dict[str, Any]] = []
@@ -2309,7 +2298,7 @@ def merge_support_resistance_results(  # noqa: C901
         "timeframe": str(timeframe),
         "mode": "auto",
         "source": "mt5_history",
-        "as_of": _format_time_iso_utc(
+        "structure_as_of": _format_time_iso_utc(
             _parse_output_time(max(end_values)) if end_values else None
         ),
         "timezone": "UTC",
@@ -2337,6 +2326,17 @@ def merge_support_resistance_results(  # noqa: C901
         "effective_tolerance_pct": float(merge_tolerance_value),
         "min_touches": int(max(1, int(min_touches))),
         "qualification_basis": "episodes",
+        "score_basis": {
+            "scale": "unbounded_nonnegative",
+            "definition": (
+                "base reaction, recency, and volume strength minus breakout "
+                "penalties plus role-reversal and multi-timeframe bonuses"
+            ),
+            "comparison": (
+                "rank within this response; use strength_score_normalized for "
+                "a relative 0-to-1 scale"
+            ),
+        },
         "max_levels": int(max_levels_value),
         "max_distance_pct": None if max_distance_value is None else float(max_distance_value),
         "volume_weighting": volume_weighting_mode,
@@ -2351,7 +2351,12 @@ def merge_support_resistance_results(  # noqa: C901
         "baseline_atr_pct": None if merge_baseline_atr_pct is None else float(merge_baseline_atr_pct),
         "decay_half_life_bars": None if decay_half_life_bars is None else int(decay_half_life_bars),
         "current_price": None if current_price is None else float(round(current_price, 6)),
-        "current_price_source": "last_completed_bar_close",
+        "current_price_source": str(
+            results[0].get("current_price_source") or "last_completed_bar_close"
+        ),
+        "reference_price_structure": results[0].get(
+            "reference_price_structure"
+        ),
         "window": {
             "start": min(start_values) if start_values else None,
             "end": max(end_values) if end_values else None,
@@ -2491,8 +2496,9 @@ def compact_support_resistance_payload(payload: Dict[str, Any]) -> Dict[str, Any
         "mode",
         "current_price",
         "current_price_source",
+        "reference_quote_as_of",
         "source",
-        "as_of",
+        "structure_as_of",
         "timezone",
         "timeframes_analyzed",
     ):
@@ -2667,6 +2673,8 @@ def compute_support_resistance_levels(
     decay_half_life_bars: Optional[int] = None,
     max_distance_pct: Optional[float] = None,
     volume_weighting: str = "off",
+    reference_price: Optional[float] = None,
+    reference_price_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     if frame is None or getattr(frame, "empty", True):
         raise ValueError("No history available")
@@ -2699,7 +2707,13 @@ def compute_support_resistance_levels(
         frame,
         volume_weighting=volume_weighting_mode,
     )
-    current_price = _last_finite(closes)
+    structure_price = _last_finite(closes)
+    current_price = _as_finite_float(reference_price)
+    if current_price is None or current_price <= 0:
+        current_price = structure_price
+        resolved_price_source = "last_completed_bar_close"
+    else:
+        resolved_price_source = str(reference_price_source or "external_reference")
     atr, adx = _compute_atr_and_adx(highs, lows, closes, period=adx_period_value)
     adaptive_settings = _resolve_adaptive_settings(
         closes,
@@ -2737,17 +2751,6 @@ def compute_support_resistance_levels(
             tolerance_pct=effective_tolerance_value,
         )
     usable_clusters = [cluster for cluster in clusters if int(cluster.get("episodes", cluster["touches"])) >= min_touches_value]
-    if not usable_clusters and clusters:
-        usable_clusters = sorted(
-            clusters,
-            key=lambda cluster: (
-                float(cluster.get("score", 0.0)),
-                int(cluster.get("episodes", cluster.get("touches", 0))),
-                int(cluster.get("touches", 0)),
-                int(cluster.get("last_index", -1)),
-            ),
-            reverse=True,
-        )[:1]
 
     formatted_levels = [
         _format_level(
@@ -2805,7 +2808,7 @@ def compute_support_resistance_levels(
         "timeframe": timeframe,
         "mode": "single",
         "source": "mt5_history",
-        "as_of": _format_time_iso_utc(window_end),
+        "structure_as_of": _format_time_iso_utc(window_end),
         "timezone": "UTC",
         "timeframes_analyzed": [str(timeframe)] if timeframe is not None else [],
         "limit": int(limit) if limit is not None else len(frame),
@@ -2814,6 +2817,17 @@ def compute_support_resistance_levels(
         "effective_tolerance_pct": float(effective_tolerance_value),
         "min_touches": int(min_touches_value),
         "qualification_basis": "episodes",
+        "score_basis": {
+            "scale": "unbounded_nonnegative",
+            "definition": (
+                "base reaction, recency, and volume strength minus breakout "
+                "penalties plus role-reversal and multi-timeframe bonuses"
+            ),
+            "comparison": (
+                "rank within this response; use strength_score_normalized for "
+                "a relative 0-to-1 scale"
+            ),
+        },
         "max_levels": int(max_levels_value),
         "max_distance_pct": None if max_distance_value is None else float(max_distance_value),
         "volume_weighting": volume_weighting_mode,
@@ -2827,7 +2841,10 @@ def compute_support_resistance_levels(
         "baseline_atr_pct": adaptive_settings["baseline_atr_pct"],
         "decay_half_life_bars": int(half_life_value),
         "current_price": None if current_price is None else float(round(current_price, 6)),
-        "current_price_source": "last_completed_bar_close",
+        "current_price_source": resolved_price_source,
+        "reference_price_structure": (
+            None if structure_price is None else float(round(structure_price, 6))
+        ),
         "window": {
             "start": _format_time(window_start),
             "end": _format_time(window_end),

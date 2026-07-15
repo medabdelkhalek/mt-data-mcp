@@ -458,7 +458,7 @@ def data_fetch_candles(
     - Data denoising and smoothing
     - Data simplification for large datasets
     - Defaults to closed candles only; set include_incomplete=true to keep the latest forming candle
-    - Set allow_stale=true to return the latest available closed bars even when freshness checks would normally fail
+    - Set allow_stale=true to return the latest available closed bars even when freshness checks would normally fail; bounded historical ranges do not use the live-feed freshness gate
     - Includes metadata for forming-candle handling (for example has_forming_candle and incomplete_candles_skipped)
     
     Parameters:
@@ -512,7 +512,10 @@ def data_fetch_candles(
         Keep the latest forming candle instead of trimming it. Defaults to false.
 
     allow_stale : bool, optional
-        Return the latest available closed bars even if they fall outside the normal freshness window. Defaults to false.
+        Return the latest available closed bars even if they fall outside the normal
+        freshness window. This only affects unbounded latest-N queries; requests with
+        start or end bounds are historical and bypass live-feed freshness checks.
+        Defaults to false.
 
     explain_indicators : bool, optional
         When true, add compact latest-value interpretation notes for common
@@ -605,13 +608,13 @@ def wait_event(
     timeframe: TimeframeLiteral = "M1",
     wait_next_bar: bool = False,
     watch_tick_count_spike: bool = True,
-    max_wait_seconds: Optional[float] = 300.0,
+    max_wait_seconds: Optional[float] = 15.0,
     poll_interval_seconds: Optional[float] = None,
     watch_for: Optional[List[Dict[str, Any]]] = None,
     end_on: Optional[List[Dict[str, Any]]] = None,
     detail: DetailLiteral = "compact",
 ) -> Dict[str, Any]:
-    """Wait for watch events on a symbol until the next timeframe boundary.
+    """BLOCKING: Wait for watch events until a match, boundary, or timeout.
 
     Defaults to M1 for faster event polling; set `timeframe="H1"` for hourly
     candle/event boundaries.
@@ -631,9 +634,9 @@ def wait_event(
     its default watcher set. For boundary-only waits, pass `watch_for=[]` and
     rely on `timeframe` or explicit `end_on` candle-close events.
 
-    `max_wait_seconds` defaults to 300 seconds on the public tool surface so
-    CLI calls have an explicit timebox. Set it to null to use no timeout, or
-    raise it for longer candle-boundary waits.
+    `max_wait_seconds` defaults to 15 seconds on the public tool surface so
+    interactive and agent calls have a short timebox. Set it to null to use no
+    timeout, or raise it explicitly for longer long-lived transport waits.
     Set `poll_interval_seconds` to tune polling cadence; omit it to use the
     engine default.
 

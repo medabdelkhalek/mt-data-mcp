@@ -67,20 +67,26 @@ def test_market_scan_error_uses_standard_error_envelope():
     from mtdata.core.symbols import _market_scan_error
 
     result = _market_scan_error(
-        "Timed out.",
-        code="tool_timeout",
+        "Scan failed.",
+        code="market_scan_failed",
         request={"group": "Forex"},
         stats={"processed": 10},
     )
 
     assert result["success"] is False
-    assert result["error"] == "Timed out."
-    assert result["error_code"] == "tool_timeout"
+    assert result["error"] == "Scan failed."
+    assert result["error_code"] == "market_scan_failed"
     assert result["operation"] == "market_scan"
     assert isinstance(result.get("request_id"), str)
     assert result["meta"]["request"] == {"group": "Forex"}
     assert result["meta"]["stats"] == {"processed": 10}
-    assert "symbols_top_markets" in result["related_tools"]
+    assert "remediation" not in result
+
+
+def test_high_volume_preset_ranks_without_unrelated_price_filter() -> None:
+    from mtdata.core.symbols import _MARKET_SCAN_PRESETS
+
+    assert _MARKET_SCAN_PRESETS["high_volume"] == {"rank_by": "tick_volume"}
 
 
 def test_market_scan_freshness_summary_counts_bool_like_stale_flags():
@@ -939,9 +945,6 @@ class TestMarketScan:
             "data_source",
             "time",
             "data_stale",
-            "market_status",
-            "market_status_reason",
-            "freshness_policy_relaxed",
             "freshness",
             "close",
             "price_change_pct",
@@ -950,6 +953,9 @@ class TestMarketScan:
             "spread_points",
             "spread_pips",
         }.issubset(row)
+        assert "market_status" not in row
+        assert "market_status_reason" not in row
+        assert "freshness_policy_relaxed" not in row
         assert row["time"].endswith("Z")
         assert row["spread_pips"] == 1.0
         assert mock_rates.call_args.args[2:] == (0, 3)
@@ -1033,6 +1039,9 @@ class TestMarketScan:
         assert "returned_count" not in result
         assert result["total_count"] == 3
         assert result["has_more"] is True
+        assert result["message"].startswith(
+            "Showing 1 of 3 symbols matching the requested market scan filters."
+        )
         assert result["meta"]["request"]["offset"] == 1
 
     @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)

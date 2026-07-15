@@ -8,7 +8,7 @@ import pandas as pd
 from ..patterns.common import interval_overlap_ratio as _interval_overlap_ratio
 from ..utils.regime_heuristics import infer_market_regime
 from ..utils.time import _format_time_minimal
-from ..utils.utils import _safe_float
+from ..utils.coercion import safe_float as _safe_float
 from ..utils.utils import to_float_np as __to_float_np
 
 _STOCK_PATTERN_CODE_TO_NAME = {
@@ -602,7 +602,8 @@ def _compact_patterns_payload(
     except Exception:
         total_i = len(rows)
 
-    signal_bias = _summarize_pattern_bias(rows)
+    signal_rows = [row for row in rows if row.get("signal_eligible") is not False]
+    signal_bias = _summarize_pattern_bias(signal_rows)
     signal: Dict[str, Any] = {}
     if signal_bias:
         signal = _summarize_pattern_review(signal_bias) or {}
@@ -630,7 +631,9 @@ def _compact_patterns_payload(
             if key == "confidence":
                 value = _round_confidence(value)
             if value not in (None, ""):
-                strongest_compact[key] = value
+                strongest_compact[
+                    "match_score" if key == "confidence" else key
+                ] = value
         time_value = _first_present(
             strongest_row,
             "time",
@@ -676,12 +679,15 @@ def _compact_patterns_payload(
             "confidence",
             "wave_count",
             "candidate_note",
+            "age_bars",
+            "is_recent",
+            "bias_scope",
         ):
             value = row.get(key)
             if key == "confidence":
                 value = _round_confidence(value)
             if value not in (None, ""):
-                item[key] = value
+                item["match_score" if key == "confidence" else key] = value
         time_value = (
             row.get("time")
             or row.get("end_date")
@@ -749,18 +755,26 @@ def _compact_patterns_payload(
             and top_patterns
         ):
             visible_confidences = [
-                _safe_float(item.get("confidence"))
+                _safe_float(item.get("match_score"))
                 for item in top_patterns
-                if _safe_float(item.get("confidence")) is not None
+                if _safe_float(item.get("match_score")) is not None
             ]
             if visible_confidences:
                 max_visible_confidence = max(float(value) for value in visible_confidences)
                 if max_visible_confidence >= 0.5:
-                    compact["max_pattern_confidence"] = _round_confidence(max_visible_confidence)
+                    compact["max_pattern_match_score"] = _round_confidence(
+                        max_visible_confidence
+                    )
                     compact["bias_suppressed_reason"] = (
                         "visible patterns are neutral or lack directional bias; "
                         "aggregate confidence measures directional bias, not max single-pattern score"
                     )
+    elif rows and not signal_rows:
+        compact["review_recommended"] = False
+        compact["pattern_status"] = "historical"
+        compact["bias_suppressed_reason"] = (
+            "all visible patterns are completed historical structures outside the recent window"
+        )
     if signal_bias and _should_expose_directional_bias(signal_bias, signal):
         compact["bias"] = signal_bias.get("net_bias")
         compact["dominant_direction"] = signal_bias.get("dominant_direction")

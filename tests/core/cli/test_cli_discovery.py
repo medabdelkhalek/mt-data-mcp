@@ -44,8 +44,8 @@ from mtdata.core.cli.api import (
     _apply_schema_overrides,
     _extract_function_from_tool_obj,
     _extract_metadata_from_tool_obj,
-    _is_typed_dict_type,
     _is_literal_origin,
+    _is_typed_dict_type,
     _is_union_origin,
     _type_name,
     _unwrap_optional_type,
@@ -53,7 +53,6 @@ from mtdata.core.cli.api import (
     discover_tools,
     get_function_info,
 )
-
 
 # ========================================================================
 # get_function_info
@@ -949,6 +948,11 @@ class TestCreateCommandFunction:
         output = capsys.readouterr().out
         assert "Missing required argument(s): symbol." in output
         assert "Use symbols_list to browse available broker symbols." in output
+        assert "success" in output
+        assert "false" in output.lower()
+        assert "cli_missing_required" in output
+        assert "operation" in output
+        assert "request_id" in output
         mock_fn.assert_not_called()
 
     def test_trade_place_missing_required_warns_about_live_orders(self, capsys):
@@ -974,8 +978,39 @@ class TestCreateCommandFunction:
         output = capsys.readouterr().out
         assert "Missing required argument(s): symbol, volume, order_type." in output
         assert "LIVE ORDER WARNING" in output
-        assert "--dry-run true" in output
+        assert "--dry-run false" in output
+        assert "Preview mode is the default" in output
         mock_fn.assert_not_called()
+
+    def test_trade_place_accepts_durable_idempotency_key(self, capsys):
+        mock_fn = MagicMock(return_value={"success": True})
+        func_info = {
+            "func": mock_fn,
+            "params": [
+                {"name": "symbol", "type": str, "required": True, "default": None},
+                {
+                    "name": "idempotency_key",
+                    "type": Optional[str],
+                    "required": False,
+                    "default": None,
+                },
+            ],
+        }
+        cmd_fn = create_command_function(func_info, cmd_name="trade_place")
+        args = argparse.Namespace(
+            symbol="EURUSD",
+            idempotency_key="retry-1",
+            json=True,
+            verbose=False,
+        )
+
+        status = cmd_fn(args)
+
+        assert status == 0
+        capsys.readouterr()
+        mock_fn.assert_called_once_with(
+            symbol="EURUSD", idempotency_key="retry-1", __cli_raw=True
+        )
 
     def test_missing_required_literal_argument_shows_valid_values(self, capsys):
         mock_fn = MagicMock(return_value={"ok": True})

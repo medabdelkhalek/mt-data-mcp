@@ -10,10 +10,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from ...bootstrap.settings import trade_guardrails_config
-from ...shared.constants import TIMEFRAME_MAP
+from ...shared.constants import BROKER_VOLUME_UNIT, TIMEFRAME_MAP
 from ...shared.result import Err, Ok, Result, to_dict
 from ...shared.validators import invalid_timeframe_error
 from ...utils.barriers import normalize_trade_direction
+from ...utils.coercion import round_finite
 from ...utils.mt5 import (
     MT5ConnectionError,
     _ensure_symbol_ready,
@@ -31,7 +32,12 @@ from ..execution_logging import (
 )
 from ..output_contract import resolve_output_contract
 from . import validation
-from .idempotency import IdempotencyStore
+from .idempotency import (
+    IdempotencyStore,
+    SQLiteIdempotencyStore,
+    create_default_idempotency_store,
+)
+from .sizing import _floor_volume_steps
 from .requests import (
     TradeCloseRequest,
     TradeGetOpenRequest,
@@ -43,15 +49,40 @@ from .requests import (
     TradeStressTestRequest,
     TradeVarCvarRequest,
 )
-from .safety import evaluate_trade_guardrails, preview_trade_guardrails
+from .safety import (
+    assess_margin_stress,
+    evaluate_trade_guardrails,
+    preview_trade_guardrails,
+)
 from .sizing import _resolve_risk_tick_value, compute_kelly_sizing_context
 
 logger = logging.getLogger(__name__)
 _DEFAULT_TRADE_HISTORY_LOOKBACK_DAYS = 7
-_TRADE_IDEMPOTENCY_STORE = IdempotencyStore()
+TradeIdempotencyStore = IdempotencyStore | SQLiteIdempotencyStore
+_TRADE_IDEMPOTENCY_STORE = create_default_idempotency_store()
 _TRADE_HISTORY_RANGE_HINT = (
     "Try narrowing the range with --minutes-back, --days, --start, or --end."
 )
+_SUPPORTED_ORDER_TYPES = (
+    "BUY",
+    "SELL",
+    "BUY_LIMIT",
+    "BUY_STOP",
+    "SELL_LIMIT",
+    "SELL_STOP",
+)
+
+
+def _invalid_order_type_payload(message: str) -> Dict[str, Any]:
+    return {
+        "error": message,
+        "error_code": "invalid_order_type",
+        "valid_values": {"order_type": list(_SUPPORTED_ORDER_TYPES)},
+        "remediation": "Choose a market side or an explicit pending-order type.",
+        "example": "mtdata-cli trade_place EURUSD --order-type BUY --volume 0.01",
+    }
+
+
 _TRADE_PLACE_PREVIEW_KEYS = (
     "success",
     "error",
@@ -60,6 +91,7 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "no_action",
     "no_action_reason",
     "would_send_order",
+    "dry_run_simulated",
     "symbol",
     "order_type",
     "pending",
@@ -69,6 +101,7 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "bid",
     "ask",
     "spread_points",
+    "spread_pips",
     "spread_pct",
     "estimated_fill_price",
     "entry_price",
@@ -85,9 +118,16 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "preview_error",
     "message",
     "dry_run_note",
+    "preview_ok",
+    "validation_passed",
+    "validation_scope",
+    "actionability",
     "validation",
+    "preview_checks_performed",
+    "broker_validation_not_performed",
     "require_sl_tp",
     "auto_close_on_sl_tp_fail",
+    "guardrails_enabled",
     "magic",
     "comment",
     "requested_price",
@@ -147,15 +187,7 @@ def _human_join(items: List[str]) -> str:
 
 
 def _round_optional_number(value: Any, digits: int) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        number = float(value)
-    except Exception:
-        return None
-    if not math.isfinite(number):
-        return None
-    return round(number, int(digits))
+    return round_finite(value, digits, on_invalid="none")
 
 
 def _coerce_warning_list(value: Any) -> List[str]:
@@ -272,6 +304,18 @@ def _normalize_idempotency_key(value: Any) -> Optional[str]:
     return key or None
 
 
+def _annotate_idempotency_scope(
+    result: Dict[str, Any],
+    key: Optional[str],
+    store: Optional[TradeIdempotencyStore],
+) -> Dict[str, Any]:
+    if key is not None:
+        result.setdefault("idempotency_key", key)
+        result.setdefault("idempotency_scope", getattr(store, "scope", "unknown"))
+        result.setdefault("idempotency_durable", bool(getattr(store, "durable", False)))
+    return result
+
+
 def _build_trade_request_signature(request: Any) -> Optional[str]:
     if request is None:
         return None
@@ -340,7 +384,7 @@ def _should_persist_idempotency_outcome(result: Any) -> bool:
 
 
 def _record_or_release_idempotency(
-    store: Optional[IdempotencyStore],
+    store: Optional[TradeIdempotencyStore],
     key: Optional[str],
     result: Any,
     *,
@@ -362,7 +406,7 @@ def _record_or_release_idempotency(
 
 def _begin_trade_idempotency(
     *,
-    idempotency_store: Optional[IdempotencyStore],
+    idempotency_store: Optional[TradeIdempotencyStore],
     key: Optional[str],
     request_signature: Optional[str],
 ) -> tuple[Optional[Dict[str, Any]], bool]:
@@ -387,6 +431,16 @@ def _begin_trade_idempotency(
             ),
             "idempotency_key": key,
             "idempotency_conflict": True,
+        }, False
+    if duplicate.get("in_progress"):
+        return {
+            "error": (
+                "An earlier request with this idempotency key is still unresolved. "
+                "The retry was suppressed to avoid a duplicate live trade."
+            ),
+            "error_code": "idempotency_request_in_progress",
+            "idempotency_key": key,
+            "idempotency_in_progress": True,
         }, False
     original_outcome = duplicate.get("original_outcome")
     if not isinstance(original_outcome, dict):
@@ -856,26 +910,6 @@ def _extract_trade_risk_kelly_inputs(
     return inputs, missing, source
 
 
-def _floor_volume_steps(raw_volume: float, volume_step: float) -> int:
-    if volume_step <= 0 or not math.isfinite(raw_volume):
-        return 0
-    step_ratio = raw_volume / volume_step
-    step_count = math.floor(step_ratio)
-    if step_count < 0:
-        return 0
-
-    next_step_count = step_count + 1
-    next_volume = float(next_step_count) * float(volume_step)
-    if next_volume >= raw_volume:
-        snap_tolerance = max(
-            math.ulp(float(raw_volume)) * 256.0,
-            math.ulp(next_volume) * 256.0,
-        )
-        if next_volume - float(raw_volume) <= snap_tolerance:
-            return next_step_count
-    return step_count
-
-
 def _normalize_var_cvar_method(method: Any) -> tuple[Optional[str], Optional[str]]:
     method_text = str(method or "historical").strip().lower()
     if method_text in {"historical", "hist"}:
@@ -1080,7 +1114,7 @@ def run_trade_place(  # noqa: C901
     close_positions: Any,
     safe_int_ticket: Any,
     build_dry_run_preview: Any = None,
-    idempotency_store: Optional[IdempotencyStore] = _TRADE_IDEMPOTENCY_STORE,
+    idempotency_store: Optional[TradeIdempotencyStore] = _TRADE_IDEMPOTENCY_STORE,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     missing: List[str] = []
@@ -1111,6 +1145,7 @@ def run_trade_place(  # noqa: C901
             operation="trade_place",
             default_error_code="trade_place_error",
         )
+        result = _annotate_idempotency_scope(result, idempotency_key, idempotency_store)
         if not idempotency_consumed:
             if _record_or_release_idempotency(
                 idempotency_store,
@@ -1141,6 +1176,7 @@ def run_trade_place(  # noqa: C901
 
     try:
         dry_run_missing_protection: List[str] = []
+        dry_run_protection_error: Optional[Dict[str, Any]] = None
 
         def _dry_run_preview(
             *,
@@ -1148,6 +1184,7 @@ def run_trade_place(  # noqa: C901
             pending: bool,
             normalized_expiration: Any,
             expiration_provided: bool,
+            guardrail_preview: Dict[str, Any],
         ) -> Dict[str, Any]:
             preview_detail = _resolve_trade_place_preview_detail(request)
             validation_scope = "local_preview_plus_estimates"
@@ -1162,6 +1199,8 @@ def run_trade_place(  # noqa: C901
                 f"missing_{field_name}"
                 for field_name in dry_run_missing_protection
             ]
+            if dry_run_protection_error is not None:
+                local_blockers.append("invalid_protection_levels")
             preview: Dict[str, Any] = {
                 "success": True,
                 "dry_run": True,
@@ -1178,6 +1217,7 @@ def run_trade_place(  # noqa: C901
                 "message": "Dry run only. No order was sent to MT5.",
                 "validation_scope": validation_scope,
                 "validation_passed": not local_blockers,
+                "preview_ok": not local_blockers,
                 "validation": {
                     "local_requirements_passed": not local_blockers,
                     "live_submission_eligible": not local_blockers,
@@ -1202,7 +1242,15 @@ def run_trade_place(  # noqa: C901
                     broker_validation_not_performed
                 ),
                 "warnings": [
-                    "Dry run only. Routing and local safety checks passed; MT5/broker validation was not executed.",
+                    (
+                        "Dry run only. Local safety requirements failed; no order "
+                        "was sent and MT5/broker validation was not executed."
+                        if local_blockers
+                        else (
+                            "Dry run only. Routing and local safety checks passed; "
+                            "MT5/broker validation was not executed."
+                        )
+                    ),
                     (
                         "Not validated in dry run: broker acceptance/enforcement, margin "
                         "reservation, fillability, and broker-side SL/TP attachment."
@@ -1210,14 +1258,8 @@ def run_trade_place(  # noqa: C901
                 ],
                 "require_sl_tp": bool(request.require_sl_tp),
                 "auto_close_on_sl_tp_fail": bool(request.auto_close_on_sl_tp_fail),
-                "guardrails_preview": preview_trade_guardrails(
-                    trade_guardrails_config,
-                    symbol=symbol_norm,
-                    volume=float(request.volume),
-                    stop_loss=request.stop_loss,
-                    deviation=request.deviation,
-                    side=_guardrail_order_side(order_type),
-                ),
+                "guardrails_enabled": bool(guardrail_preview.get("enabled")),
+                "guardrails_preview": guardrail_preview,
             }
             if dry_run_missing_protection:
                 preview["dry_run_note"] = (
@@ -1226,7 +1268,19 @@ def run_trade_place(  # noqa: C901
                     "require_sl_tp=false."
                 )
                 preview["actionability"] = "blocked_by_local_requirements"
-            if callable(build_dry_run_preview):
+            if dry_run_protection_error is not None:
+                preview.update(
+                    {
+                        "sl_tp_valid": False,
+                        "sl_tp_error": dry_run_protection_error.get("error"),
+                        "preview_error": dry_run_protection_error.get("error"),
+                        "error_code": dry_run_protection_error.get(
+                            "error_code",
+                            "invalid_protection_levels",
+                        ),
+                    }
+                )
+            elif callable(build_dry_run_preview):
                 preview.update(
                     build_dry_run_preview(
                         symbol=symbol_norm,
@@ -1244,15 +1298,43 @@ def run_trade_place(  # noqa: C901
             except Exception:
                 sl_tp_invalid = False
             if sl_tp_invalid:
+                validation_payload = preview.get("validation")
+                if isinstance(validation_payload, dict):
+                    validation_payload["local_requirements_passed"] = False
+                    validation_payload["live_submission_eligible"] = False
+                    blockers = validation_payload.setdefault("blockers", [])
+                    if "invalid_protection_levels" not in blockers:
+                        blockers.append("invalid_protection_levels")
+                preview["validation_passed"] = False
+                preview["preview_ok"] = False
                 sl_tp_error = str(preview.get("sl_tp_error") or "").strip()
                 if sl_tp_error:
                     preview["preview_error"] = sl_tp_error
                     preview.setdefault("error_code", "invalid_protection_levels")
+            if local_blockers and not preview.get("preview_error"):
+                preview["success"] = False
+                preview["error_code"] = "trade_preview_validation_failed"
+                preview["error"] = (
+                    "Dry-run validation failed: " + ", ".join(local_blockers) + "."
+                )
+                preview["no_action_reason"] = "dry_run_validation_failed"
             preview_error = str(preview.get("preview_error") or "").strip()
             if preview_error:
                 preview["success"] = False
                 preview["error"] = preview_error
-                preview.setdefault("error_code", "trade_preview_error")
+                preview.setdefault(
+                    "error_code",
+                    preview.get("preview_error_code") or "trade_preview_error",
+                )
+                validation_payload = preview.get("validation")
+                if isinstance(validation_payload, dict):
+                    validation_payload["live_submission_eligible"] = False
+                    blockers = validation_payload.setdefault("blockers", [])
+                    blocker = str(preview.get("error_code") or "preview_error")
+                    if blocker not in blockers:
+                        blockers.append(blocker)
+                preview["validation_passed"] = False
+                preview["preview_ok"] = False
                 preview["actionability"] = "preview_failed"
                 preview["no_action"] = True
                 preview["no_action_reason"] = "dry_run_preview_error"
@@ -1313,18 +1395,21 @@ def run_trade_place(  # noqa: C901
 
         order_type_norm, order_type_error = normalize_order_type_input(request.order_type)
         if order_type_error:
-            return _finish({"error": order_type_error}, order_type=order_type_norm)
+            return _finish(
+                _invalid_order_type_payload(order_type_error),
+                order_type=order_type_norm,
+            )
         explicit_pending_types = {"BUY_LIMIT", "BUY_STOP", "SELL_LIMIT", "SELL_STOP"}
         market_side_types = {"BUY", "SELL"}
         supported_order_types = explicit_pending_types.union(market_side_types)
         if order_type_norm not in supported_order_types:
             return _finish(
-                {
-                    "error": (
+                _invalid_order_type_payload(
+                    (
                         f"Unsupported order_type '{request.order_type}'. "
                         "Use BUY/SELL or BUY_LIMIT/BUY_STOP/SELL_LIMIT/SELL_STOP."
                     )
-                },
+                ),
                 order_type=order_type_norm,
             )
 
@@ -1384,6 +1469,44 @@ def run_trade_place(  # noqa: C901
             order_type_norm in explicit_pending_types
             or (expiration_provided and not ignore_market_gtc_expiration)
         )
+        if (
+            not is_pending
+            and bool(request.require_sl_tp)
+            and not bool(request.auto_close_on_sl_tp_fail)
+        ):
+            return _finish(
+                {
+                    "error": (
+                        "Conflicting safety settings: require_sl_tp=true cannot be "
+                        "combined with auto_close_on_sl_tp_fail=false for a market order."
+                    ),
+                    "error_code": "conflicting_sl_tp_safety_settings",
+                    "require_sl_tp": True,
+                    "auto_close_on_sl_tp_fail": False,
+                    "hint": (
+                        "Keep auto_close_on_sl_tp_fail=true to ensure an unprotected "
+                        "fill is closed, or set require_sl_tp=false to manage a failed "
+                        "protection attachment yourself."
+                    ),
+                },
+                order_type=order_type_norm,
+                pending=False,
+            )
+        basic_protection_error = validation._validate_basic_protection_levels(
+            side=order_type_norm,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            entry_price=request.price if is_pending else None,
+        )
+        if basic_protection_error is not None:
+            if bool(request.dry_run):
+                dry_run_protection_error = basic_protection_error
+            else:
+                return _finish(
+                    basic_protection_error,
+                    order_type=order_type_norm,
+                    pending=is_pending,
+                )
         if bool(request.require_sl_tp) and not is_pending:
             missing_protection: List[str] = []
             if request.stop_loss in (None, 0):
@@ -1487,6 +1610,7 @@ def run_trade_place(  # noqa: C901
                     pending=is_pending,
                     normalized_expiration=normalized_expiration,
                     expiration_provided=expiration_provided,
+                    guardrail_preview=guardrail_preview,
                 ),
                 order_type=order_type_norm,
                 pending=is_pending,
@@ -1556,11 +1680,7 @@ def run_trade_place(  # noqa: C901
                         warnings_out.append(critical)
                     if warnings_out:
                         result["warnings"] = warnings_out
-                    # require_sl_tp implies auto-close on protection failure so
-                    # the flag is not a false sense of safety post-fill.
-                    should_auto_close = bool(request.auto_close_on_sl_tp_fail) or bool(
-                        request.require_sl_tp
-                    )
+                    should_auto_close = bool(request.auto_close_on_sl_tp_fail)
                     if should_auto_close:
                         close_ticket = safe_int_ticket(pos_ticket)
                         if close_ticket is None:
@@ -1677,7 +1797,7 @@ def run_trade_modify(
     normalize_pending_expiration: Any,
     modify_pending_order: Any,
     modify_position: Any,
-    idempotency_store: Optional[IdempotencyStore] = _TRADE_IDEMPOTENCY_STORE,
+    idempotency_store: Optional[TradeIdempotencyStore] = _TRADE_IDEMPOTENCY_STORE,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     idempotency_key = _normalize_idempotency_key(getattr(request, "idempotency_key", None))
@@ -1700,6 +1820,7 @@ def run_trade_modify(
         pending: Optional[bool] = None,
     ) -> Dict[str, Any]:
         nonlocal idempotency_consumed
+        result = _annotate_idempotency_scope(result, idempotency_key, idempotency_store)
         if not idempotency_consumed:
             if _record_or_release_idempotency(
                 idempotency_store,
@@ -1942,6 +2063,30 @@ def run_trade_close(  # noqa: C901
                 ],
             },
             scope="bulk_confirmation",
+        )
+
+    if (
+        request.ticket is None
+        and request.symbol is None
+        and not request.close_all
+        and not request.profit_only
+        and not request.loss_only
+        and request.dry_run
+    ):
+        return _finish(
+            {
+                "error": (
+                    "Close preview requires an explicit scope: specify ticket=<ticket>, "
+                    "symbol=<symbol>, or close_all=true."
+                ),
+                "error_code": "CLOSE_SCOPE_REQUIRED",
+                "alternatives": [
+                    "Use ticket=<ticket_number> to preview a specific close",
+                    "Use symbol=<symbol> to preview positions for one symbol",
+                    "Pass close_all=true to preview all matching positions",
+                ],
+            },
+            scope="request",
         )
 
     if request.ticket is None and not request.close_all and not request.dry_run:
@@ -2723,15 +2868,14 @@ def run_trade_history(  # noqa: C901
                     return {"error": "page requires a positive limit."}
                 offset_value = int((page_value - 1) * int(limit_value))
             if (limit_value or offset_value) and "__sort_utc" in df.columns:
-                df = df.sort_values("__sort_utc")
+                df = df.sort_values(
+                    "__sort_utc",
+                    ascending=str(request.order).lower() == "asc",
+                )
             if offset_value:
-                end_idx = max(0, len(df) - offset_value)
-                df = df.iloc[:end_idx]
+                df = df.iloc[offset_value:]
             if limit_value and len(df) > limit_value:
-                if "__sort_utc" in df.columns:
-                    df = df.tail(limit_value)
-                else:
-                    df = df.tail(limit_value)
+                df = df.head(limit_value)
             if "__sort_utc" in df.columns:
                 df = df.drop(columns=["__sort_utc"])
 
@@ -2838,6 +2982,7 @@ def run_trade_risk_analyze(  # noqa: C901
                 return {"error": "Failed to get account info"}
 
             equity = validation._safe_float_attr(account, "equity", 0.0)
+            margin_stress = assess_margin_stress(account)
             currency = getattr(account, "currency", None)
             positions = (
                 gateway.positions_get(symbol=request.symbol)
@@ -2934,6 +3079,7 @@ def run_trade_risk_analyze(  # noqa: C901
                     risk_pct = None
                     reward_currency = None
                     rr_ratio = None
+                    reward_status = "undefined"
                     risk_status = "undefined"
                     position_type = validation._safe_int_attr(
                         pos, "type", position_type_sell
@@ -2946,7 +3092,8 @@ def run_trade_risk_analyze(  # noqa: C901
                             if is_buy_position
                             else (sl_price - entry_price) / tick_size
                         )
-                        risk_currency = abs(risk_ticks * risk_tick_value * volume)
+                        risk_ticks = max(0.0, risk_ticks)
+                        risk_currency = risk_ticks * risk_tick_value * abs(volume)
                         risk_pct = (
                             (risk_currency / equity) * 100.0 if equity > 0 else 0.0
                         )
@@ -2959,9 +3106,15 @@ def run_trade_risk_analyze(  # noqa: C901
                                 if is_buy_position
                                 else (entry_price - tp_price) / tick_size
                             )
-                            reward_currency = abs(reward_ticks * tick_value * volume)
-                            if risk_currency > 0:
-                                rr_ratio = reward_currency / risk_currency
+                            if reward_ticks > 0:
+                                reward_currency = (
+                                    reward_ticks * tick_value * abs(volume)
+                                )
+                                reward_status = "defined"
+                                if risk_currency > 0:
+                                    rr_ratio = reward_currency / risk_currency
+                            else:
+                                reward_status = "invalid"
                     elif sl_price:
                         risk_status = "undefined"
                         risk_calculation_failures.append(
@@ -2982,6 +3135,11 @@ def run_trade_risk_analyze(  # noqa: C901
                             "symbol": pos.symbol,
                             "type": "BUY" if is_buy_position else "SELL",
                             "volume": volume,
+                            "volume_unit": "broker_lot",
+                            "contract_size": round(contract_size, 6),
+                            "lot_definition": (
+                                "1 broker lot equals contract_size contract units."
+                            ),
                             "entry": entry_price,
                             "sl": sl_price,
                             "tp": tp_price,
@@ -2999,6 +3157,7 @@ def run_trade_risk_analyze(  # noqa: C901
                             "reward_currency": _round_optional_number(
                                 reward_currency, 2
                             ),
+                            "reward_status": reward_status,
                             "rr_ratio": _round_optional_number(rr_ratio, 2),
                         }
                     )
@@ -3100,6 +3259,7 @@ def run_trade_risk_analyze(  # noqa: C901
                         risk_pct = None
                         reward_currency = None
                         rr_ratio = None
+                        reward_status = "undefined"
                         risk_status = "undefined"
                         if entry_price > 0 and sl_price and tick_size > 0 and tick_value_valid and direction_label != "UNKNOWN":
                             risk_ticks = (
@@ -3117,9 +3277,15 @@ def run_trade_risk_analyze(  # noqa: C901
                                     if is_buy_order
                                     else (entry_price - tp_price) / tick_size
                                 )
-                                reward_currency = abs(reward_ticks * tick_value * volume)
-                                if risk_currency > 0:
-                                    rr_ratio = reward_currency / risk_currency
+                                if reward_ticks > 0:
+                                    reward_currency = (
+                                        reward_ticks * tick_value * abs(volume)
+                                    )
+                                    reward_status = "defined"
+                                    if risk_currency > 0:
+                                        rr_ratio = reward_currency / risk_currency
+                                else:
+                                    reward_status = "invalid"
                         elif sl_price:
                             risk_calculation_failures.append(
                                 {
@@ -3140,6 +3306,11 @@ def run_trade_risk_analyze(  # noqa: C901
                                 "symbol": getattr(order, "symbol", None),
                                 "type": direction_label,
                                 "volume": volume,
+                                "volume_unit": "broker_lot",
+                                "contract_size": round(contract_size, 6),
+                                "lot_definition": (
+                                    "1 broker lot equals contract_size contract units."
+                                ),
                                 "entry": entry_price,
                                 "sl": sl_price,
                                 "tp": tp_price,
@@ -3153,6 +3324,7 @@ def run_trade_risk_analyze(  # noqa: C901
                                     contract_price_product, 2
                                 ),
                                 "reward_currency": _round_optional_number(reward_currency, 2),
+                                "reward_status": reward_status,
                                 "rr_ratio": _round_optional_number(rr_ratio, 2),
                             }
                         )
@@ -3177,12 +3349,21 @@ def run_trade_risk_analyze(  # noqa: C901
                 (total_notional_exposure / equity) * 100.0 if equity > 0 else 0.0
             )
 
-            if total_risk_pct > 10:
-                quantified_risk_level = "high"
-            elif total_risk_pct > 5:
-                quantified_risk_level = "moderate"
-            else:
-                quantified_risk_level = "low"
+            stop_risk_level = "high" if total_risk_pct > 10 else "moderate" if total_risk_pct > 5 else "low"
+            margin_risk_level = (
+                "high" if margin_stress["status"] == "critical"
+                else "moderate" if margin_stress["status"] == "stressed"
+                else "low" if margin_stress["status"] == "healthy" else "unknown"
+            )
+            notional_risk_level = (
+                "high" if notional_exposure_pct >= 400.0
+                else "moderate" if notional_exposure_pct >= 200.0 else "low"
+            )
+            risk_rank = {"unknown": -1, "low": 0, "moderate": 1, "high": 2}
+            quantified_risk_level = max(
+                (stop_risk_level, margin_risk_level, notional_risk_level),
+                key=lambda value: risk_rank[value],
+            )
 
             if positions_without_sl > 0 or pending_orders_without_sl > 0:
                 overall_risk_status = "unlimited"
@@ -3195,6 +3376,13 @@ def run_trade_risk_analyze(  # noqa: C901
                 "equity": round(equity, 2),
                 "currency": currency,
             }
+            leverage = validation._safe_float_attr(account, "leverage", 0.0)
+            margin_used = validation._safe_float_attr(account, "margin", 0.0)
+            margin_free = validation._safe_float_attr(account, "margin_free", 0.0)
+            if leverage > 0:
+                account_payload["leverage"] = round(leverage, 2)
+            account_payload["margin_used"] = round(margin_used, 2)
+            account_payload["margin_free"] = round(margin_free, 2)
             account_login = getattr(account, "login", None)
             if account_login is not None:
                 account_payload = {"login": account_login, **account_payload}
@@ -3205,6 +3393,10 @@ def run_trade_risk_analyze(  # noqa: C901
                 "portfolio_risk": {
                     "overall_risk_status": overall_risk_status,
                     "quantified_risk_level": quantified_risk_level,
+                    "stop_risk_level": stop_risk_level,
+                    "margin_risk_level": margin_risk_level,
+                    "notional_risk_level": notional_risk_level,
+                    "margin_stress": margin_stress,
                     "total_risk_currency": round(total_risk_currency, 2),
                     "total_risk_pct": round(total_risk_pct, 2),
                     "open_position_risk_currency": round(open_position_risk_currency, 2),
@@ -3219,6 +3411,12 @@ def run_trade_risk_analyze(  # noqa: C901
                     ),
                     "notional_exposure": round(total_notional_exposure, 2),
                     "notional_exposure_pct": round(notional_exposure_pct, 2),
+                    "notional_to_equity": round(
+                        total_notional_exposure / equity, 4
+                    ) if equity > 0 else None,
+                    "account_leverage": round(leverage, 2) if leverage > 0 else None,
+                    "margin_used": round(margin_used, 2),
+                    "margin_free": round(margin_free, 2),
                     "open_position_notional_exposure": round(open_position_notional_exposure, 2),
                     "contingent_pending_notional_exposure": round(total_pending_notional_exposure, 2),
                     "notional_exposure_complete": (
@@ -3233,9 +3431,13 @@ def run_trade_risk_analyze(  # noqa: C901
                     "risk_currency": "account_currency",
                     "notional_value": "account_currency_linearized",
                     "notional_exposure": "account_currency_linearized",
+                    "notional_to_equity": "ratio",
+                    "volume": "broker_lot",
+                    "contract_size": "contract_units_per_lot",
                     "contract_price_product": "contract_size_times_price",
                 },
             }
+            portfolio_sizing_blocked = False
             if request.symbol:
                 other_positions_count = None
                 if portfolio_positions_total is not None:
@@ -3258,7 +3460,15 @@ def run_trade_risk_analyze(  # noqa: C901
                         else {}
                     ),
                 }
+                scoped_risk = result.pop("portfolio_risk")
+                result["scoped_risk"] = scoped_risk
+                result["risk_visibility"] = (
+                    "partial" if other_positions_count else "symbol_scope"
+                )
                 if other_positions_count:
+                    portfolio_sizing_blocked = True
+                    scoped_risk["overall_risk_status"] = "partial"
+                    scoped_risk["quantified_risk_level"] = "unknown"
                     result["scope_warning"] = (
                         f"No open {request.symbol} positions matched; "
                         f"{int(other_positions_count)} open position(s) exist on other symbols."
@@ -3269,6 +3479,7 @@ def run_trade_risk_analyze(  # noqa: C901
                         )
                     )
             else:
+                result["risk_visibility"] = "portfolio"
                 result["scope"] = {
                     "mode": "portfolio",
                     "matched_positions": len(position_risks),
@@ -3468,6 +3679,29 @@ def run_trade_risk_analyze(  # noqa: C901
                     )
                 )
             )
+            if sizing_ready and (
+                portfolio_sizing_blocked
+                or margin_stress["status"] == "critical"
+            ):
+                block_reason = (
+                    "Symbol scope hides open positions on other symbols."
+                    if portfolio_sizing_blocked
+                    else "Account margin stress is critical."
+                )
+                result["position_sizing_error"] = _build_position_sizing_error(
+                    code="portfolio_safety_block",
+                    reason=block_reason,
+                    remediation=(
+                        "Review the full portfolio and reduce margin pressure "
+                        "before sizing a new trade."
+                    ),
+                    details={
+                        "risk_visibility": result.get("risk_visibility"),
+                        "margin_stress": margin_stress,
+                    },
+                )
+                result.pop("position_sizing", None)
+                sizing_ready = False
             if sizing_ready:
                 if not request.symbol:
                     return {"error": "symbol is required for position sizing"}
@@ -3673,7 +3907,7 @@ def run_trade_risk_analyze(  # noqa: C901
                             "notional_value": 0.0,
                             "units": {
                                 "account_currency": currency,
-                                "volume": "lots",
+                                "volume": BROKER_VOLUME_UNIT,
                                 "risk_currency": "account_currency",
                                 "risk_pct": "percent_of_equity",
                                 "price": "symbol_price",
@@ -3916,7 +4150,7 @@ def run_trade_risk_analyze(  # noqa: C901
                         "notional_value": _round_optional_number(notional_value, 2),
                         "units": {
                             "account_currency": currency,
-                            "volume": "lots",
+                            "volume": BROKER_VOLUME_UNIT,
                             "risk_currency": "account_currency",
                             "risk_pct": "percent_of_equity",
                             "price": "symbol_price",

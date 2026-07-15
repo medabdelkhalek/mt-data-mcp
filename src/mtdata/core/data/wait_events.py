@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from ...shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
-from ...utils.mt5 import _normalize_times_in_struct, _to_server_query_dt
 from ...utils.market_metadata import build_tick_freshness_context
+from ...utils.mt5 import _normalize_times_in_struct, _to_server_query_dt
+from ...utils.tick_flags import is_mt5_trade_event
 from ...utils.time import format_epoch_utc
 from ..trading.time import _next_candle_wait_payload, _sleep_until_next_candle
 from .requests import (
@@ -61,6 +62,14 @@ _MARKET_EVENT_TYPES = {
     "price_enter_zone",
     "pending_near_fill",
     "stop_threat",
+}
+_MARKET_METRIC_EVENT_TYPES = {
+    "price_change",
+    "volume_spike",
+    "tick_count_spike",
+    "spread_spike",
+    "tick_count_drought",
+    "range_expansion",
 }
 
 
@@ -141,6 +150,12 @@ def run_wait_event_loop(
     )
     if isinstance(market_state, dict) and "error" in market_state:
         return market_state
+    if not request.accept_preexisting:
+        _prime_market_metric_latches(
+            watch_for=watch_for,
+            market_state=market_state,
+            gateway=gateway,
+        )
     if request.accept_preexisting:
         preexisting_match = _find_preexisting_match(
             watch_for=watch_for,
@@ -199,6 +214,9 @@ def run_wait_event_loop(
             snapshot=snapshot,
             gateway=gateway,
             live_state_cutoff_utc=evaluation_at_utc if crossed_boundary is not None else None,
+            event_start_utc=(
+                None if request.accept_preexisting else started_at_utc
+            ),
         )
         if matched_event is not None:
             return _build_wait_result(
@@ -936,6 +954,14 @@ def _collect_snapshot(
         )
         if isinstance(refreshed, dict) and "error" in refreshed:
             return refreshed
+        alignment_error = _market_quote_alignment_error(
+            gateway=gateway,
+            market_state=refreshed,
+            market_specs=market_specs,
+            observed_at_utc=observed_at_utc,
+        )
+        if alignment_error is not None:
+            return alignment_error
         market_data: Dict[str, Any] = {}
         for symbol in _market_symbols(market_specs):
             state = refreshed.get(symbol) or {}
@@ -1165,6 +1191,7 @@ def _evaluate_watch_events(  # noqa: C901
     snapshot: Dict[str, Any],
     gateway: Any,
     live_state_cutoff_utc: Optional[datetime] = None,
+    event_start_utc: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     for spec in watch_for:
         event_type = spec["type"]
@@ -1271,6 +1298,7 @@ def _evaluate_watch_events(  # noqa: C901
                 snapshot=snapshot,
                 gateway=gateway,
                 live_state_cutoff_utc=live_state_cutoff_utc,
+                event_start_utc=event_start_utc,
             )
             if match is not None:
                 return match
@@ -1688,43 +1716,82 @@ def _evaluate_market_event(
     snapshot: Dict[str, Any],
     gateway: Any,
     live_state_cutoff_utc: Optional[datetime] = None,
+    event_start_utc: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     event_type = str(spec.get("type") or "")
+    match: Optional[Dict[str, Any]] = None
     if event_type == "price_change":
-        return _evaluate_price_change(spec, market_data)
-    if event_type in {"volume_spike", "tick_count_spike"}:
-        return _evaluate_volume_spike(spec, market_data)
-    if event_type == "spread_spike":
-        return _evaluate_spread_spike(spec, market_data)
-    if event_type == "tick_count_drought":
-        return _evaluate_tick_count_drought(spec, market_data)
-    if event_type == "range_expansion":
-        return _evaluate_range_expansion(spec, market_data)
-    if event_type == "price_touch_level":
-        return _evaluate_price_touch_level(spec, market_data)
-    if event_type == "price_break_level":
-        return _evaluate_price_break_level(spec, market_data)
-    if event_type == "price_enter_zone":
-        return _evaluate_price_enter_zone(spec, market_data)
-    if event_type == "pending_near_fill":
+        match = _evaluate_price_change(spec, market_data)
+    elif event_type in {"volume_spike", "tick_count_spike"}:
+        match = _evaluate_volume_spike(spec, market_data)
+    elif event_type == "spread_spike":
+        match = _evaluate_spread_spike(spec, market_data)
+    elif event_type == "tick_count_drought":
+        match = _evaluate_tick_count_drought(spec, market_data)
+    elif event_type == "range_expansion":
+        match = _evaluate_range_expansion(spec, market_data)
+    elif event_type == "price_touch_level":
+        match = _evaluate_price_touch_level(
+            spec,
+            market_data,
+            event_start_utc=event_start_utc,
+        )
+    elif event_type == "price_break_level":
+        match = _evaluate_price_break_level(
+            spec,
+            market_data,
+            event_start_utc=event_start_utc,
+        )
+    elif event_type == "price_enter_zone":
+        match = _evaluate_price_enter_zone(
+            spec,
+            market_data,
+            event_start_utc=event_start_utc,
+        )
+    elif event_type == "pending_near_fill":
         if live_state_cutoff_utc is not None:
             return None
-        return _evaluate_pending_near_fill(
+        match = _evaluate_pending_near_fill(
             spec,
             snapshot.get("orders", []),
             market_data,
             gateway=gateway,
         )
-    if event_type == "stop_threat":
+    elif event_type == "stop_threat":
         if live_state_cutoff_utc is not None:
             return None
-        return _evaluate_stop_threat(
+        match = _evaluate_stop_threat(
             spec,
             snapshot.get("positions", []),
             market_data,
             gateway=gateway,
         )
-    return None
+    if event_type in _MARKET_METRIC_EVENT_TYPES and event_start_utc is not None:
+        if bool(spec.get("_preexisting_match_latched")):
+            if match is None:
+                spec["_preexisting_match_latched"] = False
+            return None
+    return match
+
+
+def _prime_market_metric_latches(
+    *,
+    watch_for: List[Dict[str, Any]],
+    market_state: Dict[str, Any],
+    gateway: Any,
+) -> None:
+    """Suppress already-satisfied rolling metrics until they clear once."""
+    for spec in watch_for:
+        event_type = str(spec.get("type") or "")
+        if event_type not in _MARKET_METRIC_EVENT_TYPES:
+            continue
+        match = _evaluate_market_event(
+            spec,
+            (market_state or {}).get(spec.get("symbol")),
+            snapshot={"baseline": {}},
+            gateway=gateway,
+        )
+        spec["_preexisting_match_latched"] = match is not None
 
 
 def _evaluate_price_change(spec: Dict[str, Any], market_data: Any) -> Optional[Dict[str, Any]]:
@@ -1948,7 +2015,12 @@ def _event_price_points(spec: Dict[str, Any], market_data: Any) -> List[tuple[fl
     return prices
 
 
-def _evaluate_price_touch_level(spec: Dict[str, Any], market_data: Any) -> Optional[Dict[str, Any]]:
+def _evaluate_price_touch_level(
+    spec: Dict[str, Any],
+    market_data: Any,
+    *,
+    event_start_utc: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
     prices = _event_price_points(spec, market_data)
     if len(prices) < 2:
         return None
@@ -1959,6 +2031,8 @@ def _evaluate_price_touch_level(spec: Dict[str, Any], market_data: Any) -> Optio
     direction = str(spec.get("direction") or "either")
     matched_pair = None
     for previous, current in zip(prices, prices[1:]):
+        if event_start_utc is not None and float(current[0]) <= event_start_utc.timestamp():
+            continue
         previous_price = float(previous[1])
         current_price = float(current[1])
         upward_touch = previous_price < lower and current_price >= lower
@@ -1994,7 +2068,12 @@ def _evaluate_price_touch_level(spec: Dict[str, Any], market_data: Any) -> Optio
     }
 
 
-def _evaluate_price_break_level(spec: Dict[str, Any], market_data: Any) -> Optional[Dict[str, Any]]:
+def _evaluate_price_break_level(
+    spec: Dict[str, Any],
+    market_data: Any,
+    *,
+    event_start_utc: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
     prices = _event_price_points(spec, market_data)
     confirm_ticks = max(1, int(spec.get("confirm_ticks") or 1))
     if len(prices) < confirm_ticks + 1:
@@ -2007,7 +2086,13 @@ def _evaluate_price_break_level(spec: Dict[str, Any], market_data: Any) -> Optio
     matched_window = None
     for end in range(confirm_ticks + 1, len(prices) + 1):
         previous_price = float(prices[end - confirm_ticks - 1][1])
-        confirmed_prices = [float(price) for _, price in prices[end - confirm_ticks : end]]
+        confirmed_points = prices[end - confirm_ticks : end]
+        if event_start_utc is not None and any(
+            float(epoch) <= event_start_utc.timestamp()
+            for epoch, _ in confirmed_points
+        ):
+            continue
+        confirmed_prices = [float(price) for _, price in confirmed_points]
         breakout_up = previous_price < lower and all(price >= upper for price in confirmed_prices)
         breakout_down = previous_price > upper and all(price <= lower for price in confirmed_prices)
         if (
@@ -2042,7 +2127,12 @@ def _evaluate_price_break_level(spec: Dict[str, Any], market_data: Any) -> Optio
     }
 
 
-def _evaluate_price_enter_zone(spec: Dict[str, Any], market_data: Any) -> Optional[Dict[str, Any]]:
+def _evaluate_price_enter_zone(
+    spec: Dict[str, Any],
+    market_data: Any,
+    *,
+    event_start_utc: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
     prices = _event_price_points(spec, market_data)
     if len(prices) < 2:
         return None
@@ -2051,6 +2141,8 @@ def _evaluate_price_enter_zone(spec: Dict[str, Any], market_data: Any) -> Option
     direction = str(spec.get("direction") or "either")
     matched_pair = None
     for previous, current in zip(prices, prices[1:]):
+        if event_start_utc is not None and float(current[0]) <= event_start_utc.timestamp():
+            continue
         previous_price = float(previous[1])
         current_price = float(current[1])
         crosses_zone = not (
@@ -2456,6 +2548,17 @@ def _wait_result_quote_payload(
                 now_epoch=observed_at_utc.timestamp(),
             )
         )
+    bid = _finite_number(payload.get("bid"))
+    ask = _finite_number(payload.get("ask"))
+    if bid is not None and ask is not None:
+        spread_valid = bool(ask > bid)
+        payload["spread_valid"] = spread_valid
+        payload["spread_quality"] = (
+            "two_sided" if spread_valid else "locked_or_one_sided"
+        )
+        payload["quote_usable"] = bool(
+            spread_valid and payload.get("usable_for_live_trading") is True
+        )
     precision = _symbol_price_precision_from_gateway(gateway, symbol=symbol)
     if precision is not None:
         payload["price_precision"] = precision
@@ -2502,6 +2605,88 @@ def _latest_quote_row_from_gateway(gateway: Any, *, symbol: str) -> Any:
         return gateway.symbol_info_tick(symbol)
     except Exception:
         return None
+
+
+def _quote_mid_from_row(row: Any) -> Optional[float]:
+    bid = _finite_number(_row_value(row, "bid"))
+    ask = _finite_number(_row_value(row, "ask"))
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    return bid if bid is not None else ask
+
+
+def _quote_alignment_tolerance(
+    *,
+    history_row: Any,
+    live_row: Any,
+    symbol_info: Any,
+) -> float:
+    candidates: List[float] = []
+    for row in (history_row, live_row):
+        bid = _finite_number(_row_value(row, "bid"))
+        ask = _finite_number(_row_value(row, "ask"))
+        if bid is not None and ask is not None and ask >= bid:
+            candidates.append((ask - bid) * 12.0)
+    for attr, multiplier in (("trade_tick_size", 10.0), ("point", 20.0)):
+        try:
+            value = float(getattr(symbol_info, attr, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        if math.isfinite(value) and value > 0.0:
+            candidates.append(value * multiplier)
+    return max(candidates or [1e-8])
+
+
+def _market_quote_alignment_error(
+    *,
+    gateway: Any,
+    market_state: Dict[str, Any],
+    market_specs: List[Dict[str, Any]],
+    observed_at_utc: datetime,
+) -> Optional[Dict[str, Any]]:
+    """Fail closed when history ticks diverge from the executable quote."""
+    for symbol in _market_symbols(market_specs):
+        history_row = _latest_quote_row_from_market_state(
+            market_state,
+            symbol=symbol,
+        )
+        live_row = _latest_quote_row_from_gateway(gateway, symbol=symbol)
+        history_mid = _quote_mid_from_row(history_row)
+        live_mid = _quote_mid_from_row(live_row)
+        if history_mid is None or live_mid is None:
+            continue
+        try:
+            symbol_info = gateway.symbol_info(symbol)
+        except Exception:
+            symbol_info = None
+        tolerance = _quote_alignment_tolerance(
+            history_row=history_row,
+            live_row=live_row,
+            symbol_info=symbol_info,
+        )
+        difference = abs(history_mid - live_mid)
+        if difference <= tolerance:
+            continue
+        history_epoch = _finite_number(_row_value(history_row, "epoch"))
+        live_epoch = _finite_number(_row_value(live_row, "time"))
+        return {
+            "error": (
+                f"Wait-event tick history for {symbol} diverges from the executable "
+                f"quote by {difference:g}, above the {tolerance:g} alignment tolerance."
+            ),
+            "error_code": "WAIT_EVENT_QUOTE_DIVERGENCE",
+            "diagnostics": {
+                "symbol": symbol,
+                "history_mid": history_mid,
+                "live_mid": live_mid,
+                "difference": difference,
+                "tolerance": tolerance,
+                "history_tick_epoch": history_epoch,
+                "live_tick_epoch": live_epoch,
+                "observed_at_utc": observed_at_utc.isoformat(),
+            },
+        }
+    return None
 
 
 def _quote_payload_from_row(row: Any) -> Dict[str, Any]:
@@ -3092,10 +3277,17 @@ def _resolve_market_volume_source(
 ) -> str:
     if preferred != "auto":
         return str(preferred)
-    has_real = any(_finite_number(tick.get("volume_real")) not in (None, 0.0) for tick in ticks)
+    trade_ticks = [tick for tick in ticks if is_mt5_trade_event(tick.get("flags"))]
+    has_real = any(
+        _finite_number(tick.get("volume_real")) not in (None, 0.0)
+        for tick in trade_ticks
+    )
     if has_real:
         return "volume_real"
-    has_volume = any(_finite_number(tick.get("volume")) not in (None, 0.0) for tick in ticks)
+    has_volume = any(
+        _finite_number(tick.get("volume")) not in (None, 0.0)
+        for tick in trade_ticks
+    )
     if has_volume:
         return "volume"
     if window_kind == "minutes":
@@ -3176,10 +3368,13 @@ def _volume_metric_for_ticks(ticks: List[Dict[str, Any]], *, source: str) -> Opt
         return None
     if source == "tick_count":
         return float(len(ticks))
+    trade_ticks = [tick for tick in ticks if is_mt5_trade_event(tick.get("flags"))]
+    if not trade_ticks:
+        return 0.0
     if source == "volume_real":
-        values = [_finite_number(tick.get("volume_real")) for tick in ticks]
+        values = [_finite_number(tick.get("volume_real")) for tick in trade_ticks]
     else:
-        values = [_finite_number(tick.get("volume")) for tick in ticks]
+        values = [_finite_number(tick.get("volume")) for tick in trade_ticks]
     clean = [float(value) for value in values if value is not None]
     if not clean:
         return None

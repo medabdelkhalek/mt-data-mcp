@@ -86,6 +86,8 @@ def test_eval_candidate_handles_method_selection_and_failures(monkeypatch):
         m = kwargs["methods"][0]
         if m == "bad":
             return {"results": {m: {"success": False}}}
+        if m == "nested_metric":
+            return {"results": {m: {"success": True, "metrics": {"sharpe_ratio": 2.5}}}}
         if m == "missing_metric":
             return {"results": {m: {"success": True, "avg_mae": 2.5}}}
         return {"results": {m: {"success": True, "avg_rmse": 1.2}}}
@@ -126,12 +128,39 @@ def test_eval_candidate_handles_method_selection_and_failures(monkeypatch):
         horizon=2,
         steps=2,
         spacing=1,
+        candidate_params={"method": "nested_metric"},
+        metric="sharpe_ratio",
+        mode="max",
+    )
+    assert score == -2.5
+    assert result["_sel_method"] == "nested_metric"
+
+    score, result = tune._eval_candidate(
+        symbol="EURUSD",
+        timeframe="H1",
+        method=None,
+        horizon=2,
+        steps=2,
+        spacing=1,
         candidate_params={"method": "missing_metric"},
         metric="avg_rmse",
         mode="max",
     )
-    assert score == -2.5
-    assert result["_sel_method"] == "missing_metric"
+    assert score == float("inf")
+
+    score, _ = tune._eval_candidate(
+        symbol="EURUSD",
+        timeframe="H1",
+        method="theta",
+        horizon=2,
+        steps=2,
+        spacing=1,
+        candidate_params={"method": "bad"},
+        metric="avg_rmse",
+        mode="max",
+    )
+    assert score == float("inf")
+    assert "Requested metric 'avg_rmse'" in result["tuning_error"]
 
     score, result = tune._eval_candidate(
         symbol="EURUSD",
@@ -205,6 +234,51 @@ def test_genetic_search_method_scoped_and_flat_spaces(monkeypatch):
     assert out["success"] is True
     assert out["mode"] == "max"
     assert out["history_count"] == 6
+
+
+def test_genetic_search_fails_when_all_trials_fail(monkeypatch):
+    monkeypatch.setattr(
+        tune,
+        "_eval_candidate",
+        lambda **kwargs: (float("inf"), {"error": "backtest failed"}),
+    )
+
+    out = tune.genetic_search_forecast_params(
+        symbol="EURUSD",
+        timeframe="H1",
+        method="theta",
+        search_space={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        mode="max",
+        population=2,
+        generations=1,
+    )
+
+    assert out["success"] is False
+    assert out["error_code"] == "no_successful_trials"
+
+
+def test_optuna_search_fails_when_all_trials_fail(monkeypatch):
+    pytest.importorskip("optuna")
+    monkeypatch.setattr(
+        tune,
+        "_eval_candidate",
+        lambda **kwargs: (float("inf"), {"error": "backtest failed"}),
+    )
+
+    out = tune.optuna_search_forecast_params(
+        symbol="EURUSD",
+        timeframe="H1",
+        method="theta",
+        search_space={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        mode="max",
+        n_trials=2,
+        sampler="random",
+        pruner="none",
+    )
+
+    assert out["success"] is False
+    assert out["error_code"] == "no_successful_trials"
+    assert out["history_count"] == 2
 
 
 def test_optuna_search_method_scoped_and_flat_spaces(monkeypatch):

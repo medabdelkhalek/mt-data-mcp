@@ -31,7 +31,7 @@ from ..patterns.harmonic import (
 from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
 from ..shared.validators import invalid_timeframe_error
 from ..utils.coercion import UNPARSED_BOOL, parse_bool_like
-from ..utils.denoise import _apply_denoise as _apply_denoise_util
+from ..utils.denoise import apply_denoise as apply_denoise_util
 from ..utils.denoise import normalize_denoise_spec as _normalize_denoise_spec
 from ..utils.mt5 import (
     _mt5_copy_rates_from,
@@ -212,7 +212,7 @@ def _fetch_pattern_data(
         try:
             dn = _normalize_denoise_spec(denoise, default_when='pre_ti')
             if dn:
-                _apply_denoise_util(df, dn, default_when='pre_ti')
+                apply_denoise_util(df, dn, default_when='pre_ti')
         except Exception as exc:
             warning = f"Denoise failed for pattern detection on {symbol} {timeframe}; raw prices were used."
             logger.warning(warning, exc_info=True)
@@ -748,8 +748,8 @@ def _format_fractal_patterns(
                 "end_date": end_date,
                 "direction": str(p.direction),
                 "bias": bias,
-                "price": float(p.price),
-                "level_price": float(p.price),
+                "price": _round_value(p.price),
+                "level_price": _round_value(p.price),
                 "details": details,
             }
             if current_close is not None:
@@ -788,6 +788,8 @@ def _format_harmonic_patterns(
 ) -> List[Dict[str, Any]]:
     pats = _detect_harmonic_patterns(df, cfg)
     out_list: List[Dict[str, Any]] = []
+    n_bars = len(df)
+    recent_bars = max(3, min(20, round(n_bars * 0.05)))
     for p in pats:
         try:
             start_date, end_date = _format_pattern_dates(p.start_time, p.end_time)
@@ -831,6 +833,12 @@ def _format_harmonic_patterns(
                 },
                 "details": details,
             }
+            age_bars = max(0, n_bars - 1 - int(p.end_index))
+            is_recent = age_bars < recent_bars
+            row["age_bars"] = age_bars
+            row["is_recent"] = is_recent
+            row["signal_eligible"] = is_recent
+            row["bias_scope"] = "current" if is_recent else "historical_structure"
             if target_1 is not None:
                 row["target_price"] = float(target_1)
                 row["target_price_1"] = float(target_1)
@@ -1266,7 +1274,7 @@ def _attach_pattern_usage_notice(result: Dict[str, Any]) -> None:
     if compact_shape:
         result.setdefault(
             "confidence_basis",
-            "confidence/pattern_confidence are heuristic pattern scores (0-1), not historical win rates",
+            "match_score is per-pattern heuristic fit; pattern_confidence is aggregate directional strength. Neither is a historical win rate.",
         )
         return
     result.setdefault(
@@ -1341,7 +1349,8 @@ def patterns_detect(
         Minimum gap between patterns (in bars)
     
     robust_only : bool, optional (default=False)
-        Only return high-confidence patterns
+        Restrict candlestick detection to a curated subset of established
+        multi-bar pattern types. This does not change `min_strength`.
     
     whitelist : str, optional
         Candlestick mode only. Comma-separated list of specific candlestick
@@ -1465,3 +1474,4 @@ def patterns_detect(
         detail=request.detail,
         func=_run,
     )
+

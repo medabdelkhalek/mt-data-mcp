@@ -73,7 +73,7 @@ def test_market_depth_tick_fallback_includes_price_display() -> None:
     assert out["data"]["bid"] == 65601.0
     assert out["data"]["ask"] == 65601.5
     assert out["data"]["last"] == 65601.0
-    assert out["data"]["time"] == "2023-11-14T22:13Z"
+    assert out["data"]["time"] == "2023-11-14T22:13:20Z"
     assert out["data"]["time_epoch"] == 1700000000
     assert out["units"] == {"volume": "mt5_tick_volume"}
     assert isinstance(out.get("query_latency_ms"), float)
@@ -334,7 +334,7 @@ def test_market_ticker_returns_lightweight_spread_snapshot() -> None:
     assert out["ask"] == 201.0
     assert out["spread_pct"] == 0.498753
     assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
-    assert out["market_state"] == "unknown"
+    assert "market_state" not in out
     assert out["contract_size"] == 1.0
     assert out["units"]["contract_size"] == "contract_units_per_lot"
     assert out["units"]["lot"] == "broker_lot"
@@ -342,7 +342,8 @@ def test_market_ticker_returns_lightweight_spread_snapshot() -> None:
     assert out["pricing_basis"] == "per_1_lot_estimate"
     assert out["pricing_basis_units"] == "broker_lot"
     assert out["freshness"].startswith("stale, tick ")
-    assert out["time"] == "2023-11-14T22:13Z"
+    assert out["time"] == "2023-11-14T22:13:20Z"
+    assert out["time_epoch"] == 1700000000.0
     assert "spread" not in out
     assert "spread" not in out["units"]
     assert "spread_points" not in out
@@ -350,7 +351,9 @@ def test_market_ticker_returns_lightweight_spread_snapshot() -> None:
     assert "spread_pips" not in out["units"]
     assert "spread_pct_display" not in out
     assert "data_stale" not in out
-    assert "data_age_seconds" not in out
+    assert out["data_age_seconds"] > out["stale_after_seconds"]
+    assert out["freshness_state"] == "stale"
+    assert out["usable_for_live_trading"] is False
     assert "data_age_hours" not in out
     assert "warning" not in out
     assert "last" not in out
@@ -415,7 +418,7 @@ def test_market_ticker_compact_detail_omits_verbose_fields() -> None:
     assert out["ask"] == 201.0
     assert out["spread_pct"] == 0.498753
     assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
-    assert out["market_state"] == "unknown"
+    assert "market_state" not in out
     assert out["contract_size"] == 1.0
     assert out["freshness"].startswith("stale, tick ")
     assert "spread_display" not in out
@@ -425,7 +428,7 @@ def test_market_ticker_compact_detail_omits_verbose_fields() -> None:
     assert "spread_pct_display" not in out
     assert "last" not in out
     assert "tick_volume" not in out
-    assert out["time"] == "2023-11-14T22:13Z"
+    assert out["time"] == "2023-11-14T22:13:20Z"
     assert "time_display" not in out
     assert "data_stale" not in out
     assert out["stale_after_seconds"] == 300
@@ -463,7 +466,7 @@ def test_market_ticker_none_detail_uses_compact_output() -> None:
 
     assert out["success"] is True
     assert out["spread_pct"] == 0.498753
-    assert out["market_state"] == "unknown"
+    assert "market_state" not in out
     assert out["contract_size"] == 1.0
     assert "spread" not in out
     assert "diagnostics" not in out
@@ -498,7 +501,8 @@ def test_market_ticker_price_field_returns_simple_price() -> None:
     assert out["price"] == pytest.approx(1.17229)
     assert out["price_precision"] == 5
     assert out["price_currency"] == "USD"
-    assert out["time_display"] == "2023-11-14T22:13Z"
+    assert out["time"] == "2023-11-14T22:13:20Z"
+    assert out["time_epoch"] == 1700000000.0
     assert out["data_age_seconds"] >= 0
     assert out["stale_after_seconds"] == 300
     assert out["data_stale"] is True
@@ -808,16 +812,30 @@ def test_market_ticker_rewrites_invalid_symbol_selection_error() -> None:
     with patch("mtdata.core.market_depth.mt5") as mt5:
         mt5.symbol_select.return_value = False
         mt5.last_error.return_value = (-1, "Terminal: Call failed")
+        mt5.symbols_get.return_value = [
+            SimpleNamespace(
+                name="FAKESYMBOL.NAS",
+                description="Fake Symbol CFD",
+                path="Stocks\\NASDAQ",
+            )
+        ]
 
         out = _raw_market_ticker("FAKESYMBOL")
 
     assert out["error"] == "Symbol 'FAKESYMBOL' was not found or is not available in MT5."
     assert out["success"] is False
-    assert out["error_code"] == "market_ticker_symbol_unavailable"
+    assert out["error_code"] == "symbol_not_found"
     assert out["operation"] == "market_ticker"
     assert out["request_id"]
     assert "symbols_list(search_term='FAKESYMBOL')" in out["remediation"]
     assert "symbols_search" not in out["remediation"]
+    assert out["details"]["did_you_mean"] == [
+        {
+            "symbol": "FAKESYMBOL.NAS",
+            "description": "Fake Symbol CFD",
+            "group": "Stocks\\NASDAQ",
+        }
+    ]
 
 
 def test_market_ticker_rejects_empty_quote_snapshot() -> None:

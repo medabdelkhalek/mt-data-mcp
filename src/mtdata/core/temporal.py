@@ -6,11 +6,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from ..services.data_service import (
-    _resolve_live_rate_auto_shift_seconds,
-    _shift_rate_times,
-)
 from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
+from ..shared.symbols import is_probably_forex_symbol
 from ..shared.schema import DetailLiteral, TimeframeLiteral
 from ..shared.validators import (
     invalid_timeframe_error,
@@ -25,6 +22,7 @@ from ..utils.mt5 import (
     get_symbol_info_cached,
     mt5,
 )
+from ..utils.coercion import safe_float as _safe_float
 from ..utils.time import (
     _format_time_minimal,
     _format_time_minimal_local,
@@ -32,7 +30,6 @@ from ..utils.time import (
 )
 from ..utils.utils import (
     _parse_start_datetime,
-    _safe_float,
 )
 from ._mcp_instance import mcp
 from .execution_logging import run_logged_operation
@@ -96,6 +93,18 @@ _SESSION_DEFINITION = {
         "new_york_close": "16:00",
     },
 }
+_FX_SESSION_DEFINITION = {
+    **_SESSION_DEFINITION,
+    "calendar": "fx",
+    "market_local_hours": {
+        "tokyo_open": "09:00",
+        "london_open": "08:00",
+        "london_close": "17:00",
+        "new_york_open": "08:00",
+        "new_york_close": "17:00",
+    },
+}
+_SESSION_DEFINITION["calendar"] = "equity"
 _TOKYO_TZ = ZoneInfo("Asia/Tokyo")
 _LONDON_TZ = ZoneInfo("Europe/London")
 _NEW_YORK_TZ = ZoneInfo("America/New_York")
@@ -181,7 +190,12 @@ def _session_boundary(
     ).astimezone(analysis_tz)
 
 
-def _session_boundaries_for_day(day: date, analysis_tz: Any) -> Dict[str, datetime]:
+def _session_boundaries_for_day(
+    day: date,
+    analysis_tz: Any,
+    session_calendar: str = "equity",
+) -> Dict[str, datetime]:
+    fx = session_calendar == "fx"
     return {
         "asia_open": _session_boundary(
             day,
@@ -200,21 +214,21 @@ def _session_boundaries_for_day(day: date, analysis_tz: Any) -> Dict[str, dateti
         "ny_open": _session_boundary(
             day,
             market_tz=_NEW_YORK_TZ,
-            hour=9,
-            minute=30,
+            hour=8 if fx else 9,
+            minute=0 if fx else 30,
             analysis_tz=analysis_tz,
         ),
         "london_close": _session_boundary(
             day,
             market_tz=_LONDON_TZ,
-            hour=16,
+            hour=17 if fx else 16,
             minute=0,
             analysis_tz=analysis_tz,
         ),
         "ny_close": _session_boundary(
             day,
             market_tz=_NEW_YORK_TZ,
-            hour=16,
+            hour=17 if fx else 16,
             minute=0,
             analysis_tz=analysis_tz,
         ),
@@ -226,6 +240,7 @@ def _market_session_label(
     *,
     analysis_tz: Any = timezone.utc,
     boundary_cache: Optional[Dict[date, Dict[str, datetime]]] = None,
+    session_calendar: str = "equity",
 ) -> str:
     if not isinstance(value, datetime):
         return "unknown"
@@ -243,7 +258,11 @@ def _market_session_label(
     ):
         boundaries = cache.get(day)
         if boundaries is None:
-            boundaries = _session_boundaries_for_day(day, analysis_tz or timezone.utc)
+            boundaries = _session_boundaries_for_day(
+                day,
+                analysis_tz or timezone.utc,
+                session_calendar,
+            )
             cache[day] = boundaries
         if boundaries["asia_open"] <= dt_analysis < boundaries["london_open"]:
             return "asia"
@@ -256,8 +275,9 @@ def _market_session_label(
     return "off_session"
 
 
-def _session_definition_for_clock(clock_name: str) -> Dict[str, Any]:
-    out = dict(_SESSION_DEFINITION)
+def _session_definition_for_clock(clock_name: str, session_calendar: str = "equity") -> Dict[str, Any]:
+    source = _FX_SESSION_DEFINITION if session_calendar == "fx" else _SESSION_DEFINITION
+    out = dict(source)
     out["clock"] = clock_name or "UTC"
     return out
 
@@ -390,12 +410,12 @@ def _stats_for_group(df: pd.DataFrame, volume_col: Optional[str]) -> Dict[str, A
     ret = pd.to_numeric(df.get("__return"), errors="coerce")
     ret = ret[pd.notna(ret)]
     n = int(ret.shape[0])
-    out["returns"] = n
+    out["return_observations"] = n
     if n > 0:
-        out["avg_return"] = _rounded_temporal_float(ret.mean())
-        out["median_return"] = _rounded_temporal_float(ret.median())
-        out["volatility"] = _rounded_temporal_float(ret.std(ddof=0))
-        out["avg_abs_return"] = _rounded_temporal_float(ret.abs().mean())
+        out["avg_return_pct"] = _rounded_temporal_float(ret.mean())
+        out["median_return_pct"] = _rounded_temporal_float(ret.median())
+        out["volatility_pct"] = _rounded_temporal_float(ret.std(ddof=0))
+        out["avg_abs_return_pct"] = _rounded_temporal_float(ret.abs().mean())
         win_rate = _safe_float(round((ret > 0).sum() / float(n), 4))
         out["win_rate"] = win_rate
         out["win_rate_pct"] = (
@@ -404,10 +424,10 @@ def _stats_for_group(df: pd.DataFrame, volume_col: Optional[str]) -> Dict[str, A
             else None
         )
     else:
-        out["avg_return"] = None
-        out["median_return"] = None
-        out["volatility"] = None
-        out["avg_abs_return"] = None
+        out["avg_return_pct"] = None
+        out["median_return_pct"] = None
+        out["volatility_pct"] = None
+        out["avg_abs_return_pct"] = None
         out["win_rate"] = None
         out["win_rate_pct"] = None
 
@@ -438,10 +458,10 @@ def _compact_temporal_stats(
     keys = (
         "group_label",
         "bars",
-        "avg_return",
-        "median_return",
+        "avg_return_pct",
+        "median_return_pct",
         "win_rate_pct",
-        "volatility",
+        "volatility_pct",
     )
     if include_group and row.get("group") is not None:
         keys = ("group", *keys)
@@ -450,7 +470,7 @@ def _compact_temporal_stats(
 
 def _standard_temporal_stats(row: Dict[str, Any]) -> Dict[str, Any]:
     out = _compact_temporal_stats(row, include_group=True)
-    for key in ("returns", "avg_abs_return", "avg_range_pct", "avg_volume"):
+    for key in ("return_observations", "avg_abs_return_pct", "avg_range_pct", "avg_volume"):
         value = row.get(key)
         if value is not None:
             out[key] = value
@@ -528,9 +548,9 @@ def _flatten_temporal_dimension_groups(
             (
                 row
                 for row in formatted_rows
-                if row.get("avg_return") is not None
+                if row.get("avg_return_pct") is not None
             ),
-            key=lambda row: float(row.get("avg_return") or 0.0),
+            key=lambda row: float(row.get("avg_return_pct") or 0.0),
             default=None,
         )
         if best:
@@ -653,7 +673,7 @@ def _compact_temporal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             compact_groups, best_rows, pagination = _flatten_temporal_dimension_groups(
                 groups,
                 formatter=_compact_temporal_stats,
-                best_keys=("group", "group_label", "avg_return", "win_rate", "win_rate_pct"),
+                best_keys=("group", "group_label", "avg_return_pct", "win_rate", "win_rate_pct"),
             )
             out["groups"] = compact_groups
             if best_rows:
@@ -671,15 +691,15 @@ def _compact_temporal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             (
                 row
                 for row in compact_groups
-                if row.get("avg_return") is not None
+                if row.get("avg_return_pct") is not None
             ),
-            key=lambda row: float(row.get("avg_return") or 0.0),
+            key=lambda row: float(row.get("avg_return_pct") or 0.0),
             default=None,
         )
         if best:
             out["best"] = {
                 key: best[key]
-                for key in ("group", "group_label", "avg_return", "win_rate", "win_rate_pct")
+                for key in ("group", "group_label", "avg_return_pct", "win_rate", "win_rate_pct")
                 if key in best
             }
     elif isinstance(payload.get("overall"), dict):
@@ -745,7 +765,7 @@ def _summary_temporal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(overall, dict):
         out["overall"] = {
             key: overall.get(key)
-            for key in ("bars", "avg_return", "win_rate_pct", "volatility")
+            for key in ("bars", "avg_return_pct", "win_rate_pct", "volatility_pct")
             if overall.get(key) is not None
         }
     for key in (
@@ -770,7 +790,7 @@ def _standard_temporal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             standard_groups, best_rows, pagination = _flatten_temporal_dimension_groups(
                 groups,
                 formatter=_standard_temporal_stats,
-                best_keys=("group_label", "avg_return", "win_rate", "win_rate_pct"),
+                best_keys=("group_label", "avg_return_pct", "win_rate", "win_rate_pct"),
             )
             out["groups"] = standard_groups
             if best_rows:
@@ -788,15 +808,15 @@ def _standard_temporal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                 (
                     row
                     for row in standard_groups
-                    if row.get("avg_return") is not None
+                    if row.get("avg_return_pct") is not None
                 ),
-                key=lambda row: float(row.get("avg_return") or 0.0),
+                key=lambda row: float(row.get("avg_return_pct") or 0.0),
                 default=None,
             )
         if best:
             out["best"] = {
                 key: best[key]
-                for key in ("group_label", "avg_return", "win_rate", "win_rate_pct")
+                for key in ("group_label", "avg_return_pct", "win_rate", "win_rate_pct")
                 if key in best
             }
     overall = payload.get("overall")
@@ -833,17 +853,6 @@ def _fetch_rates(
         return None, invalid_timeframe_error(timeframe, TIMEFRAME_MAP)
     mt5_tf = TIMEFRAME_MAP[timeframe]
 
-    def _apply_live_time_alignment(rates: Any) -> Any:
-        shift_seconds = _resolve_live_rate_auto_shift_seconds(
-            symbol=symbol,
-            timeframe=timeframe,
-            start_datetime=start,
-            end_datetime=end,
-        )
-        if shift_seconds:
-            return _shift_rate_times(rates, shift_seconds)
-        return rates
-
     if start and end:
         start_dt = _parse_start_datetime(start)
         end_dt = _parse_start_datetime(end)
@@ -879,7 +888,7 @@ def _fetch_rates(
     else:
         to_dt = datetime.now(timezone.utc).replace(tzinfo=None)
     rates = _mt5_copy_rates_from(symbol, mt5_tf, to_dt, int(limit))
-    return _apply_live_time_alignment(rates), None
+    return rates, None
 
 
 @mcp.tool()
@@ -890,6 +899,7 @@ def temporal_analyze(  # noqa: C901
     start: Optional[str] = None,
     end: Optional[str] = None,
     group_by: Literal["dow", "hour", "month", "session", "all"] = "dow",
+    session_calendar: Literal["auto", "fx", "equity"] = "auto",
     day_of_week: Optional[str] = None,
     month: Optional[str] = None,
     time_range: Optional[str] = None,
@@ -929,6 +939,7 @@ def temporal_analyze(  # noqa: C901
             "symbol": symbol,
             "timeframe": timeframe,
             "group_by": group_by,
+            "session_calendar": session_calendar,
             "return_mode": return_mode,
             "lookback": lookback,
             "start": start,
@@ -954,6 +965,18 @@ def temporal_analyze(  # noqa: C901
                     context=context,
                 )
             context["group_by"] = group_norm
+            session_calendar_value = str(session_calendar or "auto").strip().lower()
+            if session_calendar_value not in {"auto", "fx", "equity"}:
+                return _error_response(
+                    "Invalid session_calendar. Use: auto, fx, equity.",
+                    stage="validate",
+                    context=context,
+                )
+            resolved_session_calendar = (
+                "fx"
+                if session_calendar_value == "auto" and is_probably_forex_symbol(symbol)
+                else "equity" if session_calendar_value == "auto" else session_calendar_value
+            )
             lookback_defaulted = lookback is None
             try:
                 effective_lookback = (
@@ -1137,6 +1160,7 @@ def temporal_analyze(  # noqa: C901
                     value,
                     analysis_tz=analysis_tz,
                     boundary_cache=session_boundary_cache,
+                    session_calendar=resolved_session_calendar,
                 )
             )
 
@@ -1403,11 +1427,13 @@ def temporal_analyze(  # noqa: C901
                 "group_by": group_norm,
                 "return_mode": return_mode,
                 "units": {
-                    "returns": _PERCENTAGE_POINTS_UNIT,
+                    "avg_return_pct": _PERCENTAGE_POINTS_UNIT,
+                    "median_return_pct": _PERCENTAGE_POINTS_UNIT,
+                    "avg_abs_return_pct": _PERCENTAGE_POINTS_UNIT,
                     "win_rate": "fraction",
                     "win_rate_pct": _PERCENTAGE_POINTS_UNIT,
                     "avg_range_pct": _PERCENTAGE_POINTS_UNIT,
-                    "volatility": "percentage_point_return_stddev_per_bar",
+                    "volatility_pct": "percentage_point_return_stddev_per_bar",
                 },
                 "timezone": tz_name,
                 "lookback": effective_lookback,
@@ -1431,7 +1457,14 @@ def temporal_analyze(  # noqa: C901
             if min_bars_value is not None:
                 payload["min_bars_applied"] = int(min_bars_value or 0)
             if group_norm in {"session", "all"}:
-                payload["session_definition"] = _session_definition_for_clock(tz_name)
+                payload["session_calendar"] = resolved_session_calendar
+                payload["session_calendar_source"] = (
+                    "symbol_inference" if session_calendar_value == "auto" else "request"
+                )
+                payload["session_definition"] = _session_definition_for_clock(
+                    tz_name,
+                    resolved_session_calendar,
+                )
             if min_bars_value is not None:
                 filters["min_bars"] = {
                     "value": int(min_bars_value or 0),

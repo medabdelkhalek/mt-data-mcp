@@ -1,15 +1,14 @@
-# Environment Variables Reference
+# Environment variables
 
-Complete reference for all environment variables recognized by mtdata. Set these in a `.env` file in the project root or export them in your shell.
+Full reference for settings mtdata reads from the environment or a project-root `.env` file. Start with MT5 login + timezone; add MCP/Web API, guardrails, and provider keys only when you need them.
 
-**Related:**
-- [SETUP.md](SETUP.md) — Installation and quick-start configuration
-- [WEB_API.md](WEB_API.md) — Web API endpoint details
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Common issues
+**Related:** [Setup](SETUP.md) · [Web API](WEB_API.md) · [Timestamps](TIMESTAMPS.md) · [Trading safety](TRADING_SAFETY.md) · [Troubleshooting](TROUBLESHOOTING.md)
+
+Never commit real credentials. Keep `.env` local.
 
 ---
 
-## MT5 Connection
+## MT5 connection
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -31,15 +30,22 @@ MT5_TIMEOUT=30
 
 ## Timezone
 
-MT5 server clocks vary by broker. Configure one of the two methods below so mtdata can normalize timestamps to UTC correctly.
+MT5 documents UTC request datetimes and returned epochs. mtdata also supports
+broker terminals that expose server-clock epochs: it detects that mode from a
+fresh tick and uses the broker setting below to normalize request bounds and
+results at the adapter boundary. Public payload timestamps remain UTC.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MT5_SERVER_TZ` | — | IANA timezone of the MT5 server (e.g. `Europe/Athens`). Handles DST automatically. |
-| `MT5_TIME_OFFSET_MINUTES` | `0` | Fixed offset from UTC in minutes (e.g. `120` for UTC+2). When set to a non-zero value, this explicit offset overrides `MT5_SERVER_TZ`. |
+| `MT5_SERVER_TZ` | — | IANA timezone used for broker session/calendar boundaries and detected server-clock conversion (e.g. `Europe/Athens`). Handles DST automatically. |
+| `MT5_TIME_OFFSET_MINUTES` | `0` | Fixed broker offset from UTC in minutes. A non-zero value overrides `MT5_SERVER_TZ`. |
 | `MT5_CLIENT_TZ` / `CLIENT_TZ` | auto-detect | IANA timezone of the local machine. `CLIENT_TZ` takes precedence if both are set. |
 
-Prefer `MT5_SERVER_TZ` because it adjusts for DST. Use `MT5_TIME_OFFSET_MINUTES` only when you do not know the server's IANA name, and avoid setting both unless you intentionally want the fixed offset to win.
+Configure these when broker-local boundaries matter or when the terminal uses
+broker server-clock epochs. Timestamp-mode detection is automatic.
+Prefer `MT5_SERVER_TZ` because it adjusts for DST. Use
+`MT5_TIME_OFFSET_MINUTES` only when you know a fixed session offset, and avoid
+setting both unless you intentionally want the fixed offset to win.
 
 ```ini
 # Option A — timezone name (recommended)
@@ -49,21 +55,15 @@ MT5_SERVER_TZ=Europe/Athens
 MT5_TIME_OFFSET_MINUTES=120
 ```
 
-To detect the offset automatically:
-
-```bash
-python scripts/detect_mt5_time_offset.py --symbol EURUSD
-```
-
 ---
 
 ## Broker Time Verification
 
-Optional runtime check that compares the MT5 server clock against known market hours.
+Optional runtime check for stale tick/bar data and implausible future UTC timestamps.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MTDATA_BROKER_TIME_CHECK` | `false` | Enable broker time verification (`1`, `true`, `yes`, or `on`) |
+| `MTDATA_BROKER_TIME_CHECK` | `false` | Enable live MT5 UTC freshness verification (`1`, `true`, `yes`, or `on`) |
 | `MTDATA_BROKER_TIME_CHECK_TTL_SECONDS` | `60` | Cache TTL for the check result (seconds) |
 
 ---
@@ -193,6 +193,8 @@ Concurrency caps and on-disk cache used by `forecast_train` / `forecast_task_*` 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MTDATA_ORDER_MAGIC` | `234000` | Magic number stamped on all orders placed by mtdata. Change this to distinguish mtdata orders from orders placed by other EAs or scripts on the same account. |
+| `MTDATA_TRADE_IDEMPOTENCY_DB` | `~/.mtdata/trade_idempotency.sqlite3` | SQLite database shared by CLI and server processes for durable `trade_place` and `trade_modify` retry suppression. All workers that can reach the same MT5 account should use the same path. |
+| `MTDATA_TRADE_IDEMPOTENCY_TTL_SECONDS` | `86400` | Retention for completed idempotency outcomes. In-progress records are not automatically expired because the broker outcome may be ambiguous after a crash. |
 
 ---
 
@@ -329,6 +331,8 @@ A starter template with all sections. Uncomment and fill in what you need.
 
 # ── Trading ────────────────────────────────────────────
 # MTDATA_ORDER_MAGIC=234000
+# MTDATA_TRADE_IDEMPOTENCY_DB=~/.mtdata/trade_idempotency.sqlite3
+# MTDATA_TRADE_IDEMPOTENCY_TTL_SECONDS=86400
 
 # ── CLI / Debug ────────────────────────────────────────
 # MTDATA_CLI_DEBUG=0

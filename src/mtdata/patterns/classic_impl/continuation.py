@@ -38,10 +38,15 @@ def detect_flags_pennants(
         return out
     idx0 = n - window
     seg = c[-window:]
-    seg_high = float(np.max(seg))
-    seg_low = float(np.min(seg))
-    bull_tip_idx_local = int(np.argmax(seg))
-    bear_tip_idx_local = int(np.argmin(seg))
+    use_high_low = bool(cfg.pivot_use_hl) and h.size == n and l.size == n
+    upper_source = h if use_high_low else c
+    lower_source = l if use_high_low else c
+    seg_h = upper_source[-window:]
+    seg_l = lower_source[-window:]
+    seg_high = float(np.max(seg_h))
+    seg_low = float(np.min(seg_l))
+    bull_tip_idx_local = int(np.argmax(seg_h))
+    bear_tip_idx_local = int(np.argmin(seg_l))
     pole_len = max(10, max_len // 2)
     fallback_base_idx = idx0 - pole_len
     if fallback_base_idx < 0:
@@ -51,8 +56,8 @@ def detect_flags_pennants(
     hist_troughs = troughs if isinstance(troughs, np.ndarray) else np.asarray([], dtype=int)
     bull_base_idx = int(hist_troughs[hist_troughs < idx0][-1]) if hist_troughs.size and np.any(hist_troughs < idx0) else int(fallback_base_idx)
     bear_base_idx = int(hist_peaks[hist_peaks < idx0][-1]) if hist_peaks.size and np.any(hist_peaks < idx0) else int(fallback_base_idx)
-    bull_base = float(c[bull_base_idx])
-    bear_base = float(c[bear_base_idx])
+    bull_base = float(lower_source[bull_base_idx])
+    bear_base = float(upper_source[bear_base_idx])
     bull_ret = (seg_high - bull_base) / max(1e-9, abs(bull_base)) * 100.0
     bear_ret = (seg_low - bear_base) / max(1e-9, abs(bear_base)) * 100.0
     if abs(bull_ret) >= abs(bear_ret):
@@ -75,8 +80,6 @@ def detect_flags_pennants(
         return out
     pole_slope_price_per_bar = (pole_tip - pole_base) / float(pole_bars)
 
-    seg_h = h[-window:] if h.size >= window else seg
-    seg_l = l[-window:] if l.size >= window else seg
     consolidation_offset = int(max(0, min(seg.size - 1, pole_tip_idx_local)))
     consolidation_seg = seg[consolidation_offset:]
     if consolidation_seg.size < 10:
@@ -93,7 +96,15 @@ def detect_flags_pennants(
         return out
 
     # build local arrays for consolidation region
-    sh, bh, r2h, sl, bl, r2l, top, bot = _fit_lines_and_arrays(peaks2, troughs2, consolidation_seg, consolidation_seg.size, cfg)
+    sh, bh, r2h, sl, bl, r2l, top, bot = _fit_lines_and_arrays(
+        peaks2,
+        troughs2,
+        consolidation_seg,
+        consolidation_seg.size,
+        cfg,
+        upper_source=consolidation_h,
+        lower_source=consolidation_l,
+    )
     dist_recent = float(np.mean((top - bot)[-max(5, consolidation_seg.size//4):]))
     dist_past = float(np.mean((top - bot)[:max(5, consolidation_seg.size//4)]))
     min_convergence_ratio = float(max(0.0, min(0.95, getattr(cfg, "pennant_min_convergence_ratio", 0.05))))
@@ -161,23 +172,23 @@ def detect_flags_pennants(
                 "breakout_index": int(idx0 + consolidation_offset + bidx_local) if bidx_local is not None else None,
                 "breakout_expected": expected,
                 "bias": "bullish" if ret > 0 else "bearish",
+                "geometry_price_source": "high_low" if use_high_low else "close",
             },
         )
         out.append(base)
 
     return out
 
-def _detect_cup_handle_variant(
+def _detect_cup_handle_window(
     c: np.ndarray,
     t: np.ndarray,
     cfg: ClassicDetectorConfig,
     *,
     invert: bool,
+    window_bars: int,
 ) -> Optional[ClassicPatternResult]:
     n = c.size
-    W = min(int(cfg.cup_handle_max_window_bars), n)
-    if W < int(cfg.cup_handle_min_window_bars):
-        return None
+    W = int(window_bars)
 
     price_seg = c[-W:]
     if invert:
@@ -191,7 +202,6 @@ def _detect_cup_handle_variant(
 
     i_max_left = int(np.argmax(seg[:i_min])) if i_min > 5 else 0
     left = float(seg[i_max_left])
-    bottom = float(seg[i_min])
     left_price = float(price_seg[i_max_left])
     extreme_price = float(price_seg[i_min])
     if left <= 0 or left_price <= 0:
@@ -308,6 +318,45 @@ def _detect_cup_handle_variant(
         int(break_i if break_i is not None else (n - 1)),
         t,
         details,
+    )
+
+
+def _detect_cup_handle_variant(
+    c: np.ndarray,
+    t: np.ndarray,
+    cfg: ClassicDetectorConfig,
+    *,
+    invert: bool,
+) -> Optional[ClassicPatternResult]:
+    min_window = int(cfg.cup_handle_min_window_bars)
+    max_window = min(int(cfg.cup_handle_max_window_bars), int(c.size))
+    if max_window < min_window:
+        return None
+
+    candidates = [
+        candidate
+        for window_bars in range(min_window, max_window + 1)
+        if (
+            candidate := _detect_cup_handle_window(
+                c,
+                t,
+                cfg,
+                invert=invert,
+                window_bars=window_bars,
+            )
+        )
+        is not None
+    ]
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate.status == "completed",
+            float(candidate.confidence),
+            int(candidate.start_index),
+        ),
     )
 
 

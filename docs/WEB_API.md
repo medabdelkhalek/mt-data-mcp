@@ -1,20 +1,18 @@
-# Web API Reference
+# Web API
 
-The `mtdata` Web API exposes a focused REST surface for market data,
-forecasting, and analysis, and can serve a separately built Web UI. Use it when
-you want local HTTP access from dashboards, notebooks, scripts, or another
-application.
+Local HTTP access to mtdata for dashboards, notebooks, scripts, and apps — plus an optional React UI after you build `webui/`. Same research strengths as the CLI; **smaller surface** than full CLI/MCP (if a tool is missing here, use those instead).
 
 **Base URL:** `http://localhost:8000` (default)
 
-Route versioning:
-- Every API route below is available under both `/api/...` and `/api/v1/...`.
-- Prefer `/api/v1` for new integrations.
-- The examples below use `/api` for brevity.
+| Versioning | Guidance |
+|------------|----------|
+| `/api/...` and `/api/v1/...` | Both work for every route below |
+| New integrations | Prefer `/api/v1` |
+| Examples on this page | Use `/api` for brevity |
 
-The Web API is intentionally smaller than the full CLI/MCP tool surface. If an endpoint is not listed here, use `mtdata-cli` or an MCP client for that tool.
+**Related:** [Setup](SETUP.md) · [Deployment](DEPLOYMENT.md) · [Env vars](ENV_VARS.md) · [Output contract](OUTPUT.md)
 
-## Quick Start
+## Quick start
 
 Start the local server:
 
@@ -43,6 +41,12 @@ If you want remote access, set `WEBAPI_ALLOW_REMOTE=1`, use a non-loopback `WEBA
 
 - `Authorization: Bearer <token>`
 - `X-API-Key: <token>`
+
+The bundled Web UI has an **Auth** control in the chart toolbar. Enter the
+same token there after the page loads. The token is held only in the current
+tab's JavaScript memory, is attached as a Bearer token to API requests, and is
+cleared by a page reload or the control's **Clear** action. It is never embedded
+in the Vite build or written to browser storage.
 
 Credentialed CORS requests require explicit origins. `CORS_ORIGINS=*` is rejected.
 
@@ -84,6 +88,8 @@ Search for available trading symbols.
 - **Query Params:**
   - `search` (string, optional): Search query for symbol name/description.
   - `limit` (int, optional): Max results to return.
+- **Response:** Items use `symbol`, `group`, and `description`; pass `symbol`
+  directly to history, tick, and analysis routes.
 
 #### `GET /api/timeframes`
 Get supported timeframes.
@@ -99,16 +105,19 @@ Fetch OHLCV candles for a symbol.
   - `ohlcv` (string): Column selector (default "ohlc").
   - `include_spread` (bool): Append the historical candle `spread` field without changing the default row shape.
   - `include_incomplete` (bool): Include the latest forming candle.
-  - `timestamp_format` (`epoch` | `iso`): Timestamp encoding for returned rows. Default `epoch`; use `iso` to match the data tool's default.
+  - `timestamp_format` (`epoch` | `iso`): Timestamp encoding for returned rows. Default `iso`; explicit epoch responses identify the unit as `unix_seconds_utc`.
+  - `extras` (`metadata`, optional): Include full diagnostics and runtime metadata. Compact responses omit the diagnostic `meta` tree.
   - `denoise_method` (string, optional): Apply denoising (e.g., "ema").
-  - `denoise_params` (string, optional): JSON or "k=v" params for denoising.    
+  - `denoise_params` (string, optional): JSON or "k=v" params for denoising.
 - **Response Notes:**
-  - Both `/api/history` and `/api/v1/history` include modern runtime timezone
-    metadata under `meta.runtime.timezone` (`utc`, `server`, and `client` when
-    configured). The legacy `used` timezone compatibility field is not emitted.
+  - Compact responses expose `server_utc_offset_seconds` when available.
+    `extras=metadata` includes the full runtime timezone tree under
+    `meta.runtime.timezone`. The legacy `used` compatibility field is not emitted.
 
 #### `GET /api/tick`
-Get the latest real-time tick.
+Get the latest quote using the same compact schema as `market_ticker`, including
+mid/spread, ISO and epoch timestamps, freshness, and live-usability metadata.
+Unavailable FX `last` and volume values are omitted rather than represented as zero.
 
 - **Query Params:**
   - `symbol` (string, required).
@@ -271,8 +280,10 @@ Control the server host and port via environment variables:
 
 ---
 
-## See Also
+## See also
 
-- [SETUP.md](SETUP.md) — Installation and MCP server configuration
-- [CLI.md](CLI.md) — CLI command reference
+- [SETUP.md](SETUP.md) — Install and run modes
+- [DEPLOYMENT.md](DEPLOYMENT.md) — Long-lived local service
+- [CLI.md](CLI.md) — Full tool surface via CLI
+- [OUTPUT.md](OUTPUT.md) — Shared payload contract
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Common issues
