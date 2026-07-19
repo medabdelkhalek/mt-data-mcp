@@ -50,11 +50,13 @@ _COMPACT_TICK_TOP_LEVEL_FIELDS = (
     "trade_event_count",
     "quote_update_count",
     "data",
+    "last_quote",
     "timezone",
     "price_precision",
     "price_point",
     "price_currency",
     "units",
+    "spread_statistics_basis",
     "freshness",
     "freshness_state",
     "data_age_seconds",
@@ -164,7 +166,14 @@ def run_wait_event(
             now_utc_impl=now_utc_impl,
         ),
         success_eval=lambda r: (
-            isinstance(r, Ok) or (isinstance(r, dict) and "error" not in r)
+            (
+                isinstance(r, Ok)
+                and (
+                    not isinstance(r.value, dict)
+                    or r.value.get("success") is not False
+                )
+            )
+            or (isinstance(r, dict) and "error" not in r)
         ),
     )
     return to_dict(result) if isinstance(result, (Ok, Err)) else result
@@ -205,10 +214,11 @@ def _run_data_fetch_candles_impl(
             spread_all_zero = True
             for bar in data:
                 if isinstance(bar, dict):
-                    if "spread" in bar and bar.get("spread") is not None:
+                    spread_value = bar.get("spread_points", bar.get("spread"))
+                    if spread_value is not None:
                         has_spread_values = True
                         try:
-                            if float(bar.get("spread", 0)) != 0.0:
+                            if float(spread_value) != 0.0:
                                 spread_all_zero = False
                                 break
                         except Exception:
@@ -220,7 +230,9 @@ def _run_data_fetch_candles_impl(
             if not has_spread_values:
                 # No spread values present at all
                 result.setdefault("warnings", []).append(
-                    "include_spread requested but returned bars do not contain 'spread' values; spread unavailable at this timeframe or source."
+                    "include_spread requested but returned bars do not contain "
+                    "spread or spread_points values; spread unavailable at this "
+                    "timeframe or source."
                 )
                 result["spread_unavailable"] = True
             elif spread_all_zero:
@@ -692,7 +704,7 @@ def _slim_projected_candles_payload(payload: Dict[str, Any]) -> None:
     if not projected_fields or "real_volume" not in projected_fields:
         for key in ("real_volume_type", "real_volume_unit"):
             payload.pop(key, None)
-    if "spread" not in projected_fields:
+    if projected_fields.isdisjoint({"spread", "spread_points"}):
         payload.pop("spread_estimate", None)
         payload.pop("spread_unavailable", None)
     _filter_candle_units_to_projected_fields(payload, projected_fields)
@@ -791,7 +803,17 @@ def _summary_candles_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(latest, dict):
             summary["latest_candle"] = {
                 key: latest[key]
-                for key in ("time", "open", "high", "low", "close", "tick_volume", "real_volume")
+                for key in (
+                    "time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "tick_volume",
+                    "real_volume",
+                    "spread",
+                    "spread_points",
+                )
                 if key in latest
             }
         statistics = _candle_summary_statistics(rows)
@@ -1083,11 +1105,85 @@ def _run_data_fetch_ticks_impl(
         time_as_epoch=str(request.timestamp_format).strip().lower() != "iso",
         format=_TICK_DETAIL_FORMATS.get(request.detail, "summary"),
     )
+    result = _normalize_tick_query_error(result, request=request)
     if str(request.detail or "compact").strip().lower() == "compact":
         result = _compact_tick_rows_payload(result)
     _attach_tick_freshness_contract(result)
     _attach_tick_pagination(result, requested_limit=request.limit)
     return result
+
+
+def _normalize_tick_query_error(
+    result: Any,
+    *,
+    request: DataFetchTicksRequest,
+) -> Any:
+    if not isinstance(result, dict) or not result.get("error"):
+        return result
+    if result.get("error_code"):
+        return result
+
+    message = str(result["error"])
+    normalized = message.lower()
+    error_code = "data_fetch_ticks_provider_failure"
+    remediation = "Check the MT5 connection and broker data feed, then retry."
+
+    if (
+        ("not found" in normalized and "symbol" in normalized)
+        or "failed to select symbol" in normalized
+        or "unknown symbol" in normalized
+    ):
+        error_code = "symbol_not_found"
+        remediation = (
+            "Use symbols_list to find the broker's exact symbol name, including "
+            "any suffix or alias."
+        )
+    elif "could not parse" in normalized and "date" in normalized:
+        error_code = "data_fetch_ticks_invalid_date"
+        remediation = "Use an ISO-8601 timestamp such as 2026-07-16T12:00:00Z."
+    elif "start must be before or equal to end" in normalized:
+        error_code = "data_fetch_ticks_invalid_date_range"
+        remediation = "Set start to a timestamp earlier than or equal to end."
+    elif "no tick data" in normalized:
+        if _tick_request_is_future_only(request):
+            error_code = "data_fetch_ticks_future_date_range"
+            remediation = "Use a start and end timestamp at or before the current time."
+        else:
+            error_code = "data_fetch_ticks_no_data"
+            remediation = (
+                "Check the requested market session and symbol history; an empty "
+                "historical interval is not a provider failure."
+            )
+
+    details: Dict[str, Any] = {
+        "symbol": request.symbol,
+        "timezone": "UTC",
+    }
+    if request.start is not None:
+        details["start"] = str(request.start)
+    if request.end is not None:
+        details["end"] = str(request.end)
+    return build_error_payload(
+        message,
+        code=error_code,
+        operation="data_fetch_ticks",
+        details=details,
+        remediation=remediation,
+        related_tools=["symbols_list"] if error_code == "symbol_not_found" else None,
+    )
+
+
+def _tick_request_is_future_only(request: DataFetchTicksRequest) -> bool:
+    value = request.start or request.end
+    if value in (None, ""):
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc) > datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return False
 
 
 def _attach_tick_pagination(payload: Any, *, requested_limit: int) -> None:
@@ -1138,6 +1234,8 @@ def _compact_tick_rows_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             compact_rows.append(compact_row)
         compact["data"] = compact_rows
         compact["count"] = len(compact["data"])
+        if compact.get("tick_count") == compact["count"]:
+            compact.pop("tick_count", None)
         units = compact.get("units")
         present_fields = {
             key
@@ -1270,29 +1368,36 @@ def _compact_tick_row(
         volume = _tick_row_price(row.get(field))
         if volume is not None and volume != 0.0:
             compact[field] = volume
-    flags = _as_nonnegative_int(row.get("flags"))
-    if flags is not None:
-        compact["flags"] = flags
     decoded = row.get("flags_decoded")
+    sample_eligible: Optional[bool] = None
     if isinstance(decoded, list) and decoded:
-        compact["flags_decoded"] = list(decoded)
         quote_flags = {str(value).strip().lower() for value in decoded}
         bid_updated = "bid" in quote_flags
         ask_updated = "ask" in quote_flags
+        compact["bid_changed"] = bid_updated
+        compact["ask_changed"] = ask_updated
+        sample_eligible = bid_updated and ask_updated
         if bid_updated != ask_updated:
             compact["quote_update_type"] = (
                 "bid_only_update" if bid_updated else "ask_only_update"
             )
-            compact["spread_valid"] = False
-            compact["ask" if bid_updated else "bid"] = None
-            compact["spread"] = None
-            for field in ("mid", "mid_inferred", "spread_points", "spread_pct"):
-                compact.pop(field, None)
-            numeric_spread = None
         elif bid_updated and ask_updated:
             compact["quote_update_type"] = "bid_ask_update"
-            compact["spread_valid"] = True
-    return compact, numeric_spread
+    if row.get("spread_sample_eligible") is not None:
+        sample_eligible = bool(row.get("spread_sample_eligible"))
+    if sample_eligible is not None:
+        compact["spread_sample_eligible"] = sample_eligible
+    compact["spread_valid"] = bool(
+        bid is not None
+        and ask is not None
+        and numeric_spread is not None
+        and ask > bid
+        and numeric_spread > 0.0
+    )
+    compact["spread_basis"] = (
+        "quote_snapshot" if compact["spread_valid"] else "unavailable"
+    )
+    return compact, numeric_spread if compact["spread_valid"] else None
 
 
 def _tick_price_point(payload: Dict[str, Any]) -> Optional[float]:

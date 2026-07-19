@@ -29,11 +29,19 @@ def test_template_minimal_builds_fast_path_without_basic_template() -> None:
         if func_name == "forecast_generate":
             assert kwargs["method"] == "arima"
             return {
-                "forecast_price": [1.1070, 1.1080, 1.1090],
-                "lower_price": [1.1040, 1.1050, 1.1060],
-                "upper_price": [1.1100, 1.1110, 1.1120],
-                "trend": "up",
-                "ci_alpha": 0.05,
+                "forecast": [
+                    {"time": "2026-03-29T11:00Z", "value": 1.1070},
+                    {"time": "2026-03-29T12:00Z", "value": 1.1080},
+                    {"time": "2026-03-29T13:00Z", "value": 1.1090},
+                ],
+                "last_observation_time": "2026-03-29T10:00Z",
+                "forecast_vs_last_price": {
+                    "direction": "bullish",
+                    "horizon_delta_pct": 0.36,
+                },
+                "ci_status": "unavailable",
+                "forecast_mode": "point_only",
+                "data_window": {"history_bars_used": 200},
                 "timezone": "UTC",
             }
         raise AssertionError(f"Unexpected tool call: {func_name}")
@@ -53,6 +61,11 @@ def test_template_minimal_builds_fast_path_without_basic_template() -> None:
     assert list(report["sections"].keys()) == ["context", "forecast"]
     assert report["sections"]["forecast"]["method"] == "arima"
     assert report["sections"]["forecast"]["timezone"] == "UTC"
+    assert report["sections"]["forecast"]["forecast"][-1]["value"] == 1.1090
+    assert report["sections"]["forecast"]["last_observation_time"] == "2026-03-29T10:00Z"
+    assert report["sections"]["forecast"]["forecast_vs_last_price"]["direction"] == "bullish"
+    assert report["sections"]["forecast"]["ci_status"] == "unavailable"
+    assert "error" not in report["sections"]["forecast"]
     assert report["sections"]["forecast"]["selection_mode"] == "direct"
     assert "skips backtest ranking" in report["sections"]["forecast"]["selection_note"]
     assert report["sections"]["context"]["timezone"] == "UTC"
@@ -107,6 +120,64 @@ def test_template_minimal_forwards_context_indicators_param() -> None:
         )
 
     assert requested_indicators == ["ema(20),rsi(14)"]
+
+
+def test_template_minimal_context_plan_skips_forecast_call() -> None:
+    calls: list[str] = []
+
+    def _fake_get_raw_result(func, *args, **kwargs):
+        func_name = getattr(func, "__name__", "")
+        calls.append(func_name)
+        if func_name == "data_fetch_candles":
+            return {"bars": _make_context_bars()}
+        raise AssertionError(f"Unexpected tool call: {func_name}")
+
+    with patch(
+        "mtdata.core.report_templates.minimal._get_raw_result",
+        side_effect=_fake_get_raw_result,
+    ):
+        from mtdata.core.report_templates.minimal import template_minimal
+
+        report = template_minimal(
+            "EURUSD",
+            12,
+            None,
+            {"_report_execution_sections": ["context"]},
+        )
+
+    assert calls == ["data_fetch_candles"]
+    assert list(report["sections"]) == ["context"]
+
+
+def test_template_basic_context_plan_skips_expensive_sections() -> None:
+    calls: list[str] = []
+
+    def _fake_get_raw_result(func, *args, **kwargs):
+        func_name = getattr(func, "__name__", "")
+        calls.append(func_name)
+        if func_name == "data_fetch_candles":
+            return {"data": _make_context_bars()}
+        raise AssertionError(f"Unexpected tool call: {func_name}")
+
+    with (
+        patch(
+            "mtdata.core.report_templates.basic._get_raw_result",
+            side_effect=_fake_get_raw_result,
+        ),
+        patch("mtdata.core.report_templates.basic.attach_multi_timeframes") as attach_mtf,
+    ):
+        from mtdata.core.report_templates.basic import template_basic
+
+        report = template_basic(
+            "EURUSD",
+            12,
+            None,
+            {"_report_execution_sections": ["context"]},
+        )
+
+    assert calls == ["data_fetch_candles"]
+    assert list(report["sections"]) == ["context"]
+    attach_mtf.assert_not_called()
 
 
 def test_template_basic_forwards_context_indicators_param() -> None:

@@ -147,7 +147,7 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
 
         self.assertTrue(first["success"])
         self.assertEqual(first["seed"], second["seed"])
-        self.assertEqual(first["seed_source"], "request")
+        self.assertEqual(first["seed_source"], "derived_from_request")
         self.assertEqual(first["n_sims"], 50)
         self.assertEqual(first["prob_tp_first"], second["prob_tp_first"])
         self.assertEqual(first["prob_sl_first"], second["prob_sl_first"])
@@ -176,6 +176,7 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["seed"], 5)
+        self.assertEqual(result["seed_source"], "params")
         self.assertEqual(seen_seeds, [5])
 
     def test_forecast_barrier_hit_probabilities_accepts_tick_aliases(self):
@@ -210,8 +211,8 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
         self.assertAlmostEqual(result["last_price"], 1.2345, places=8)
         self.assertAlmostEqual(result["last_price_close"], 1.0, places=8)
         self.assertEqual(result["last_price_source"], "live_tick_ask")
-        self.assertAlmostEqual(result["tp_price"], 1.2345 * 1.005, places=8)
-        self.assertAlmostEqual(result["sl_price"], 1.2345 * 0.995, places=8)
+        self.assertEqual(result["tp_price"], 1.2407)
+        self.assertEqual(result["sl_price"], 1.2283)
         self.assertEqual(len(result["tp_hit_prob_by_t"]), 4)
         self.assertEqual(len(result["sl_hit_prob_by_t"]), 4)
         self.assertAlmostEqual(result["tp_hit_prob_by_t"][0], 0.0, places=8)

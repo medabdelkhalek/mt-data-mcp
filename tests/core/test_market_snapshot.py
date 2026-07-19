@@ -7,7 +7,8 @@ import mtdata.core.market_snapshot as snapshot_mod
 
 
 def _raw_market_snapshot(**kwargs):
-    return snapshot_mod.market_snapshot.__wrapped__(**kwargs)
+    with patch.object(snapshot_mod, "_preflight_snapshot_symbol", return_value=None):
+        return snapshot_mod.market_snapshot.__wrapped__(**kwargs)
 
 
 def test_market_snapshot_help_discloses_builtin_section_methods():
@@ -80,6 +81,49 @@ def test_market_snapshot_marks_invalid_symbol_failure(monkeypatch):
     assert result["summary"] == "NOTREAL snapshot; failed=quote,levels."
 
 
+def test_market_snapshot_rejects_invalid_symbol_before_sections(monkeypatch):
+    preflight_error = {
+        "success": False,
+        "error": "Symbol 'NOTREAL' not found in MT5 terminal.",
+        "error_code": "symbol_not_found",
+        "request_id": "test-request",
+        "operation": "market_snapshot",
+        "remediation": "Use symbols_list.",
+    }
+    section_call = MagicMock(side_effect=AssertionError("sections must not run"))
+    monkeypatch.setattr(
+        snapshot_mod,
+        "_preflight_snapshot_symbol",
+        lambda symbol: preflight_error,
+    )
+    monkeypatch.setattr(snapshot_mod, "_call_section", section_call)
+
+    result = snapshot_mod.market_snapshot.__wrapped__(symbol="NOTREAL")
+
+    assert result["success"] is False
+    assert result["error_code"] == "symbol_not_found"
+    assert result["sections_not_run"] == ["quote", "status", "levels", "patterns"]
+    assert result["section_status"] == {
+        "quote": "not_run",
+        "status": "not_run",
+        "levels": "not_run",
+        "patterns": "not_run",
+    }
+    section_call.assert_not_called()
+
+
+def test_snapshot_symbol_preflight_classifies_missing_symbol() -> None:
+    gateway = MagicMock()
+    gateway.symbol_info.return_value = None
+
+    result = snapshot_mod._preflight_snapshot_symbol("NOTREAL", gateway=gateway)
+
+    assert result is not None
+    assert result["error_code"] == "symbol_not_found"
+    assert result["details"]["symbol"] == "NOTREAL"
+    assert result["related_tools"] == ["symbols_list"]
+
+
 def test_market_snapshot_marks_partial_section_failure(monkeypatch):
     def fake_call_section(name, symbol, timeframe, horizon, detail):
         if name == "levels":
@@ -137,6 +181,11 @@ def test_market_snapshot_summary_detail_returns_lean_snapshot(monkeypatch):
         "nearest_support": 1.098,
         "nearest_resistance": 1.105,
         "pattern_count": 2,
+        "pattern_window_bars": 3,
+        "pattern_scan_note": (
+            "Candlestick triggers are limited to the latest 3 bars; "
+            "use patterns_detect for a wider historical scan."
+        ),
     }
     assert "quote" not in result
     assert "levels" not in result
@@ -185,6 +234,9 @@ def test_market_snapshot_compact_defaults_to_lean_snapshot(monkeypatch):
 
     result = _raw_market_snapshot(symbol="EURUSD", detail="compact")
 
+    assert "sections" not in result
+    assert result["sections_requested"] == ["quote", "status", "levels", "patterns"]
+    assert result["sections_summarized"] == ["quote", "status", "levels", "patterns"]
     assert result["snapshot"] == {
         "bid": 1.1001,
         "ask": 1.1003,
@@ -203,6 +255,11 @@ def test_market_snapshot_compact_defaults_to_lean_snapshot(monkeypatch):
         "nearest_support": 1.098,
         "nearest_resistance": 1.105,
         "pattern_count": 2,
+        "pattern_window_bars": 3,
+        "pattern_scan_note": (
+            "Candlestick triggers are limited to the latest 3 bars; "
+            "use patterns_detect for a wider historical scan."
+        ),
     }
     assert "quote" not in result
     assert "levels" not in result
@@ -294,6 +351,54 @@ def test_market_snapshot_exposes_quote_and_assembly_timestamps(monkeypatch):
     assert result["assembled_at"] == "2026-06-15T19:34:08Z"
 
 
+def test_market_snapshot_fetches_quote_after_analytical_sections(monkeypatch):
+    calls = []
+
+    def fake_call_section(name, symbol, timeframe, horizon, detail):
+        calls.append(name)
+        if name == "quote":
+            return {"success": True, "symbol": symbol, "mid": 1.1}
+        return {"success": True}
+
+    monkeypatch.setattr(snapshot_mod, "_call_section", fake_call_section)
+
+    _raw_market_snapshot(symbol="EURUSD", sections="quote,status,levels")
+
+    assert calls == ["status", "levels", "quote"]
+
+
+def test_market_snapshot_revalidates_quote_at_assembly_time() -> None:
+    sections = {
+        "quote": {
+            "success": True,
+            "time_epoch": 1_700_000_000.0,
+            "data_age_seconds": 29.0,
+            "live_max_age_seconds": 30.0,
+            "usable_for_live_trading": True,
+        }
+    }
+
+    warning = snapshot_mod._revalidate_snapshot_quote(
+        sections,
+        symbol="BTCUSD",
+        assembled_at_epoch=1_700_000_031.0,
+    )
+
+    quote = sections["quote"]
+    assert quote["data_age_seconds"] == 31.0
+    assert quote["usable_for_live_trading"] is False
+    assert quote["freshness_reason"] == "quote_age_exceeds_live_threshold"
+    assert warning == {
+        "code": "quote_expired_during_snapshot_assembly",
+        "message": (
+            "The quote crossed its live-readiness threshold while the snapshot "
+            "was being assembled."
+        ),
+        "quote_age_seconds": 31.0,
+        "live_max_age_seconds": 30,
+    }
+
+
 def test_market_snapshot_standard_strips_nested_request_echoes(monkeypatch):
     def fake_call_section(name, symbol, timeframe, horizon, detail):
         if name == "levels":
@@ -323,6 +428,7 @@ def test_market_snapshot_standard_strips_nested_request_echoes(monkeypatch):
     result = _raw_market_snapshot(symbol="EURUSD", detail="standard")
 
     assert result["symbol"] == "EURUSD"
+    assert result["sections_embedded"] == ["quote", "status", "levels", "patterns"]
     assert "summary" not in result
     assert result["levels"] == {
         "success": True,
@@ -367,6 +473,25 @@ def test_market_snapshot_qualifies_uncertain_pattern_bias(monkeypatch):
     assert snapshot["pattern_is_signal"] is False
     assert snapshot["pattern_usage"] == "information_only"
     assert snapshot["pattern_window_bars"] == 3
+    assert snapshot["pattern_scan_note"] == (
+        "Candlestick triggers are limited to the latest 3 bars; "
+        "use patterns_detect for a wider historical scan."
+    )
+
+
+def test_market_snapshot_discloses_pattern_window_when_no_patterns(monkeypatch):
+    def fake_call_section(name, symbol, timeframe, horizon, detail):
+        if name == "patterns":
+            return {"success": True, "n_patterns": 0, "last_n_bars": 3}
+        return {"success": True, "symbol": symbol, "mid": 1.1}
+
+    monkeypatch.setattr(snapshot_mod, "_call_section", fake_call_section)
+
+    result = _raw_market_snapshot(symbol="EURUSD", detail="compact")
+
+    assert result["snapshot"]["pattern_count"] == 0
+    assert result["snapshot"]["pattern_window_bars"] == 3
+    assert "latest 3 bars" in result["snapshot"]["pattern_scan_note"]
 
 
 def test_snapshot_patterns_section_requests_recent_candlestick_triggers(monkeypatch):

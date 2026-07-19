@@ -213,7 +213,7 @@ class TestMain:
             },
         }
 
-        with patch("sys.argv", ["cli.py", "correlation_matrix", "EURUSD,GBPUSD"]):
+        with patch("sys.argv", ["cli.py", "correlation_matrix", "EURUSD", "GBPUSD"]):
             result = main()
 
         assert result == 0
@@ -313,7 +313,7 @@ class TestMain:
             },
         }
 
-        with patch("sys.argv", ["cli.py", "cointegration_test", "EURUSD,GBPUSD"]):
+        with patch("sys.argv", ["cli.py", "cointegration_test", "EURUSD", "GBPUSD"]):
             result = main()
 
         assert result == 0
@@ -714,6 +714,34 @@ class TestMain:
         assert "runtime warning" in out.out
         assert "deprecated runtime path" not in out.out
         assert "pending deprecation path" not in out.out
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_cli_ignores_import_warnings_in_structured_output(
+        self, mock_discover, capsys
+    ):
+        import warnings
+
+        def noisy_tool(**_kwargs):
+            warnings.warn("optional package feature unavailable", ImportWarning)
+            warnings.warn("runtime warning", RuntimeWarning)
+            return {"ok": True}
+
+        info = get_function_info(noisy_tool)
+        mock_discover.return_value = {
+            "noisy_tool": {
+                "func": noisy_tool,
+                "meta": {"description": "Noisy tool"},
+                "_cli_func_info": info,
+            },
+        }
+
+        with patch("sys.argv", ["cli.py", "noisy_tool"]):
+            result = main()
+
+        assert result == 0
+        out = capsys.readouterr()
+        assert "runtime warning" in out.out
+        assert "optional package feature unavailable" not in out.out
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_cli_ignores_resource_warnings_in_structured_output(
@@ -1160,7 +1188,55 @@ class TestForecastGenerateIntegration:
         assert request.library == "native"
         assert request.method == "theta"
         assert request.detail == "compact"
+        assert request.ci_alpha == 0.05
         assert call_kwargs["__cli_raw"] is True
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_generate_missing_symbol_is_usage_error(
+        self, mock_discover, capsys
+    ):
+        mock_discover.return_value = {
+            "forecast_generate": {
+                "func": MagicMock(),
+                "meta": {"description": "Generate forecasts"},
+            },
+        }
+        with (
+            patch("sys.argv", ["cli.py", "forecast_generate", "--json"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "cli_invalid_arguments"
+        assert payload["operation"] == "forecast_generate"
+        assert "symbol" in payload["error"]
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_generate_invalid_timeframe_is_usage_error(
+        self, mock_discover, capsys
+    ):
+        mock_discover.return_value = {
+            "forecast_generate": {
+                "func": MagicMock(),
+                "meta": {"description": "Generate forecasts"},
+            },
+        }
+        with (
+            patch(
+                "sys.argv",
+                ["cli.py", "forecast_generate", "EURUSD", "--timeframe", "M7", "--json"],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "cli_invalid_arguments"
+        assert payload["operation"] == "forecast_generate"
+        assert "invalid choice" in payload["error"]
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_forecast_generate_maps_extras_to_internal_detail(self, mock_discover):
@@ -1206,7 +1282,9 @@ class TestForecastGenerateIntegration:
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_forecast_generate_forwards_shared_output_controls(self, mock_discover):
-        mock_fn = MagicMock(return_value={"success": True, "forecast": [1.0]})
+        mock_fn = MagicMock(
+            return_value={"success": True, "forecast": [1.0], "method": "theta"}
+        )
         mock_fn.__module__ = "mtdata.core.server"
         mock_fn.__name__ = "forecast_generate"
         mock_fn.__doc__ = "Generate forecasts."
@@ -1232,12 +1310,12 @@ class TestForecastGenerateIntegration:
             result = main()
 
         assert result == 0
-        call = mock_fn.call_args.kwargs
-        assert call["extras"] == "metadata"
-        assert call["fields"] == "forecast,method"
+        call_kwargs = mock_fn.call_args.kwargs
+        assert call_kwargs["extras"] == "metadata"
+        assert call_kwargs["fields"] == "forecast,method"
 
     @patch("mtdata.core.cli.api.discover_tools")
-    def test_forecast_generate_accepts_symbol_flag_alias(self, mock_discover):
+    def test_forecast_generate_rejects_symbol_flag_alias(self, mock_discover):
         mock_fn = MagicMock(return_value={"forecast": [1.0, 2.0]})
         mock_fn.__module__ = "mtdata.core.server"
         mock_fn.__name__ = "forecast_generate"
@@ -1249,11 +1327,13 @@ class TestForecastGenerateIntegration:
                 "meta": {"description": "Generate forecasts"},
             },
         }
-        with patch("sys.argv", ["cli.py", "forecast_generate", "--symbol", "BTCUSD"]):
-            result = main()
-        assert result == 0
-        request = mock_fn.call_args[1]["request"]
-        assert request.symbol == "BTCUSD"
+        with (
+            patch("sys.argv", ["cli.py", "forecast_generate", "--symbol", "BTCUSD"]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 2
+        mock_fn.assert_not_called()
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_forecast_generate_print_config(self, mock_discover, capsys):
@@ -1321,6 +1401,37 @@ class TestForecastGenerateIntegration:
         out = capsys.readouterr().out
         parsed = json.loads(out)
         assert parsed["text"] == "text forecast"
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_generate_invalid_horizon_returns_json_error(self, mock_discover, capsys):
+        mock_fn = MagicMock(return_value={"forecast": [1.0]})
+        mock_fn.__module__ = "mtdata.core.server"
+        mock_fn.__name__ = "forecast_generate"
+        mock_fn.__doc__ = "Generate forecasts."
+        mock_discover.return_value = {
+            "forecast_generate": {
+                "func": mock_fn,
+                "meta": {"description": "Generate forecasts"},
+            },
+        }
+
+        with (
+            patch(
+                "sys.argv",
+                ["cli.py", "--json", "forecast_generate", "EURUSD", "--horizon", "0"],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 2
+        mock_fn.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["success"] is False
+        assert payload["error_code"] == "cli_invalid_arguments"
+        assert payload["operation"] == "forecast_generate"
+        assert payload["error"] == "horizon must be between 1 and 500."
+        assert "ForecastGenerateRequest" not in payload["error"]
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_forecast_generate_tool_error_returns_nonzero(self, mock_discover, capsys):
@@ -1514,6 +1625,52 @@ class TestForecastGenerateIntegration:
 
 
 class TestEdgeCases:
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_invalid_extras_preserves_json_argument_error_contract(
+        self, mock_discover, capsys
+    ):
+        def sample_tool():
+            return {"success": True, "value": 1}
+
+        mock_discover.return_value = {
+            "sample_tool": {
+                "func": sample_tool,
+                "meta": {"description": "Sample tool"},
+            }
+        }
+
+        with patch(
+            "sys.argv",
+            ["cli.py", "sample_tool", "--extras", "nonsense", "--json"],
+        ), pytest.raises(SystemExit, match="2"):
+            main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["success"] is False
+        assert payload["error_code"] == "cli_invalid_arguments"
+        assert "extras" in payload["error"]
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_invalid_output_fields_exit_nonzero(self, mock_discover):
+        def sample_tool():
+            return {"success": True, "value": 1}
+
+        mock_discover.return_value = {
+            "sample_tool": {
+                "func": sample_tool,
+                "meta": {"description": "Sample tool"},
+            }
+        }
+
+        with patch(
+            "sys.argv",
+            ["cli.py", "sample_tool", "--fields", "missing", "--json"],
+        ):
+            status = main()
+
+        assert status == 1
+        assert mock_discover.called
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_json_mode_formats_argparse_failures_as_json(self, mock_discover, capsys):

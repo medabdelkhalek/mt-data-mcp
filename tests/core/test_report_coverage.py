@@ -112,6 +112,23 @@ def test_report_section_control_type_hints_resolve() -> None:
     assert get_type_hints(_apply_report_section_controls)
 
 
+@pytest.mark.parametrize(
+    "template",
+    ["minimal", "basic", "advanced", "scalping", "intraday", "swing", "position"],
+)
+def test_report_section_plan_limits_every_template_to_context(template: str) -> None:
+    from mtdata.core.report.use_cases import _resolve_report_section_plan
+
+    plan = _resolve_report_section_plan(
+        template,
+        include_sections=["context", "forecast"],
+        max_sections=1,
+    )
+
+    assert plan["selected"] == ["context"]
+    assert plan["execution"] == ["context"]
+
+
 def test_report_generate_request_template_choices_are_validated():
     from mtdata.core.report.requests import ReportGenerateRequest
 
@@ -290,14 +307,11 @@ def test_compact_report_payload_omits_duplicate_assessment_blocks():
         template="basic",
     )
 
-    assert out["overall_assessment"]["partial_sections"] == ["barriers"]
-    assert out["overall_assessment"]["section_health"] == {
-        "ok": 7,
-        "partial": 1,
-        "error": 0,
-    }
+    assert out["assessment"]["partial_sections"] == ["barriers"]
+    assert "section_health" not in out["assessment"]
     assert out["summary_structured"]["template_focus"] == {"profile": "balanced"}
     assert "executive_summary" not in out
+    assert "overall_assessment" not in out
     assert "sections_with_issues" not in out
     assert out["sections_status"] == {
         "summary": {"ok": 7, "partial": 1, "error": 0, "total": 8},
@@ -309,6 +323,42 @@ def test_compact_report_payload_omits_duplicate_assessment_blocks():
             }
         },
     }
+
+
+def test_compact_report_payload_uses_one_named_assessment_when_healthy():
+    from mtdata.core.report.use_cases import _compact_report_payload
+
+    out = _compact_report_payload(
+        {
+            "success": True,
+            "overall_assessment": {
+                "is_trade_signal": False,
+                "recommended_action": "review_key_levels_and_risk",
+                "assembly_confidence": "high",
+                "assembly_confidence_basis": "report_section_health",
+                "section_health": {"ok": 4, "partial": 0, "error": 0, "total": 4},
+            },
+            "executive_summary": {
+                "is_trade_signal": False,
+                "recommended_action": "review_key_levels_and_risk",
+                "assembly_confidence": "high",
+                "section_health": {"ok": 4, "partial": 0, "error": 0, "total": 4},
+            },
+            "sections_status": {"summary": {"ok": 4, "partial": 0, "error": 0}},
+            "summary_structured": {"market": {"close": 1.1}},
+        },
+        symbol="EURUSD",
+        template="basic",
+    )
+
+    assert out["assessment"] == {
+        "is_trade_signal": False,
+        "recommended_action": "review_key_levels_and_risk",
+        "section_completeness": "high",
+        "section_health": {"ok": 4, "partial": 0, "error": 0},
+    }
+    assert "overall_assessment" not in out
+    assert "executive_summary" not in out
 
 
 def test_compact_report_payload_elevates_barrier_conflicts():
@@ -482,6 +532,7 @@ def _make_full_sections():
         },
         "forecast": {
             "method": "EMA",
+            "forecast": [{"time": "2026-01-01T01:00Z", "value": 1.103}],
         },
         "barriers": {
             "long": {
@@ -962,6 +1013,11 @@ class TestReportSummaryBarriers:
         assert structured["ev_edge_conflict"] is True
         assert structured["conflict_reason"] == "ev and edge_vs_breakeven have opposite signs"
         assert "Expected value and break-even edge disagree" in structured["trading_note"]
+        metric_basis = res["summary_structured"]["barriers"]["metric_basis"]
+        assert metric_basis["ev"]["definition"].startswith("mean simulated barrier payoff")
+        assert metric_basis["probability_edge"] == (
+            "take_profit_first_probability minus stop_loss_first_probability"
+        )
 
     def test_no_barriers_section(self):
         sec = _make_full_sections()
@@ -1120,6 +1176,50 @@ class TestReportWarnings:
         assert res["error_code"] == "report_sections_not_found"
         assert res["section_controls"]["missing_requested_sections"] == ["not-a-section"]
 
+    def test_forecast_selection_runs_dependency_without_summary_leak(self):
+        fn = _get_report_generate()
+        captured_params: Dict[str, Any] = {}
+
+        def mock_template(_symbol, _horizon, _denoise, params):
+            captured_params.update(params)
+            return _make_report(
+                sections={
+                    "backtest": {
+                        "best_method": {
+                            "method": "theta",
+                            "stats": {"avg_rmse": 0.001},
+                        }
+                    },
+                    "forecast": {
+                        "method": "theta",
+                        "forecast": [
+                            {"time": "2026-01-01T01:00Z", "value": 1.101},
+                            {"time": "2026-01-01T02:00Z", "value": 1.102},
+                            {"time": "2026-01-01T03:00Z", "value": 1.103},
+                        ],
+                    },
+                    "barriers": {"long": {"best": {"ev": 0.2}}},
+                }
+            )
+
+        with (
+            patch("mtdata.core.report_templates.template_basic", mock_template, create=True),
+            patch(_FMT_NUM, side_effect=str),
+        ):
+            res = fn(
+                "EURUSD",
+                template="basic",
+                include_sections=["forecast"],
+                format="toon",
+            )
+
+        assert captured_params["_report_execution_sections"] == ["forecast", "backtest"]
+        assert list(res["sections"]) == ["forecast"]
+        assert list(res["summary_structured"]) == ["forecast"]
+        assert res["section_controls"]["included_sections"] == ["forecast"]
+        assert "backtest" in res["section_controls"]["omitted_sections"]
+        assert "barriers" in res["section_controls"]["omitted_sections"]
+
 
     def test_report_generate_uses_data_timestamp_for_as_of(self):
         fn = _get_report_generate()
@@ -1215,6 +1315,26 @@ class TestReportWarnings:
         assert res["sections_status"]["sections"]["forecast"] == "error"
         assert res["completeness"] == "failed"
         assert res["success"] is False
+
+    def test_forecast_section_without_finite_values_is_not_healthy(self):
+        from mtdata.core.report.use_cases import _build_sections_status
+
+        status = _build_sections_status(
+            {
+                "forecast": {
+                    "method": "theta",
+                    "forecast": [{"time": "2026-01-01T01:00Z", "value": None}],
+                }
+            }
+        )
+
+        assert status["sections"]["forecast"] == "error"
+        assert status["details"]["forecast"]["errors"] == [
+            {
+                "path": "forecast",
+                "message": "Forecast section contains no finite forecast values.",
+            }
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1313,3 +1433,18 @@ def test_report_assessment_names_section_health_confidence_explicitly():
     assert assessment["assembly_confidence_basis"] == "report_section_health"
     assert "confidence" not in assessment
     assert assessment["is_trade_signal"] is False
+
+
+@pytest.mark.parametrize("horizon", [0, -1])
+def test_report_request_rejects_nonpositive_horizon(horizon):
+    from mtdata.core.report.requests import ReportGenerateRequest
+
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        ReportGenerateRequest(symbol="EURUSD", horizon=horizon)
+
+
+def test_report_request_rejects_nonpositive_params_horizon():
+    from mtdata.core.report.requests import ReportGenerateRequest
+
+    with pytest.raises(ValidationError, match="params.horizon"):
+        ReportGenerateRequest(symbol="EURUSD", params={"horizon": 0})

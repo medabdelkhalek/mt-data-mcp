@@ -252,7 +252,10 @@ def test_forecast_generate_native_theta_adds_disambiguation_warning(monkeypatch)
 
     assert out["ok"] is True
     assert out["success"] is True
-    assert any("StatsForecast theta is available" in str(w) for w in out.get("warnings", []))
+    assert any(
+        "StatsForecast theta is available via the statsforecast library" in str(w)
+        for w in out.get("warnings", [])
+    )
 
 
 def test_forecast_generate_native_theta_suppresses_duplicate_interval_guidance(monkeypatch):
@@ -334,7 +337,19 @@ def test_forecast_generate_defaults_to_compact_payload(monkeypatch):
         "horizon_delta": 0.15,
         "first_step_delta_pct": -4.7619,
         "horizon_delta_pct": 14.2857,
+        "direction_significant": None,
+        "direction_significance_basis": "not_tested",
+        "direction_interpretation": "point_estimate_only_not_significance_tested",
     }
+    assert out["uncertainty"] == {
+        "status": "not_requested",
+        "mode": "point_only",
+        "reason": "ci_alpha was not requested; direction is based on the point estimate only.",
+        "recommended_tool": "forecast_conformal_intervals",
+    }
+    assert out["units"]["forecast_vs_last_price.*_delta_pct"] == (
+        "percentage_points (1.0 = 1%)"
+    )
     assert "forecast_time" not in out
     assert "forecast_price" not in out
     assert out["forecast"] == [
@@ -502,6 +517,25 @@ def test_forecast_backtest_request_accepts_methods():
     assert request.methods == ["theta"]
 
 
+def test_forecast_backtest_request_validates_anchor_spacing_up_front():
+    equal_spacing = ForecastBacktestRequest(
+        symbol="EURUSD", horizon=6, steps=3, spacing=6
+    )
+    assert equal_spacing.spacing == equal_spacing.horizon
+
+    with pytest.raises(
+        ValidationError,
+        match=r"got spacing=5, horizon=6.*try spacing=6 or steps=1",
+    ):
+        ForecastBacktestRequest(symbol="EURUSD", horizon=6, steps=3, spacing=5)
+
+    descriptions = {
+        name: str(ForecastBacktestRequest.model_fields[name].description)
+        for name in ("horizon", "steps", "spacing")
+    }
+    assert all("spacing" in value.lower() for value in descriptions.values())
+
+
 def test_forecast_generate_compact_omits_training_period(monkeypatch):
     raw = _unwrap(cf.forecast_generate)
     monkeypatch.setattr(
@@ -589,6 +623,9 @@ def test_forecast_generate_rounds_price_outputs_to_symbol_digits(monkeypatch):
         "horizon_delta": 0.00149,
         "first_step_delta_pct": 0.0409,
         "horizon_delta_pct": 0.1271,
+        "direction_significant": None,
+        "direction_significance_basis": "not_tested",
+        "direction_interpretation": "point_estimate_only_not_significance_tested",
     }
     assert "forecast_price" not in out
     assert out["forecast"] == [
@@ -620,11 +657,13 @@ def test_forecast_generate_compact_flags_flat_theta_display(monkeypatch):
     out = raw(request=ForecastGenerateRequest(symbol="EURUSD", timeframe="H1", method="theta", horizon=3))
 
     assert "forecast_price" not in out
-    assert out["forecast"] == [
-        {"time": "t1", "value": 1.16836},
-        {"time": "t2", "value": 1.16836},
-        {"time": "t3", "value": 1.16836},
-    ]
+    assert "forecast" not in out
+    assert out["forecast_summary"] == {
+        "steps": 3,
+        "first": {"time": "t1", "value": 1.16836},
+        "last": {"time": "t3", "value": 1.16836},
+        "path_omitted": "non_informative_flat_path",
+    }
     assert "theta_signal" not in out
     assert "params_used" not in out
     assert out["path_flat"] is True
@@ -632,6 +671,8 @@ def test_forecast_generate_compact_flags_flat_theta_display(monkeypatch):
     assert out["point_forecast_mode"] == "flat_model_path"
     assert out["forecast_status"] == "non_informative"
     assert out["signal_status"] == "not_actionable"
+    assert out["suggested_methods"] == ["drift", "analog", "fourier_ols"]
+    assert out["suggested_uncertainty_tool"] == "forecast_conformal_intervals"
     assert "usable_for_live_trading" not in out
     assert out["forecast_vs_last_price"]["direction"] == "neutral"
     assert out["forecast_vs_last_price"]["direction_basis"] == "flat_path"
@@ -772,6 +813,7 @@ def test_forecast_generate_compact_nests_available_ci(monkeypatch):
             "upper_price": [101.0, 102.5],
             "ci_status": "available",
             "ci_alpha": 0.05,
+            "last_price": 100.0,
         },
     )
 
@@ -808,6 +850,14 @@ def test_forecast_generate_compact_nests_available_ci(monkeypatch):
     assert "forecast_time" not in out
     assert "forecast_price" not in out
     assert "forecast" not in out
+    assert out["forecast_vs_last_price"]["direction"] == "bullish"
+    assert out["forecast_vs_last_price"]["direction_significant"] is False
+    assert out["forecast_vs_last_price"]["direction_significance_basis"] == (
+        "horizon_interval_vs_last_price"
+    )
+    assert out["forecast_vs_last_price"]["direction_interpretation"] == (
+        "interval_contains_last_price_or_direction_is_neutral"
+    )
 
 
 def test_forecast_generate_standard_preserves_full_arrays(monkeypatch):
@@ -1620,6 +1670,18 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
     assert standard["methods"][0]["params_count"] == 1
     assert "volatility_methods" in standard
 
+    volatility_filtered = _unwrap(cf.forecast_list_methods)(
+        detail="full",
+        profile="all",
+        search_term="ewma",
+        show_unavailable=True,
+    )
+    assert volatility_filtered["volatility_methods"]["total_filtered"] == 1
+    assert [
+        row["method"]
+        for row in volatility_filtered["volatility_methods"]["methods"]
+    ] == ["ewma"]
+
     compact_all = _unwrap(cf.forecast_list_methods)(show_unavailable=True, profile="all")
     unavailable_method = next(row for row in compact_all["methods"] if row["available"] is False)
     assert unavailable_method["unavailable_reason"] == "Requires: mlforecast, sklearn"
@@ -1664,6 +1726,7 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
         },
     )
     compact_repeated_description = _unwrap(cf.forecast_list_methods)()
+    assert compact_repeated_description["profile"] == "quickstart"
     assert "description" not in compact_repeated_description["methods"][0]
 
     monkeypatch.setattr(
@@ -2816,6 +2879,7 @@ def test_forecast_barrier_prob_compact_omits_confidence_diagnostics():
         "symbol": "EURUSD",
         "n_sims": 2000,
         "seed": 42,
+        "seed_source": "derived_from_request",
         "prob_tp_first": 0.55,
         "prob_sl_first": 0.30,
         "prob_no_hit": 0.15,
@@ -2833,7 +2897,8 @@ def test_forecast_barrier_prob_compact_omits_confidence_diagnostics():
     )
 
     assert out["n_sims"] == 2000
-    assert "seed" not in out
+    assert out["seed"] == 42
+    assert out["seed_source"] == "derived_from_request"
     assert "confidence" not in out
     assert "prob_tp_first_ci95" not in out
     assert "prob_sl_first_ci95" not in out
@@ -2930,7 +2995,8 @@ def test_forecast_barrier_prob_detail_rounds_display_values():
     assert out["probability_unit"] == "fraction"
     assert out["probability_edge_definition"] == "prob_tp_first - prob_sl_first"
     assert "edge" not in out
-    assert out["confidence"]["prob_tp_first_ci95"] == {"low": 0.5, "high": 0.6}
+    assert "confidence" not in out
+    assert "prob_tp_first_ci95" not in out
 
 
 def test_forecast_barrier_prob_marks_stale_reference_verdict_research_only():
@@ -3075,9 +3141,11 @@ def test_options_and_quantlib_tool_routing(monkeypatch):
         dividend_yield=0.01,
         volatility=0.25,
         rebate=0.0,
+        valuation_date="2026-07-03",
     )
     assert out["kind"] == "price"
     assert out["spot"] == 100.0
+    assert out["valuation_date"] == "2026-07-03"
 
     out = raw_cal(
         symbol="AAPL",
@@ -3303,6 +3371,9 @@ def test_options_tools_support_compact_and_full_detail(monkeypatch):
             "delta": 0.4,
             "gamma": 0.01,
             "vega": 0.2,
+            "valuation_date": kwargs.get("valuation_date") or "2026-07-03",
+            "maturity_date": "2026-08-02",
+            "time_to_maturity_years": 30 / 365,
             "params_used": {
                 "spot": kwargs["spot"],
                 "strike": kwargs["strike"],
@@ -3342,10 +3413,20 @@ def test_options_tools_support_compact_and_full_detail(monkeypatch):
     assert "implied_volatility" not in compact_chain["options"][0]
     assert raw_chain("AAPL", detail="full")["options"][0]["implied_volatility"] == 0.2
 
-    compact_price = raw_price(100, 105, 120, 30, detail="compact")
+    compact_price = raw_price(
+        100,
+        105,
+        120,
+        30,
+        valuation_date="2026-07-03",
+        detail="compact",
+    )
     assert compact_price["price"] == 1.23
     assert compact_price["delta"] == 0.4
     assert compact_price["detail"] == "compact"
+    assert compact_price["valuation_date"] == "2026-07-03"
+    assert compact_price["maturity_date"] == "2026-08-02"
+    assert compact_price["time_to_maturity_years"] == 30 / 365
     assert compact_price["units"] == {
         "price": "premium_per_underlying_unit",
         "delta": "premium_change_per_underlying_price_unit",

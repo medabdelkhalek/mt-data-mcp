@@ -59,7 +59,7 @@ def test_market_scan_freshness_uses_broker_crypto_category_on_weekends() -> None
         )
 
     assert result["data_stale"] is False
-    assert result["usable_for_live_trading"] is True
+    assert "usable_for_live_trading" not in result
     assert "market_status" not in result
 
 
@@ -106,6 +106,9 @@ def test_market_scan_freshness_summary_counts_bool_like_stale_flags():
 
     assert result["stale_rows"] == 2
     assert result["freshness"] == "mixed, 2/3 stale"
+    assert result["freshness_basis"] == "conservative_quote_or_bar"
+    assert result["stale_bar_rows"] == 0
+    assert result["unsafe_quote_rows"] == 2
 
 
 def test_market_scan_freshness_summary_labels_closed_weekend_snapshot():
@@ -157,6 +160,66 @@ def test_market_scan_bar_freshness_uses_timeframe_window():
     assert result["stale_after_seconds"] == 2 * 60 * 60
     assert result["data_stale"] is True
     assert result["freshness"] == "stale, bar 1d 2h ago"
+
+
+def test_market_scan_labels_recent_bars_as_completed_not_current():
+    from mtdata.core.symbols import _market_scan_freshness_fields
+
+    with patch("mtdata.core.symbols.time.time", return_value=1_700_000_000.0):
+        result = _market_scan_freshness_fields(
+            1_700_000_000.0 - (60 * 60),
+            timeframe="H1",
+        )
+
+    assert result["data_stale"] is False
+    assert result["freshness"] == "latest completed bar, 1h 0m ago"
+
+
+def test_market_scan_keeps_future_quote_unsafe_when_bar_is_fresh() -> None:
+    from mtdata.core import symbols as symbols_mod
+
+    now = 1_700_000_000.0
+    symbol = _make_symbol("BTCUSD", path="Crypto")
+    tick = SimpleNamespace(bid=40_000.0, ask=40_000.5, time=now + 12.0)
+    bars = _make_bars([40_000.0, 40_010.0, 40_020.0])
+    bars[0]["time"] = now - (3 * 3600.0)
+    bars[1]["time"] = now - (2 * 3600.0)
+    bars[2]["time"] = now - 3600.0
+
+    with (
+        patch.object(symbols_mod.mt5, "symbols_get", return_value=[symbol]),
+        patch.object(symbols_mod.mt5, "symbol_info_tick", return_value=tick),
+        patch.object(symbols_mod, "_mt5_copy_rates_from_pos", return_value=bars),
+        patch.object(symbols_mod.time, "time", return_value=now),
+        patch.object(symbols_mod, "ensure_mt5_connection_or_raise", return_value=None),
+    ):
+        result = _unwrap(symbols_mod.market_scan)(
+            symbols="BTCUSD",
+            timeframe="H1",
+            lookback=3,
+            detail="full",
+        )
+
+    row = result["data"][0]
+    assert row["timestamp_in_future"] is True
+    assert row["data_stale"] is True
+    assert row["usable_for_live_trading"] is False
+    assert row["freshness_reason"] == "future_timestamp"
+    assert row["warning"] == row["timestamp_warning"]
+    assert row["bar_stale"] is False
+    assert row["bar_freshness"] == "latest completed bar, 1h 0m ago"
+    assert result["freshness"] == "stale"
+    assert result["stale_rows"] == 1
+    assert result["stale_bar_rows"] == 0
+    assert result["unsafe_quote_rows"] == 1
+
+
+def test_market_scan_default_limit_is_concise():
+    from inspect import signature
+
+    from mtdata.core.symbols import market_scan
+
+    assert signature(_unwrap(market_scan)).parameters["limit"].default == 10
 
 
 @patch("mtdata.core.symbols.time.time", return_value=10_000.0)
@@ -307,6 +370,44 @@ def test_symbol_category_prefers_stock_group_over_crypto_substrings():
 
     assert _symbol_category(stock) == "stocks"
     assert _symbol_category(crypto) == "crypto"
+
+
+def test_symbol_category_recognizes_exotic_forex_pairs_and_groups():
+    from types import SimpleNamespace
+
+    from mtdata.core.symbols import _symbol_category
+
+    gbpsgd = SimpleNamespace(
+        name="GBPSGD",
+        path="Forex\\Exotics",
+        description="Great Britain Pound vs Singapore Dollar",
+    )
+    usddkk = SimpleNamespace(
+        name="USDDKK",
+        path="Forex\\Exotics",
+        description="US Dollar vs Danish Krone",
+    )
+
+    assert _symbol_category(gbpsgd) == "forex"
+    assert _symbol_category(usddkk) == "forex"
+
+
+def test_symbol_category_recognizes_metal_group_and_codes():
+    from mtdata.core.symbols import _symbol_category
+
+    platinum = _make_symbol(
+        "XPTUSD",
+        path="Commodities\\Metals",
+        description="Platinum spot",
+    )
+    copper = _make_symbol(
+        "XCUUSD",
+        path="Markets\\Spot",
+        description="Copper spot",
+    )
+
+    assert _symbol_category(platinum) == "commodities"
+    assert _symbol_category(copper) == "commodities"
 
 
 @contextmanager
@@ -944,8 +1045,8 @@ class TestMarketScan:
             "timeframe",
             "data_source",
             "time",
-            "data_stale",
-            "freshness",
+            "bar_stale",
+            "bar_freshness",
             "close",
             "price_change_pct",
             "tick_volume",
@@ -953,9 +1054,9 @@ class TestMarketScan:
             "spread_points",
             "spread_pips",
         }.issubset(row)
-        assert "market_status" not in row
-        assert "market_status_reason" not in row
-        assert "freshness_policy_relaxed" not in row
+        assert "bar_market_status" not in row
+        assert "bar_market_status_reason" not in row
+        assert "bar_freshness_policy_relaxed" not in row
         assert row["time"].endswith("Z")
         assert row["spread_pips"] == 1.0
         assert mock_rates.call_args.args[2:] == (0, 3)
@@ -1039,6 +1140,14 @@ class TestMarketScan:
         assert "returned_count" not in result
         assert result["total_count"] == 3
         assert result["has_more"] is True
+        assert result["pagination"] == {
+            "total": 3,
+            "returned": 1,
+            "offset": 1,
+            "limit": 1,
+            "has_more": True,
+            "more_available": 1,
+        }
         assert result["message"].startswith(
             "Showing 1 of 3 symbols matching the requested market scan filters."
         )
@@ -1127,8 +1236,8 @@ class TestMarketScan:
 
         assert result["success"] is True
         assert [row["symbol"] for row in result["data"]] == ["FRESHWIDE", "STALETIGHT"]
-        assert result["data"][0]["data_stale"] is False
-        assert result["data"][1]["data_stale"] is True
+        assert result["data"][0]["bar_stale"] is False
+        assert result["data"][1]["bar_stale"] is True
         assert result["freshness"] == "mixed, 1/2 stale"
         assert result["stale_rows"] == 1
         assert "stale_symbols" not in result

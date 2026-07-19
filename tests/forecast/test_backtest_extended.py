@@ -254,11 +254,16 @@ class TestForecastBacktest:
             methods=["theta"],
         )
 
-        assert result == {"error": "spacing must be greater than horizon when steps > 1"}
+        assert result == {
+            "error": (
+                "spacing must be greater than or equal to horizon when steps > 1 "
+                "(got spacing=10, horizon=12); try spacing=12 or steps=1"
+            )
+        }
         fetch.assert_not_called()
 
     @patch("mtdata.forecast.backtest._fetch_history")
-    def test_rejects_boundary_overlapping_generated_backtest_windows(self, fetch):
+    def test_allows_adjacent_generated_backtest_windows(self, fetch):
         result = forecast_backtest(
             "EURUSD",
             timeframe="H1",
@@ -268,8 +273,8 @@ class TestForecastBacktest:
             methods=["theta"],
         )
 
-        assert result == {"error": "spacing must be greater than horizon when steps > 1"}
-        fetch.assert_not_called()
+        assert result == {"error": "Not enough closed bars for backtest"}
+        fetch.assert_called_once()
 
     @patch("mtdata.forecast.backtest._fetch_history")
     def test_explicit_anchors(self, fetch):
@@ -360,12 +365,19 @@ class TestForecastBacktest:
         fetch.return_value = _make_df(500)
         with patch("mtdata.forecast.backtest.forecast") as fc:
             fc.return_value = {"forecast_price": [101.0] * 12}
-            with patch("mtdata.forecast.backtest._normalize_denoise_spec", return_value={"method": "wavelet"}):
+            with patch(
+                "mtdata.forecast.backtest._normalize_denoise_spec",
+                return_value={"method": "ema", "causality": "zero_phase"},
+            ):
                 result = forecast_backtest(
                     "EURUSD", timeframe="H1", methods=["naive"],
-                    denoise={"method": "wavelet"},
+                    denoise={"method": "ema", "causality": "zero_phase"},
                 )
-        assert isinstance(result, dict)
+        assert result["denoise_causality"] == "zero_phase"
+        assert result["denoise_live_safe"] is False
+        assert result["denoise_usage"] == "research_only"
+        assert result["history_policy_ok"] is False
+        assert any("uses future observations" in warning for warning in result["warnings"])
 
     @patch("mtdata.forecast.backtest._fetch_history")
     def test_slippage_and_threshold(self, fetch):

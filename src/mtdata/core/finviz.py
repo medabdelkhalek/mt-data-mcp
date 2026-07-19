@@ -39,6 +39,7 @@ from ._mcp_instance import mcp
 from .error_envelope import build_error_payload
 from .execution_logging import run_logged_operation
 from .output_contract import (
+    build_pagination_meta,
     normalize_output_detail,
     normalize_output_extras,
     normalize_output_verbosity_detail,
@@ -697,6 +698,12 @@ def _normalize_finviz_market_payload(
     available = len(normalized_rows)
     if rows_key != "stocks":
         out["available_count"] = available
+    out["pagination"] = build_pagination_meta(
+        total=(int(out.get("total") or 0) if rows_key == "stocks" else available),
+        returned=len(output_rows),
+        offset=0,
+        limit=limit_value,
+    )
     if rows_key == "stocks" and out.get("total") not in (None, ""):
         omitted = max(0, int(out.get("total") or 0) - int(out["count"]))
     else:
@@ -3631,6 +3638,9 @@ def finviz_earnings(
             "page": result.get("page"),
             "total": result.get("total"),
             "pages": result.get("pages"),
+            "has_more": bool(result.get("has_more")),
+            "total_lower_bound": result.get("total_lower_bound"),
+            "truncated": bool(result.get("truncated")),
         }
         stats = {
             "truncated": result.get("truncated"),
@@ -3645,9 +3655,19 @@ def finviz_earnings(
             "total": result.get("total"),
             "page": result.get("page"),
             "pages": result.get("pages"),
+            "has_more": bool(result.get("has_more")),
+            "truncated": bool(result.get("truncated")),
         }
+        if result.get("total_lower_bound") is not None:
+            out["total_lower_bound"] = result.get("total_lower_bound")
+        if out["has_more"] and out.get("page") is not None:
+            out["next_page"] = int(out["page"]) + 1
         if out["detail"] != "full":
-            out["omitted_item_count"] = max(0, int(out.get("total") or 0) - int(out["count"]))
+            out["omitted_item_count"] = (
+                None
+                if out.get("total") is None
+                else max(0, int(out["total"]) - int(out["count"]))
+            )
             out["hint"] = (
                 "Period-based earnings view; use finviz_calendar(calendar='earnings') "
                 "for date-range EPS/sales actuals and surprises."

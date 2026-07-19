@@ -5,7 +5,11 @@ from pydantic import ValidationError
 
 from mtdata.core import data as core_data
 from mtdata.core.data.requests import DataFetchCandlesRequest, DataFetchTicksRequest
-from mtdata.core.data.use_cases import run_data_fetch_candles, run_data_fetch_ticks
+from mtdata.core.data.use_cases import (
+    _compact_tick_row,
+    run_data_fetch_candles,
+    run_data_fetch_ticks,
+)
 from mtdata.utils.mt5 import MT5ConnectionError
 
 
@@ -1278,6 +1282,18 @@ def test_run_data_fetch_ticks_echoes_limit_and_cap_signal():
     assert partial["limit_reached"] is False
 
 
+def test_compact_tick_row_marks_locked_quote_spread_unavailable():
+    row, spread_sample = _compact_tick_row(
+        {"time": "2026-07-17T01:53:23Z", "bid": 1.14396, "ask": 1.14396},
+        price_point=0.00001,
+    )
+
+    assert row["spread"] == 0.0
+    assert row["spread_valid"] is False
+    assert row["spread_basis"] == "unavailable"
+    assert spread_sample is None
+
+
 def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
     result = run_data_fetch_ticks(
         DataFetchTicksRequest(symbol="EURUSD", limit=2, detail="compact"),
@@ -1286,6 +1302,7 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             "success": True,
             "symbol": "EURUSD",
             "count": 2,
+            "tick_count": 2,
             "data": [
                 {
                     "time": "2026-05-29 20:56",
@@ -1352,14 +1369,19 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             {
                 "time": "2026-05-29 20:56",
                 "bid": 1.1659,
-                "ask": None,
-                "spread": None,
+                "ask": 1.16596,
+                "spread": 0.00006,
+                "mid": 1.16593,
+                "spread_points": 6.0,
+                "spread_pct": 0.005146,
                 "volume": 3.0,
                 "volume_real": 1.25,
-                "flags": 1026,
-                "flags_decoded": ["bid", "volume_real"],
+                "bid_changed": True,
+                "ask_changed": False,
                 "quote_update_type": "bid_only_update",
-                "spread_valid": False,
+                "spread_sample_eligible": False,
+                "spread_valid": True,
+                "spread_basis": "quote_snapshot",
             },
             {
                 "time": "2026-05-29 20:57",
@@ -1370,15 +1392,18 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
                 "spread_points": 8.0,
                 "spread_pct": 0.006861,
                 "volume": 4.0,
-                "flags": 1030,
-                "flags_decoded": ["bid", "ask", "volume_real"],
+                "bid_changed": True,
+                "ask_changed": True,
                 "quote_update_type": "bid_ask_update",
+                "spread_sample_eligible": True,
                 "spread_valid": True,
+                "spread_basis": "quote_snapshot",
             },
         ],
         "timezone": "UTC",
         "price_precision": 5,
         "price_point": 0.00001,
+        "last_quote": {"bid": 1.16591, "ask": 1.16599},
         "freshness": "stale, tick 10m 0s ago",
         "data_age_seconds": 600.0,
         "data_age_anchor": "wall_clock",
@@ -1400,6 +1425,70 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
         "requested_limit": 2,
         "limit_reached": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("error", "start", "end", "error_code"),
+    [
+        (
+            "start must be before or equal to end.",
+            "2026-07-16T12:00:00Z",
+            "2026-07-15T12:00:00Z",
+            "data_fetch_ticks_invalid_date_range",
+        ),
+        (
+            "Could not parse start date 'garbage'.",
+            "garbage",
+            "2026-07-16T12:00:00Z",
+            "data_fetch_ticks_invalid_date",
+        ),
+        (
+            "No tick data available",
+            "2099-01-01T00:00:00Z",
+            "2099-01-01T01:00:00Z",
+            "data_fetch_ticks_future_date_range",
+        ),
+        (
+            "No tick data available",
+            "2026-07-11T12:00:00Z",
+            "2026-07-11T13:00:00Z",
+            "data_fetch_ticks_no_data",
+        ),
+    ],
+)
+def test_run_data_fetch_ticks_classifies_query_errors(
+    error: str,
+    start: str,
+    end: str,
+    error_code: str,
+) -> None:
+    result = run_data_fetch_ticks(
+        DataFetchTicksRequest(symbol="EURUSD", start=start, end=end),
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_ticks_impl=lambda **_kwargs: {"error": error},
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == error_code
+    assert result["details"] == {
+        "symbol": "EURUSD",
+        "timezone": "UTC",
+        "start": start,
+        "end": end,
+    }
+
+
+def test_run_data_fetch_ticks_classifies_unknown_symbol() -> None:
+    result = run_data_fetch_ticks(
+        DataFetchTicksRequest(symbol="NOTAREAL"),
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_ticks_impl=lambda **_kwargs: {
+            "error": "Symbol NOTAREAL not found in Market Watch"
+        },
+    )
+
+    assert result["error_code"] == "symbol_not_found"
+    assert result["related_tools"] == ["symbols_list"]
 
 
 def test_run_data_fetch_ticks_compact_summarizes_quality_without_verbose_warnings():

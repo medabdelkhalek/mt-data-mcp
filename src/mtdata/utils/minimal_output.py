@@ -94,6 +94,26 @@ def _move_top_level_metadata_to_tail(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _compact_error_envelope(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact error details without dropping machine-readable discriminators."""
+    keys = (
+        "success",
+        "error",
+        "error_code",
+        "request_id",
+        "operation",
+        "remediation",
+        "related_tools",
+        "valid_values",
+        "details",
+    )
+    return {
+        key: payload[key]
+        for key in keys
+        if key in payload and not _is_empty_value(payload.get(key))
+    }
+
+
 def _render_news_bucket_toon(
     key: str,
     items: List[Any],
@@ -450,6 +470,7 @@ def _normalize_forecast_payload(
                 "forecast_vs_last_price",
                 "path_flat",
                 "path_range",
+                "units",
             ):
                 value = payload.get(key)
                 if (
@@ -803,16 +824,27 @@ def _normalize_trade_payload(
     if _is_empty_value(resolved_ticket):
         resolved_ticket = payload.get("ticket")
     order_value = payload.get("order")
+    is_successful_dry_run_preview = (
+        payload.get("dry_run") is True
+        and payload.get("success") is True
+        and payload.get("preview_ok") is True
+    )
 
     _maybe_add_trade_key(out, "retcode_name", payload.get("retcode_name"))
     if "retcode_name" not in out:
         _maybe_add_trade_key(out, "retcode", payload.get("retcode"))
     _maybe_add_trade_key(out, "dry_run", payload.get("dry_run"))
-    _maybe_add_trade_key(out, "dry_run_simulated", payload.get("dry_run_simulated"))
+    if not is_successful_dry_run_preview:
+        _maybe_add_trade_key(out, "dry_run_simulated", payload.get("dry_run_simulated"))
     _maybe_add_trade_key(out, "preview_ok", payload.get("preview_ok"))
-    _maybe_add_trade_key(out, "validation_passed", payload.get("validation_passed"))
-    _maybe_add_trade_key(out, "trade_gate_passed", payload.get("trade_gate_passed"))
-    _maybe_add_trade_key(out, "actionability", payload.get("actionability"))
+    if not is_successful_dry_run_preview:
+        _maybe_add_trade_key(out, "validation_passed", payload.get("validation_passed"))
+        _maybe_add_trade_key(out, "trade_gate_passed", payload.get("trade_gate_passed"))
+    if not (
+        is_successful_dry_run_preview
+        and payload.get("actionability") == "preview_only"
+    ):
+        _maybe_add_trade_key(out, "actionability", payload.get("actionability"))
     _maybe_add_trade_key(out, "symbol", payload.get("symbol"))
     _maybe_add_trade_key(out, "order_type", payload.get("order_type"))
     _maybe_add_trade_key(out, "pending", payload.get("pending"))
@@ -860,14 +892,15 @@ def _normalize_trade_payload(
     _maybe_add_trade_key(out, "protection_status", payload.get("protection_status"))
     _maybe_add_trade_key(out, "protection_error", protection_error)
     _maybe_add_trade_key(out, "validation_scope", payload.get("validation_scope"))
-    _maybe_add_trade_key(
-        out,
-        "broker_validation_not_performed",
-        payload.get("broker_validation_not_performed"),
-    )
-    _maybe_add_trade_key(
-        out, "preview_scope_summary", payload.get("preview_scope_summary")
-    )
+    if not is_successful_dry_run_preview:
+        _maybe_add_trade_key(
+            out,
+            "broker_validation_not_performed",
+            payload.get("broker_validation_not_performed"),
+        )
+        _maybe_add_trade_key(
+            out, "preview_scope_summary", payload.get("preview_scope_summary")
+        )
     _maybe_add_trade_key(out, "require_sl_tp", payload.get("require_sl_tp"))
     _maybe_add_trade_key(
         out, "auto_close_on_sl_tp_fail", payload.get("auto_close_on_sl_tp_fail")
@@ -876,13 +909,19 @@ def _normalize_trade_payload(
     _maybe_add_trade_key(
         out, "remaining_volume", payload.get("position_volume_remaining_estimate")
     )
-    _maybe_add_trade_key(out, "no_action", payload.get("no_action"))
+    if not is_successful_dry_run_preview:
+        _maybe_add_trade_key(out, "no_action", payload.get("no_action"))
     _maybe_add_trade_key(out, "message", payload.get("message"))
-    _maybe_add_trade_key(
-        out, "actionability_reason", payload.get("actionability_reason")
-    )
+    if not is_successful_dry_run_preview:
+        _maybe_add_trade_key(
+            out, "actionability_reason", payload.get("actionability_reason")
+        )
 
-    warnings_out = _compact_trade_warnings(payload.get("warnings"), verbose=verbose)
+    warnings_out = (
+        []
+        if is_successful_dry_run_preview
+        else _compact_trade_warnings(payload.get("warnings"), verbose=verbose)
+    )
     if warnings_out:
         out["warnings"] = warnings_out
 
@@ -981,6 +1020,7 @@ def _normalize_market_ticker_payload(
         "field",
         "price",
         "price_precision",
+        "point",
         "price_currency",
         "bid",
         "ask",
@@ -1031,6 +1071,8 @@ def _normalize_market_ticker_payload(
         ]
         if primary_spread_key is not None:
             compact_keys.append(primary_spread_key)
+        if primary_spread_key == "spread_points":
+            compact_keys.append("point")
         selected_keys = tuple(compact_keys)
     for key in selected_keys:
         value = _freshness_label() if key == "freshness" else payload.get(key)
@@ -1257,6 +1299,8 @@ def _normalize_barrier_prob_payload(
         "edge_score",
         "expected_value",
         "units",
+        "seed",
+        "seed_source",
         "verdict",
         "method",
         "warning",
@@ -1545,6 +1589,14 @@ def _normalize_regime_all_payload(
     if comparison_out:
         out["comparison"] = comparison_out
 
+    runtime_in = payload.get("runtime")
+    if isinstance(runtime_in, dict) and runtime_in.get("partial_results") is True:
+        runtime_out: Dict[str, Any] = {"partial_results": True}
+        failed_methods = runtime_in.get("failed_methods")
+        if isinstance(failed_methods, list) and failed_methods:
+            runtime_out["failed_methods"] = failed_methods
+        out["runtime"] = runtime_out
+
     if detail_value != "full" and ("results" in payload or "params_used" in payload):
         if detail_value == "summary":
             out["show_all_hint"] = (
@@ -1572,7 +1624,7 @@ def _normalize_forecast_methods_payload(
         return None
 
     if "error" in payload and not _is_empty_value(payload.get("error")):
-        return {"error": payload.get("error")}
+        return _compact_error_envelope(payload)
 
     out: Dict[str, Any] = {
         "success": bool(payload.get("success"))
@@ -1688,17 +1740,55 @@ def _normalize_library_models_payload(
     *,
     verbose: bool,
     tool_name: str,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[Dict[str, Any]]:  # noqa: C901
     if tool_name != "forecast_list_library_models" or verbose:
         return None
 
     if "error" in payload and not _is_empty_value(payload.get("error")):
-        return {"error": payload.get("error")}
+        return _compact_error_envelope(payload)
 
     out: Dict[str, Any] = {}
     library = payload.get("library")
     if not _is_empty_value(library):
         out["library"] = library
+
+    for key in ("total", "total_filtered", "available"):
+        if key in payload and not _is_empty_value(payload.get(key)):
+            out[key] = payload.get(key)
+
+    libraries = payload.get("libraries")
+    if isinstance(libraries, list):
+        compact_libraries: List[Dict[str, Any]] = []
+        for section in libraries:
+            if not isinstance(section, dict):
+                continue
+            models = section.get("models")
+            model_names: List[Any] = []
+            if isinstance(models, list):
+                for model in models:
+                    if isinstance(model, dict):
+                        model_name = model.get("display_name") or model.get("method")
+                    else:
+                        model_name = model
+                    if not _is_empty_value(model_name):
+                        model_names.append(model_name)
+            compact_section = {
+                key: value
+                for key, value in {
+                    "library": section.get("library"),
+                    "total_filtered": section.get("total_filtered"),
+                    "available": section.get("available"),
+                    "models_shown": len(model_names),
+                    "has_more": section.get("has_more"),
+                    "models": model_names,
+                    "error": section.get("error"),
+                }.items()
+                if not _is_empty_value(value)
+            }
+            if compact_section:
+                compact_libraries.append(compact_section)
+        if compact_libraries:
+            out["libraries"] = compact_libraries
 
     capabilities = payload.get("capabilities")
     compact_rows: List[Dict[str, Any]] = []
@@ -1803,7 +1893,7 @@ def _normalize_support_resistance_payload(
         return None
 
     if "error" in payload and not _is_empty_value(payload.get("error")):
-        return {"error": payload.get("error")}
+        return _compact_error_envelope(payload)
 
     detail_value = str(payload.get("detail") or "compact").strip().lower()
     if detail_value in {"standard", "full"}:
@@ -1818,6 +1908,7 @@ def _normalize_support_resistance_payload(
         "method",
         "current_price",
         "level_counts",
+        "units",
     ):
         value = payload.get(key)
         if not _is_empty_value(value):
@@ -1981,6 +2072,13 @@ def _compact_forecast_ci(
 
     if not _is_empty_value(ci_status):
         out["status"] = ci_status
+
+    if ci_status == "not_requested":
+        out["mode"] = "point_only"
+        out["reason"] = (
+            "ci_alpha was not requested; direction is based on the point estimate only."
+        )
+        out["recommended_tool"] = "forecast_conformal_intervals"
 
     if alpha is not None:
         out["ci_alpha"] = alpha

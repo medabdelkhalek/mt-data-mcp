@@ -27,7 +27,7 @@ from typing import (
     is_typeddict,
 )
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ...bootstrap.settings import load_environment
 from ...bootstrap.tools import bootstrap_tools, cli_tool_module_names
@@ -35,6 +35,7 @@ from ...forecast.requests import ForecastGenerateRequest
 from .._mcp_instance import mcp
 from .._mcp_tools import _get_pydantic_model_fields, _select_output_fields
 from .._mcp_tools import get_tool_registry as get_registered_tools
+from ..error_envelope import build_error_payload
 from ..output_contract import resolve_output_contract
 from .formatting import (
     _attach_cli_meta,
@@ -77,7 +78,11 @@ from .runtime import (
     _debug_enabled,
     _suppress_cli_side_output,
 )
-from .runtime.commands import LIVE_TRADE_MUTATION_TOOLS, LIVE_TRADE_MUTATION_WARNING
+from .runtime.commands import (
+    LIVE_TRADE_MUTATION_TOOLS,
+    LIVE_TRADE_MUTATION_WARNING,
+    friendly_validation_error,
+)
 from .runtime.commands import (
     coerce_cli_scalar as _coerce_cli_scalar_impl,
 )
@@ -135,7 +140,8 @@ def _invoke_cli_tool_function(
     for record in warning_records:
         category = getattr(record, "category", Warning)
         if isinstance(category, type) and issubclass(
-            category, (DeprecationWarning, PendingDeprecationWarning)
+            category,
+            (DeprecationWarning, PendingDeprecationWarning, ImportWarning),
         ):
             continue
         if isinstance(category, type) and issubclass(category, ResourceWarning):
@@ -182,6 +188,7 @@ def _invoke_cli_tool_function(
     return {"success": True, "data": result, "warnings": warning_texts}
 
 
+from ...shared.constants import TIMEFRAME_MAP
 from ...shared.schema import PARAM_HINTS as _PARAM_HINTS
 from ...shared.schema import enrich_schema_with_shared_defs
 from ...shared.schema import get_function_info as _schema_get_function_info
@@ -506,7 +513,7 @@ def _write_cli_text(text: str, *, stream: Any = None) -> None:
             pass
 
 
-def _render_cli_result(result: Any, *, args: Any, cmd_name: str) -> None:
+def _render_cli_result(result: Any, *, args: Any, cmd_name: str) -> Any:
     verbose = resolve_output_contract(args).verbose
     result = _attach_cli_meta(result, cmd_name=cmd_name, verbose=verbose)
     result = _select_output_fields(result, getattr(args, "fields", None))
@@ -519,10 +526,13 @@ def _render_cli_result(result: Any, *, args: Any, cmd_name: str) -> None:
     )
     if output:
         _write_cli_text(output)
+    return result
 
 
 def _result_has_tool_error(result: Any) -> bool:
     if isinstance(result, dict):
+        if result.get("success") is False:
+            return True
         if bool(result.get("no_action", False)) and result.get("success") is not True:
             return True
         err = result.get("error")
@@ -532,6 +542,11 @@ def _result_has_tool_error(result: Any) -> bool:
     if isinstance(result, str):
         return result.strip().lower().startswith("error:")
     return False
+
+
+def _render_cli_result_status(result: Any, *, args: Any, cmd_name: str) -> int:
+    rendered_result = _render_cli_result(result, args=args, cmd_name=cmd_name)
+    return int(_result_has_tool_error(rendered_result))
 
 
 def _json_parse_errors_requested() -> bool:
@@ -558,18 +573,22 @@ class _CLIArgumentParser(argparse.ArgumentParser):
                 "The broker must also provide Level 2/DOM data."
             )
         if _json_parse_errors_requested():
-            payload = {
-                "success": False,
-                "error": str(message),
-                "error_code": (
-                    "feature_disabled" if market_depth_disabled else "cli_invalid_arguments"
+            program_parts = str(self.prog or "").split()
+            operation = program_parts[-1] if len(program_parts) > 1 else "cli"
+            payload = build_error_payload(
+                str(message),
+                code=(
+                    "feature_disabled"
+                    if market_depth_disabled
+                    else "cli_invalid_arguments"
                 ),
-                "remediation": (
+                operation=operation,
+                remediation=(
                     "Set MTDATA_ENABLE_MARKET_DEPTH_FETCH=1 and restart the process."
                     if market_depth_disabled
                     else f"Run '{self.prog} --help' to inspect valid arguments."
                 ),
-            }
+            )
             if market_depth_disabled:
                 payload["details"] = {
                     "feature": "market_depth_fetch",
@@ -579,6 +598,13 @@ class _CLIArgumentParser(argparse.ArgumentParser):
             _write_cli_text(json.dumps(payload, ensure_ascii=False, indent=2))
             self.exit(2)
         super().error(message)
+
+
+def _resolve_cli_output_contract_or_error(parser: argparse.ArgumentParser, args: Any):
+    try:
+        return resolve_output_contract(args)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
 
 
 def get_function_info(func):
@@ -876,12 +902,7 @@ def _add_forecast_generate_args(cmd_parser: argparse.ArgumentParser) -> None:
 
     cmd_parser.add_argument(
         "symbol",
-        nargs="?",
-        default=argparse.SUPPRESS,
         help=_PARAM_HINTS["symbol"],
-    )
-    cmd_parser.add_argument(
-        "--symbol", dest="symbol", default=argparse.SUPPRESS, help=argparse.SUPPRESS
     )
 
     group_method = cmd_parser.add_argument_group("Method")
@@ -915,6 +936,7 @@ def _add_forecast_generate_args(cmd_parser: argparse.ArgumentParser) -> None:
     group_window.add_argument(
         "--timeframe",
         type=str,
+        choices=tuple(TIMEFRAME_MAP),
         default="H1",
         help=_PARAM_HINTS["timeframe"],
     )
@@ -962,7 +984,7 @@ def _add_forecast_generate_args(cmd_parser: argparse.ArgumentParser) -> None:
         dest="ci_alpha",
         type=float,
         default=0.05,
-        help="CI alpha (0.05 => 95%%).",
+        help="Confidence interval alpha (default 0.05 => 95%%).",
     )
     group_uncertainty.add_argument(
         "--detail",
@@ -1628,15 +1650,16 @@ def main():
 
     shell_parser = subparsers.add_parser(
         "shell",
-        help="Run repeated CLI commands in one warm Python process",
+        help="Run interactive commands or a stdin batch in one warm Python process",
         description=(
-            "Run an interactive mtdata-cli session. Enter ordinary command lines "
-            "without the mtdata-cli prefix; use exit or quit to stop."
+            "Run an interactive mtdata-cli session or read a batch from stdin. "
+            "Enter ordinary command lines without the mtdata-cli prefix; blank "
+            "lines and comments are ignored, and exit or quit stops the session."
         ),
         formatter_class=_CLIHelpFormatter,
         allow_abbrev=False,
     )
-    shell_parser.set_defaults(func=lambda _args: run_shell())
+    shell_parser.set_defaults(func=lambda _args: run_shell(interactive=sys.stdin.isatty()))
 
     # Dynamically create subparsers for each function, except forecast_generate
     forecast_tool = None
@@ -1738,15 +1761,6 @@ def main():
             except ValueError as exc:
                 cmd_parser.error(str(exc))
 
-            symbol = getattr(args, "symbol", None)
-            if symbol in (None, ""):
-                _render_cli_result(
-                    {"error": "Missing required argument(s): symbol."},
-                    args=args,
-                    cmd_name="forecast_generate",
-                )
-                return 1
-
             params_raw = _resolve_forecast_typed_cli_value(
                 args.params,
                 key="params",
@@ -1816,29 +1830,34 @@ def main():
             dimred_params = _merge_dict(dimred_params, overrides.get("dimred"))
             target_spec = _merge_dict(target_spec, overrides.get("target"))
 
-            request = ForecastGenerateRequest(
-                symbol=symbol,
-                timeframe=args.timeframe,
-                library=args.library,
-                method=args.method,
-                horizon=int(args.horizon),
-                lookback=args.lookback,
-                as_of=args.as_of,
-                start=args.start,
-                end=args.end,
-                params=params,
-                ci_alpha=args.ci_alpha,
-                quantity=args.quantity,
-                proxy=args.proxy,
-                denoise=cast(Any, denoise or None),
-                features=features or None,
-                dimred_method=args.dimred_method,
-                dimred_params=dimred_params or None,
-                target_spec=target_spec or None,
-                async_mode=bool(args.async_mode),
-                model_id=args.model_id,
-                detail=resolve_output_contract(args).detail,
-            )
+            try:
+                request = ForecastGenerateRequest(
+                    symbol=args.symbol,
+                    timeframe=args.timeframe,
+                    library=args.library,
+                    method=args.method,
+                    horizon=int(args.horizon),
+                    lookback=args.lookback,
+                    as_of=args.as_of,
+                    start=args.start,
+                    end=args.end,
+                    params=params,
+                    ci_alpha=args.ci_alpha,
+                    quantity=args.quantity,
+                    proxy=args.proxy,
+                    denoise=cast(Any, denoise or None),
+                    features=features or None,
+                    dimred_method=args.dimred_method,
+                    dimred_params=dimred_params or None,
+                    target_spec=target_spec or None,
+                    async_mode=bool(args.async_mode),
+                    model_id=args.model_id,
+                    detail=resolve_output_contract(args).detail,
+                )
+            except ValidationError as exc:
+                cmd_parser.error(
+                    friendly_validation_error(exc, cmd_name="forecast_generate")
+                )
 
             if getattr(args, "print_config", False):
                 config_output = _format_result_for_cli(
@@ -1863,8 +1882,11 @@ def main():
                     "__cli_raw": True,
                 },
             )
-            _render_cli_result(out, args=args, cmd_name="forecast_generate")
-            return 1 if _result_has_tool_error(out) else 0
+            return _render_cli_result_status(
+                out,
+                args=args,
+                cmd_name="forecast_generate",
+            )
 
         cmd_parser.set_defaults(func=_forecast_generate_cmd)
 
@@ -1881,7 +1903,8 @@ def main():
         parser.print_help()
         return 1
 
-    _configure_cli_logging(verbose=resolve_output_contract(args).verbose)
+    output_contract = _resolve_cli_output_contract_or_error(parser, args)
+    _configure_cli_logging(verbose=output_contract.verbose)
 
     try:
         status = args.func(args)
@@ -1900,35 +1923,55 @@ def main():
         return 1
 
 
-def run_shell() -> int:
+def run_shell(*, interactive: bool = True) -> int:
     """Run repeated CLI commands while reusing the initialized Python process."""
-    print("mtdata-cli shell (type 'exit' or 'quit' to stop)")
+    if interactive:
+        print("mtdata-cli shell (type 'exit' or 'quit' to stop)")
     original_argv = list(sys.argv)
+    overall_status = 0
     try:
         while True:
-            try:
-                line = input("mtdata> ")
-            except EOFError:
-                print("")
-                return 0
-            except KeyboardInterrupt:
-                print("")
-                continue
+            if interactive:
+                try:
+                    line = input("mtdata> ")
+                except EOFError:
+                    print("")
+                    return overall_status
+                except KeyboardInterrupt:
+                    print("")
+                    continue
+            else:
+                line = sys.stdin.readline()
+                if line == "":
+                    return overall_status
             stripped = line.strip()
-            if not stripped:
+            if not stripped or stripped.startswith("#"):
                 continue
             if stripped.lower() in {"exit", "quit"}:
-                return 0
+                return overall_status
             try:
                 command_argv = shlex.split(stripped, posix=False)
             except ValueError as exc:
                 print(f"Invalid command line: {exc}", file=sys.stderr)
+                if not interactive:
+                    overall_status = 2
                 continue
             if command_argv and command_argv[0].lower() == "shell":
                 print("A shell session is already active.", file=sys.stderr)
+                if not interactive:
+                    overall_status = 2
                 continue
             sys.argv = [original_argv[0], *command_argv]
-            main()
+            try:
+                status = main()
+                if not interactive and isinstance(status, int) and status != 0:
+                    overall_status = status
+            except SystemExit as exc:
+                # argparse has already rendered its error or help text. Keep the
+                # warmed shell alive for the next command.
+                if not interactive and isinstance(exc.code, int) and exc.code != 0:
+                    overall_status = exc.code
+                continue
     finally:
         sys.argv = original_argv
 

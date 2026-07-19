@@ -8,8 +8,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from ..shared.schema import DetailLiteral, TimeframeLiteral
+from ..utils.market_metadata import build_tick_freshness_context
 from ._mcp_instance import mcp
+from .error_envelope import build_error_payload
 from .execution_logging import run_logged_operation
+from .mt5_gateway import create_mt5_gateway
 from .tool_calling import call_tool_sync_structured
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,38 @@ def _section_error(exc: Exception) -> Dict[str, Any]:
     return {"error": str(exc)}
 
 
+def _preflight_snapshot_symbol(
+    symbol: str,
+    *,
+    gateway: Any = None,
+) -> Optional[Dict[str, Any]]:
+    symbol_name = str(symbol or "").strip()
+    try:
+        mt5_gateway = gateway or create_mt5_gateway()
+        mt5_gateway.ensure_connection()
+        symbol_info = mt5_gateway.symbol_info(symbol_name)
+    except Exception as exc:
+        return build_error_payload(
+            str(exc),
+            code="mt5_connection_error",
+            operation="market_snapshot",
+        )
+    if symbol_info is not None:
+        return None
+    return build_error_payload(
+        f"Symbol '{symbol_name}' not found in MT5 terminal.",
+        code="symbol_not_found",
+        operation="market_snapshot",
+        details={
+            "symbol": symbol_name,
+            "search_hint": (
+                f"Use symbols_list(search_term='{symbol_name}') to browse matching "
+                "broker symbols."
+            ),
+        },
+    )
+
+
 def _compact_quote(quote: Any) -> Any:
     if not isinstance(quote, dict) or quote.get("error"):
         return quote
@@ -84,8 +119,10 @@ def _compact_quote(quote: Any) -> Any:
         "spread_pct",
         "freshness",
         "freshness_state",
+        "freshness_reason",
         "data_age_seconds",
         "usable_for_live_trading",
+        "usable_for_live_trading_basis",
         "live_max_age_seconds",
         "market_status_reason",
         "time",
@@ -93,6 +130,42 @@ def _compact_quote(quote: Any) -> Any:
         "data_stale",
     )
     return {key: normalized_quote[key] for key in keys if key in normalized_quote}
+
+
+def _revalidate_snapshot_quote(
+    sections: Dict[str, Any],
+    *,
+    symbol: str,
+    assembled_at_epoch: float,
+) -> Optional[Dict[str, Any]]:
+    quote = sections.get("quote")
+    if not isinstance(quote, dict) or _section_failed(quote):
+        return None
+    quote_epoch = _coerce_float(quote.get("time_epoch"))
+    if quote_epoch is None:
+        return None
+
+    was_usable = quote.get("usable_for_live_trading") is True
+    freshness = build_tick_freshness_context(
+        symbol,
+        tick_epoch=quote_epoch,
+        now_epoch=assembled_at_epoch,
+    )
+    quote.update(freshness)
+    if not was_usable or quote.get("usable_for_live_trading") is True:
+        return None
+
+    warning = {
+        "code": "quote_expired_during_snapshot_assembly",
+        "message": (
+            "The quote crossed its live-readiness threshold while the snapshot "
+            "was being assembled."
+        ),
+        "quote_age_seconds": quote.get("data_age_seconds"),
+        "live_max_age_seconds": quote.get("live_max_age_seconds"),
+    }
+    quote["snapshot_warning"] = warning
+    return warning
 
 
 def _utc_iso_text(epoch_seconds: float) -> str:
@@ -471,6 +544,7 @@ def _snapshot_summary_payload(sections: Dict[str, Any]) -> Dict[str, Any]:
         for key in (
             "usable_for_live_trading",
             "live_max_age_seconds",
+            "freshness_reason",
             "market_status_reason",
         ):
             if quote.get(key) is not None:
@@ -524,8 +598,16 @@ def _snapshot_summary_payload(sections: Dict[str, Any]) -> Dict[str, Any]:
         if usage not in (None, ""):
             out["pattern_usage"] = usage
         applied_window = patterns.get("applied_last_n_bars")
+        if applied_window is None:
+            applied_window = patterns.get("last_n_bars")
+        if applied_window is None and patterns.get("success") is True:
+            applied_window = _SNAPSHOT_PATTERN_LAST_N_BARS
         if applied_window is not None:
             out["pattern_window_bars"] = applied_window
+            out["pattern_scan_note"] = (
+                f"Candlestick triggers are limited to the latest {applied_window} bars; "
+                "use patterns_detect for a wider historical scan."
+            )
     if isinstance(regime, dict):
         compact_regime = {
             key: regime[key]
@@ -658,29 +740,51 @@ def market_snapshot(
     - regime (opt-in): HMM only, detail=summary
     - forecast (opt-in): Theta only, detail=compact; ``horizon`` applies here only
 
-    Top-level ``detail`` mainly shapes the assembled snapshot envelope
-    (summary vs embedded sections). Sub-tools use the fixed recipe above so the
+    Top-level ``detail`` mainly shapes the assembled snapshot envelope: compact
+    and summary return section summaries, while standard and full embed the
+    selected section payloads. Sub-tools use the fixed recipe above so the
     snapshot stays fast and comparable. Call dedicated regime/forecast/pattern
     tools for custom methods and parameters.
 
     Timestamp semantics: `as_of` tracks the latest quote time when available,
     `quote_as_of` duplicates that normalized quote timestamp explicitly, and
-    `assembled_at` records when this snapshot payload was built.
+    `assembled_at` records when this snapshot payload was built. The quote runs
+    after analytical sections and its freshness is revalidated at `assembled_at`,
+    so live-readiness describes the delivered snapshot rather than an early step.
     """
 
     def _run() -> Dict[str, Any]:
         selected = _parse_snapshot_sections(sections)
         detail_mode = str(detail or "compact").strip().lower()
+        preflight_error = _preflight_snapshot_symbol(symbol)
+        if preflight_error is not None:
+            return {
+                **preflight_error,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "sections_requested": list(selected),
+                "sections_not_run": list(selected),
+                "section_status": {name: "not_run" for name in selected},
+            }
+        run_order = tuple(name for name in selected if name != "quote")
+        if "quote" in selected:
+            run_order += ("quote",)
         section_payloads = {
             name: _call_section(name, symbol, str(timeframe), int(horizon), detail_mode)
-            for name in selected
+            for name in run_order
         }
         health = _snapshot_health(symbol, selected, section_payloads)
+        assembled_at_dt = datetime.now(timezone.utc)
         assembled_at = (
-            datetime.now(timezone.utc)
+            assembled_at_dt
             .replace(microsecond=0)
             .isoformat()
             .replace("+00:00", "Z")
+        )
+        quote_warning = _revalidate_snapshot_quote(
+            section_payloads,
+            symbol=symbol,
+            assembled_at_epoch=assembled_at_dt.timestamp(),
         )
         quote_as_of = _snapshot_quote_as_of(section_payloads)
         payload: Dict[str, Any] = {
@@ -689,12 +793,15 @@ def market_snapshot(
             "timeframe": timeframe,
             "as_of": quote_as_of or assembled_at,
             "assembled_at": assembled_at,
-            "sections": list(selected),
+            "sections_requested": list(selected),
             **{key: value for key, value in health.items() if key != "success"},
         }
         if quote_as_of is not None:
             payload["quote_as_of"] = quote_as_of
+        if quote_warning is not None:
+            payload["warnings"] = [quote_warning]
         if detail_mode in {"summary", "compact"}:
+            payload["sections_summarized"] = list(selected)
             summary_payload = _snapshot_summary_payload(section_payloads)
             if summary_payload:
                 payload["snapshot"] = summary_payload
@@ -704,6 +811,7 @@ def market_snapshot(
                 health.get("failed_sections"),
             )
         else:
+            payload["sections_embedded"] = list(selected)
             payload.update(
                 {
                     name: _embedded_section_payload(name, section_payload)

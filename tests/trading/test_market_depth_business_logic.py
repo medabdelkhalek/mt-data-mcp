@@ -333,29 +333,26 @@ def test_market_ticker_returns_lightweight_spread_snapshot() -> None:
     assert out["bid"] == 200.0
     assert out["ask"] == 201.0
     assert out["spread_pct"] == 0.498753
-    assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
+    assert out["point"] == 0.01
     assert "market_state" not in out
-    assert out["contract_size"] == 1.0
-    assert out["units"]["contract_size"] == "contract_units_per_lot"
-    assert out["units"]["lot"] == "broker_lot"
-    assert out["lot_definition"] == "1 broker lot equals contract_size contract units."
-    assert out["pricing_basis"] == "per_1_lot_estimate"
-    assert out["pricing_basis_units"] == "broker_lot"
+    assert "units" not in out
+    assert "contract_size" not in out
+    assert "lot_definition" not in out
+    assert "pricing_basis" not in out
+    assert "pricing_basis_units" not in out
     assert out["freshness"].startswith("stale, tick ")
     assert out["time"] == "2023-11-14T22:13:20Z"
     assert out["time_epoch"] == 1700000000.0
-    assert "spread" not in out
-    assert "spread" not in out["units"]
-    assert "spread_points" not in out
+    assert out["spread"] == 1.0
+    assert out["spread_points"] == 100.0
     assert "spread_pips" not in out
-    assert "spread_pips" not in out["units"]
     assert "spread_pct_display" not in out
     assert "data_stale" not in out
     assert out["data_age_seconds"] > out["stale_after_seconds"]
     assert out["freshness_state"] == "stale"
     assert out["usable_for_live_trading"] is False
     assert "data_age_hours" not in out
-    assert "warning" not in out
+    assert out["warning"].startswith("Tick data may be stale")
     assert "last" not in out
     assert "tick_volume" not in out
     assert "spread_cost_per_lot" not in out
@@ -417,13 +414,13 @@ def test_market_ticker_compact_detail_omits_verbose_fields() -> None:
     assert out["bid"] == 200.0
     assert out["ask"] == 201.0
     assert out["spread_pct"] == 0.498753
-    assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
     assert "market_state" not in out
-    assert out["contract_size"] == 1.0
+    assert "units" not in out
+    assert "contract_size" not in out
     assert out["freshness"].startswith("stale, tick ")
     assert "spread_display" not in out
-    assert "spread" not in out
-    assert "spread_points" not in out
+    assert out["spread"] == 1.0
+    assert out["spread_points"] == 100.0
     assert "spread_pips" not in out
     assert "spread_pct_display" not in out
     assert "last" not in out
@@ -434,7 +431,7 @@ def test_market_ticker_compact_detail_omits_verbose_fields() -> None:
     assert out["stale_after_seconds"] == 300
     assert "freshness_basis" not in out
     assert "data_age" not in out
-    assert "warning" not in out
+    assert out["warning"].startswith("Tick data may be stale")
     assert "spread_cost_per_lot" not in out
     assert "spread_cost_currency" not in out
     assert "diagnostics" not in out
@@ -467,8 +464,8 @@ def test_market_ticker_none_detail_uses_compact_output() -> None:
     assert out["success"] is True
     assert out["spread_pct"] == 0.498753
     assert "market_state" not in out
-    assert out["contract_size"] == 1.0
-    assert "spread" not in out
+    assert "contract_size" not in out
+    assert out["spread"] == 1.0
     assert "diagnostics" not in out
     assert "spread_cost_per_lot" not in out
 
@@ -507,9 +504,89 @@ def test_market_ticker_price_field_returns_simple_price() -> None:
     assert out["stale_after_seconds"] == 300
     assert out["data_stale"] is True
     assert out["freshness_basis"] == "absolute_300s"
+    assert out["freshness_state"] == "stale"
+    assert out["freshness_reason"] == "stale_age"
+    assert out["usable_for_live_trading"] is False
+    assert out["live_max_age_seconds"] == 30
     assert "bid" not in out
     assert "spread_pips" not in out
     assert out["meta"]["tool"] == "market_ticker"
+
+
+def test_market_ticker_refreshes_stale_symbol_tick_from_live_stream() -> None:
+    now = 1_700_000_100.0
+    cached_tick = SimpleNamespace(
+        bid=3976.34,
+        ask=3976.84,
+        last=3976.5,
+        volume=1,
+        time=now + 3600.0,
+    )
+    stream_tick = {
+        "bid": 3981.46,
+        "ask": 3981.57,
+        "last": 3981.5,
+        "volume": 2,
+        "time": now - 1.0,
+        "time_msc": (now - 1.0) * 1000.0,
+    }
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.time", return_value=now
+    ), patch("mtdata.core.market_depth._use_client_tz", return_value=False):
+        mt5.COPY_TICKS_ALL = 0
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            trade_tick_value=1.0,
+            currency_profit="USD",
+        )
+        mt5.symbol_info_tick.return_value = cached_tick
+        mt5.copy_ticks_range.return_value = [stream_tick]
+
+        out = _raw_market_ticker("XAUUSD", detail="compact")
+
+    assert out["bid"] == 3981.46
+    assert out["ask"] == 3981.57
+    assert out["time_epoch"] == now - 1.0
+    assert out["usable_for_live_trading"] is True
+    assert out["quote_source"] == "mt5.copy_ticks_range"
+    assert out["quote_source_state"] == "refreshed_from_tick_stream"
+    assert out["quote_refresh_attempted"] is True
+
+
+def test_market_ticker_compact_explains_unrefreshable_future_tick() -> None:
+    now = 1_700_000_100.0
+    future_tick = SimpleNamespace(
+        bid=1.1,
+        ask=1.1002,
+        last=1.1001,
+        volume=1,
+        time=now + 10.0,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.time", return_value=now
+    ), patch("mtdata.core.market_depth._use_client_tz", return_value=False):
+        mt5.COPY_TICKS_ALL = 0
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = future_tick
+        mt5.copy_ticks_range.return_value = []
+
+        out = _raw_market_ticker("EURUSD", detail="compact")
+
+    assert out["freshness"] == "stale, tick 0s ago"
+    assert out["freshness_reason"] == "future_timestamp"
+    assert out["timestamp_in_future"] is True
+    assert out["timestamp_skew_seconds"] == 10.0
+    assert "MT5 time alignment" in out["timestamp_warning"]
+    assert out["quote_source_state"] == "unverified_stale"
 
 
 def test_market_ticker_reports_weekend_relaxed_freshness_basis() -> None:
@@ -714,12 +791,12 @@ def test_market_ticker_rounds_tick_precision_noise() -> None:
     assert out["bid"] == 1.17581
     assert out["ask"] == 1.1759
     assert out["spread_pips"] == 0.9
-    assert out["units"]["spread_pips"] == "pips"
-    assert "spread" not in out
-    assert "spread_points" not in out
+    assert "units" not in out
+    assert out["spread"] == 0.00009
+    assert out["spread_points"] == 9.0
     assert "last" not in out
     assert "spread_display" not in out
-    assert "spread_pct" not in out
+    assert out["spread_pct"] > 0
 
 
 def test_market_depth_returns_connection_error_payload() -> None:

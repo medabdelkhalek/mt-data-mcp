@@ -547,18 +547,69 @@ def build_level_confluence_payload(
             "fraction": tolerance_pct,
             "points": tolerance_points,
         },
+        "score_basis": {
+            "scale": "unbounded_nonnegative",
+            "definition": (
+                "additive source-family score plus pivot-method, support/resistance, "
+                "touch, Fibonacci, and cluster-tightness bonuses"
+            ),
+            "comparison": (
+                "rank within this response; higher means more independent agreement, "
+                "not a probability or historical win rate"
+            ),
+        },
+        "units": {
+            "score": "unbounded_heuristic_points",
+            "distance_pct": "percentage_points (1.0 = 1%)",
+        },
         "levels": top_clusters,
     }
+    side_counts = {
+        role: sum(1 for cluster in top_clusters if cluster.get("role") == role)
+        for role in ("above", "below", "at")
+    }
+    out["level_coverage"] = side_counts
+    volume_profile_contributed = any(
+        "volume_profile" in set(cluster.get("source_families") or [])
+        for cluster in top_clusters
+    )
+    if volume_profile_contributed and isinstance(volume_profile_payload, dict):
+        diagnostics = volume_profile_payload.get("diagnostics")
+        fallback_reason = (
+            diagnostics.get("auto_fallback_reason")
+            if isinstance(diagnostics, dict)
+            else None
+        )
+        volume_profile_quality = {
+            key: value
+            for key, value in {
+                "source": volume_profile_payload.get("profile_source")
+                or volume_profile_payload.get("source"),
+                "volume_kind": volume_profile_payload.get("volume_kind"),
+                "is_synthetic": volume_profile_payload.get("is_synthetic"),
+                "accuracy": volume_profile_payload.get("volume_profile_accuracy"),
+                "volume_source_quality": volume_profile_payload.get(
+                    "volume_source_quality"
+                ),
+                "fallback_reason": fallback_reason,
+                "warnings": volume_profile_payload.get("warnings"),
+            }.items()
+            if value not in (None, "", [], {})
+        }
+        if volume_profile_quality:
+            out["source_quality"] = {
+                "volume_profile": volume_profile_quality,
+            }
     if detail_value == "compact":
         out["count"] = len(top_clusters)
     else:
         out["detail"] = detail_value
-        out["units"] = {
+        out["units"].update({
             "tolerance.price": "price",
             "tolerance.pct_points": "percentage_points (1.0 = 1%)",
             "tolerance.fraction": "price_fraction (0.0015 = 0.15%)",
             "tolerance.points": "broker_points",
-        }
+        })
         out["max_distance_pct"] = max_distance_pct
         out["min_source_families"] = min_families
         out["level_counts"] = level_counts
@@ -566,6 +617,12 @@ def build_level_confluence_payload(
         out["level_scan_note"] = (
             "No confluence clusters qualified inside the scan filters. "
             "Try wider tolerance_pct/tolerance_points, wider max_distance_pct, or min_source_families=1."
+        )
+    elif side_counts["above"] == 0 or side_counts["below"] == 0:
+        missing_side = "above" if side_counts["above"] == 0 else "below"
+        out["coverage_note"] = (
+            f"No confluence levels {missing_side} the reference price qualified "
+            "inside the current scan filters."
         )
     if detail_value == "full":
         out["candidates"] = [_compact_source(record) for record in records]

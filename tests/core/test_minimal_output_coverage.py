@@ -245,6 +245,9 @@ class TestNormalizeForecastPayload:
             "forecast_vs_last_price": {"first_forecast_delta": -1.0},
             "path_flat": True,
             "path_range": 0.00001,
+            "units": {
+                "forecast_vs_last_price.*_delta_pct": "percentage_points (1.0 = 1%)"
+            },
         }
         result = _normalize_forecast_payload(payload, verbose=False)
         assert "meta" not in result
@@ -258,6 +261,25 @@ class TestNormalizeForecastPayload:
         assert result["forecast_vs_last_price"] == {"first_forecast_delta": -1.0}
         assert result["path_flat"] is True
         assert result["path_range"] == 0.00001
+        assert result["units"]["forecast_vs_last_price.*_delta_pct"] == (
+            "percentage_points (1.0 = 1%)"
+        )
+
+    def test_non_verbose_discloses_unrequested_uncertainty(self):
+        payload = {
+            "times": ["t1"],
+            "forecast_price": [100.0],
+            "ci_status": "not_requested",
+        }
+
+        result = _normalize_forecast_payload(payload, verbose=False)
+
+        assert result["ci"] == {
+            "status": "not_requested",
+            "mode": "point_only",
+            "reason": "ci_alpha was not requested; direction is based on the point estimate only.",
+            "recommended_tool": "forecast_conformal_intervals",
+        }
 
     def test_q50_dedup(self):
         payload = {
@@ -1202,6 +1224,8 @@ class TestFormatResultMinimal:
             "prob_sl_first": 0.48,
             "probability_edge": 0.04,
             "probability_edge_definition": "prob_tp_first - prob_sl_first",
+            "seed": 42,
+            "seed_source": "request",
             "confidence": {
                 "prob_tp_first_ci95": {"low": 0.48, "high": 0.56},
             },
@@ -1217,6 +1241,8 @@ class TestFormatResultMinimal:
         assert "prob_sl_first: 0.48" in compact
         assert "confidence" not in compact
         assert "ci95" not in compact
+        assert "seed: 42" in compact
+        assert "seed_source: request" in compact
 
     def test_compact_barrier_optimize_output_keeps_best_only(self):
         payload = {
@@ -1426,6 +1452,7 @@ class TestFormatResultMinimal:
         payload = {
             "success": True,
             "dry_run": True,
+            "preview_ok": True,
             "no_action": True,
             "trade_gate_passed": False,
             "actionability": "preview_only",
@@ -1449,19 +1476,17 @@ class TestFormatResultMinimal:
         }
         result = format_result_minimal(payload, verbose=False, tool_name="trade_place")
         assert "dry_run: true" in result
-        assert "trade_gate_passed: false" in result
-        assert "actionability: preview_only" in result
+        assert "trade_gate_passed" not in result
         assert "symbol: BTCUSD" in result
         assert "order_type: BUY_LIMIT" in result
         assert "pending: true" in result
         assert "action: place_pending_order" in result
         assert "price: 64500" in result
         assert "validation_scope: request_routing_only" in result
-        assert "preview_scope_summary: Routing and local request checks only." in result
         assert "message: Dry run only. No order was sent to MT5." in result
-        assert "actionability_reason: Dry run did not execute MT5 or broker-side validation. Use this preview for request routing only." in result
-        assert "warnings[1]:" in result
-        assert "MT5/broker validation was not executed" in result
+        assert "preview_scope_summary" not in result
+        assert "actionability_reason" not in result
+        assert "warnings" not in result
 
 
 class TestFormatComplexValue:
@@ -1476,3 +1501,32 @@ class TestFormatComplexValue:
     def test_scalar(self):
         result = _format_complex_value(42)
         assert "42" in result
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "support_resistance_levels",
+        "forecast_list_methods",
+        "forecast_list_library_models",
+    ],
+)
+def test_compact_tool_errors_preserve_standard_envelope(tool_name):
+    result = format_result_minimal(
+        {
+            "success": False,
+            "error": "request failed",
+            "error_code": "invalid_input",
+            "request_id": "request-123",
+            "operation": tool_name,
+            "remediation": "Correct the request.",
+        },
+        verbose=False,
+        tool_name=tool_name,
+    )
+
+    assert "success: false" in result
+    assert "error: request failed" in result
+    assert "error_code: invalid_input" in result
+    assert "request_id: request-123" in result
+    assert f"operation: {tool_name}" in result

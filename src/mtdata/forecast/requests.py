@@ -10,24 +10,16 @@ from ..shared.schema import (
     ForecastLibraryLiteral,
     TimeframeLiteral,
     reject_removed_field,
+    validate_as_of_time_window,
 )
 from ..utils.barriers import (
-    normalize_trade_direction,
+    normalize_trade_direction_alias,
     validate_barrier_unit_family_exclusivity,
 )
 
 MAX_FORECAST_HORIZON = 500
 MAX_BACKTEST_STEPS = 200
 MAX_BACKTEST_SPACING = 10_000
-
-
-def _normalize_trade_direction_alias(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-    normalized, error = normalize_trade_direction(value)
-    if error is None and normalized is not None:
-        return normalized
-    return value
 
 
 class ForecastGenerateRequest(BaseModel):
@@ -47,10 +39,13 @@ class ForecastGenerateRequest(BaseModel):
     end: Optional[str] = None
     params: Optional[Dict[str, Any]] = None
     ci_alpha: Optional[float] = Field(
-        None,
+        0.05,
         ge=0.0,
         le=0.5,
-        description="Interval tail probability; confidence is 1 - ci_alpha. Use None to omit intervals.",
+        description=(
+            "Interval tail probability; confidence is 1 - ci_alpha. Defaults "
+            "to 0.05 (95%); use null to omit intervals."
+        ),
     )
     quantity: Literal["price", "return", "volatility"] = Field(
         "price",
@@ -82,8 +77,7 @@ class ForecastGenerateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_time_window(self) -> "ForecastGenerateRequest":
-        if self.as_of and (self.start or self.end):
-            raise ValueError("as_of cannot be combined with start/end")
+        validate_as_of_time_window(self.as_of, self.start, self.end)
         return self
 
 
@@ -97,9 +91,24 @@ def _normalize_methods_value(value: Any) -> Any:
 class ForecastBacktestRequest(BaseModel):
     symbol: str
     timeframe: TimeframeLiteral = "H1"
-    horizon: int = Field(12, ge=1, le=MAX_FORECAST_HORIZON, description="Bars forecast after each backtest anchor.")
-    steps: int = Field(5, ge=1, le=MAX_BACKTEST_STEPS, description="Number of rolling-origin backtest anchors to run.")
-    spacing: int = Field(20, ge=1, le=MAX_BACKTEST_SPACING, description="Bars between consecutive rolling-origin anchors.")
+    horizon: int = Field(
+        12,
+        ge=1,
+        le=MAX_FORECAST_HORIZON,
+        description="Bars forecast after each backtest anchor; spacing must be at least this value when steps > 1.",
+    )
+    steps: int = Field(
+        5,
+        ge=1,
+        le=MAX_BACKTEST_STEPS,
+        description="Number of rolling-origin backtest anchors; when greater than 1, spacing must be at least horizon.",
+    )
+    spacing: int = Field(
+        20,
+        ge=1,
+        le=MAX_BACKTEST_SPACING,
+        description="Spacing in bars between anchors; must be greater than or equal to horizon when steps > 1.",
+    )
     start: Optional[str] = None
     end: Optional[str] = None
     methods: Optional[List[str]] = None
@@ -131,6 +140,16 @@ class ForecastBacktestRequest(BaseModel):
     def _reject_removed_target(cls, values: Any) -> Any:
         return reject_removed_field(values, field_name="target", replacement="quantity")
 
+    @model_validator(mode="after")
+    def _validate_spacing(self) -> "ForecastBacktestRequest":
+        if self.steps > 1 and self.spacing < self.horizon:
+            raise ValueError(
+                "spacing must be greater than or equal to horizon when steps > 1 "
+                f"(got spacing={self.spacing}, horizon={self.horizon}); try "
+                f"spacing={self.horizon} or steps=1"
+            )
+        return self
+
 
 class StrategyBacktestRequest(BaseModel):
     symbol: str
@@ -147,7 +166,7 @@ class StrategyBacktestRequest(BaseModel):
     oversold: float = Field(30.0, gt=0.0, lt=100.0)
     overbought: float = Field(70.0, gt=0.0, lt=100.0)
     max_hold_bars: Optional[int] = Field(None, ge=1)
-    cost_model: Literal["mt5_observed", "fixed"] = "mt5_observed"
+    cost_model: Literal["current_spread_proxy", "fixed"] = "current_spread_proxy"
     spread_bps: Optional[float] = Field(None, ge=0.0)
     slippage_bps: float = 1.0
 
@@ -282,7 +301,7 @@ class ForecastBarrierProbRequest(BaseModel):
     @field_validator("direction", mode="before")
     @classmethod
     def _normalize_direction(cls, value: Optional[str]) -> Optional[str]:
-        return _normalize_trade_direction_alias(value)
+        return normalize_trade_direction_alias(value)
 
 
 class ForecastOptimizeHintsRequest(BaseModel):
@@ -350,14 +369,21 @@ class ForecastBarrierOptimizeRequest(BaseModel):
     @field_validator("direction", mode="before")
     @classmethod
     def _normalize_direction(cls, value: Optional[str]) -> Optional[str]:
-        return _normalize_trade_direction_alias(value)
+        return normalize_trade_direction_alias(value)
 
 
 class ForecastVolatilityEstimateRequest(BaseModel):
     symbol: str
     timeframe: TimeframeLiteral = "H1"
     horizon: int = Field(12, ge=1, le=MAX_FORECAST_HORIZON)
-    method: str = "ewma"
+    method: str = Field(
+        "ewma",
+        description=(
+            "Volatility estimator (for example ewma, rolling_std, har_rv, "
+            "garch, arima, theta, or ensemble). Use forecast_list_methods "
+            "with detail=standard and search_term to inspect the full namespace."
+        ),
+    )
     proxy: Optional[str] = None
     params: Optional[Dict[str, Any]] = None
     as_of: Optional[str] = None
@@ -368,6 +394,5 @@ class ForecastVolatilityEstimateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_time_window(self) -> "ForecastVolatilityEstimateRequest":
-        if self.as_of and (self.start or self.end):
-            raise ValueError("as_of cannot be combined with start/end")
+        validate_as_of_time_window(self.as_of, self.start, self.end)
         return self

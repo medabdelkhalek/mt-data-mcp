@@ -106,6 +106,42 @@ def test_no_data_context_uses_non_negative_history_position(monkeypatch) -> None
     assert "before earliest available data" in result["error"]
 
 
+def test_no_data_context_explains_bounded_weekend_closure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "mtdata.services.data_service._mt5_copy_rates_from_pos",
+        lambda *args, **kwargs: None,
+    )
+
+    result = _build_no_data_error_with_context(
+        "EURUSD",
+        "H1",
+        1,
+        "2026-07-11",
+        "2026-07-12",
+    )
+
+    assert result["details"]["no_data_reason"] == "market_closed_weekend"
+    assert result["details"]["market_status_reason"] == "weekend"
+    assert "no candles are expected" in result["details"]["note"]
+
+
+def test_no_data_context_does_not_label_continuous_crypto_weekend(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "mtdata.services.data_service._mt5_copy_rates_from_pos",
+        lambda *args, **kwargs: None,
+    )
+
+    result = _build_no_data_error_with_context(
+        "BTCUSD",
+        "H1",
+        1,
+        "2026-07-11",
+        "2026-07-12",
+    )
+
+    assert "no_data_reason" not in result["details"]
+
+
 def test_compact_tick_summary_preserves_false_like_spread_availability() -> None:
     class FalseLike:
         def __bool__(self):
@@ -194,6 +230,23 @@ class TestFetchRatesWithWarmup(unittest.TestCase):
         )
         self.assertIsNone(result)
         self.assertIn('before', err)
+
+    @patch(_RATES_RANGE)
+    @patch(_PARSE_START)
+    def test_equal_start_and_end_is_allowed(self, mock_parse, mock_range):
+        """Inclusive MT5 ranges allow a single timestamp boundary."""
+        instant = datetime(2025, 1, 1, tzinfo=_UTC)
+        mock_parse.side_effect = [instant, instant]
+        mock_range.return_value = _make_rates(1, base_ts=instant.timestamp())
+
+        result, err = _fetch_rates_with_warmup(
+            'EURUSD', 16385, 'H1', 5, 0, '2025-01-01', '2025-01-01',
+            retry=False, sanity_check=False,
+        )
+
+        self.assertIsNone(err)
+        self.assertIsNotNone(result)
+        mock_range.assert_called_once()
 
     @patch(_RATES_RANGE)
     @patch(_PARSE_START)

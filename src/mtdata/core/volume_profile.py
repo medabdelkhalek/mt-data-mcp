@@ -15,6 +15,7 @@ from ..utils.mt5 import (
 )
 from ..utils.time import _format_datetime_explicit
 from ..utils.utils import (
+    _parse_end_datetime,
     _parse_start_datetime,
     _positive_float_attr,
 )
@@ -57,7 +58,7 @@ def _positive_int_attr(obj: Any, *names: str) -> Optional[int]:
 
 def _window_days(start: Optional[str], end: Optional[str]) -> Optional[float]:
     start_dt = _parse_start_datetime(start) if start else None
-    end_dt = _parse_start_datetime(end) if end else None
+    end_dt = _parse_end_datetime(end) if end else None
     if start and start_dt is None:
         return None
     if end and end_dt is None:
@@ -82,7 +83,7 @@ def _resolve_profile_window(
     if start:
         return {"start": start, "end": end}
     if timeframe is None and limit is None:
-        end_dt = _parse_start_datetime(end) if end else _utc_now_naive()
+        end_dt = _parse_end_datetime(end) if end else _utc_now_naive()
         if end and end_dt is None:
             return {"error": f"Could not parse end datetime {end!r}"}
         assert end_dt is not None
@@ -111,7 +112,7 @@ def _resolve_profile_window(
                     f"omit limit to use the default {int(_DEFAULT_PROFILE_LIMIT)} bars."
                 )
             }
-    end_dt = _parse_start_datetime(end) if end else _utc_now_naive()
+    end_dt = _parse_end_datetime(end) if end else _utc_now_naive()
     if end and end_dt is None:
         return {"error": f"Could not parse end datetime {end!r}"}
     assert end_dt is not None
@@ -455,6 +456,8 @@ def _profile_detail_payload(profile: Dict[str, Any], detail: str) -> Dict[str, A
         "diagnostics",
         "truncated",
         "truncation_reason",
+        "data_quality",
+        "coverage_note",
         "warnings",
         "as_of",
         "timezone",
@@ -658,6 +661,16 @@ def compute_volume_profile_payload(
     if profile["diagnostics"].get("tick_limit_reached") is True:
         profile["truncated"] = True
         profile["truncation_reason"] = "max_ticks"
+        tick_rows = int(profile["diagnostics"].get("tick_rows") or 0)
+        max_ticks_value = int(profile["diagnostics"].get("requested_max_ticks") or tick_rows)
+        profile["data_quality"] = {
+            "status": "partial",
+            "reason": "max_ticks",
+        }
+        profile["coverage_note"] = (
+            f"Profile uses only the latest {tick_rows} ticks because max_ticks="
+            f"{max_ticks_value} was reached; it does not represent the full requested window."
+        )
     fetch_payload = selected.get("fetch_payload")
     profile.update(_profile_freshness_meta(fetch_payload))
     profile["units"] = _profile_units(profile)

@@ -10,9 +10,7 @@ from ..shared.validators import unsupported_timeframe_seconds_error
 from ..utils.barriers import (
     barrier_prices_are_valid as _barrier_prices_are_valid,
 )
-from ..utils.barriers import (
-    get_pip_size as _get_pip_size,
-)
+from ..utils.barriers import get_tick_size as _get_pip_size
 from ..utils.barriers import (
     normalize_same_bar_policy,
     normalize_trade_direction,
@@ -628,7 +626,7 @@ def forecast_barrier_hit_probabilities(  # noqa: C901
             "sl_price": float(sl_price),
             "n_sims": int(S),
             "seed": int(request_seed_base),
-            "seed_source": "params" if seed_provided else "request",
+            "seed_source": "params" if seed_provided else "derived_from_request",
             **resolved_probabilities,
             "prob_tp_first_se": _binomial_se(prob_tp_first, int(S)),
             "prob_sl_first_se": _binomial_se(prob_sl_first, int(S)),

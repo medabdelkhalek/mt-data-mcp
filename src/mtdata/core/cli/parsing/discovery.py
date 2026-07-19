@@ -57,6 +57,10 @@ _COMMAND_PARAM_CHOICE_OVERRIDES: Dict[tuple[str, str], list[str]] = {
     ("forecast_barrier_optimize", "search_profile"): ["fast", "medium", "long"],
 }
 
+_MULTI_VALUE_SYMBOL_POSITIONAL_COMMANDS = frozenset(
+    {"correlation_matrix", "cointegration_test", "cross_correlation"}
+)
+
 _COMMAND_REQUIRED_OPTIONS: set[tuple[str, str]] = {
     ("trade_place", "volume"),
     ("trade_place", "order_type"),
@@ -79,6 +83,11 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
     ("finviz_calendar", "start"): "Start date (YYYY-MM-DD).",
     ("finviz_calendar", "end"): "End date (YYYY-MM-DD).",
     ("forecast_barrier_optimize", "method"): "Barrier simulation method: mc_gbm, mc_gbm_bb, hmm_mc, garch, bootstrap, heston, jump_diffusion, or auto.",
+    ("forecast_volatility_estimate", "method"): (
+        "Volatility estimator, such as ewma, rolling_std, har_rv, garch, "
+        "arima, theta, or ensemble. Run forecast_list_methods with "
+        "--detail standard --search-term NAME to browse the full namespace."
+    ),
     ("causal_discover_signals", "symbols"): (
         "Comma-separated MT5 symbols (e.g. EURUSD,GBPUSD); one symbol auto-expands "
         "to its MT5 group. Optional with --group."
@@ -134,7 +143,7 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "Historical bars per symbol used for causal tests."
     ),
     ("cointegration_test", "symbols"): (
-        "Comma-separated MT5 symbols (e.g. EURUSD,GBPUSD); one symbol auto-expands "
+        "Comma- or space-separated MT5 symbols (e.g. EURUSD,GBPUSD or EURUSD GBPUSD); one symbol auto-expands "
         "to its MT5 group. Optional with --group."
     ),
     ("cointegration_test", "limit"): "Max cointegration pair rows to return.",
@@ -146,8 +155,11 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "Historical bars per symbol used for the correlation window."
     ),
     ("correlation_matrix", "symbols"): (
-        "Comma-separated MT5 symbols (e.g. EURUSD,GBPUSD); one symbol auto-expands "
+        "Comma- or space-separated MT5 symbols (e.g. EURUSD,GBPUSD or EURUSD GBPUSD); one symbol auto-expands "
         "to its MT5 group. Optional with --group."
+    ),
+    ("cross_correlation", "symbols"): (
+        "Comma- or space-separated MT5 symbols (e.g. EURUSD,GBPUSD or EURUSD GBPUSD)."
     ),
     ("market_scan", "symbols"): (
         "Comma-separated MT5 symbols to scan. Optional with --group."
@@ -242,6 +254,10 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
     ),
     ("trade_place", "detail"): (
         "Dry-run preview detail: compact for key checks, full for execution diagnostics."
+    ),
+    ("trade_stress_test", "shocks"): (
+        "JSON object mapping symbols to percentage shocks. Examples: "
+        "'{\"*\":-2}' or '{\"EURUSD\":-1,\"XAUUSD\":-3}'."
     ),
     ("trade_place", "require_sl_tp"): (
         "Require both stop_loss and take_profit for market orders."
@@ -690,20 +706,23 @@ def add_dynamic_arguments(
 
         if param["required"] and param == param_info["params"][0]:
             positional_kwargs = {k: v for k, v in kwargs.items() if k in ("help", "type", "choices", "metavar")}
-            positional_kwargs["nargs"] = "?"
-            positional_kwargs["default"] = argparse.SUPPRESS
+            if (
+                str(cmd_name or "") in _MULTI_VALUE_SYMBOL_POSITIONAL_COMMANDS
+                and str(param["name"]) == "symbols"
+            ):
+                positional_kwargs["nargs"] = "+"
             positional_kwargs["help"] = f"{positional_kwargs.get('help') or param['name']} (required)"
-            positional_action = parser.add_argument(param["name"], **positional_kwargs)
-            positional_action._cli_logically_required = True
-            hidden_alias_kwargs = dict(kwargs)
-            hidden_alias_kwargs["help"] = argparse.SUPPRESS
-            if option_flags:
-                parser.add_argument(*option_flags, **hidden_alias_kwargs)
-            if hidden_option_flags:
-                parser.add_argument(*hidden_option_flags, **hidden_alias_kwargs)
+            parser.add_argument(param["name"], **positional_kwargs)
         elif allow_optional_first_positional:
             positional_kwargs = {k: v for k, v in kwargs.items() if k in ("help", "type", "choices", "metavar")}
-            positional_kwargs["nargs"] = "?"
+            positional_kwargs["nargs"] = (
+                "*"
+                if (
+                    str(cmd_name or "") in _MULTI_VALUE_SYMBOL_POSITIONAL_COMMANDS
+                    and str(param["name"]) == "symbols"
+                )
+                else "?"
+            )
             positional_kwargs["default"] = argparse.SUPPRESS
             parser.add_argument(param["name"], **positional_kwargs)
             option_kwargs = dict(kwargs)

@@ -6,6 +6,9 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+from pydantic import ValidationError
+
 from mtdata.core.trading import trade_history as _trade_history_tool
 from mtdata.core.trading.account import trade_journal_analyze as _trade_journal_tool
 from mtdata.core.trading.positions import normalize_trade_history_output
@@ -117,11 +120,19 @@ def test_trade_history_supports_offset_pagination() -> None:
         out = trade_history(history_kind="deals", limit=2, offset=1, __cli_raw=True)
 
     assert out["success"] is True
-    assert [item["ticket"] for item in out["items"]] == [3, 2]
+    assert [item["deal_ticket"] for item in out["items"]] == [3, 2]
     assert out["total_count"] == 4
     assert out["offset"] == 1
     assert out["limit"] == 2
     assert out["has_more"] is True
+    assert out["pagination"] == {
+        "total": 4,
+        "returned": 2,
+        "offset": 1,
+        "limit": 2,
+        "has_more": True,
+        "more_available": 1,
+    }
 
     with patch("mtdata.core.trading.account._use_client_tz", lambda: False):
         ascending = trade_history(
@@ -132,7 +143,7 @@ def test_trade_history_supports_offset_pagination() -> None:
         )
     if prev is not None:
         sys.modules["MetaTrader5"] = prev
-    assert [item["ticket"] for item in ascending["items"]] == [1, 2]
+    assert [item["deal_ticket"] for item in ascending["items"]] == [1, 2]
 
 
 def test_trade_history_rounds_money_fields_for_display() -> None:
@@ -181,7 +192,7 @@ def test_trade_history_deals_accept_simplenamespace_rows() -> None:
 
     assert out["success"] is True
     assert out["count"] == 1
-    assert out["items"][0]["ticket"] == 1
+    assert out["items"][0]["deal_ticket"] == 1
     assert out["items"][0]["fill_time"] == _format_utc_seconds(
         _mt5_epoch_to_utc(1700000000)
     )
@@ -274,7 +285,9 @@ def test_trade_history_compact_omits_parallel_normalized_rows() -> None:
     assert out["row_key"] == "items"
     assert row == {
         "fill_time": "2024-01-01 12:00:00",
-        "ticket": 11,
+        "deal_ticket": 11,
+        "order_ticket": 22,
+        "position_ticket": 33,
         "symbol": "EURUSD",
         "fill_side": "Buy",
         "deal_effect": "close",
@@ -308,21 +321,24 @@ def test_trade_history_full_detail_uses_normalized_deal_items() -> None:
     )
 
     assert "normalized_items" not in out
-    assert out["item_schema"] == "normalized_trade_history.v2"
+    assert out["item_schema"] == "trade_history.v3"
     assert out["items"] == [
         {
-            "ticket": 11,
+            "fill_time": "2024-01-01 12:00:00",
+            "fill_time_msc": 1704110400000,
+            "deal_ticket": 11,
+            "order_ticket": 22,
             "symbol": "EURUSD",
             "volume": 0.5,
             "price": 1.2345,
-            "action": "close",
             "deal_effect": "close",
-            "order": 22,
-            "time": "2024-01-01 12:00:00",
-            "time_msc": 1704110400000,
-            "entry": "Out",
-            "reason": "Expert",
             "comment": "closed",
+            "raw": {
+                "entry": "Out",
+                "entry_code": 1,
+                "reason": "Expert",
+                "external_id": "diagnostic-noise",
+            },
         }
     ]
     assert out["request_echo"]["history_kind"] == "deals"
@@ -371,7 +387,7 @@ def test_trade_history_full_detail_ignores_humanized_style_for_canonical_items()
         ),
     )
 
-    assert out["items"][0]["ticket"] == 11
+    assert out["items"][0]["deal_ticket"] == 11
     assert out["items"][0]["symbol"] == "EURUSD"
     assert out["items"][0]["comment"] == "closed"
     assert "deal_details" not in out["items"][0]
@@ -401,24 +417,19 @@ def test_trade_history_full_detail_uses_normalized_order_items() -> None:
     assert "normalized_items" not in out
     assert out["items"] == [
         {
-            "ticket": 33,
+            "placed_time": "2024-01-01 12:00:00",
+            "done_time": "2024-01-01 12:05:00",
+            "order_ticket": 33,
             "symbol": "GBPUSD",
-            "volume": 1.0,
-            "price": 1.251,
-            "time_setup": "2024-01-01 12:00:00",
-            "time_done": "2024-01-01 12:05:00",
             "volume_initial": 1.0,
             "price_open": 1.25,
             "price_current": 1.251,
-            "state_label": "Filled",
-            "order_details": {"provider_order_note": "kept"},
+            "state": "Filled",
+            "raw": {"state_code": 3, "provider_order_note": "kept"},
         }
     ]
-    assert "state_code" not in out["items"][0]["order_details"]
-    assert out["units"] == {
-        "volume": "broker_lot",
-        "volume_initial": "broker_lot",
-    }
+    assert out["items"][0]["raw"]["state_code"] == 3
+    assert out["units"] == {"volume_initial": "broker_lot"}
 
 
 def test_trade_history_normalizes_price_and_millisecond_artifacts() -> None:
@@ -440,7 +451,7 @@ def test_trade_history_normalizes_price_and_millisecond_artifacts() -> None:
 
     row = out["items"][0]
     assert row["price"] == 1.16274
-    assert row["time_msc"] == 1778822029181
+    assert row["fill_time_msc"] == 1778822029181
     assert row["exit_trigger_price"] == 1.16274
 
 
@@ -510,21 +521,32 @@ def test_trade_history_filters_deals_by_side_alias() -> None:
     assert out["success"] is True
     assert out["request_echo"]["side"] == "BUY"
     assert out["count"] == 1
-    assert out["items"][0]["ticket"] == 1
-    assert out["items"][0]["type"] == "Buy"
+    assert out["items"][0]["deal_ticket"] == 1
+    assert out["items"][0]["fill_side"] == "Buy"
     assert "deal_details" not in out["items"][0]
 
 
 def test_trade_history_request_normalizes_buy_sell_aliases() -> None:
     assert TradeHistoryRequest(side="buy").side == "BUY"
     assert TradeHistoryRequest(side="sell").side == "SELL"
-    assert TradeHistoryRequest(side="weird").side == "weird"
+    with pytest.raises(ValidationError, match="side must be BUY or SELL"):
+        TradeHistoryRequest(side="weird")
     assert TradeHistoryRequest(side="long").side == "BUY"
     assert TradeHistoryRequest(side="short").side == "SELL"
     assert TradeHistoryRequest().detail == "compact"
     assert TradeJournalAnalyzeRequest().detail == "compact"
     assert TradeGetOpenRequest().detail == "compact"
     assert TradeGetPendingRequest().detail == "compact"
+
+
+@pytest.mark.parametrize(
+    "request_type",
+    [TradeHistoryRequest, TradeGetOpenRequest, TradeGetPendingRequest],
+)
+@pytest.mark.parametrize("limit", [0, -1, 1.5])
+def test_trade_query_requests_reject_invalid_limits(request_type, limit) -> None:
+    with pytest.raises(ValidationError):
+        request_type(limit=limit)
 
 
 def test_trade_history_filters_orders_by_side_prefix() -> None:
@@ -545,10 +567,9 @@ def test_trade_history_filters_orders_by_side_prefix() -> None:
     assert out["success"] is True
     assert out["request_echo"]["side"] == "SELL"
     assert out["count"] == 1
-    assert out["items"][0]["ticket"] == 12
-    assert out["items"][0]["type"] == "Sell Stop"
-    # Non-top-level labels (e.g. type_label) remain under order_details.
-    assert out["items"][0].get("order_details", {}).get("type_label") == "Sell Stop"
+    assert out["items"][0]["order_ticket"] == 12
+    assert out["items"][0]["order_type"] == "Sell Stop"
+    assert out["items"][0]["raw"]["type_code"] == 5
 
 
 def test_trade_history_deals_decodes_enum_codes_to_labels() -> None:
@@ -690,7 +711,7 @@ def test_trade_history_deals_extracts_exit_trigger_from_reason_when_comment_miss
     row = out["items"][0]
     assert row["exit_trigger"] == "TP"
     assert "exit_trigger_price" not in row
-    assert row["action"] == "close"
+    assert row["deal_effect"] == "close"
     assert row["exit_trigger_source"] == "mt5_reason"
 
 
@@ -812,6 +833,7 @@ def test_run_trade_history_logs_finish_event(caplog) -> None:
             format_time_minimal=lambda ts: f"t{int(ts)}",
             format_time_minimal_local=lambda ts: f"lt{int(ts)}",
             mt5_epoch_to_utc=lambda ts: ts,
+            parse_end_datetime=lambda value: None,
             parse_start_datetime=lambda value: None,
             normalize_limit=lambda value: value,
             comment_row_metadata=lambda comment: {},
@@ -845,7 +867,7 @@ def test_trade_history_filters_deals_by_position_ticket() -> None:
 
     assert out["scope"] == "ticket"
     assert out["count"] == 1
-    assert out["items"][0]["ticket"] == 2
+    assert out["items"][0]["deal_ticket"] == 2
     assert out["items"][0]["position_ticket"] == 222
 
 
@@ -896,11 +918,8 @@ def test_trade_history_rejects_start_with_minutes_back() -> None:
 
 
 def test_trade_history_rejects_invalid_side_filter() -> None:
-    out = trade_history(history_kind="deals", side="flat", detail="full", __cli_raw=True)
-
-    assert out["success"] is False
-    assert out["error"] == "side must be BUY or SELL."
-    assert out["request_echo"]["side"] == "flat"
+    with pytest.raises(ValidationError, match="side must be BUY or SELL"):
+        TradeHistoryRequest(history_kind="deals", side="flat", detail="full")
 
 
 def test_trade_history_compact_hides_comment_limit_metadata() -> None:
@@ -1011,6 +1030,7 @@ def test_trade_history_queries_minutes_back_as_absolute_mt5_epoch_window() -> No
         format_time_minimal=lambda ts: f"t{int(ts)}",
         format_time_minimal_local=lambda ts: f"lt{int(ts)}",
         mt5_epoch_to_utc=lambda ts: ts,
+        parse_end_datetime=lambda value: parsed_end if value == "2026-03-01 11:00" else None,
         parse_start_datetime=lambda value: parsed_end if value == "2026-03-01 11:00" else None,
         normalize_limit=lambda value: value,
         comment_row_metadata=lambda comment: {},
@@ -1099,17 +1119,18 @@ def test_trade_history_compact_detail_omits_echoed_filters() -> None:
     assert "limit" not in out
 
 
-def test_trade_history_compact_omits_period_context() -> None:
+def test_trade_history_compact_includes_period_context() -> None:
     out = normalize_trade_history_output(
         [{"ticket": 1, "symbol": "EURUSD"}],
         request=TradeHistoryRequest(history_kind="deals", detail="compact"),
     )
 
-    assert "period_source" not in out
-    assert "period_start" not in out
-    assert "period_end" not in out
-    assert "minutes_back_effective" not in out
-    assert "defaults_applied" not in out
+    assert out["period_source"] == "default_lookback"
+    assert out["minutes_back_effective"] == 10_080
+    assert out["period_start"]
+    assert out["period_end"]
+    assert out["defaults_applied"] == {"lookback_minutes": 10_080}
+    assert "note" in out
     keys = list(out)
     assert keys.index("items") < len(keys)
 
@@ -1146,6 +1167,21 @@ def test_trade_history_reports_explicit_period_context() -> None:
     assert out["period_source"] == "explicit_range"
     assert "minutes_back_effective" not in out
     assert "note" not in out
+
+
+def test_trade_history_date_only_end_covers_full_day() -> None:
+    out = normalize_trade_history_output(
+        [{"ticket": 1, "symbol": "EURUSD"}],
+        request=TradeHistoryRequest(
+            history_kind="deals",
+            detail="standard",
+            start="2026-01-01",
+            end="2026-01-03",
+        ),
+    )
+
+    assert out["period_start"] == "2026-01-01T00:00:00Z"
+    assert out["period_end"] == "2026-01-03T23:59:59Z"
 
 
 def test_trade_history_empty_message_uses_enveloped_contract() -> None:
@@ -1234,12 +1270,63 @@ def test_trade_journal_analyze_summarizes_realized_exit_deals() -> None:
     assert out["summary"]["sample_notice"]["code"] == "low_sample_unreliable_metrics"
     assert "avg_pnl" not in out["summary"]
     assert out["breakdowns"]["by_symbol"][0]["symbol"] == "EURUSD"
-    assert out["item_schema"] == "trade_journal_analyzed_exit.v1"
-    assert [item["ticket"] for item in out["items"]] == [2, 3]
+    assert out["item_schema"] == "trade_journal_analyzed_exit.v2"
+    assert [item["deal_ticket"] for item in out["items"]] == [2, 3]
+    assert out["items"][0]["fill_time"] == "2026-01-01 12:00"
     assert out["items"][0]["net_pnl"] == 23.5
-    assert out["best_trades"][0]["ticket"] == 2
+    assert out["best_trades"][0]["deal_ticket"] == 2
     assert out["best_trades"][0]["profit"] == 25.0
-    assert out["worst_trades"][0]["ticket"] == 3
+    assert out["worst_trades"][0]["deal_ticket"] == 3
+
+
+def test_trade_journal_includes_canonical_manual_close_deals() -> None:
+    history_rows = [
+        {
+            "fill_time": "2026-07-16T20:26:44Z",
+            "deal_ticket": 101,
+            "order_ticket": 201,
+            "position_ticket": 301,
+            "symbol": "TSLA.NAS-24",
+            "deal_effect": "close",
+            "position_action": "close_long",
+            "position_side": "long",
+            "profit": 0.92,
+            "commission": -0.02,
+            "volume": 0.2,
+            "comment": "MCP close",
+        }
+    ]
+
+    with patch(
+        "mtdata.core.trading.account._run_trade_history_request",
+        return_value={
+            "success": True,
+            "count": 1,
+            "items": history_rows,
+        },
+    ):
+        out = trade_journal_analyze(detail="full", __cli_raw=True)
+
+    assert out["summary"]["closed_deals"] == 1
+    assert out["summary"]["net_pnl"] == 0.9
+    assert out["meta"]["exit_deals"] == 1
+    assert out["items"] == [
+        {
+            "deal_ticket": 101,
+            "order_ticket": 201,
+            "position_ticket": 301,
+            "symbol": "TSLA.NAS-24",
+            "fill_time": "2026-07-16T20:26:44Z",
+            "side": "long",
+            "exit_trigger": "Unspecified",
+            "net_pnl": 0.9,
+            "profit": 0.92,
+            "commission": -0.02,
+            "swap": None,
+            "fee": None,
+            "volume": 0.2,
+        }
+    ]
 
 
 def test_trade_journal_analyze_compact_returns_summary_only() -> None:
@@ -1483,16 +1570,22 @@ def test_trade_journal_analyze_filters_best_worst_by_pnl_sign() -> None:
     # Verify best_trades only contains winners (positive P&L)
     assert len(out["best_trades"]) == 2
     for trade in out["best_trades"]:
-        assert trade["net_pnl"] > 0, f"best_trades should only contain wins, but found ticket {trade['ticket']} with net_pnl {trade['net_pnl']}"
+        assert trade["net_pnl"] > 0, (
+            "best_trades should only contain wins, but found deal "
+            f"{trade['deal_ticket']} with net_pnl {trade['net_pnl']}"
+        )
 
     # Verify worst_trades only contains losers (negative P&L)
     assert len(out["worst_trades"]) == 1
     for trade in out["worst_trades"]:
-        assert trade["net_pnl"] < 0, f"worst_trades should only contain losses, but found ticket {trade['ticket']} with net_pnl {trade['net_pnl']}"
+        assert trade["net_pnl"] < 0, (
+            "worst_trades should only contain losses, but found deal "
+            f"{trade['deal_ticket']} with net_pnl {trade['net_pnl']}"
+        )
 
     # Verify specific tickets in correct lists
-    best_tickets = {trade["ticket"] for trade in out["best_trades"]}
-    worst_tickets = {trade["ticket"] for trade in out["worst_trades"]}
+    best_tickets = {trade["deal_ticket"] for trade in out["best_trades"]}
+    worst_tickets = {trade["deal_ticket"] for trade in out["worst_trades"]}
     
     assert 1 in best_tickets  # EURUSD +0.82
     assert 2 in best_tickets  # USDJPY +0.04
@@ -1601,5 +1694,6 @@ def test_trade_journal_analyze_forwards_side_filter() -> None:
     assert out["summary"]["closed_deals"] == 0
 
 
-def test_trade_journal_request_preserves_invalid_side_for_tool_level_error() -> None:
-    assert TradeJournalAnalyzeRequest(side="sideways").side == "sideways"
+def test_trade_journal_request_rejects_invalid_side() -> None:
+    with pytest.raises(ValidationError, match="side must be BUY or SELL"):
+        TradeJournalAnalyzeRequest(side="sideways")

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from ..execution_logging import log_operation_exception, run_logged_operation
 from ..output_contract import normalize_output_detail
 from .requests import ReportGenerateRequest
+from .utils import extract_report_forecast_values
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,37 @@ _BARRIER_EV_EDGE_CONFLICT_NOTE = (
     "Expected value and break-even edge disagree; treat this barrier setup as "
     "lower-confidence and review win probability, payoff skew, and no-hit share."
 )
+
+_BASIC_REPORT_SECTIONS = (
+    "context",
+    "pivot",
+    "contexts_multi",
+    "pivot_multi",
+    "volatility",
+    "backtest",
+    "forecast",
+    "barriers",
+    "patterns",
+)
+_REPORT_TEMPLATE_SECTIONS = {
+    "minimal": ("context", "forecast"),
+    "basic": _BASIC_REPORT_SECTIONS,
+    "advanced": (
+        *_BASIC_REPORT_SECTIONS,
+        "regime",
+        "volatility_har_rv",
+        "forecast_conformal",
+    ),
+    "scalping": (*_BASIC_REPORT_SECTIONS, "market", "execution_gates"),
+    "intraday": (*_BASIC_REPORT_SECTIONS, "market", "execution_gates"),
+    "swing": _BASIC_REPORT_SECTIONS,
+    "position": _BASIC_REPORT_SECTIONS,
+}
+_REPORT_SECTION_DEPENDENCIES = {
+    "forecast": ("backtest",),
+    "forecast_conformal": ("backtest",),
+    "execution_gates": ("market",),
+}
 
 
 def _round_report_barrier_metric(name: str, value: Any) -> Any:
@@ -205,6 +237,15 @@ def _build_sections_status(sections: Dict[str, Any]) -> Dict[str, Any]:
         has_error = _has_payload_error(payload)
         has_content = _has_payload_content(payload)
         errors = _collect_payload_errors(payload)
+        if str(name) == "forecast" and not extract_report_forecast_values(payload):
+            has_error = True
+            has_content = False
+            missing_error = {
+                "path": "forecast",
+                "message": "Forecast section contains no finite forecast values.",
+            }
+            if missing_error not in errors:
+                errors.append(missing_error)
         if has_error and has_content:
             status = "partial"
         elif has_error:
@@ -375,6 +416,12 @@ def _compact_report_assessment(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
     out = dict(value)
+    assembly_confidence = out.pop("assembly_confidence", None)
+    if assembly_confidence not in (None, ""):
+        out["section_completeness"] = assembly_confidence
+    # Compact assessment is exclusively about report assembly, so the fixed
+    # basis adds no decision value once the field is named explicitly.
+    out.pop("assembly_confidence_basis", None)
     section_health = out.get("section_health")
     if isinstance(section_health, dict):
         section_health = dict(section_health)
@@ -419,7 +466,7 @@ def _compact_sections_status(value: Any) -> Any:
     return out
 
 
-def _compact_report_payload(
+def _compact_report_payload(  # noqa: C901
     report: Dict[str, Any],
     *,
     symbol: str,
@@ -469,14 +516,28 @@ def _compact_report_payload(
         compact["completeness"] = completeness
     assessment = report.get("overall_assessment")
     if assessment not in (None, "", [], {}):
-        compact["overall_assessment"] = _compact_report_assessment(assessment)
+        compact["assessment"] = _compact_report_assessment(assessment)
     sections_status = _compact_sections_status(report.get("sections_status"))
     if sections_status not in (None, "", [], {}):
         compact["sections_status"] = sections_status
-    elif report.get("executive_summary") not in (None, "", [], {}):
-        compact["executive_summary"] = _compact_report_assessment(
-            report.get("executive_summary")
-        )
+        if isinstance(compact.get("assessment"), dict):
+            compact["assessment"].pop("section_health", None)
+    elif "assessment" not in compact:
+        executive_summary = report.get("executive_summary")
+        if isinstance(executive_summary, dict):
+            compact["assessment"] = _compact_report_assessment(
+                {
+                    key: executive_summary[key]
+                    for key in (
+                        "is_trade_signal",
+                        "recommended_action",
+                        "assembly_confidence",
+                        "assembly_confidence_basis",
+                        "section_health",
+                    )
+                    if key in executive_summary
+                }
+            )
     for key in ("section_controls",):
         value = report.get(key)
         if value not in (None, "", [], {}):
@@ -565,18 +626,61 @@ def _split_report_section_names(value: Any) -> Optional[List[str]]:
     return None
 
 
+def _resolve_report_section_plan(
+    template: str,
+    *,
+    include_sections: Any = None,
+    max_sections: Optional[int] = None,
+) -> Dict[str, List[str]]:
+    available = list(_REPORT_TEMPLATE_SECTIONS.get(template, ()))
+    requested = _split_report_section_names(include_sections)
+    missing: List[str] = []
+    if requested:
+        lookup = {name.casefold(): name for name in available}
+        selected: List[str] = []
+        for requested_name in requested:
+            actual = lookup.get(requested_name.casefold())
+            if actual is None:
+                missing.append(requested_name)
+            elif actual not in selected:
+                selected.append(actual)
+    else:
+        selected = list(available)
+    if max_sections is not None:
+        selected = selected[: max(0, int(max_sections))]
+
+    execution = list(selected)
+    dependency_index = 0
+    while dependency_index < len(execution):
+        section = execution[dependency_index]
+        for dependency in _REPORT_SECTION_DEPENDENCIES.get(section, ()):
+            if dependency not in execution:
+                execution.append(dependency)
+        dependency_index += 1
+    if template == "scalping" and "barriers" in execution and "market" not in execution:
+        execution.append("market")
+    return {
+        "available": available,
+        "selected": selected,
+        "execution": execution,
+        "missing": missing,
+    }
+
+
 def _apply_report_section_controls(
     report: Dict[str, Any],
     *,
     include_sections: Any = None,
     max_sections: Optional[int] = None,
     summary_mode: bool = False,
+    available_sections: Optional[List[str]] = None,
 ) -> None:
     sections = report.get("sections")
     if not isinstance(sections, dict):
         return
 
     original_names = list(sections.keys())
+    selectable_names = list(available_sections or original_names)
     if summary_mode and original_names:
         report["sections_available"] = list(original_names)
     if summary_mode:
@@ -585,7 +689,7 @@ def _apply_report_section_controls(
     else:
         requested_names = _split_report_section_names(include_sections)
         if requested_names:
-            requested_lookup = {name.casefold(): name for name in original_names}
+            requested_lookup = {name.casefold(): name for name in selectable_names}
             selected_names = []
             missing_requested = []
             for requested in requested_names:
@@ -595,19 +699,20 @@ def _apply_report_section_controls(
                 elif actual not in selected_names:
                     selected_names.append(actual)
         else:
-            selected_names = list(original_names)
+            selected_names = list(selectable_names)
             missing_requested = []
 
         if max_sections is not None:
             selected_names = selected_names[: max(0, int(max_sections))]
 
-    report["sections"] = {name: sections[name] for name in selected_names if name in sections}
-    omitted_names = [name for name in original_names if name not in selected_names]
+    selected_present = [name for name in selected_names if name in sections]
+    report["sections"] = {name: sections[name] for name in selected_present}
+    omitted_names = [name for name in selectable_names if name not in selected_names]
     if omitted_names or missing_requested or summary_mode or max_sections is not None or include_sections:
         report["section_controls"] = {
             "summary_mode": bool(summary_mode),
-            "included_sections": selected_names,
-            "included_count": len(selected_names),
+            "included_sections": selected_present,
+            "included_count": len(selected_present),
             "omitted_sections": omitted_names,
             "omitted_count": len(omitted_names),
         }
@@ -797,6 +902,16 @@ def run_report_generate(  # noqa: C901
                 params["end"] = request.end
             if request.methods is not None:
                 params["methods"] = request.methods
+            section_plan = _resolve_report_section_plan(
+                name,
+                include_sections=request.include_sections,
+                max_sections=request.max_sections,
+            )
+            params["_report_execution_sections"] = section_plan["execution"]
+            params["_report_selected_sections"] = section_plan["selected"]
+            params["_report_section_controls_active"] = bool(
+                request.include_sections or request.max_sections is not None
+            )
 
             try:
                 from ..report_templates import (
@@ -883,6 +998,35 @@ def run_report_generate(  # noqa: C901
                 for warning_text in captured_warnings:
                     append_diagnostic_warning(rep, warning_text)
 
+            source_sections_status = None
+            summary_mode = detail_value == "summary"
+            template_sections = (
+                rep.get("sections") if isinstance(rep.get("sections"), dict) else None
+            )
+            if summary_mode and isinstance(rep.get("sections"), dict):
+                source_sections_status = _build_sections_status(rep["sections"])
+            if not summary_mode:
+                _apply_report_section_controls(
+                    rep,
+                    include_sections=request.include_sections,
+                    max_sections=request.max_sections,
+                    summary_mode=False,
+                    available_sections=(
+                        section_plan["available"]
+                        if request.include_sections or request.max_sections is not None
+                        else None
+                    ),
+                )
+            if summary_mode:
+                source_sections = template_sections
+            else:
+                source_sections = (
+                    rep.get("sections")
+                    if isinstance(rep.get("sections"), dict)
+                    else None
+                )
+
+            rep.pop("summary_structured", None)
             summ: List[str] = []
             summary_structured: Dict[str, Any] = {}
             try:
@@ -1162,6 +1306,27 @@ def run_report_generate(  # noqa: C901
             try:
                 bar = rep.get("sections", {}).get("barriers", {})
                 barriers_summary: Dict[str, Any] = {}
+
+                def _barrier_metric_basis(best_row: Dict[str, Any]) -> Dict[str, Any]:
+                    return {
+                        "tp_pct": "percentage_points",
+                        "sl_pct": "percentage_points",
+                        "ev": {
+                            "unit": str(best_row.get("distance_unit") or "price"),
+                            "definition": (
+                                "mean simulated barrier payoff including timeout "
+                                "mark-to-market, net of supplied costs"
+                            ),
+                        },
+                        "probability_edge": (
+                            "take_profit_first_probability minus "
+                            "stop_loss_first_probability"
+                        ),
+                        "edge_vs_breakeven": (
+                            "resolved win probability minus break-even win probability"
+                        ),
+                    }
+
                 if isinstance(bar, dict) and any(k in bar for k in ("long", "short")):
                     for dname in ("long", "short"):
                         sub = bar.get(dname)
@@ -1223,6 +1388,9 @@ def run_report_generate(  # noqa: C901
                             summ.append("barrier best " + " ".join(details))
                         if barrier_entry:
                             barriers_summary[dname] = barrier_entry
+                            barriers_summary.setdefault(
+                                "metric_basis", _barrier_metric_basis(best)
+                            )
                 else:
                     best = bar.get("best") if isinstance(bar, dict) else None
                     direction = bar.get("direction") if isinstance(bar, dict) else None
@@ -1283,6 +1451,9 @@ def run_report_generate(  # noqa: C901
                             summ.append("barrier best " + " ".join(details))
                         if barrier_entry:
                             barriers_summary["best"] = barrier_entry
+                            barriers_summary.setdefault(
+                                "metric_basis", _barrier_metric_basis(best)
+                            )
                 if barriers_summary:
                     summary_structured["barriers"] = barriers_summary
             except Exception:
@@ -1312,17 +1483,8 @@ def run_report_generate(  # noqa: C901
             rep["summary"] = summ
             if summary_structured:
                 rep["summary_structured"] = summary_structured
-            source_sections_status = None
-            source_sections = rep.get("sections") if isinstance(rep.get("sections"), dict) else None
-            summary_mode = detail_value == "summary"
-            if summary_mode and isinstance(rep.get("sections"), dict):
-                source_sections_status = _build_sections_status(rep["sections"])
-            _apply_report_section_controls(
-                rep,
-                include_sections=request.include_sections,
-                max_sections=request.max_sections,
-                summary_mode=summary_mode,
-            )
+            if summary_mode:
+                _apply_report_section_controls(rep, summary_mode=True)
             sections = rep.get("sections")
             if isinstance(sections, dict):
                 sections_status = source_sections_status or _build_sections_status(sections)

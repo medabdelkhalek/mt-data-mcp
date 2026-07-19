@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 from ...shared.schema import (
-    DetailLiteral,
     DenoiseSpec,
+    DetailLiteral,
     TimeframeLiteral,
     reject_removed_field,
 )
@@ -33,7 +33,11 @@ _REPORT_TEMPLATE_HELP = (
 
 class ReportGenerateRequest(BaseModel):
     symbol: str
-    horizon: Optional[int] = None
+    horizon: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Forecast/report horizon in bars; must be at least 1 when supplied.",
+    )
     template: ReportTemplateLiteral = Field("basic", description=_REPORT_TEMPLATE_HELP)
     timeframe: Optional[TimeframeLiteral] = None
     start: Optional[str] = None
@@ -41,12 +45,18 @@ class ReportGenerateRequest(BaseModel):
     methods: Optional[Union[str, List[str]]] = None
     include_sections: Optional[Union[str, List[str]]] = Field(
         None,
-        description="Only include these report sections. Accepts a list or comma/space separated names.",
+        description=(
+            "Only execute and return these report sections (plus internal dependencies). "
+            "Accepts a list or comma/space separated names."
+        ),
     )
     max_sections: Optional[int] = Field(
         None,
         ge=1,
-        description="Maximum number of report sections to include, after include_sections filtering.",
+        description=(
+            "Maximum number of report sections to execute and return, after "
+            "include_sections filtering."
+        ),
     )
     denoise: Optional[DenoiseSpec] = None
     params: Optional[Dict[str, Any]] = Field(
@@ -75,4 +85,13 @@ class ReportGenerateRequest(BaseModel):
         if isinstance(values, dict) and isinstance(values.get("template"), str):
             values = dict(values)
             values["template"] = values["template"].strip().lower()
+        if isinstance(values, dict) and isinstance(values.get("params"), dict):
+            params_horizon = values["params"].get("horizon")
+            if params_horizon is not None:
+                try:
+                    valid_horizon = int(params_horizon) >= 1
+                except (TypeError, ValueError):
+                    valid_horizon = False
+                if not valid_horizon:
+                    raise ValueError("params.horizon must be an integer greater than or equal to 1")
         return values

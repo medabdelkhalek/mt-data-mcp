@@ -4,6 +4,7 @@ from mtdata.core.finviz import (
     finviz_calendar,
     finviz_earnings,
     finviz_filters_list,
+    finviz_forex,
     finviz_insider,
     finviz_insider_activity,
     finviz_peers,
@@ -135,8 +136,37 @@ class TestFinvizEarningsOutputContract:
             "page": 2,
             "total": 6,
             "pages": 3,
+            "has_more": False,
+            "truncated": False,
         }
         assert result["meta"]["stats"]["truncated"] is False
+
+    @patch("mtdata.core.finviz.get_earnings_calendar")
+    def test_unknown_total_preserves_truncation_and_next_page(self, mock_get):
+        mock_get.return_value = {
+            "success": True,
+            "period": "This Week",
+            "count": 2,
+            "total": None,
+            "page": 1,
+            "pages": None,
+            "has_more": True,
+            "total_lower_bound": 3,
+            "truncated": True,
+            "earnings": [
+                {"Ticker": "AAPL", "Date": "2026-01-10"},
+                {"Ticker": "MSFT", "Date": "2026-01-11"},
+            ],
+        }
+
+        result = self._unwrapped()(period="This Week", limit=2, page=1)
+
+        assert result["success"] is True
+        assert result["omitted_item_count"] is None
+        assert result["has_more"] is True
+        assert result["truncated"] is True
+        assert result["total_lower_bound"] == 3
+        assert result["next_page"] == 2
 
     @patch("mtdata.core.finviz.get_earnings_calendar")
     def test_full_includes_numeric_market_cap(self, mock_get):
@@ -672,6 +702,27 @@ class TestFinvizProgressiveDisclosure:
 
         assert result["success"] is True
         assert result["detail"] == "compact"
+
+    @patch("mtdata.core.finviz.get_forex_performance")
+    def test_forex_includes_normalized_pagination(self, mock_get):
+        mock_get.return_value = {
+            "success": True,
+            "pairs": [
+                {"Ticker": "EURUSD", "Price": "1.10"},
+                {"Ticker": "GBPUSD", "Price": "1.25"},
+            ],
+        }
+
+        result = _unwrap(finviz_forex)(limit=1)
+
+        assert result["pagination"] == {
+            "total": 2,
+            "returned": 1,
+            "offset": 0,
+            "limit": 1,
+            "has_more": True,
+            "more_available": 1,
+        }
 
 
 def test_finviz_description_compact_truncates_long_text():

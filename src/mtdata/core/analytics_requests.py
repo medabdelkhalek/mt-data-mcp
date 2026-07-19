@@ -7,7 +7,13 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from ..shared.schema import DetailLiteral, TimeframeLiteral
+from ..shared.schema import (
+    DetailLiteral,
+    TimeframeLiteral,
+    normalize_optional_symbol,
+    normalize_required_symbol,
+    validate_complete_time_window,
+)
 
 
 class MarketMicrostructureRequest(BaseModel):
@@ -22,15 +28,11 @@ class MarketMicrostructureRequest(BaseModel):
     @field_validator("symbol")
     @classmethod
     def _symbol(cls, value: str) -> str:
-        value = str(value or "").strip().upper()
-        if not value:
-            raise ValueError("symbol is required")
-        return value
+        return normalize_required_symbol(value)
 
     @model_validator(mode="after")
     def _window(self) -> "MarketMicrostructureRequest":
-        if bool(self.start) != bool(self.end):
-            raise ValueError("start and end must be supplied together")
+        validate_complete_time_window(self.start, self.end)
         return self
 
 
@@ -43,6 +45,7 @@ class TradeExecutionQualityRequest(BaseModel):
     magic: Optional[int] = None
     limit: int = Field(200, ge=1, le=1_000)
     benchmark: Literal["arrival_quote", "order_price"] = "arrival_quote"
+    benchmark_fallback: Literal["skip", "order_price"] = "skip"
     quote_window_seconds: int = Field(5, ge=1, le=60)
     markout_seconds: List[int] = Field(default_factory=lambda: [1, 5, 30])
     min_sample: int = Field(30, ge=1)
@@ -51,7 +54,7 @@ class TradeExecutionQualityRequest(BaseModel):
     @field_validator("symbol")
     @classmethod
     def _optional_symbol(cls, value: Optional[str]) -> Optional[str]:
-        return str(value).strip().upper() if value else None
+        return normalize_optional_symbol(value)
 
     @field_validator("markout_seconds")
     @classmethod
@@ -63,8 +66,7 @@ class TradeExecutionQualityRequest(BaseModel):
 
     @model_validator(mode="after")
     def _window(self) -> "TradeExecutionQualityRequest":
-        if bool(self.start) != bool(self.end):
-            raise ValueError("start and end must be supplied together")
+        validate_complete_time_window(self.start, self.end)
         return self
 
 
@@ -107,7 +109,7 @@ class StrategyValidateRequest(BaseModel):
     barrier: BarrierSpec = Field(default_factory=BarrierSpec)
     purge_bars: Optional[int] = Field(None, ge=0)
     embargo_bars: Optional[int] = Field(None, ge=0)
-    cost_model: Literal["mt5_observed", "fixed"] = "mt5_observed"
+    cost_model: Literal["current_spread_proxy", "fixed"] = "current_spread_proxy"
     spread_bps: Optional[float] = Field(None, ge=0.0)
     commission_bps: float = Field(0.0, ge=0.0)
     slippage_bps: float = Field(0.0, ge=0.0)
@@ -119,15 +121,11 @@ class StrategyValidateRequest(BaseModel):
     @field_validator("symbol")
     @classmethod
     def _symbol(cls, value: str) -> str:
-        value = str(value or "").strip().upper()
-        if not value:
-            raise ValueError("symbol is required")
-        return value
+        return normalize_required_symbol(value)
 
     @model_validator(mode="after")
     def _window(self) -> "StrategyValidateRequest":
-        if bool(self.start) != bool(self.end):
-            raise ValueError("start and end must be supplied together")
+        validate_complete_time_window(self.start, self.end)
         return self
 
 
@@ -145,6 +143,7 @@ class PortfolioRiskDecomposeRequest(BaseModel):
     method: Literal["filtered_historical", "historical"] = "filtered_historical"
     ewma_half_life: float = Field(60.0, gt=1.0)
     simulations: int = Field(5_000, ge=500, le=50_000)
+    seed: int = Field(42, ge=0, le=4_294_967_295)
     proposed_trade: Optional[ProposedTrade] = None
     allow_partial: bool = False
     detail: DetailLiteral = "compact"

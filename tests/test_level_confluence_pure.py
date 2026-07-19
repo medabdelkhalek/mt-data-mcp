@@ -90,9 +90,12 @@ def test_confluence_compact_omits_verbose_source_narration():
     assert payload["tolerance"]["fraction"] == 0.001
     assert "input_pct" not in payload["tolerance"]
     assert "detail" not in payload
-    assert "units" not in payload
+    assert payload["units"]["distance_pct"] == "percentage_points (1.0 = 1%)"
+    assert payload["units"]["score"] == "unbounded_heuristic_points"
     assert "max_distance_pct" not in payload
     assert "min_source_families" not in payload
+    assert payload["level_coverage"] == {"above": 1, "below": 0, "at": 0}
+    assert "No confluence levels below" in payload["coverage_note"]
 
 
 def test_confluence_standard_keeps_units_and_filter_context():

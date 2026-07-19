@@ -55,6 +55,9 @@ from .smoothing import (
 logger = logging.getLogger(__name__)
 
 _PELT_DIRECTION_T_STAT_THRESHOLD = 1.96
+_ENSEMBLE_STATE_METHODS = frozenset(
+    {"hmm", "gmm", "ms_ar", "clustering", "wavelet"}
+)
 
 
 def _pelt_return_direction(
@@ -1093,7 +1096,9 @@ def regime_detect(  # noqa: C901
         `cp_confirm_bars` (default `1`, live-oriented),
         `min_cp_distance_bars`, `cp_edge_multiplier`.
     - include_series: If True, include raw time series data (probs, states) in output. Default False.
-    - lookback: Number of recent bars to include in summary/compact detail. Omit for timeframe-based defaults:
+    - lookback: Number of recent observations to analyze when `limit` is omitted,
+      and the summary window when `limit` is provided. Extra history may be fetched
+      for feature warmup but is excluded from model fitting. Omit for timeframe-based defaults:
         M1: 3000, M5: 2000, M15: 1000, M30: 800, H1: 500, H2: 400, H4: 300, H6-H12: 200-150, D1: 200, W1: 100, MN1: 48
     - min_regime_bars: Confirm a new state only after it persists for this many
         consecutive bars. Confirmation is causal and never rewrites earlier labels.
@@ -1374,6 +1379,30 @@ def regime_detect(  # noqa: C901
 
         if x.size < 2:
             return _finish({"error": "Insufficient finite observations after filter"})
+
+        if method == "rule_based":
+            analysis_limit = int(rule_based_config["window_bars"])
+            bars_analyzed = min(analysis_limit, int(price_series.size))
+            warmup_bars = max(0, int(len(df)) - bars_analyzed)
+        else:
+            analysis_limit = int(limit) if limit is not None else int(lookback)
+            observations_available = int(x.size)
+            if observations_available > analysis_limit:
+                x = x[-analysis_limit:]
+                t = t[-analysis_limit:]
+            calibration_returns = calibration_returns[-analysis_limit:]
+            bars_analyzed = int(x.size)
+            price_bars_used = bars_analyzed + (1 if target == "return" else 0)
+            warmup_bars = max(0, int(len(df)) - price_bars_used)
+
+        analysis_window_meta.update(
+            {
+                "bars_fetched": int(fetched_range_bars),
+                "warmup_bars": int(warmup_bars),
+                "bars_analyzed": int(bars_analyzed),
+                "analysis_limit": int(analysis_limit),
+            }
+        )
 
         # format times
         t_fmt = [_format_time_minimal(tt) for tt in t]
@@ -2900,7 +2929,6 @@ def regime_detect(  # noqa: C901
                 }
             regime_info = {
                 "state": regime_state,
-                "direction": direction,
                 "state_label_native": regime_state,
                 "state_label_canonical": regime_state,
                 "direction_basis": "net_window_move",
@@ -2911,6 +2939,10 @@ def regime_detect(  # noqa: C901
                 "window_move_pct": window_move_pct,
                 "signal_source": "price",
             }
+            if regime_state == "trending":
+                regime_info["direction"] = direction
+            else:
+                regime_info["window_bias"] = direction
             if state_note:
                 regime_info["note"] = state_note
             confidence = 0.0
@@ -2957,12 +2989,13 @@ def regime_detect(  # noqa: C901
                 "regime_confidence": regime_confidence,
                 "since": regime_since,
                 "bars": int(window_bars),
-                "direction": direction,
                 "state_label_native": regime_state,
                 "state_label_canonical": regime_state,
                 "headline": f"regime={regime_state}; window_bias={direction}",
             }
-            if regime_state != "trending":
+            if regime_state == "trending":
+                current_regime["direction"] = direction
+            else:
                 current_regime["window_bias"] = direction
             regime_payload = dict(regime_info)
 
@@ -2990,13 +3023,21 @@ def regime_detect(  # noqa: C901
                         "regime": int(regime_id),
                         "label": regime_state,
                         "regime_confidence": regime_confidence,
-                        "direction": direction,
+                        **(
+                            {"direction": direction}
+                            if regime_state == "trending"
+                            else {"window_bias": direction}
+                        ),
                     }
                 ],
                 "regime_info": {
                     int(regime_id): {
                         "label": regime_state,
-                        "direction": direction,
+                        **(
+                            {"direction": direction}
+                            if regime_state == "trending"
+                            else {"window_bias": direction}
+                        ),
                         "trend_strength": trend_strength_out,
                         "efficiency_ratio": efficiency_ratio_out,
                         "window_move_pct": window_move_pct,
@@ -3019,8 +3060,11 @@ def regime_detect(  # noqa: C901
                     "lookback": int(window_bars),
                     "last_state": int(regime_id),
                     "label": regime_state,
-                    "direction": direction,
-                    "window_bias": direction if regime_state != "trending" else None,
+                    **(
+                        {"direction": direction}
+                        if regime_state == "trending"
+                        else {"window_bias": direction}
+                    ),
                     "headline": f"regime={regime_state}; window_bias={direction}",
                     "regime_confidence": regime_confidence,
                 }
@@ -3326,7 +3370,6 @@ def regime_detect(  # noqa: C901
         elif method == "ensemble":
             # Consensus regime detection: run multiple fast methods and
             # aggregate their state_probabilities via soft or hard voting.
-            state_methods = {"hmm", "gmm", "ms_ar", "clustering", "wavelet"}
             default_sub = ["hmm", "clustering", "wavelet"]
             sub_methods_raw = p.get("methods", default_sub)
             if isinstance(sub_methods_raw, str):
@@ -3335,7 +3378,7 @@ def regime_detect(  # noqa: C901
             unsupported_methods: List[str] = []
             for candidate in sub_methods_raw:
                 normalized = _normalize_regime_method_name(candidate)
-                if normalized not in state_methods:
+                if normalized not in _ENSEMBLE_STATE_METHODS:
                     if normalized not in unsupported_methods:
                         unsupported_methods.append(normalized)
                     continue
@@ -3724,6 +3767,7 @@ def regime_detect(  # noqa: C901
                 "bocpd",
                 "pelt",
                 "hmm",
+                "gmm",
                 "ms_ar",
                 "clustering",
                 "garch",
@@ -3818,9 +3862,11 @@ def regime_detect(  # noqa: C901
             try:
                 ensemble_started_at = time.perf_counter()
                 ens_params = dict(p)
-                ens_params["methods"] = list(
-                    results_by_method.keys()
-                )  # Use methods that succeeded
+                ens_params["methods"] = [
+                    method_name
+                    for method_name in results_by_method
+                    if method_name in _ENSEMBLE_STATE_METHODS
+                ]
                 ensemble_result = call_tool_sync_structured(
                     regime_detect,
                     symbol=symbol,
@@ -3870,21 +3916,27 @@ def regime_detect(  # noqa: C901
                     3,
                 )
 
-            comparison = _build_all_method_comparison(results_by_method)
-            comparison["methods_failed"] = [e.split(":")[0] for e in all_errors]
-            individual_methods_succeeded = [
+            attempted_components = [*all_methods, "ensemble"]
+            succeeded_components = [
                 method_name
-                for method_name in all_methods
+                for method_name in attempted_components
                 if method_name in results_by_method
             ]
+            failed_components = [
+                method_name
+                for method_name in attempted_components
+                if method_name in method_errors
+            ]
+            comparison = _build_all_method_comparison(results_by_method)
+            comparison["methods_failed"] = failed_components
             ensemble_aggregated = "ensemble" in results_by_method
 
             summary_payload: Optional[Dict[str, Any]] = None
             if detail_value in {"summary", "compact"}:
                 summary_payload = {
-                    "methods_attempted": int(len(all_methods)),
-                    "methods_succeeded": int(len(individual_methods_succeeded)),
-                    "methods_failed": int(len(all_errors)),
+                    "methods_attempted": int(len(attempted_components)),
+                    "methods_succeeded": int(len(succeeded_components)),
+                    "methods_failed": int(len(failed_components)),
                 }
                 if ensemble_aggregated:
                     summary_payload["ensemble_aggregated"] = True
@@ -3900,9 +3952,9 @@ def regime_detect(  # noqa: C901
                     compact_comparison["agreement"] = comparison.get("agreement")
                 comparison = compact_comparison
             runtime_payload: Dict[str, Any] = {
-                "completed_methods": list(individual_methods_succeeded),
-                "failed_methods": list(method_errors.keys()),
-                "partial_results": bool(method_errors),
+                "completed_methods": list(succeeded_components),
+                "failed_methods": list(failed_components),
+                "partial_results": bool(failed_components),
             }
             if ensemble_aggregated:
                 runtime_payload["ensemble_aggregated"] = True
@@ -3929,9 +3981,9 @@ def regime_detect(  # noqa: C901
             }
             if detail_value == "full":
                 payload["params_used"] = {
-                    "methods_attempted": all_methods,
-                    "methods_succeeded": list(individual_methods_succeeded),
-                    "methods_failed": [e.split(":")[0] for e in all_errors],
+                    "methods_attempted": attempted_components,
+                    "methods_succeeded": list(succeeded_components),
+                    "methods_failed": list(failed_components),
                 }
                 if ensemble_aggregated:
                     payload["params_used"]["ensemble_aggregated"] = True
@@ -3939,8 +3991,12 @@ def regime_detect(  # noqa: C901
                 payload["summary"] = summary_payload
             if detail_value == "full":
                 payload["results"] = results_by_method
-            if all_errors:
-                payload["warnings"] = [f"Method errors: {'; '.join(all_errors)}"]
+            if failed_components:
+                error_summary = "; ".join(
+                    f"{method_name}: {method_errors[method_name]}"
+                    for method_name in failed_components
+                )
+                payload["warnings"] = [f"Method errors: {error_summary}"]
 
             return _finish(payload)
 

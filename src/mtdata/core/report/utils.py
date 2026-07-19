@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ...shared.constants import TIME_DISPLAY_FORMAT
-from ...utils.barriers import get_pip_size as _get_pip_size
+from ...shared.market_units import forex_pip_size
+from ...utils.barriers import get_tick_size as _get_pip_size
 from ...utils.mt5 import get_symbol_info_cached
 from ..tool_calling import call_tool_sync_structured
 from .shared import (
@@ -22,6 +23,120 @@ from .shared import (
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime(TIME_DISPLAY_FORMAT)
+
+
+_REPORT_FORECAST_FIELDS = (
+    "forecast",
+    "forecast_summary",
+    "forecast_price",
+    "forecast_return",
+    "forecast_series",
+    "lower_price",
+    "upper_price",
+    "trend",
+    "forecast_vs_last_price",
+    "uncertainty",
+    "ci_status",
+    "ci_alpha",
+    "forecast_mode",
+    "quantity",
+    "quantity_note",
+    "timezone",
+    "last_observation_time",
+    "last_observation_epoch",
+    "forecast_start_time",
+    "forecast_start_epoch",
+    "forecast_anchor",
+    "forecast_start_gap_bars",
+    "forecast_step_seconds",
+    "data_window",
+    "freshness",
+    "last_price",
+    "path_flat",
+    "path_range",
+    "volatility_per_bar",
+    "volatility_annualized",
+    "volatility_horizon",
+    "volatility_horizon_annualized",
+    "volatility_unit",
+    "warnings",
+)
+
+
+def extract_report_forecast_values(payload: Any) -> List[float]:
+    """Extract finite forecast values from legacy or canonical forecast payloads."""
+    if not isinstance(payload, dict):
+        return []
+
+    values: List[float] = []
+
+    def _append(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                _append(item)
+            return
+        if isinstance(value, dict):
+            for key in (
+                "value",
+                "forecast_price",
+                "forecast_return",
+                "volatility",
+                "volatility_per_bar",
+            ):
+                if key in value:
+                    _append(value.get(key))
+                    return
+            return
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(numeric):
+            values.append(numeric)
+
+    for key in (
+        "forecast_price",
+        "forecast_return",
+        "forecast_series",
+        "forecast",
+        "volatility_per_bar",
+        "volatility_annualized",
+        "volatility_horizon",
+        "volatility_horizon_annualized",
+    ):
+        if key in payload:
+            _append(payload.get(key))
+        if values:
+            return values
+
+    summary = payload.get("forecast_summary")
+    if isinstance(summary, dict):
+        _append(summary.get("first"))
+        _append(summary.get("last"))
+    return values
+
+
+def adapt_forecast_payload_for_report(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep canonical forecast decisions and timing while dropping engine noise."""
+    out = {
+        key: payload.get(key)
+        for key in _REPORT_FORECAST_FIELDS
+        if payload.get(key) not in (None, "", [], {})
+    }
+    if not extract_report_forecast_values(payload):
+        out["error"] = "Forecast result did not contain any finite forecast values."
+    return out
+
+
+def report_section_enabled(params: Optional[Dict[str, Any]], section: str) -> bool:
+    """Return whether a template section belongs to the request execution plan."""
+    if not isinstance(params, dict) or "_report_execution_sections" not in params:
+        return True
+    requested = params.get("_report_execution_sections")
+    if not isinstance(requested, (list, tuple, set, frozenset)):
+        return True
+    section_key = str(section).strip().casefold()
+    return any(str(item).strip().casefold() == section_key for item in requested)
 
 
 def parse_table_tail(data: Any, tail: int = 1) -> List[Dict[str, Any]]:
@@ -370,18 +485,16 @@ def market_snapshot(symbol: str, timezone: str = 'UTC') -> Dict[str, Any]:
                 point_size = None
             if point_size is not None and point_size <= 0:
                 point_size = None
-        pip_size = None
-        if point_size is not None:
-            pip_size = point_size * 10.0 if digits in (3, 5) else point_size
-        elif tick_size is not None and tick_size > 0:
-            pip_size = tick_size
-            if math.isclose(tick_size, 0.00001, rel_tol=0.0, abs_tol=1e-12) or math.isclose(
-                tick_size,
-                0.001,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            ):
-                pip_size = tick_size * 10.0
+        pip_size = (
+            forex_pip_size(
+                symbol,
+                path=str(getattr(info, "path", "") or ""),
+                point=point_size,
+                digits=digits,
+            )
+            if point_size is not None and digits is not None
+            else None
+        )
         spread_ticks = None
         if tick_size and spread is not None:
             try:
@@ -718,8 +831,12 @@ def attach_report_timeframes(
     default_pivots: Optional[List[str]] = None,
     _fetch_cache: Optional[Dict[Tuple[str, ...], Optional[Dict[str, Any]]]] = None,
 ) -> None:
-    extra = (params or {}).get('extra_timeframes') or default_extra
-    pivots = (params or {}).get('pivot_timeframes') or default_pivots
+    context_enabled = report_section_enabled(params, 'contexts_multi')
+    pivot_enabled = report_section_enabled(params, 'pivot_multi')
+    if not context_enabled and not pivot_enabled:
+        return
+    extra = ((params or {}).get('extra_timeframes') or default_extra) if context_enabled else []
+    pivots = ((params or {}).get('pivot_timeframes') or default_pivots) if pivot_enabled else []
     start = (params or {}).get('start')
     end = (params or {}).get('end')
     attach_multi_timeframes(
@@ -745,11 +862,15 @@ def attach_market_and_timeframes(
     snapshot: Optional[Dict[str, Any]] = None,
     _fetch_cache: Optional[Dict[Tuple[str, ...], Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
-    snap = snapshot if snapshot is not None else market_snapshot(symbol)
-    report.setdefault('sections', {})['market'] = snap
-    gates = apply_market_gates(snap if isinstance(snap, dict) else {}, params or {})
-    if gates:
-        report['sections']['execution_gates'] = gates
+    market_enabled = report_section_enabled(params, 'market')
+    gates_enabled = report_section_enabled(params, 'execution_gates')
+    snap: Dict[str, Any] = {}
+    if market_enabled or gates_enabled:
+        snap = snapshot if snapshot is not None else market_snapshot(symbol)
+        report.setdefault('sections', {})['market'] = snap
+        gates = apply_market_gates(snap if isinstance(snap, dict) else {}, params or {})
+        if gates:
+            report['sections']['execution_gates'] = gates
     attach_report_timeframes(
         report,
         symbol,

@@ -145,9 +145,10 @@ class MT5Adapter:
 
     def history_orders_get(self, dt_from, dt_to, **kwargs):
         with _mt5_lock:
-            mode = _cached_timestamp_mode()
+            module = self._module()
+            mode = _timestamp_mode_for_history_query(module, kwargs)
             return _normalize_object_time_rows(
-                self._module().history_orders_get(
+                module.history_orders_get(
                     _to_server_query_dt(dt_from, mode=mode),
                     _to_server_query_dt(dt_to, mode=mode),
                     **kwargs,
@@ -157,9 +158,10 @@ class MT5Adapter:
 
     def history_deals_get(self, dt_from, dt_to, **kwargs):
         with _mt5_lock:
-            mode = _cached_timestamp_mode()
+            module = self._module()
+            mode = _timestamp_mode_for_history_query(module, kwargs)
             return _normalize_object_time_rows(
-                self._module().history_deals_get(
+                module.history_deals_get(
                     _to_server_query_dt(dt_from, mode=mode),
                     _to_server_query_dt(dt_to, mode=mode),
                     **kwargs,
@@ -531,6 +533,33 @@ def _timestamp_mode_for_object_rows(
             probe_symbol = str(getattr(rows[0], "symbol", "") or "").strip()
         except Exception:
             probe_symbol = ""
+    if probe_symbol:
+        return _timestamp_mode_for_symbol(module, probe_symbol)
+    return _cached_timestamp_mode()
+
+
+def _timestamp_mode_for_history_query(
+    module: Any,
+    kwargs: Dict[str, Any],
+) -> str:
+    """Reuse a fresh clock mode or probe before converting history bounds."""
+    cached_mode = _valid_cached_timestamp_mode()
+    if cached_mode is not None:
+        return cached_mode
+
+    probe_symbol = str(kwargs.get("symbol") or "").strip()
+    if not probe_symbol:
+        try:
+            positions = module.positions_get()
+        except Exception:
+            positions = None
+        if positions:
+            try:
+                probe_symbol = str(
+                    getattr(positions[0], "symbol", "") or ""
+                ).strip()
+            except Exception:
+                probe_symbol = ""
     if probe_symbol:
         return _timestamp_mode_for_symbol(module, probe_symbol)
     return _cached_timestamp_mode()

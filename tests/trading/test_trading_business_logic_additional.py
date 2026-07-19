@@ -13,6 +13,7 @@ from mtdata.core.trading.use_cases import run_trade_close, run_trade_place
 from mtdata.core.trading.validation import (
     _normalize_order_type_input,
     _normalize_price_for_symbol,
+    _normalize_trade_price_inputs,
     _retcode_is_done,
     _safe_float_attr,
     _trade_done_codes,
@@ -79,6 +80,30 @@ def test_trade_done_helpers_use_safe_int_attr_and_cached_codes():
 def test_normalize_price_for_symbol_accepts_negative_non_zero_values():
     normalized = _normalize_price_for_symbol(-37.634, point=0.01, digits=2)
     assert normalized == -37.63
+
+
+def test_normalize_price_for_symbol_removes_binary_tick_residue():
+    assert _normalize_price_for_symbol(1.10001, point=0.00001, digits=5) == 1.10001
+    assert _normalize_price_for_symbol(2654.56, point=0.01, digits=2) == 2654.56
+
+
+def test_trade_prices_snap_to_trade_tick_size_when_coarser_than_point():
+    symbol_info = SimpleNamespace(point=0.01, trade_tick_size=0.05, digits=2)
+
+    normalized, error = _normalize_trade_price_inputs(
+        symbol_info=symbol_info,
+        price=2654.57,
+        require_price=True,
+        stop_loss=2650.02,
+        take_profit=2660.03,
+    )
+
+    assert error is None
+    assert normalized["point"] == 0.01
+    assert normalized["price_increment"] == 0.05
+    assert normalized["price"] == 2654.55
+    assert normalized["stop_loss"] == 2650.0
+    assert normalized["take_profit"] == 2660.05
 
 
 def test_validate_live_protection_levels_accepts_negative_quotes():
@@ -337,6 +362,7 @@ def test_run_trade_place_dry_run_includes_quote_preview_when_available():
             "margin_required": 110.0,
             "margin_sufficient": True,
             "sl_tp_valid": True,
+            "quote_context": {"usable_for_live_trading": True},
         }
     )
     place_market_order = MagicMock(return_value={"success": True, "path": "market"})
@@ -373,6 +399,43 @@ def test_run_trade_place_dry_run_includes_quote_preview_when_available():
     place_pending_order.assert_not_called()
 
 
+def test_run_trade_place_dry_run_blocks_untrusted_quote_preview():
+    request = TradePlaceRequest(
+        symbol="EURUSD",
+        volume=0.1,
+        order_type="BUY",
+        stop_loss=1.08,
+        take_profit=1.12,
+        dry_run=True,
+        detail="standard",
+    )
+    result = run_trade_place(
+        request,
+        normalize_order_type_input=lambda value: ("BUY", None),
+        normalize_pending_expiration=lambda value: (value, False),
+        prevalidate_trade_place_market_input=lambda symbol, volume: None,
+        place_market_order=MagicMock(),
+        place_pending_order=MagicMock(),
+        close_positions=MagicMock(),
+        safe_int_ticket=lambda value: value,
+        build_dry_run_preview=lambda **_kwargs: {
+            "bid": 1.0999,
+            "ask": 1.1001,
+            "estimated_fill_price": 1.1001,
+            "sl_tp_valid": True,
+            "quote_context": {
+                "freshness_state": "stale",
+                "freshness_reason": "stale_age",
+                "usable_for_live_trading": False,
+            },
+        },
+    )
+
+    assert result["preview_ok"] is False
+    assert result["validation_passed"] is False
+    assert result["quote_context"]["usable_for_live_trading"] is False
+
+
 def test_build_trade_place_dry_run_preview_uses_live_quote_and_margin():
     adapter = SimpleNamespace(
         ORDER_TYPE_BUY=0,
@@ -391,7 +454,11 @@ def test_build_trade_place_dry_run_preview_uses_live_quote_and_margin():
         trade_stops_level=10,
         trade_freeze_level=0,
     )
-    gateway.symbol_info_tick.return_value = SimpleNamespace(bid=1.0999, ask=1.1001)
+    gateway.symbol_info_tick.return_value = SimpleNamespace(
+        bid=1.0999,
+        ask=1.1001,
+        time=datetime.now(timezone.utc).timestamp(),
+    )
     gateway.account_info.return_value = SimpleNamespace(margin_free=1000.0)
 
     result = build_trade_place_dry_run_preview(
@@ -416,6 +483,9 @@ def test_build_trade_place_dry_run_preview_uses_live_quote_and_margin():
     assert result["margin_required"] == 123.45
     assert result["margin_free"] == 1000.0
     assert result["margin_sufficient"] is True
+    assert result["quote_context"]["usable_for_live_trading"] is True
+    assert result["quote_context"]["freshness_state"] == "live"
+    assert result["quote_context"]["quote_timezone"] == "UTC"
     adapter.order_calc_margin.assert_called_once_with(0, "EURUSD", 0.1, 1.1001)
 
 
@@ -437,7 +507,11 @@ def test_build_trade_place_dry_run_preview_preserves_zero_symbol_digits():
         trade_stops_level=10,
         trade_freeze_level=0,
     )
-    gateway.symbol_info_tick.return_value = SimpleNamespace(bid=12344.6, ask=12345.4)
+    gateway.symbol_info_tick.return_value = SimpleNamespace(
+        bid=12344.6,
+        ask=12345.4,
+        time=datetime.now(timezone.utc).timestamp(),
+    )
     gateway.account_info.return_value = SimpleNamespace(margin_free=1000.0)
 
     result = build_trade_place_dry_run_preview(

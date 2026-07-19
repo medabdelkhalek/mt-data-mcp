@@ -6,9 +6,18 @@ from mtdata.utils.barriers import (
     build_barrier_kwargs,
     build_barrier_kwargs_from,
     normalize_trade_direction,
+    normalize_trade_direction_alias,
     resolve_barrier_prices,
     resolve_same_bar_probabilities,
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("buy", "long"), ("DOWN", "short"), ("sideways", "sideways"), (None, None)],
+)
+def test_normalize_trade_direction_alias_preserves_unknown_values(value, expected):
+    assert normalize_trade_direction_alias(value) == expected
 
 
 @pytest.mark.parametrize(
@@ -39,8 +48,20 @@ class TestResolveBarrierPrices:
         tp, sl = resolve_barrier_prices(
             price=1.16026, direction="long", tp_pct=2.0, sl_pct=-2.0, pip_size=0.00001,
         )
-        assert tp == pytest.approx(1.1834652)
-        assert sl == pytest.approx(1.1370548)
+        assert tp == 1.18347
+        assert sl == 1.13705
+
+    def test_percentage_barriers_snap_to_executable_tick_grid(self):
+        tp, sl = resolve_barrier_prices(
+            price=1.1,
+            direction="long",
+            tp_pct=0.37,
+            sl_pct=0.37,
+            pip_size=0.0001,
+        )
+
+        assert tp == 1.1041
+        assert sl == 1.0959
 
     def test_short_pct(self):
         tp, sl = resolve_barrier_prices(

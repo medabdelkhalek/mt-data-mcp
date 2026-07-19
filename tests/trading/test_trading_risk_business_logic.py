@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -113,7 +114,7 @@ def test_trade_risk_analyze_blocks_sizing_and_escalates_critical_margin() -> Non
     assert "position_sizing" not in out
 
 
-def test_trade_risk_analyze_does_not_round_up_substep_boundary_volume() -> None:
+def test_trade_risk_analyze_removes_stop_distance_tick_residue() -> None:
     mt5 = MagicMock()
     mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
     mt5.positions_get.return_value = []
@@ -129,11 +130,11 @@ def test_trade_risk_analyze_does_not_round_up_substep_boundary_volume() -> None:
         )
 
     sizing = out["position_sizing"]
-    assert sizing["suggested_volume"] == 0.2
+    assert out["trade_evaluation"]["sl_distance_ticks"] == 10
+    assert sizing["suggested_volume"] == 0.3
     assert sizing["volume_rounding"] == "rounded_down_to_step"
     assert sizing["risk_over_target"] is False
-    assert sizing["suggested_volume"] < sizing["raw_volume"]
-    assert any("rounded down" in note.lower() for note in sizing["sizing_notes"])
+    assert sizing["suggested_volume"] == sizing["raw_volume"]
 
 
 def test_trade_risk_analyze_rounds_down_to_step_to_avoid_overshoot() -> None:
@@ -178,9 +179,14 @@ def test_trade_risk_analyze_compact_position_sizing_keeps_decision_fields() -> N
 
     assert out["position_sizing"] == {
         "suggested_volume": 1.2,
+        "requested_risk_currency": 10.0,
+        "requested_risk_pct": 1.0,
         "risk_currency": 9.6,
         "risk_pct": 0.96,
+        "risk_shortfall_currency": 0.4,
+        "risk_shortfall_pct": 0.04,
         "risk_compliance": "within_requested_risk",
+        "volume_rounding": "rounded_down_to_step",
         "entry": 100.0,
         "sl": 92.0,
         "tp": 116.0,
@@ -315,9 +321,14 @@ def test_trade_risk_analyze_compact_keeps_blocked_sizing_context() -> None:
     assert out["position_sizing"] == {
         "status": "risk_too_small_for_min_lot",
         "suggested_volume": 0.0,
+        "requested_risk_currency": 1.0,
+        "requested_risk_pct": 0.1,
         "risk_currency": 0.0,
         "risk_pct": 0.0,
+        "risk_shortfall_currency": 1.0,
+        "risk_shortfall_pct": 0.1,
         "risk_compliance": "blocked_min_volume_exceeds_requested_risk",
+        "volume_rounding": "blocked_by_min_volume_risk",
         "min_viable_volume": 0.1,
         "min_viable_risk_currency": 2.0,
         "min_viable_risk_pct": 0.2,
@@ -352,7 +363,11 @@ def test_trade_risk_analyze_marks_position_sizing_incomplete_without_required_in
         "entry",
         "stop_loss",
     ]
-    assert "Portfolio risk analysis completed" in out["position_sizing"]["message"]
+    assert out["book_state"] == "flat"
+    assert out["book_state_scope"] == "symbol"
+    assert "No open positions or pending orders" in out["message"]
+    assert "scoped_risk" not in out
+    assert "Risk analysis completed" in out["position_sizing"]["message"]
     assert "--desired-risk-pct" in out["position_sizing"]["message"]
     assert "desired_risk_pct" not in out["position_sizing"]["message"]
     # Compact missing-inputs payload keeps a short note, not the full required_for_sizing list.
@@ -415,7 +430,7 @@ def test_trade_risk_analyze_resolves_missing_entry_from_live_tick() -> None:
     mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
     mt5.positions_get.return_value = []
     mt5.symbol_info.return_value = _make_symbol_info()
-    mt5.symbol_info_tick.return_value = SimpleNamespace(bid=99.8, ask=100.2)
+    mt5.symbol_info_tick.return_value = SimpleNamespace(bid=99.8, ask=100.2, time=time.time())
 
     with _patched_mt5_module(mt5):
         out = trade_risk_analyze(
@@ -432,6 +447,9 @@ def test_trade_risk_analyze_resolves_missing_entry_from_live_tick() -> None:
     assert out["position_sizing"]["risk_compliance"] == "within_requested_risk"
     assert out["trade_evaluation"]["entry"] == 100.2
     assert out["trade_evaluation"]["entry_source"] == "live_tick_ask"
+    assert out["quote_context"]["usable_for_live_trading"] is True
+    assert out["quote_context"]["freshness_state"] == "live"
+    assert out["quote_context"]["quote_timezone"] == "UTC"
 
 
 def test_trade_risk_analyze_reanchors_omitted_entry_after_direction_inference() -> None:
@@ -439,7 +457,7 @@ def test_trade_risk_analyze_reanchors_omitted_entry_after_direction_inference() 
     mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
     mt5.positions_get.return_value = []
     mt5.symbol_info.return_value = _make_symbol_info()
-    mt5.symbol_info_tick.return_value = SimpleNamespace(bid=99.8, ask=100.2)
+    mt5.symbol_info_tick.return_value = SimpleNamespace(bid=99.8, ask=100.2, time=time.time())
 
     with _patched_mt5_module(mt5):
         out = trade_risk_analyze(
@@ -453,6 +471,32 @@ def test_trade_risk_analyze_reanchors_omitted_entry_after_direction_inference() 
     assert out["position_sizing"]["entry"] == 100.2
     assert out["position_sizing"]["entry_source"] == "live_tick_ask"
     assert out["trade_evaluation"]["entry"] == 100.2
+
+
+def test_trade_risk_analyze_does_not_size_from_stale_live_tick() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
+    mt5.positions_get.return_value = []
+    mt5.symbol_info.return_value = _make_symbol_info()
+    mt5.symbol_info_tick.return_value = SimpleNamespace(
+        bid=99.8,
+        ask=100.2,
+        time=1.0,
+    )
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(
+            symbol="EURUSD",
+            direction="long",
+            desired_risk_pct=1.0,
+            stop_loss=95.0,
+        )
+
+    assert out["quote_context"]["usable_for_live_trading"] is False
+    assert out["quote_context"]["freshness_state"] == "stale"
+    assert out["position_sizing"]["status"] == "parameters_missing"
+    assert "entry" in out["position_sizing"]["missing"]
+    assert "trade_evaluation" not in out
 
 
 def test_trade_risk_analyze_keeps_exposure_analysis_with_partial_sizing_params() -> None:
@@ -595,8 +639,22 @@ def test_trade_risk_analyze_reports_symbol_scope_when_other_positions_exist() ->
     assert out["scoped_risk"]["positions_count"] == 0
     assert out["scoped_risk"]["overall_risk_status"] == "partial"
     assert out["scoped_risk"]["quantified_risk_level"] == "unknown"
-    assert out["position_sizing_error"]["code"] == "portfolio_safety_block"
-    assert "position_sizing" not in out
+    assert out["position_sizing"]["suggested_volume"] == 1.0
+    assert out["position_sizing"]["risk_compliance"] == "within_requested_risk"
+    assert out["sizing_risk_policy"] == {
+        "mode": "incremental_candidate_risk",
+        "risk_target_basis": "percent_of_account_equity",
+        "candidate_symbol": "EURUSD",
+        "account_margin_context_included": True,
+        "existing_portfolio_stop_risk_included": False,
+        "portfolio_positions": 2,
+        "other_positions": 2,
+        "note": (
+            "Suggested volume limits this candidate trade's stop risk; it does not "
+            "cap aggregate portfolio stop risk."
+        ),
+    }
+    assert "incremental candidate sizing" in out["position_sizing"]["sizing_notes"][-1]
 
 
 def test_trade_risk_analyze_blocks_min_volume_risk_overshoot_by_default() -> None:

@@ -1,8 +1,8 @@
 """Trade modification and closure workflows for MetaTrader integration."""
 
+import logging
 import math
 import time as _stdlib_time
-import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -13,6 +13,8 @@ from .gateway import MT5TradingGateway, create_trading_gateway, trading_connecti
 from .positions import _resolve_open_position, _resolve_pending_order
 from .safety import evaluate_trade_guardrails, pending_order_risk_increased
 from .time import ExpirationValue
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_position_side(position: Any, mt5: Any) -> Optional[str]:
@@ -213,15 +215,15 @@ def _unexpected_operation_error(
     mt5: Any,
     context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    logger.error(
+        "Unexpected error while %s",
+        operation,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
     payload: Dict[str, Any] = {
         "error": f"Unexpected error while {operation}",
-        "error_type": type(exc).__name__,
-        "error_detail": str(exc),
-        "traceback": traceback.format_exc(limit=5).strip(),
+        "error_code": "internal_execution_error",
     }
-    last_error = validation._safe_last_error(mt5)
-    if last_error is not None:
-        payload["last_error"] = last_error
     if context:
         payload["context"] = context
     return payload
@@ -342,6 +344,7 @@ def _modify_position(
             if price_inputs_error is not None:
                 return {"error": price_inputs_error}
             point = float(price_inputs["point"])
+            price_increment = float(price_inputs["price_increment"])
             digits = int(price_inputs["digits"])
             requested_sl = price_inputs["stop_loss"]
             requested_tp = price_inputs["take_profit"]
@@ -351,12 +354,12 @@ def _modify_position(
             # Normalize SL/TP values
             existing_sl = validation._normalize_price_for_symbol(
                 getattr(position, "sl", None),
-                point=point,
+                point=price_increment,
                 digits=digits,
             )
             existing_tp = validation._normalize_price_for_symbol(
                 getattr(position, "tp", None),
-                point=point,
+                point=price_increment,
                 digits=digits,
             )
             norm_sl = (
@@ -491,12 +494,12 @@ def _modify_position(
                         refreshed_position = None
                 refreshed_sl = validation._normalize_price_for_symbol(
                     getattr(refreshed_position, "sl", None) if refreshed_position is not None else getattr(position, "sl", None),
-                    point=point,
+                    point=price_increment,
                     digits=digits,
                 )
                 refreshed_tp = validation._normalize_price_for_symbol(
                     getattr(refreshed_position, "tp", None) if refreshed_position is not None else getattr(position, "tp", None),
-                    point=point,
+                    point=price_increment,
                     digits=digits,
                 )
                 final_sl = _normalize_protection_level(refreshed_sl, tol=price_tol)
@@ -633,7 +636,7 @@ def _modify_pending_order(
             )
             if price_inputs_error is not None:
                 return {"error": price_inputs_error}
-            point = float(price_inputs["point"])
+            price_increment = float(price_inputs["price_increment"])
             digits = int(price_inputs["digits"])
             normalized_price = float(price_inputs["price"])
             requested_sl = price_inputs["stop_loss"]
@@ -643,12 +646,12 @@ def _modify_pending_order(
 
             existing_sl = validation._normalize_price_for_symbol(
                 getattr(order, "sl", None),
-                point=point,
+                point=price_increment,
                 digits=digits,
             )
             existing_tp = validation._normalize_price_for_symbol(
                 getattr(order, "tp", None),
-                point=point,
+                point=price_increment,
                 digits=digits,
             )
             request_sl = (
@@ -1704,13 +1707,43 @@ def _resolve_close_dry_run_target(
         symbol=symbol,
     )
     if position is not None:
+        position_volume = validation._safe_float_attr(position, "volume") or None
+        if volume is not None:
+            symbol_info = mt5.symbol_info(getattr(position, "symbol", ""))
+            if symbol_info is None:
+                return {"error": f"Failed to get symbol info for {position.symbol}"}
+            requested_volume, volume_error = validation._validate_volume(
+                volume, symbol_info
+            )
+            if volume_error:
+                return {"error": volume_error, "requested_volume": volume}
+            if position_volume is None or requested_volume is None:
+                return {"error": "Open position volume is invalid for partial close."}
+            if requested_volume > position_volume + 1e-12:
+                return {
+                    "error": f"volume must be <= open position volume ({position_volume:g})",
+                    "requested_volume": requested_volume,
+                    "position_volume": position_volume,
+                }
+            remaining_volume = max(0.0, position_volume - requested_volume)
+            if remaining_volume > 1e-12:
+                _, remaining_error = validation._validate_volume(
+                    remaining_volume, symbol_info
+                )
+                if remaining_error:
+                    return {
+                        "error": "Partial close would leave an invalid remaining volume: "
+                        + remaining_error,
+                        "requested_volume": requested_volume,
+                        "position_volume": position_volume,
+                    }
         return {
             "success": True,
             "target_scope": "positions",
             "target_kind": "open_position",
             "resolved_ticket": resolved_ticket,
             "target_symbol": getattr(position, "symbol", None),
-            "target_volume": getattr(position, "volume", None),
+            "target_volume": position_volume,
             "ticket_resolution": position_resolution,
         }
 

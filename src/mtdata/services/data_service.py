@@ -42,7 +42,7 @@ from ..utils.denoise import (
 from ..utils.denoise import (
     normalize_denoise_spec as _normalize_denoise_spec,
 )
-from ..utils.freshness import closed_session_context
+from ..utils.freshness import closed_session_context, is_standard_weekend_closure
 from ..utils.indicators import (
     _apply_ta_indicators,
     _estimate_warmup_bars,
@@ -96,6 +96,7 @@ from ..utils.time import (
 from ..utils.utils import (
     _format_numeric_rows_from_df,
     _normalize_ohlcv_arg,
+    _parse_end_datetime,
     _parse_start_datetime,
     _table_from_rows,
     _utc_epoch_seconds,
@@ -111,7 +112,7 @@ _DATE_FORMAT_HINT = (
     "Accepted examples: '2026-01-15', '2026-01-15 14:30', "
     "'2026-01-15T14:30:00Z', 'yesterday', '2 days ago', 'last Friday'."
 )
-_CANDLE_PRICE_COLUMNS = frozenset({"open", "high", "low", "close"})
+_CANDLE_PRICE_COLUMNS = frozenset({"open", "high", "low", "close", "spread"})
 _TICK_PRICE_COLUMNS = frozenset({"bid", "ask", "mid", "spread", "last"})
 _TICK_PRICE_STAT_KEYS = frozenset(
     {
@@ -279,6 +280,60 @@ def _describe_rate_fetch_error(symbol: str, *, info_before: Any = None) -> str:
     return f"Failed to get rates for {symbol}: {error_text}"
 
 
+def _bounded_weekend_no_data_context(
+    symbol: str,
+    start_datetime: Optional[str],
+    end_datetime: Optional[str],
+) -> Dict[str, Any]:
+    if not start_datetime or not end_datetime:
+        return {}
+    try:
+        start_utc, _ = _parse_fetch_datetime_arg(start_datetime)
+        end_utc, _ = _parse_fetch_datetime_arg(end_datetime, end_bound=True)
+        if start_utc is None or end_utc is None:
+            return {}
+        start_utc = (
+            start_utc.replace(tzinfo=dt_timezone.utc)
+            if start_utc.tzinfo is None
+            else start_utc.astimezone(dt_timezone.utc)
+        )
+        end_utc = (
+            end_utc.replace(tzinfo=dt_timezone.utc)
+            if end_utc.tzinfo is None
+            else end_utc.astimezone(dt_timezone.utc)
+        )
+        duration = end_utc - start_utc
+        if duration.total_seconds() < 0 or duration > timedelta(days=3):
+            return {}
+        if not (
+            is_standard_weekend_closure(start_utc)
+            and is_standard_weekend_closure(end_utc)
+        ):
+            return {}
+        midpoint = start_utc + duration / 2
+        session = closed_session_context(
+            symbol,
+            now_epoch=midpoint.timestamp(),
+            item="candles",
+        )
+        if not session or session.get("market_status_reason") != "weekend":
+            return {}
+    except Exception:
+        return {}
+
+    return {
+        "no_data_reason": "market_closed_weekend",
+        "market_status": "closed",
+        "market_status_reason": "weekend",
+        "market_status_source": "standard_weekend_hours",
+        "note": (
+            f"The requested range falls entirely within standard weekend closure "
+            f"hours for {symbol}; no candles are expected."
+        ),
+        "suggestion": "Choose a range containing an open trading session.",
+    }
+
+
 def _build_no_data_error_with_context(
     symbol: str,
     timeframe: TimeframeLiteral,
@@ -296,6 +351,9 @@ def _build_no_data_error_with_context(
             k: v for k, v in [("start", start_datetime), ("end", end_datetime)]
             if v is not None
         }
+    details.update(
+        _bounded_weekend_no_data_context(symbol, start_datetime, end_datetime)
+    )
     
     # Try to sample available bars for this timeframe to suggest a usable range.
     try:
@@ -524,11 +582,11 @@ def _fetch_rates_with_warmup(  # noqa: C901
         if timeframe_error:
             return None, timeframe_error
         from_date, from_date_error = _parse_fetch_datetime_arg(start_datetime)
-        to_date, to_date_error = _parse_fetch_datetime_arg(end_datetime)
+        to_date, to_date_error = _parse_fetch_datetime_arg(end_datetime, end_bound=True)
         if from_date_error or to_date_error:
             return None, from_date_error or to_date_error
         if from_date > to_date:
-            return None, "start_datetime must be before end_datetime"
+            return None, "start must be before or equal to end."
         future_error = _future_start_error(start_datetime, from_date, seconds_per_bar)
         if future_error:
             return None, future_error
@@ -560,7 +618,7 @@ def _fetch_rates_with_warmup(  # noqa: C901
             )
 
     elif end_datetime:
-        to_date, to_date_error = _parse_fetch_datetime_arg(end_datetime)
+        to_date, to_date_error = _parse_fetch_datetime_arg(end_datetime, end_bound=True)
         if to_date_error:
             return None, to_date_error
         seconds_per_bar, timeframe_error = _resolve_fetch_timeframe_seconds(timeframe)
@@ -644,8 +702,12 @@ def _fetch_rates_with_warmup(  # noqa: C901
     return rates, None
 
 
-def _parse_fetch_datetime_arg(value: str) -> tuple[Optional[datetime], Optional[str]]:
-    parsed = _parse_start_datetime(value)
+def _parse_fetch_datetime_arg(
+    value: str,
+    *,
+    end_bound: bool = False,
+) -> tuple[Optional[datetime], Optional[str]]:
+    parsed = _parse_end_datetime(value) if end_bound else _parse_start_datetime(value)
     if parsed is None:
         return None, f"Could not parse date {value!r}. {_DATE_FORMAT_HINT}"
     return parsed, None
@@ -857,7 +919,7 @@ def _trim_df_to_target(
 ) -> pd.DataFrame:
     if start_datetime and end_datetime:
         from_dt = _parse_start_datetime(start_datetime)
-        to_dt = _parse_start_datetime(end_datetime)
+        to_dt = _parse_end_datetime(end_datetime)
         if not from_dt or not to_dt:
             out = df.iloc[0:0]
             return out.copy() if copy_rows else out
@@ -874,7 +936,7 @@ def _trim_df_to_target(
         if len(out) > candles:
             out = out.iloc[-candles:]
     elif end_datetime:
-        to_dt = _parse_start_datetime(end_datetime)
+        to_dt = _parse_end_datetime(end_datetime)
         if not to_dt:
             out = df.iloc[0:0]
             return out.copy() if copy_rows else out
@@ -1012,7 +1074,7 @@ def _build_candle_headers(
         if "V" in requested:
             headers.append("tick_volume")
         if include_spread:
-            headers.append("spread")
+            headers.append("spread_points")
         return headers
 
     headers.extend(["open", "high", "low", "close"])
@@ -1021,7 +1083,7 @@ def _build_candle_headers(
     if has_real_volume:
         headers.append("real_volume")
     if include_spread:
-        headers.append("spread")
+        headers.append("spread_points")
     return headers
 
 
@@ -1037,9 +1099,35 @@ def _candle_volume_metadata(headers: List[str]) -> Dict[str, Any]:
     if "real_volume" in headers:
         meta["real_volume_type"] = "traded_volume"
         units["real_volume"] = "traded_volume"
+    if "spread" in headers:
+        units["spread"] = "absolute_price"
+    if "spread_points" in headers:
+        units["spread_points"] = "broker_points"
     if units:
         meta["units"] = units
     return meta
+
+
+def _normalize_candle_spread_columns(
+    df: pd.DataFrame,
+    headers: List[str],
+    *,
+    price_point: Optional[float],
+) -> None:
+    """Expose MT5 candle spread with explicit price and point units."""
+    if "spread_points" not in df.columns and "spread" in df.columns:
+        df.rename(columns={"spread": "spread_points"}, inplace=True)
+    if "spread_points" not in df.columns:
+        return
+    if "spread_points" not in headers:
+        headers.append("spread_points")
+    if price_point is None or price_point <= 0.0:
+        return
+    df["spread"] = pd.to_numeric(df["spread_points"], errors="coerce") * float(
+        price_point
+    )
+    if "spread" not in headers:
+        headers.insert(headers.index("spread_points"), "spread")
 
 
 def _candle_time_convention_metadata(timeframe: str) -> Dict[str, str]:
@@ -1474,6 +1562,7 @@ def fetch_candles(  # noqa: C901
                 return {"error": err}
             price_digits = _symbol_price_digits(_info, _info_before)
             price_currency = _symbol_price_currency(_info, _info_before)
+            price_point = _symbol_price_point(_info, _info_before)
             price_basis = _symbol_candle_price_basis(_info, _info_before)
 
             try:
@@ -1558,6 +1647,12 @@ def fetch_candles(  # noqa: C901
         client_tz = _resolve_client_tz()
         _use_ctz = client_tz is not None
         df = _build_rates_df(rates, _use_ctz)
+        if include_spread:
+            _normalize_candle_spread_columns(
+                df,
+                headers,
+                price_point=price_point,
+            )
         quality_rows_removed = 0
         ohlcv_warnings: List[str] = []
         try:
@@ -1627,6 +1722,12 @@ def fetch_candles(  # noqa: C901
                             ti_spec=ti_spec,
                             headers=headers,
                         )
+                        if include_spread:
+                            _normalize_candle_spread_columns(
+                                df,
+                                headers,
+                                price_point=price_point,
+                            )
                         denoise_warnings.extend(consume_denoise_warnings(df))
                         try:
                             rows_before_quality = int(len(df))
@@ -1937,11 +2038,8 @@ def fetch_candles(  # noqa: C901
         if isinstance(freshness_diagnostics, dict):
             payload["meta"]["diagnostics"]["freshness"] = dict(freshness_diagnostics)
         if include_spread:
-            payload["spread_unit"] = "broker_points"
-            payload["spread_note"] = (
-                "Native MT5 candle spread is reported in broker points. If a fallback "
-                "estimate is applied, spread_unit is changed to price."
-            )
+            payload["spread_source"] = "mt5_candle"
+            payload["spread_historical_available"] = True
         if session_gap_warning:
             payload["meta"]["diagnostics"]["session_gaps"]["warning"] = session_gap_warning
         payload["timezone"] = _timezone_label(use_client_tz=_use_ctz, client_tz=client_tz)
@@ -2048,19 +2146,23 @@ def fetch_candles(  # noqa: C901
             spread_all_zero = True
             spread_value_count = 0
             spread_zero_count = 0
-            spread_idx = None
+            spread_indices: List[int] = []
             try:
-                if "spread" in headers:
-                    spread_idx = headers.index("spread")
+                spread_indices = [
+                    headers.index(field)
+                    for field in ("spread", "spread_points")
+                    if field in headers
+                ]
             except Exception:
-                spread_idx = None
+                spread_indices = []
             for row in data_rows:
                 if isinstance(row, dict):
-                    if "spread" in row and row.get("spread") is not None:
+                    spread_value = row.get("spread_points", row.get("spread"))
+                    if spread_value is not None:
                         has_spread_values = True
                         spread_value_count += 1
                         try:
-                            if float(row.get("spread", 0)) == 0.0:
+                            if float(spread_value) == 0.0:
                                 spread_zero_count += 1
                             else:
                                 spread_all_zero = False
@@ -2068,7 +2170,9 @@ def fetch_candles(  # noqa: C901
                             has_spread_values = True
                             spread_all_zero = False
                 elif isinstance(row, (list, tuple)):
-                    if spread_idx is not None and spread_idx < len(row):
+                    for spread_idx in spread_indices:
+                        if spread_idx >= len(row):
+                            continue
                         val = row[spread_idx]
                         if val is not None:
                             has_spread_values = True
@@ -2081,6 +2185,7 @@ def fetch_candles(  # noqa: C901
                             except Exception:
                                 has_spread_values = True
                                 spread_all_zero = False
+                        break
             spread_mostly_zero = (
                 has_spread_values
                 and spread_value_count >= 3
@@ -2089,12 +2194,17 @@ def fetch_candles(  # noqa: C901
             if not has_spread_values or spread_all_zero or spread_mostly_zero:
                 data_rows = _remove_unavailable_spread_from_candle_rows(
                     data_rows,
-                    spread_idx=spread_idx,
+                    spread_indices=spread_indices,
                 )
                 payload["data"] = data_rows
                 payload["spread_historical_available"] = False
-                payload.pop("spread_unit", None)
-                payload.pop("spread_note", None)
+                payload.pop("spread_source", None)
+                units = payload.get("units")
+                if isinstance(units, dict):
+                    units.pop("spread", None)
+                    units.pop("spread_points", None)
+                    if not units:
+                        payload.pop("units", None)
                 if spread_mostly_zero and not spread_all_zero:
                     payload.setdefault("warnings", []).append(
                         "include_spread native candle spread is zero for most bars; "
@@ -2193,16 +2303,18 @@ def _live_tick_spread(symbol: str) -> Optional[float]:
 def _remove_unavailable_spread_from_candle_rows(
     data_rows: list[Any],
     *,
-    spread_idx: int | None,
+    spread_indices: list[int],
 ) -> list[Any]:
     for i, row in enumerate(data_rows):
         if isinstance(row, dict):
             row.pop("spread", None)
+            row.pop("spread_points", None)
             row.pop("spread_source", None)
         else:
             row_list = list(row)
-            if spread_idx is not None and spread_idx < len(row_list):
-                row_list[spread_idx] = None
+            for spread_idx in spread_indices:
+                if spread_idx < len(row_list):
+                    row_list[spread_idx] = None
             data_rows[i] = row_list
     return data_rows
 
@@ -2353,6 +2465,7 @@ def _compact_tick_summary(out: Dict[str, Any]) -> Dict[str, Any]:
         "time_normalization",
         "broker_server_tz",
         "session_utc_offset_seconds",
+        "spread_statistics_basis",
     ):
         if out.get(key) is not None:
             compact[key] = out.get(key)
@@ -2435,7 +2548,7 @@ def fetch_ticks(  # noqa: C901
                 if not from_date:
                     return {"error": f"Could not parse start date {start!r}. {_DATE_FORMAT_HINT}"}
                 if end:
-                    to_date = _parse_start_datetime(end)
+                    to_date = _parse_end_datetime(end)
                     if not to_date:
                         return {"error": f"Could not parse end date {end!r}. {_DATE_FORMAT_HINT}"}
                     if from_date > to_date:
@@ -2564,9 +2677,13 @@ def fetch_ticks(  # noqa: C901
         has_quote_update_flags = any(flag & quote_update_mask for flag in flags)
         quote_update_types: List[str] = []
         spread_valid_flags: List[bool] = []
+        bid_changed_flags: List[bool] = []
+        ask_changed_flags: List[bool] = []
         for flag, quote_type in zip(flags, quote_types, strict=False):
             bid_updated = bool(flag & bid_update_flag)
             ask_updated = bool(flag & ask_update_flag)
+            bid_changed_flags.append(bid_updated)
+            ask_changed_flags.append(ask_updated)
             if bid_updated and ask_updated:
                 update_type = "bid_ask_update"
             elif bid_updated:
@@ -2589,12 +2706,19 @@ def fetch_ticks(  # noqa: C901
             for update_type in quote_update_types
         )
         zero_spread_count = sum(
-            bool(valid)
+            quote_type == "bid_ask"
+            and (
+                (bid_updated and ask_updated)
+                if has_quote_update_flags
+                else True
+            )
             and bid is not None
             and ask is not None
             and float(ask) == float(bid)
-            for valid, bid, ask in zip(
-                spread_valid_flags,
+            for quote_type, bid_updated, ask_updated, bid, ask in zip(
+                quote_types,
+                bid_changed_flags,
+                ask_changed_flags,
                 effective_bids,
                 effective_asks,
                 strict=False,
@@ -2612,7 +2736,16 @@ def fetch_ticks(  # noqa: C901
         if include_quote_type:
             headers.append("quote_type")
         if full_rows:
-            headers.extend(["quote_update_type", "spread_valid"])
+            headers.extend(
+                [
+                    "quote_update_type",
+                    "bid_changed",
+                    "ask_changed",
+                    "spread_valid",
+                    "spread_basis",
+                    "spread_sample_eligible",
+                ]
+            )
             headers.extend(["mid", "spread"])
             if price_point is not None:
                 headers.append("spread_points")
@@ -2687,7 +2820,29 @@ def fetch_ticks(  # noqa: C901
         df_ticks["volume_real"] = volumes_real
         df_ticks["flags"] = flags
         df_ticks["trade_event"] = trade_events
-        df_ticks["spread_valid"] = spread_valid_flags
+        df_ticks["spread_valid"] = [
+            bid is not None and ask is not None and ask > bid
+            for bid, ask in zip(effective_bids, effective_asks, strict=False)
+        ]
+        spread_sample_eligible_flags = [
+            eligible
+            and bid is not None
+            and ask is not None
+            and ask > bid
+            for eligible, bid, ask in zip(
+                spread_valid_flags,
+                effective_bids,
+                effective_asks,
+                strict=False,
+            )
+        ]
+        df_ticks["spread_sample_eligible"] = spread_sample_eligible_flags
+        df_ticks["spread_basis"] = [
+            "quote_snapshot" if valid else "unavailable"
+            for valid in df_ticks["spread_valid"].tolist()
+        ]
+        df_ticks["bid_changed"] = bid_changed_flags
+        df_ticks["ask_changed"] = ask_changed_flags
         df_ticks["quote_update_type"] = quote_update_types
         if include_quote_type:
             df_ticks["quote_type"] = quote_types
@@ -2716,9 +2871,12 @@ def fetch_ticks(  # noqa: C901
                 "incomplete_ticks": incomplete_ticks,
                 "total_ticks": int(original_count),
                 "incomplete_quote_ratio": round(incomplete_ratio, 4),
-                "spread_ticks_excluded": int(incomplete_quote_count),
+                "spread_ticks_excluded": int(
+                    original_count - sum(spread_sample_eligible_flags)
+                ),
                 "one_sided_updates": int(one_sided_update_count),
-                "valid_spread_ticks": int(sum(spread_valid_flags)),
+                "valid_spread_ticks": int(sum(spread_sample_eligible_flags)),
+                "spread_sample_basis": "coherent_bid_ask_updates",
                 "zero_spread_ticks": int(zero_spread_count),
                 "warning_ratio": _ONE_SIDED_TICK_WARNING_RATIO,
                 "quote_type_counts": quote_type_counts,
@@ -2755,6 +2913,7 @@ def fetch_ticks(  # noqa: C901
             payload["warnings"] = warnings_list
 
         def _add_tick_context_fields(payload: Dict[str, Any]) -> None:
+            payload["spread_statistics_basis"] = "coherent_bid_ask_updates"
             last_quote = payload.get("last_quote")
             if isinstance(last_quote, dict) and price_point is not None:
                 spread_value = _finite_or_none(last_quote.get("spread"))
@@ -2785,6 +2944,23 @@ def fetch_ticks(  # noqa: C901
             )
             payload.update(freshness_context)
 
+        def _last_snapshot_quote(frame: pd.DataFrame) -> Dict[str, Any]:
+            bid = _finite_or_none(frame["bid"].iloc[-1])
+            ask = _finite_or_none(frame["ask"].iloc[-1])
+            spread_valid = bool(
+                bid is not None and ask is not None and float(ask) > float(bid)
+            )
+            spread = float(ask) - float(bid) if spread_valid else None
+            mid = (float(bid) + float(ask)) / 2.0 if spread_valid else None
+            return {
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread": spread,
+                "spread_valid": spread_valid,
+                "spread_basis": "quote_snapshot" if spread_valid else "unavailable",
+            }
+
         def _compact_summary_from_ticks() -> Dict[str, Any]:
             df_stats = df_ticks.copy()
             df_stats["mid"] = (df_stats["bid"] + df_stats["ask"]) / 2.0
@@ -2796,7 +2972,7 @@ def fetch_ticks(  # noqa: C901
                 float(len(df_stats) / duration_seconds) if duration_seconds > 0 else None
             )
             spread = pd.to_numeric(
-                df_stats["spread"].where(df_stats["spread_valid"]),
+                df_stats["spread"].where(df_stats["spread_sample_eligible"]),
                 errors="coerce",
             ).dropna()
             out: Dict[str, Any] = {
@@ -2820,12 +2996,7 @@ def fetch_ticks(  # noqa: C901
                         "mean": float(spread.mean()),
                     }
                 },
-                "last_quote": {
-                    "bid": float(df_stats["bid"].iloc[-1]),
-                    "ask": float(df_stats["ask"].iloc[-1]),
-                    "mid": float(df_stats["mid"].iloc[-1]),
-                    "spread": float(df_stats["spread"].iloc[-1]),
-                },
+                "last_quote": _last_snapshot_quote(df_stats),
             }
             if price_digits > 0:
                 out["price_precision"] = int(price_digits)
@@ -2908,7 +3079,7 @@ def fetch_ticks(  # noqa: C901
             df_stats = df_ticks.copy()
             df_stats["mid"] = (df_stats["bid"] + df_stats["ask"]) / 2.0
             df_stats["spread"] = (df_stats["ask"] - df_stats["bid"]).where(
-                df_stats["spread_valid"]
+                df_stats["spread_sample_eligible"]
             )
 
             start_epoch = float(df_stats["__epoch"].iloc[0])
@@ -2937,12 +3108,7 @@ def fetch_ticks(  # noqa: C901
                     "spread": _series_stats(df_stats["spread"], total_count=len(df_stats)),
                 },
             }
-            out["last_quote"] = {
-                "bid": float(df_stats["bid"].iloc[-1]),
-                "ask": float(df_stats["ask"].iloc[-1]),
-                "mid": float(df_stats["mid"].iloc[-1]),
-                "spread": float(df_stats["spread"].iloc[-1]),
-            }
+            out["last_quote"] = _last_snapshot_quote(df_stats)
             if duration_seconds <= 0:
                 out["tick_rate_note"] = "< 1s window"
             small_summary_sample = (
@@ -3244,18 +3410,31 @@ def fetch_ticks(  # noqa: C901
             if include_quote_type:
                 values.append(quote_types[i])
             if full_rows:
-                values.extend([quote_update_types[i], spread_valid_flags[i]])
                 bid_value = effective_bids[i]
                 ask_value = effective_asks[i]
-                spread_valid = spread_valid_flags[i]
+                snapshot_spread_valid = bool(
+                    bid_value is not None
+                    and ask_value is not None
+                    and ask_value > bid_value
+                )
+                values.extend(
+                    [
+                        quote_update_types[i],
+                        bid_changed_flags[i],
+                        ask_changed_flags[i],
+                        snapshot_spread_valid,
+                        "quote_snapshot" if snapshot_spread_valid else "unavailable",
+                        spread_sample_eligible_flags[i],
+                    ]
+                )
                 mid = (
                     (bid_value + ask_value) / 2.0
-                    if spread_valid and bid_value is not None and ask_value is not None
+                    if snapshot_spread_valid
                     else None
                 )
                 spread = (
                     ask_value - bid_value
-                    if spread_valid and bid_value is not None and ask_value is not None
+                    if snapshot_spread_valid
                     else None
                 )
                 spread_points = _tick_spread_points(spread, price_point)

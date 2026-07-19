@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from ...shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
+from ...shared.market_units import snap_to_increment
 from ...utils.market_metadata import build_tick_freshness_context
 from ...utils.mt5 import _normalize_times_in_struct, _to_server_query_dt
 from ...utils.tick_flags import is_mt5_trade_event
@@ -112,6 +113,18 @@ def run_wait_event_loop(
     )
     poll_interval_seconds = float(request.poll_interval_seconds)
 
+    connection_error = _wait_event_connection_error(gateway)
+    if connection_error is not None:
+        return connection_error
+    symbol_error = _wait_event_symbol_preflight(
+        gateway,
+        request=request,
+        watch_for=watch_for,
+        boundaries=boundaries,
+    )
+    if symbol_error is not None:
+        return symbol_error
+
     if not watch_for and len(boundaries) == 1 and boundaries[0]["type"] == "candle_close":
         return _run_candle_boundary_only(
             request=request,
@@ -120,9 +133,6 @@ def run_wait_event_loop(
             sleep_impl=sleep_impl,
             now_utc=started_at_utc,
         )
-    connection_error = _wait_event_connection_error(gateway)
-    if connection_error is not None:
-        return connection_error
 
     history_state = _build_account_history_state(
         gateway=gateway,
@@ -1058,6 +1068,7 @@ def _update_order_filled_snapshot_state(
         "last_row_by_order_ticket",
         {},
     )
+    volume_step_by_symbol: Dict[str, Optional[float]] = {}
     _remember_order_fill_targets(
         target_volume_by_order_ticket,
         snapshot.get("baseline", {}).get("orders", []),
@@ -1078,8 +1089,14 @@ def _update_order_filled_snapshot_state(
         fill_volume = _order_fill_volume(row)
         if fill_volume is None:
             continue
-        filled_volume_by_order_ticket[order_ticket] = (
-            float(filled_volume_by_order_ticket.get(order_ticket) or 0.0) + fill_volume
+        filled_volume_by_order_ticket[order_ticket] = _accumulate_filled_volume(
+            filled_volume_by_order_ticket.get(order_ticket),
+            fill_volume,
+            volume_step=_deal_volume_step(
+                row,
+                gateway=gateway,
+                cache=volume_step_by_symbol,
+            ),
         )
     _remember_order_fill_targets(
         target_volume_by_order_ticket,
@@ -1096,6 +1113,50 @@ def _update_order_filled_snapshot_state(
         "target_volume_by_order_ticket": target_volume_by_order_ticket,
         "last_row_by_order_ticket": last_row_by_order_ticket,
     }
+
+
+def _accumulate_filled_volume(
+    current_volume: Any,
+    fill_volume: float,
+    *,
+    volume_step: Optional[float],
+) -> float:
+    current = _finite_number(current_volume) or 0.0
+    total = math.fsum((current, float(fill_volume)))
+    if volume_step is not None and volume_step > 0.0:
+        snapped = snap_to_increment(total, volume_step)
+        if snapped is not None:
+            return snapped
+    return total
+
+
+def _deal_volume_step(
+    row: Any,
+    *,
+    gateway: Any,
+    cache: Dict[str, Optional[float]],
+) -> Optional[float]:
+    symbol_value = _row_value(row, "symbol")
+    if symbol_value is None:
+        return None
+    symbol = str(symbol_value).strip()
+    if not symbol:
+        return None
+    if symbol in cache:
+        return cache[symbol]
+
+    step: Optional[float] = None
+    symbol_info = getattr(gateway, "symbol_info", None)
+    if callable(symbol_info):
+        try:
+            info = symbol_info(symbol)
+        except Exception:
+            info = None
+        candidate = _finite_number(_row_value(info, "volume_step"))
+        if candidate is not None and candidate > 0.0:
+            step = candidate
+    cache[symbol] = step
+    return step
 
 
 def _remember_order_fill_targets(
@@ -2372,9 +2433,19 @@ def _fetch_market_ticks_range(
     try:
         if hasattr(gateway, "symbol_select"):
             try:
-                gateway.symbol_select(symbol, True)
-            except Exception:
-                pass
+                selected = gateway.symbol_select(symbol, True)
+            except Exception as exc:
+                return _wait_event_symbol_error(
+                    symbol,
+                    code="wait_event_symbol_unavailable",
+                    message=f"Could not select symbol {symbol} while waiting: {exc}",
+                )
+            if selected is False:
+                return _wait_event_symbol_error(
+                    symbol,
+                    code="wait_event_symbol_unavailable",
+                    message=f"MT5 could not select symbol {symbol} while waiting.",
+                )
         flags = getattr(gateway, "COPY_TICKS_ALL", 0)
         rows = gateway.copy_ticks_range(
             symbol,
@@ -2385,6 +2456,86 @@ def _fetch_market_ticks_range(
     except Exception as exc:
         return {"error": f"Failed to fetch tick data for {symbol}: {exc}"}
     return _normalize_tick_rows(rows)
+
+
+def _wait_event_symbol_error(
+    symbol: str,
+    *,
+    code: str,
+    message: str,
+) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "status": "error",
+        "error": message,
+        "error_code": code,
+        "symbol": str(symbol).upper(),
+        "remediation": "Verify the broker symbol name and that it is available in Market Watch.",
+    }
+
+
+def _wait_event_symbol_preflight(
+    gateway: Any,
+    *,
+    request: WaitEventRequest,
+    watch_for: List[Dict[str, Any]],
+    boundaries: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    symbols = {
+        str(symbol).upper().strip()
+        for symbol in [
+            request.symbol,
+            *(item.get("symbol") for item in watch_for),
+            *(item.get("symbol") for item in boundaries),
+        ]
+        if str(symbol or "").strip()
+    }
+    for symbol in sorted(symbols):
+        info_before = None
+        if hasattr(gateway, "symbol_info"):
+            try:
+                info_before = gateway.symbol_info(symbol)
+            except Exception as exc:
+                return _wait_event_symbol_error(
+                    symbol,
+                    code="wait_event_symbol_lookup_failed",
+                    message=f"Could not resolve symbol {symbol}: {exc}",
+                )
+
+        selected = True
+        if hasattr(gateway, "symbol_select"):
+            try:
+                selected = gateway.symbol_select(symbol, True)
+            except Exception as exc:
+                return _wait_event_symbol_error(
+                    symbol,
+                    code="wait_event_symbol_unavailable",
+                    message=f"Could not select symbol {symbol}: {exc}",
+                )
+
+        info_after = info_before
+        if info_after is None and hasattr(gateway, "symbol_info"):
+            try:
+                info_after = gateway.symbol_info(symbol)
+            except Exception as exc:
+                return _wait_event_symbol_error(
+                    symbol,
+                    code="wait_event_symbol_lookup_failed",
+                    message=f"Could not resolve symbol {symbol}: {exc}",
+                )
+            if info_after is None:
+                return _wait_event_symbol_error(
+                    symbol,
+                    code="symbol_not_found",
+                    message=f"Symbol {symbol} was not found by MT5.",
+                )
+        if selected is False:
+            return _wait_event_symbol_error(
+                symbol,
+                code="wait_event_symbol_unavailable",
+                message=f"MT5 found symbol {symbol} but could not select it for monitoring.",
+            )
+    return None
 
 
 def _build_wait_result(
@@ -2404,8 +2555,9 @@ def _build_wait_result(
 ) -> Dict[str, Any]:
     elapsed_seconds = max(0.0, (observed_at_utc - started_at_utc).total_seconds())
     matched_event = _with_wait_event_identity(matched_event)
+    timed_out = status == "timeout"
     result = {
-        "success": True,
+        "success": not timed_out,
         "status": status,
         "matched": status in {"matched", "already_satisfied"},
         "event": matched_event["type"] if matched_event is not None else None,
@@ -2427,6 +2579,16 @@ def _build_wait_result(
             "accept_preexisting": bool(request.accept_preexisting),
         },
     }
+    if timed_out:
+        result.update(
+            {
+                "timeout": True,
+                "error_code": "wait_event_timeout",
+                "error": (
+                    "Wait timed out before a watched event or boundary was observed."
+                ),
+            }
+        )
     result.update(
         _wait_result_identity_payload(
             request,

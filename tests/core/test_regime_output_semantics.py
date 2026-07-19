@@ -169,12 +169,15 @@ def test_regime_detect_all_respects_full_and_summary_detail(monkeypatch) -> None
     )
 
     subcall_details: list[tuple[str, str, bool]] = []
+    ensemble_voters: list[str] = []
 
     def fake_recursive(*args, **kwargs):
         method_name = str(kwargs.get("method") or "")
         detail_name = str(kwargs.get("detail") or "")
         include_series = bool(kwargs.get("include_series"))
         subcall_details.append((method_name, detail_name, include_series))
+        if method_name == "ensemble":
+            ensemble_voters.extend(kwargs["params"]["methods"])
         result = {
             "success": True,
             "symbol": kwargs.get("symbol"),
@@ -198,6 +201,7 @@ def test_regime_detect_all_respects_full_and_summary_detail(monkeypatch) -> None
     assert subcall_details
     assert all(detail == "full" for _, detail, _ in subcall_details)
     assert all(include_series is True for _, _, include_series in subcall_details)
+    assert ensemble_voters == ["hmm", "gmm", "ms_ar", "clustering", "wavelet"]
 
     subcall_details.clear()
     summary = real("EURUSD", method="all", detail="summary", include_series=True)
@@ -207,7 +211,7 @@ def test_regime_detect_all_respects_full_and_summary_detail(monkeypatch) -> None
     assert "params_used" not in summary
     assert summary["summary"]["methods_succeeded"] == summary["summary"]["methods_attempted"]
     assert summary["summary"]["ensemble_aggregated"] is True
-    assert "ensemble" not in summary["runtime"]["completed_methods"]
+    assert "ensemble" in summary["runtime"]["completed_methods"]
     assert summary["runtime"]["ensemble_aggregated"] is True
     assert summary["summary"]["agreement"] == {"basis": "test"}
     comparison = summary.get("comparison", {})
@@ -583,7 +587,8 @@ def test_rule_based_explains_ranging_direction_bias() -> None:
 
     regime = out["regime"]
     assert regime["state"] == "ranging"
-    assert regime["direction"] == "bearish"
+    assert "direction" not in regime
+    assert regime["window_bias"] == "bearish"
     assert regime["direction_basis"] == "net_window_move"
     assert "window bias, not a trend classification" in regime["interpretation"]
     assert regime["trend_strength"] >= out["params_used"]["trend_strength_threshold"]
@@ -612,7 +617,7 @@ def test_rule_based_compact_explains_direction_bias() -> None:
     assert out["signal_status"] == "not_actionable"
     assert current_regime["bars"] == 60
     assert current_regime["label"] == "ranging"
-    assert current_regime["direction"] == "bearish"
+    assert "direction" not in current_regime
     assert current_regime["window_bias"] == "bearish"
     assert current_regime["direction_role"] == "window_bias_not_trend"
     assert "headline" not in current_regime
@@ -653,7 +658,8 @@ def test_rule_based_summary_explains_direction_bias() -> None:
 
     summary = out["summary"]
     assert summary["label"] == "ranging"
-    assert summary["direction"] == "bearish"
+    assert "direction" not in summary
+    assert summary["window_bias"] == "bearish"
     assert summary["direction_basis"] == "net_window_move"
     assert "window bias, not a trend classification" in summary["interpretation"]
 

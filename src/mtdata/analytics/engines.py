@@ -20,6 +20,7 @@ from ..core.analytics_requests import (
     TradeExecutionQualityRequest,
 )
 from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
+from ..shared.market_units import forex_points_per_pip
 from ..utils.barriers import normalize_same_bar_policy
 from ..utils.freshness import closed_session_context
 from ..utils.tick_flags import mt5_trade_event_mask
@@ -112,6 +113,34 @@ def _bootstrap_mean_ci(values: Sequence[float], samples: int, seed: int = 42) ->
         draw = np.concatenate([arr[(start + np.arange(block)) % len(arr)] for start in starts])[: len(arr)]
         means.append(float(np.mean(draw)))
     return [float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))]
+
+
+def _round_execution_stat(value: Any, *, significant_digits: int = 6) -> Any:
+    """Remove binary float tails from derived execution statistics."""
+    if value is None:
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric == 0.0:
+        return numeric
+    decimals = significant_digits - int(math.floor(math.log10(abs(numeric)))) - 1
+    return round(numeric, decimals)
+
+
+def _execution_percentiles(values: Iterable[float]) -> Dict[str, Optional[float]]:
+    return {
+        key: _round_execution_stat(value)
+        for key, value in _percentiles(values).items()
+    }
+
+
+def _execution_bootstrap_mean_ci(
+    values: Sequence[float],
+    samples: int,
+) -> Optional[List[float]]:
+    interval = _bootstrap_mean_ci(values, samples)
+    if interval is None:
+        return None
+    return [_round_execution_stat(value) for value in interval]
 
 
 def _block_bootstrap_positive_mean_p_value(
@@ -246,6 +275,12 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
         symbol_info = None
     point = float(getattr(symbol_info, "point", 0.0) or 0.0)
     digits = int(getattr(symbol_info, "digits", 0) or 0)
+    points_per_pip = forex_points_per_pip(
+        request.symbol,
+        path=str(getattr(symbol_info, "path", "") or ""),
+        point=point,
+        digits=digits,
+    )
     revision_pressure = float(np.nanmean((q["bid_revision"] + q["ask_revision"]) / 2.0)) if len(q) > 1 else 0.0
     start_epoch = float(df["epoch"].iloc[0])
     duration = max(0.001, float(df["epoch"].iloc[-1] - start_epoch))
@@ -280,8 +315,10 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
     }
     if point > 0:
         summary["spread_points"] = _percentiles(q["spread"] / point)
-        if digits in {3, 5}:
-            summary["spread_pips"] = _percentiles(q["spread"] / (point * 10.0))
+        if points_per_pip:
+            summary["spread_pips"] = _percentiles(
+                q["spread"] / (point * points_per_pip)
+            )
     applicability = {
         "quote_metrics": bool(len(q) >= 20),
         "trade_direction_metrics": tier in {"trade_ticks", "trade_volume"},
@@ -326,6 +363,56 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
     warnings.append(
         "Metrics describe the connected broker's tick feed and do not establish centralized market-wide order flow or liquidity."
     )
+    data_quality = {
+        "feed_tier": tier,
+        "quote_coverage": float(quote_mask.mean()),
+        "trade_tick_coverage": float(trade_mask.mean()),
+        "real_volume_trade_coverage": real_share,
+        "invalid_partial_quote_ticks": int((~df["spread_valid"]).sum()),
+        "truncated": truncated,
+        "requested_start": start.isoformat(),
+        "requested_end": end.isoformat(),
+        "observed_start_epoch": float(df["epoch"].iloc[0]),
+        "observed_end_epoch": float(df["epoch"].iloc[-1]),
+    }
+    if request.detail in {"compact", "summary"}:
+        spread_key = (
+            "spread_pips"
+            if "spread_pips" in summary
+            else "spread_points"
+            if "spread_points" in summary
+            else "spread"
+        )
+        spread_unit = {
+            "spread_pips": "fx_pips",
+            "spread_points": "broker_points",
+            "spread": "absolute_price",
+        }[spread_key]
+        spread_stats = summary[spread_key]
+        return {
+            "success": True,
+            "symbol": request.symbol,
+            "summary": {
+                "feed_tier": tier,
+                "ticks": int(len(df)),
+                "duration_seconds": duration,
+                "ticks_per_second": float(len(df) / duration),
+                "spread": {
+                    "median": spread_stats.get("median"),
+                    "p95": spread_stats.get("p95"),
+                    "unit": spread_unit,
+                },
+            },
+            "data_quality": {
+                key: data_quality[key]
+                for key in (
+                    "quote_coverage",
+                    "invalid_partial_quote_ticks",
+                    "truncated",
+                )
+            },
+            "warnings": warnings,
+        }
     return {
         "success": True,
         "symbol": request.symbol,
@@ -333,18 +420,7 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
         "summary": summary,
         "liquidity_events": events,
         **({"windows": windows} if request.detail == "full" else {}),
-        "data_quality": {
-            "feed_tier": tier,
-            "quote_coverage": float(quote_mask.mean()),
-            "trade_tick_coverage": float(trade_mask.mean()),
-            "real_volume_trade_coverage": real_share,
-            "invalid_partial_quote_ticks": int((~df["spread_valid"]).sum()),
-            "truncated": truncated,
-            "requested_start": start.isoformat(),
-            "requested_end": end.isoformat(),
-            "observed_start_epoch": float(df["epoch"].iloc[0]),
-            "observed_end_epoch": float(df["epoch"].iloc[-1]),
-        },
+        "data_quality": data_quality,
         "method_applicability": applicability,
         "estimator_scope": {
             "market_scope": "connected_broker_tick_feed",
@@ -355,7 +431,7 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
         "units": {
             "spread": "absolute_price",
             "spread_points": "broker_points",
-            "spread_pips": "fx_pips_when_digits_are_3_or_5",
+            "spread_pips": "fx_pips_when_symbol_is_identifiable_as_forex",
             "quote_gap_seconds": "seconds",
             "broker_quote_revision_imbalance": "signed_fraction",
             "broker_tick_signed_volume_impact_slope": "log_return_per_broker_real_volume",
@@ -375,6 +451,25 @@ def _deal_side(row: Dict[str, Any], gateway: Any) -> Optional[str]:
     return None
 
 
+def _order_type_label(value: Any, gateway: Any) -> str:
+    order_types = (
+        ("ORDER_TYPE_BUY", 0),
+        ("ORDER_TYPE_SELL", 1),
+        ("ORDER_TYPE_BUY_LIMIT", 2),
+        ("ORDER_TYPE_SELL_LIMIT", 3),
+        ("ORDER_TYPE_BUY_STOP", 4),
+        ("ORDER_TYPE_SELL_STOP", 5),
+        ("ORDER_TYPE_BUY_STOP_LIMIT", 6),
+        ("ORDER_TYPE_SELL_STOP_LIMIT", 7),
+        ("ORDER_TYPE_CLOSE_BY", 8),
+    )
+    for name, fallback in order_types:
+        code = getattr(gateway, name, fallback)
+        if value == code or str(value) == str(code):
+            return name.removeprefix("ORDER_TYPE_")
+    return "UNKNOWN"
+
+
 def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: Any) -> Dict[str, Any]:
     start, end = _window(request.start, request.end, request.minutes_back)
     kwargs = {"group": f"*{request.symbol}*"} if request.symbol else {}
@@ -383,7 +478,8 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
     order_by_ticket = {int(row.get("ticket") or 0): row for row in orders if row.get("ticket")}
     fills = []
     skipped = {"non_trade": 0, "filter": 0, "unbenchmarked": 0, "missing_markout": 0}
-    for deal in sorted(deals, key=lambda row: (float(row.get("time_msc") or 0), int(row.get("ticket") or 0))):
+    eligible_deals = []
+    for deal in deals:
         side = _deal_side(deal, gateway)
         volume = float(deal.get("volume") or 0.0)
         symbol = str(deal.get("symbol") or "").strip()
@@ -396,6 +492,22 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
         if request.magic is not None and int(deal.get("magic") or 0) != int(request.magic):
             skipped["filter"] += 1
             continue
+        eligible_deals.append(deal)
+
+    eligible_deals.sort(
+        key=lambda row: (
+            float(row.get("time_msc") or 0),
+            int(row.get("ticket") or 0),
+        ),
+        reverse=True,
+    )
+    benchmark_sources = {"arrival_quote": 0, "order_price": 0, "order_price_fallback": 0}
+    processed_candidates = 0
+    for deal in eligible_deals:
+        processed_candidates += 1
+        side = _deal_side(deal, gateway)
+        volume = float(deal.get("volume") or 0.0)
+        symbol = str(deal.get("symbol") or "").strip()
         order = order_by_ticket.get(int(deal.get("order") or 0), {})
         fill_epoch = float(deal.get("time_msc") or 0) / 1000.0 or float(deal.get("time") or 0)
         qstart = datetime.fromtimestamp(fill_epoch - request.quote_window_seconds, tz=timezone.utc)
@@ -408,15 +520,24 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             latest = before.iloc[-1]
             arrival = float(latest["ask"] if side == "buy" else latest["bid"])
             benchmark_source = "arrival_quote"
-        if not arrival or arrival <= 0:
+        if request.benchmark == "order_price":
             candidate = float(order.get("price_open") or order.get("price_current") or 0.0)
             if candidate > 0:
                 arrival = candidate
                 benchmark_source = "order_price"
+        elif (
+            (not arrival or arrival <= 0)
+            and request.benchmark_fallback == "order_price"
+        ):
+            candidate = float(order.get("price_open") or order.get("price_current") or 0.0)
+            if candidate > 0:
+                arrival = candidate
+                benchmark_source = "order_price_fallback"
         fill_price = float(deal.get("price") or 0.0)
         if not arrival or fill_price <= 0:
             skipped["unbenchmarked"] += 1
             continue
+        benchmark_sources[str(benchmark_source)] += 1
         sign = 1.0 if side == "buy" else -1.0
         slippage_bps = sign * (fill_price - arrival) / arrival * 10_000.0
         time_setup_msc = float(order.get("time_setup_msc") or 0.0)
@@ -432,6 +553,7 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
                 skipped["missing_markout"] += 1
         initial_volume = float(order.get("volume_initial") or volume)
         order_type_value = order.get("type")
+        order_type_label = _order_type_label(order_type_value, gateway)
         market_order_types = {
             getattr(gateway, "ORDER_TYPE_BUY", 0),
             getattr(gateway, "ORDER_TYPE_SELL", 1),
@@ -466,7 +588,8 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             "commission_fee_per_lot": (float(deal.get("commission") or 0.0) + float(deal.get("fee") or 0.0)) / volume,
             "markout_bps": markouts,
             "fill_epoch": fill_epoch,
-            "order_type": str(order_type_value if order_type_value is not None else "unknown"),
+            "order_type": order_type_label,
+            "order_type_code": order_type_value,
             "hour_utc": datetime.fromtimestamp(fill_epoch, tz=timezone.utc).hour,
         }
         hour = int(item["hour_utc"])
@@ -481,28 +604,47 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
         fills.append(item)
         if len(fills) >= request.limit:
             break
+    fills.sort(
+        key=lambda item: (
+            float(item.get("fill_epoch") or 0),
+            int(item.get("deal_ticket") or 0),
+        )
+    )
     slippages = [float(item["slippage_bps"]) for item in fills]
+    market_order_fills = [item for item in fills if item.get("is_market_order")]
+    non_market_order_fills = [item for item in fills if not item.get("is_market_order")]
     summary = {
         "fills": len(fills),
         "orders": len({item["order_ticket"] for item in fills}),
-        "slippage_bps": _percentiles(slippages),
-        "mean_slippage_ci_95": _bootstrap_mean_ci(slippages, 500),
-        "price_improvement_rate": float(np.mean([item["price_improved"] for item in fills])) if fills else None,
-        "partial_fill_rate": float(np.mean([(item.get("fill_ratio") or 1.0) < 0.999 for item in fills])) if fills else None,
-        "market_order_latency_ms": _percentiles(
+        "market_order_fills": len(market_order_fills),
+        "non_market_order_fills": len(non_market_order_fills),
+        "slippage_bps": _execution_percentiles(slippages),
+        "mean_slippage_ci_95": _execution_bootstrap_mean_ci(slippages, 500),
+        "price_improvement_rate": _round_execution_stat(
+            np.mean([item["price_improved"] for item in fills])
+        ) if fills else None,
+        "partial_fill_rate": _round_execution_stat(
+            np.mean([(item.get("fill_ratio") or 1.0) < 0.999 for item in fills])
+        ) if fills else None,
+        "market_order_latency_ms": _execution_percentiles(
             item["order_to_fill_ms"]
-            for item in fills
-            if item.get("is_market_order") and item.get("order_to_fill_ms") is not None
+            for item in market_order_fills
+            if item.get("order_to_fill_ms") is not None
         ),
-        "order_to_fill_ms": _percentiles(
+        "non_market_order_latency_ms": _execution_percentiles(
+            item["order_to_fill_ms"]
+            for item in non_market_order_fills
+            if item.get("order_to_fill_ms") is not None
+        ),
+        "order_to_fill_ms": _execution_percentiles(
             item["order_to_fill_ms"]
             for item in fills
             if item.get("order_to_fill_ms") is not None
         ),
-        "commission_fee_per_lot": _percentiles(item["commission_fee_per_lot"] for item in fills),
+        "commission_fee_per_lot": _execution_percentiles(item["commission_fee_per_lot"] for item in fills),
     }
     for horizon in request.markout_seconds:
-        summary.setdefault("markout_bps", {})[str(horizon)] = _percentiles(item["markout_bps"].get(str(horizon)) for item in fills if item["markout_bps"].get(str(horizon)) is not None)
+        summary.setdefault("markout_bps", {})[str(horizon)] = _execution_percentiles(item["markout_bps"].get(str(horizon)) for item in fills if item["markout_bps"].get(str(horizon)) is not None)
     breakdowns: Dict[str, List[Dict[str, Any]]] = {}
     if fills:
         fill_frame = pd.DataFrame(fills)
@@ -511,22 +653,65 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             for group_key, items in fill_frame.groupby(keys):
                 labels = group_key if isinstance(group_key, tuple) else (group_key,)
                 row = {name: value for name, value in zip(keys, labels)}
-                row.update({"fills": len(items), "slippage_bps": _percentiles(items["slippage_bps"])})
+                row.update({"fills": len(items), "slippage_bps": _execution_percentiles(items["slippage_bps"])})
                 if label == "by_order_type":
-                    row["order_to_fill_ms"] = _percentiles(items["order_to_fill_ms"])
+                    codes = [
+                        value
+                        for value in items["order_type_code"].dropna().unique().tolist()
+                    ]
+                    if len(codes) == 1:
+                        row["order_type_code"] = codes[0]
+                    row["order_to_fill_ms"] = _execution_percentiles(items["order_to_fill_ms"])
                 breakdowns[label].append(row)
+    sample_start = format_epoch_utc(fills[0]["fill_epoch"]) if fills else None
+    sample_end = format_epoch_utc(fills[-1]["fill_epoch"]) if fills else None
+    benchmark_attempts = len(fills) + skipped["unbenchmarked"]
+    fallback_count = benchmark_sources["order_price_fallback"]
+    warnings = []
+    if fallback_count:
+        warnings.append(
+            f"{fallback_count} fill(s) used order price because no arrival quote was available."
+        )
     return {
         "success": True,
         "summary": summary,
         "breakdowns": breakdowns,
         **({"items": fills} if request.detail == "full" else {}),
         "sample_quality": {"status": "ok" if len(fills) >= request.min_sample else "insufficient", "minimum": request.min_sample, "observed": len(fills)},
-        "data_quality": {"history_deals": len(deals), "history_orders": len(orders), "matched_fills": len(fills), "skipped": skipped},
+        "data_quality": {
+            "history_deals": len(deals),
+            "history_orders": len(orders),
+            "eligible_trade_deals": len(eligible_deals),
+            "processed_candidates": processed_candidates,
+            "matched_fills": len(fills),
+            "skipped": skipped,
+            "benchmark": {
+                "requested": request.benchmark,
+                "fallback_policy": request.benchmark_fallback,
+                "source_counts": benchmark_sources,
+                "fallback_count": fallback_count,
+                "arrival_quote_coverage": (
+                    benchmark_sources["arrival_quote"] / benchmark_attempts
+                    if benchmark_attempts
+                    else None
+                ),
+            },
+        },
+        "sample": {
+            "selection_order": "latest_first",
+            "display_order": "chronological",
+            "total_eligible": len(eligible_deals),
+            "sample_start": sample_start,
+            "sample_end": sample_end,
+            "truncated": processed_candidates < len(eligible_deals),
+        },
         "latency_definition": {
             "market_order_latency_ms": "market_order_setup_to_fill_elapsed_time",
+            "non_market_order_latency_ms": "non_market_order_setup_to_fill_elapsed_time_including_pending_wait",
             "order_to_fill_ms": "all_order_setup_to_fill_elapsed_time_including_pending_wait",
         },
-        "units": {"slippage_bps": "basis_points_positive_is_worse", "markout_bps": "basis_points_positive_is_favorable", "market_order_latency_ms": "milliseconds", "order_to_fill_ms": "milliseconds"},
+        "units": {"slippage_bps": "basis_points_positive_is_worse", "markout_bps": "basis_points_positive_is_favorable", "market_order_latency_ms": "milliseconds", "non_market_order_latency_ms": "milliseconds", "order_to_fill_ms": "milliseconds"},
+        "warnings": warnings,
     }
 
 
@@ -1001,6 +1186,23 @@ def _position_sensitivity(gateway: Any, row: Dict[str, Any]) -> Tuple[Optional[f
 
 
 def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: Any) -> Dict[str, Any]:
+    holding_periods = [
+        f"{horizon} {request.timeframe} bar{'s' if horizon != 1 else ''}"
+        for horizon in request.horizon_bars
+    ]
+    model_context: Dict[str, Any] = {
+        "timeframe": request.timeframe,
+        "horizon_bars": list(request.horizon_bars),
+        "holding_periods": holding_periods,
+        "lookback_requested": request.lookback,
+        "confidence_levels": list(request.confidence),
+        "simulations": request.simulations,
+        "ewma_half_life": request.ewma_half_life,
+        "random_seed": request.seed,
+        "completion_policy": "allow_partial" if request.allow_partial else "fail_closed",
+        "valuation_time": format_epoch_utc(datetime.now(timezone.utc).timestamp()),
+        "valuation_basis": "live_position_marks_with_completed_bar_return_history",
+    }
     account = None
     try:
         account_info = getattr(gateway, "account_info", None)
@@ -1021,7 +1223,17 @@ def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: An
             "proposed": True,
         })
     if not positions:
-        return {"success": True, "message": "No open positions.", "summary": {"positions": 0}, "risk": []}
+        return {
+            "success": True,
+            "empty": True,
+            "positions": 0,
+            "message": "No open positions.",
+            "summary": {"positions": 0},
+            "risk": [],
+            "timeframe": request.timeframe,
+            "holding_periods": holding_periods,
+            "model_context": model_context,
+        }
     sensitivities: Dict[str, float] = {}
     proposed_sensitivity: Optional[Tuple[str, float]] = None
     failures = []
@@ -1076,7 +1288,7 @@ def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: An
     if request.method == "historical":
         standardized = returns.copy()
         current_vol = pd.Series(1.0, index=returns.columns)
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(request.seed)
     risk_rows = []
     scenario_details: Dict[int, np.ndarray] = {}
     sensitivity_vec = np.asarray([sensitivities[column] for column in standardized.columns], dtype=float)
@@ -1104,6 +1316,10 @@ def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: An
             after_es = float(max(0.0, -np.mean(pnl[tail]))) if np.any(tail) else None
             risk_rows.append({
                 "horizon_bars": horizon,
+                "holding_period": (
+                    f"{horizon} {request.timeframe} "
+                    f"bar{'s' if horizon != 1 else ''}"
+                ),
                 "confidence": confidence,
                 "var": float(max(0.0, -cutoff)),
                 "expected_shortfall": after_es,
@@ -1176,9 +1392,21 @@ def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: An
         warnings_out.append(
             "Some priced symbols lacked sufficient return history and were omitted because allow_partial=true."
         )
+    data_start = format_epoch_utc(float(returns.index[0]))
+    data_end = format_epoch_utc(float(returns.index[-1]))
+    model_context.update(
+        {
+            "aligned_returns": len(returns),
+            "data_start": data_start,
+            "data_end": data_end,
+        }
+    )
     return {
         "success": True,
         "method": request.method,
+        "timeframe": request.timeframe,
+        "holding_periods": holding_periods,
+        "model_context": model_context,
         **account_context,
         "summary": {"positions": base_position_count, "positions_after_proposed": len(positions), "symbols": len(modeled_symbols), "symbols_requested": len(requested_symbols), "aligned_rows": len(returns), "concentration_hhi": float(np.sum(weights**2))},
         "risk": risk_rows,

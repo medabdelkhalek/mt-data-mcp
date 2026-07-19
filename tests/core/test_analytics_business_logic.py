@@ -10,6 +10,7 @@ import pytest
 from mtdata.analytics.engines import (
     _barrier_returns,
     _filtered_historical_returns,
+    _execution_percentiles,
     _tick_frame,
     analyze_execution_quality,
     analyze_microstructure,
@@ -133,7 +134,8 @@ def test_microstructure_distinguishes_trade_volume_from_quote_proxy() -> None:
     gateway = FakeGateway()
     gateway.tick_rows = _ticks(real_volume=True)
     result = analyze_microstructure(
-        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60), gateway
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60, detail="standard"),
+        gateway,
     )
     assert result["success"] is True
     assert result["summary"]["feed_tier"] == "trade_volume"
@@ -148,6 +150,27 @@ def test_microstructure_distinguishes_trade_volume_from_quote_proxy() -> None:
     assert result["units"]["spread_points"] == "broker_points"
     assert all("start" in item and "end" in item for item in result["liquidity_events"])
     assert all("start_epoch" not in item for item in result["liquidity_events"])
+
+
+def test_microstructure_compact_output_omits_research_events() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = _ticks(real_volume=True)
+
+    result = analyze_microstructure(
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60),
+        gateway,
+    )
+
+    assert result["summary"]["feed_tier"] == "trade_volume"
+    assert result["summary"]["spread"]["unit"] == "fx_pips"
+    assert result["summary"]["spread"]["median"] == pytest.approx(1.0)
+    assert "liquidity_events" not in result
+    assert "method_applicability" not in result
+    assert set(result["data_quality"]) == {
+        "quote_coverage",
+        "invalid_partial_quote_ticks",
+        "truncated",
+    }
     assert any("broker's tick feed" in warning for warning in result["warnings"])
 
 
@@ -161,7 +184,8 @@ def test_microstructure_does_not_recount_last_trade_snapshots() -> None:
     gateway.tick_rows[0]["flags"] = 1032
 
     result = analyze_microstructure(
-        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60), gateway
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60, detail="standard"),
+        gateway,
     )
 
     assert result["success"] is True
@@ -278,10 +302,27 @@ def test_execution_quality_matches_order_and_computes_markout() -> None:
     assert result["items"][0]["benchmark_source"] == "arrival_quote"
     assert result["items"][0]["order_to_fill_ms"] == 1000.0
     assert result["summary"]["market_order_latency_ms"]["mean"] == 1000.0
+    assert result["summary"]["market_order_fills"] == 1
+    assert result["summary"]["non_market_order_fills"] == 0
+    assert result["summary"]["non_market_order_latency_ms"]["mean"] is None
     assert result["latency_definition"]["order_to_fill_ms"].endswith(
         "including_pending_wait"
     )
     assert result["items"][0]["markout_bps"]["5"] is not None
+    assert result["items"][0]["order_type"] == "BUY"
+    assert result["items"][0]["order_type_code"] == 0
+    assert result["breakdowns"]["by_order_type"][0]["order_type"] == "BUY"
+    assert result["breakdowns"]["by_order_type"][0]["order_type_code"] == 0
+
+
+def test_execution_quality_statistics_remove_binary_float_tails() -> None:
+    stats = _execution_percentiles(
+        [-0.47683719545640957, 0.2623938317292096, 1.375197583110125]
+    )
+
+    assert stats["mean"] == pytest.approx(0.386918)
+    assert stats["median"] == pytest.approx(0.262394)
+    assert stats["p95"] == pytest.approx(1.26392)
 
 
 def test_execution_quality_handles_empty_tick_history() -> None:
@@ -309,8 +350,71 @@ def test_execution_quality_handles_empty_tick_history() -> None:
     )
 
     assert result["success"] is True
-    assert result["summary"]["fills"] == 1
-    assert result["data_quality"]["skipped"]["missing_markout"] == 2
+    assert result["summary"]["fills"] == 0
+    assert result["data_quality"]["skipped"]["unbenchmarked"] == 1
+    assert result["data_quality"]["benchmark"]["fallback_count"] == 0
+    assert result["data_quality"]["benchmark"]["arrival_quote_coverage"] == 0.0
+
+    fallback_result = analyze_execution_quality(
+        TradeExecutionQualityRequest(
+            minutes_back=60,
+            markout_seconds=[1],
+            benchmark_fallback="order_price",
+            detail="full",
+        ),
+        gateway,
+    )
+    assert fallback_result["summary"]["fills"] == 1
+    assert fallback_result["items"][0]["benchmark_source"] == "order_price_fallback"
+    assert fallback_result["data_quality"]["benchmark"]["fallback_count"] == 1
+    assert "used order price" in fallback_result["warnings"][0]
+
+
+def test_execution_quality_limit_selects_latest_eligible_fill() -> None:
+    gateway = FakeGateway()
+    start = _now() - 100
+    gateway.tick_rows = []
+    gateway.orders = [
+        {"ticket": 10, "type": 0, "price_open": 1.1, "volume_initial": 1.0},
+        {"ticket": 11, "type": 0, "price_open": 1.2, "volume_initial": 1.0},
+    ]
+    gateway.deals = [
+        {
+            "ticket": 20,
+            "order": 10,
+            "symbol": "EURUSD",
+            "type": 0,
+            "volume": 1.0,
+            "price": 1.1001,
+            "time_msc": start * 1000,
+        },
+        {
+            "ticket": 21,
+            "order": 11,
+            "symbol": "EURUSD",
+            "type": 0,
+            "volume": 1.0,
+            "price": 1.2001,
+            "time_msc": (start + 50) * 1000,
+        },
+    ]
+
+    result = analyze_execution_quality(
+        TradeExecutionQualityRequest(
+            minutes_back=60,
+            limit=1,
+            min_sample=1,
+            benchmark="order_price",
+            markout_seconds=[1],
+            detail="full",
+        ),
+        gateway,
+    )
+
+    assert [item["deal_ticket"] for item in result["items"]] == [21]
+    assert result["sample"]["selection_order"] == "latest_first"
+    assert result["sample"]["total_eligible"] == 2
+    assert result["sample"]["truncated"] is True
 
 
 def test_strategy_validation_returns_walk_forward_oos_metrics() -> None:
@@ -413,6 +517,24 @@ def test_forecast_strategy_folds_cover_computed_signal_window(monkeypatch) -> No
     assert result["validation"]["forecast_signal_anchor_limit"] == 200
 
 
+def test_portfolio_risk_marks_empty_position_book() -> None:
+    gateway = FakeGateway()
+    gateway.positions = []
+
+    result = decompose_portfolio_risk(
+        PortfolioRiskDecomposeRequest(),
+        gateway,
+    )
+
+    assert result["success"] is True
+    assert result["empty"] is True
+    assert result["positions"] == 0
+    assert result["risk"] == []
+    assert result["timeframe"] == "H1"
+    assert result["holding_periods"] == ["1 H1 bar", "5 H1 bars"]
+    assert result["model_context"]["random_seed"] == 42
+
+
 def test_portfolio_risk_reconciles_component_expected_shortfall() -> None:
     gateway = FakeGateway()
     gateway.account_info = lambda: SimpleNamespace(currency="USD", equity=25000.0)
@@ -432,6 +554,29 @@ def test_portfolio_risk_reconciles_component_expected_shortfall() -> None:
     assert component_total == pytest.approx(row["expected_shortfall"])
     assert "correlation_to_one_loss_proxy" not in result["stresses"]
     assert result["stresses"]["perfect_positive_correlation_1sigma"][0]["horizon_bars"] == 1
+    assert result["timeframe"] == "H1"
+    assert result["holding_periods"] == ["1 H1 bar"]
+    assert row["holding_period"] == "1 H1 bar"
+    assert result["model_context"] == {
+        "timeframe": "H1",
+        "horizon_bars": [1],
+        "holding_periods": ["1 H1 bar"],
+        "lookback_requested": 300,
+        "confidence_levels": [0.95],
+        "simulations": 500,
+        "ewma_half_life": 60.0,
+        "random_seed": 42,
+        "completion_policy": "fail_closed",
+        "valuation_time": result["model_context"]["valuation_time"],
+        "valuation_basis": "live_position_marks_with_completed_bar_return_history",
+        "aligned_returns": result["summary"]["aligned_rows"],
+        "data_start": result["model_context"]["data_start"],
+        "data_end": result["model_context"]["data_end"],
+    }
+    assert datetime.fromisoformat(
+        result["model_context"]["valuation_time"].replace("Z", "+00:00")
+    ).tzinfo == timezone.utc
+    assert "as_of" not in result["model_context"]
 
 
 def test_filtered_historical_shock_uses_pre_shock_volatility() -> None:

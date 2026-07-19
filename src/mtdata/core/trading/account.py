@@ -22,6 +22,7 @@ from ...utils.time import (
 )
 from ...utils.utils import (
     _normalize_limit,
+    _parse_end_datetime,
     _parse_start_datetime,
 )
 from .._mcp_instance import mcp
@@ -41,9 +42,7 @@ logger = logging.getLogger(__name__)
 _TRADE_ACCOUNT_COMPACT_KEYS = (
     "success",
     "source",
-    "as_of",
     "retrieved_at",
-    "as_of_source",
     "timezone",
     "broker_server_tz",
     "server_time",
@@ -90,6 +89,7 @@ def _run_trade_history_request(request: TradeHistoryRequest) -> Any:
         format_time_minimal=_format_time_minimal,
         format_time_minimal_local=_format_time_minimal_local,
         mt5_epoch_to_utc=_utc_epoch_identity,
+        parse_end_datetime=_parse_end_datetime,
         parse_start_datetime=_parse_start_datetime,
         normalize_limit=_normalize_limit,
         comment_row_metadata=comments._comment_row_metadata,
@@ -116,6 +116,12 @@ def _round_trade_journal_value(value: Any, *, digits: int) -> Optional[float]:
 
 
 def _is_exit_deal_row(row: Dict[str, Any]) -> bool:
+    deal_effect = str(row.get("deal_effect") or "").strip().lower()
+    if deal_effect in {"close", "close_by", "reverse"}:
+        return True
+    position_action = str(row.get("position_action") or "").strip().lower()
+    if position_action.startswith(("close_", "close_by_", "reverse_")):
+        return True
     entry_text = str(row.get("entry") or "").strip().lower()
     if entry_text and "out" in entry_text:
         return True
@@ -292,9 +298,11 @@ def _trade_journal_breakdowns(
 
 def _trade_journal_trade_snapshot(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "ticket": row.get("ticket"),
+        "deal_ticket": row.get("deal_ticket", row.get("ticket")),
+        "order_ticket": row.get("order_ticket"),
+        "position_ticket": row.get("position_ticket"),
         "symbol": row.get("symbol"),
-        "time": row.get("time"),
+        "fill_time": row.get("fill_time", row.get("time")),
         "side": row.get("side"),
         "exit_trigger": row.get("exit_trigger"),
         "net_pnl": row.get("net_pnl"),
@@ -521,7 +529,7 @@ def _run_trade_journal_request(request: TradeJournalAnalyzeRequest) -> Dict[str,
         payload["items"] = [
             _trade_journal_trade_snapshot(row) for row in analyzed_rows
         ]
-        payload["item_schema"] = "trade_journal_analyzed_exit.v1"
+        payload["item_schema"] = "trade_journal_analyzed_exit.v2"
         payload["best_trades"] = [
             _trade_journal_trade_snapshot(row)
             for row in ranked_best[: min(5, len(ranked_best))]
@@ -694,7 +702,7 @@ def _trade_account_clock_fields(
     *,
     retrieved_at_epoch: float,
 ) -> Dict[str, Any]:
-    fields: Dict[str, Any] = {"as_of_source": "client_utc_clock"}
+    fields: Dict[str, Any] = {}
     broker_tz = str(getattr(mt5_config, "server_tz_name", "") or "").strip()
     if broker_tz:
         fields["broker_server_tz"] = broker_tz
@@ -803,7 +811,6 @@ def trade_account_info(
         payload = {
             "success": True,
             "source": "mt5_account_snapshot",
-            "as_of": retrieved_at,
             "retrieved_at": retrieved_at,
             "timezone": "UTC",
             **_trade_account_clock_fields(
@@ -869,11 +876,10 @@ def trade_history(request: TradeHistoryRequest) -> Dict[str, Any]:
     Rows expose three distinct identifiers: `deal_ticket` (the unique executed
     fill), `order_ticket` (the order that produced the fill), and
     `position_ticket` (the position opened/closed; matches `trade_get_open.ticket`).
-    Compact deals use `fill_time`; compact orders use `placed_time` and
-    `done_time`. Full/detail rows retain native MT5 time fields.
-    Use `detail="compact"` (default) for rows plus minimal envelope metadata.
-    Use `detail="standard"` or `detail="full"` to include period context, and
-    `detail="full"` to retain request echo fields.
+    Deals use `fill_time` and `fill_side`; orders use `placed_time` and
+    `done_time` at every detail level. Full rows add native MT5 attributes
+    under `raw` without renaming canonical fields. Every response includes the
+    effective period context. Use `detail="full"` for request echo fields.
     """
     return run_logged_operation(
         logger,

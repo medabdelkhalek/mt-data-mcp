@@ -13,7 +13,7 @@ from ..shared.constants import (
 )
 from ..shared.market_units import forex_points_per_pip
 from ..shared.schema import DetailLiteral, TimeframeLiteral
-from ..shared.symbols import FIAT_CURRENCY_CODES as _FOREX_CURRENCY_CODES
+from ..shared.symbols import FOREX_CURRENCY_CODES as _FOREX_CURRENCY_CODES
 from ..shared.validators import invalid_timeframe_error
 from ..utils.freshness import (
     QUOTE_STALE_SECONDS,
@@ -57,6 +57,7 @@ from .execution_logging import run_logged_operation
 from .mt5_gateway import create_mt5_gateway
 from .output_contract import (
     attach_collection_contract,
+    build_pagination_meta,
     normalize_output_detail,
     normalize_output_verbosity_detail,
     resolve_output_contract,
@@ -85,6 +86,15 @@ _FOREX_SEARCH_PAIR_PRIORITY = {
             "GBPCHF",
         )
     )
+}
+_SYMBOL_DEFAULT_CATEGORY_PRIORITY = {
+    "indices": 2,
+    "commodities": 3,
+    "crypto": 4,
+    "stocks": 5,
+    "etfs": 6,
+    "bonds": 7,
+    "other": 8,
 }
 
 
@@ -347,7 +357,7 @@ def _symbol_category(symbol: Any) -> str:
     text = f"{name} {path} {description}".casefold()
     pair_prefix = _symbol_forex_pair(symbol)
 
-    if pair_prefix:
+    if pair_prefix or "forex" in path.casefold():
         return "forex"
     if any(token in text for token in ("bond", "treasury", "bund", "gilt")):
         return "bonds"
@@ -359,7 +369,29 @@ def _symbol_category(symbol: Any) -> str:
         return "crypto"
     if any(token in text for token in ("index", "indices", "nasdaq", "dow", "dax")):
         return "indices"
-    if any(token in text for token in ("gold", "silver", "oil", "xau", "xag", "brent")):
+    if any(
+        token in text
+        for token in (
+            "commodity",
+            "commodities",
+            "metal",
+            "metals",
+            "energy",
+            "energies",
+            "gold",
+            "silver",
+            "oil",
+            "brent",
+            "copper",
+            "platinum",
+            "palladium",
+            "xau",
+            "xag",
+            "xpt",
+            "xpd",
+            "xcu",
+        )
+    ):
         return "commodities"
     return "other"
 
@@ -430,6 +462,19 @@ def _symbol_search_forex_rank(symbol: Any, search_term: str) -> int:
     if not pair or query not in (pair[:3], pair[3:]):
         return 100
     return _FOREX_SEARCH_PAIR_PRIORITY.get(pair, 50)
+
+
+def _symbol_default_list_sort_key(symbol: Any) -> tuple[int, int, str, str]:
+    """Rank a no-filter symbol overview without fetching live market data."""
+    pair = _symbol_forex_pair(symbol)
+    if pair in _FOREX_SEARCH_PAIR_PRIORITY:
+        return 0, _FOREX_SEARCH_PAIR_PRIORITY[pair], *_case_insensitive_sort_key(
+            getattr(symbol, "name", "")
+        )
+    if pair:
+        return 1, 0, *_case_insensitive_sort_key(getattr(symbol, "name", ""))
+    category_rank = _SYMBOL_DEFAULT_CATEGORY_PRIORITY.get(_symbol_category(symbol), 9)
+    return category_rank, 0, *_case_insensitive_sort_key(getattr(symbol, "name", ""))
 
 
 def _symbol_top_match(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -821,8 +866,10 @@ def symbols_list(  # noqa: C901
     description and group matches.
 
     Without a search term, universe="visible" lists Market Watch symbols and
-    universe="all" lists the broker catalog. Searches use the broker catalog.
-    Use group, currency, and category to filter the resulting symbol set.
+    universe="all" lists the broker catalog. The unfiltered overview ranks FX
+    majors, other FX pairs, then broad asset categories before symbol name.
+    Searches use the broker catalog. Use group, currency, and category to
+    filter the resulting symbol set.
     """
     raw_search_term = str(search_term or "").strip() or None
     normalized_search_term = _normalize_symbol_search_term(search_term)
@@ -904,9 +951,7 @@ def symbols_list(  # noqa: C901
             else:
                 matched_symbols = sorted(
                     matched_symbols,
-                    key=lambda symbol: _case_insensitive_sort_key(
-                        getattr(symbol, "name", "")
-                    ),
+                    key=_symbol_default_list_sort_key,
                 )
             only_visible = effective_universe == "visible"
             symbol_list = []
@@ -1033,10 +1078,18 @@ def symbols_list(  # noqa: C901
                             f"({visible_count} of {broker_symbol_count}); "
                             "use universe=all or search_term for the broker catalog."
                         )
+                if not normalized_search_term:
+                    out["sort"] = "market_overview"
                 if offset_value or has_more:
                     out["total_count"] = total_count
                     out["offset"] = offset_value
                     out["has_more"] = has_more
+                out["pagination"] = build_pagination_meta(
+                    total=total_count,
+                    returned=len(symbol_list),
+                    offset=offset_value,
+                    limit=limit_value,
+                )
                 return out
             if detail_mode == "compact":
                 headers = ["symbol", "group", "description"]
@@ -1094,11 +1147,19 @@ def symbols_list(  # noqa: C901
                         f"({visible_count} of {broker_symbol_count}); "
                         "use universe=all or search_term for the broker catalog."
                     )
+            if not normalized_search_term:
+                result["sort"] = "market_overview"
             if offset_value or has_more:
                 result["total_count"] = total_count
                 result["offset"] = offset_value
                 result["limit"] = limit_value
                 result["has_more"] = has_more
+            result["pagination"] = build_pagination_meta(
+                total=total_count,
+                returned=len(symbol_list),
+                offset=offset_value,
+                limit=limit_value,
+            )
             return attach_collection_contract(
                 result,
                 collection_kind="table",
@@ -1554,8 +1615,6 @@ def _market_scan_freshness_fields(
         "bar_age_hours": _market_scan_round(age_seconds / 3600.0, digits=3),
         "data_stale": data_stale,
         "history_policy_ok": not data_stale and not bool(closed_session),
-        "usable_for_live_trading": not data_stale and not bool(closed_session),
-        "usable_for_live_trading_basis": "ranking_bar_policy_not_execution_quote",
         "freshness": format_freshness_label(
             data_stale=data_stale,
             age_seconds=age_seconds,
@@ -1576,7 +1635,7 @@ def _market_scan_freshness_fields(
         )
     elif not data_stale:
         age_text = format_age_seconds(age_seconds)
-        fields["freshness"] = f"current closed bar, {age_text} ago"
+        fields["freshness"] = f"latest completed bar, {age_text} ago"
     if fields["data_stale"]:
         fields["stale_warning"] = (
             "Completed bar data may be stale; latest bar is "
@@ -1607,12 +1666,49 @@ def _quote_staleness_fields(
     )
     fields.pop("freshness_state", None)
     fields["data_age"] = format_age_seconds(age_seconds)
-    if fields["data_stale"]:
+    if fields.get("timestamp_in_future"):
+        fields["warning"] = fields.get("timestamp_warning")
+    elif fields["data_stale"]:
         fields["warning"] = (
             "Live quote timestamp is older than "
             f"{int(_MARKET_SCAN_STALE_QUOTE_SECONDS)} seconds."
         )
     return fields
+
+
+_MARKET_SCAN_BAR_FRESHNESS_FIELDS = {
+    "data_freshness_seconds": "bar_age_seconds",
+    "data_freshness_anchor": "bar_freshness_anchor",
+    "data_freshness_metric": "bar_freshness_metric",
+    "stale_after_seconds": "bar_stale_after_seconds",
+    "bar_age_hours": "bar_age_hours",
+    "data_stale": "bar_stale",
+    "history_policy_ok": "history_policy_ok",
+    "freshness": "bar_freshness",
+    "market_status": "bar_market_status",
+    "market_status_reason": "bar_market_status_reason",
+    "freshness_policy_relaxed": "bar_freshness_policy_relaxed",
+    "stale_warning": "bar_stale_warning",
+}
+
+
+def _market_scan_bar_freshness_fields(
+    bar_time: Optional[float],
+    *,
+    timeframe: Optional[str] = None,
+    symbol: Any = None,
+) -> Dict[str, Any]:
+    """Return bar-policy fields that cannot overwrite quote safety fields."""
+    fields = _market_scan_freshness_fields(
+        bar_time,
+        timeframe=timeframe,
+        symbol=symbol,
+    )
+    return {
+        output_name: fields[input_name]
+        for input_name, output_name in _MARKET_SCAN_BAR_FRESHNESS_FIELDS.items()
+        if input_name in fields
+    }
 
 
 def _market_scan_quote_freshness_fields(
@@ -1835,6 +1931,8 @@ _MARKET_SCAN_UNITS = {
     "data_age_seconds": "seconds",
     "data_freshness_seconds": "seconds",
     "stale_after_seconds": "seconds",
+    "bar_age_seconds": "seconds",
+    "bar_stale_after_seconds": "seconds",
     "bar_age_hours": "hours",
 }
 
@@ -1937,7 +2035,17 @@ def _market_scan_freshness_summary(
 ) -> Dict[str, Any]:
     if not rows:
         return {}
-    stale_count = sum(1 for row in rows if bool(row.get("data_stale")))
+    def _row_stale(row: Dict[str, Any]) -> bool:
+        return bool(row.get("bar_stale")) or bool(row.get("data_stale"))
+
+    stale_count = sum(1 for row in rows if _row_stale(row))
+    stale_bar_count = sum(1 for row in rows if bool(row.get("bar_stale")))
+    unsafe_quote_count = sum(
+        1
+        for row in rows
+        if bool(row.get("data_stale"))
+        or row.get("usable_for_live_trading") is False
+    )
     row_count = len(rows)
     if stale_count == row_count:
         freshness = "stale"
@@ -1949,12 +2057,15 @@ def _market_scan_freshness_summary(
     out: Dict[str, Any] = {
         "freshness": freshness,
         "stale_rows": int(stale_count),
+        "freshness_basis": "conservative_quote_or_bar",
+        "stale_bar_rows": int(stale_bar_count),
+        "unsafe_quote_rows": int(unsafe_quote_count),
     }
     if stale_count and include_stale_symbols:
         out["stale_symbols"] = [
             str(row.get("symbol"))
             for row in rows
-            if bool(row.get("data_stale")) and str(row.get("symbol") or "").strip()
+            if _row_stale(row) and str(row.get("symbol") or "").strip()
         ]
     row_times = [
         str(row.get("time") or "").strip()
@@ -2392,7 +2503,11 @@ def _build_market_scan_signal_row(
             "timeframe": timeframe,
             "data_source": f"{timeframe}_bars",
             "time": _format_time_explicit(bar_time) if bar_time is not None else None,
-            **_market_scan_freshness_fields(bar_time, timeframe=timeframe, symbol=symbol),
+            **_market_scan_bar_freshness_fields(
+                bar_time,
+                timeframe=timeframe,
+                symbol=symbol,
+            ),
             "previous_close": _market_scan_round(previous_close, digits=digits),
             "open": _market_scan_round(open_price, digits=digits),
             "close": _market_scan_round(close_price, digits=digits),
@@ -2511,7 +2626,7 @@ def _market_scan_sort_rows(
     if rank_by == "abs_price_change_pct":
         rows.sort(
             key=lambda row: (
-                bool(row.get("data_stale")),
+                bool(row.get("bar_stale")),
                 row.get("price_change_pct") is None,
                 (
                     abs(float(row.get("price_change_pct") or 0.0))
@@ -2527,7 +2642,7 @@ def _market_scan_sort_rows(
 
     rows.sort(
         key=lambda row: (
-            bool(row.get("data_stale")),
+            bool(row.get("bar_stale")),
             row.get(rank_by) is None,
             (
                 float(row.get(rank_by) if row.get(rank_by) is not None else missing_value)
@@ -3085,7 +3200,7 @@ def market_scan(  # noqa: C901
     symbols: Optional[str] = None,
     group: Optional[str] = None,
     preset: Optional[str] = None,
-    limit: Optional[int] = 50,
+    limit: Optional[int] = 10,
     offset: int = 0,
     universe: Literal["visible", "all"] = "visible",  # type: ignore
     timeframe: TimeframeLiteral = "H1",
@@ -3339,7 +3454,7 @@ def market_scan(  # noqa: C901
                     request=request,
                 )
 
-            limit_value = _normalize_limit(limit) or 50
+            limit_value = _normalize_limit(limit) or 10
             request["limit"] = limit_value
             try:
                 offset_value = int(offset or 0)
@@ -3468,16 +3583,31 @@ def market_scan(  # noqa: C901
                 "description",
                 "timeframe",
                 "time",
-                "data_freshness_seconds",
-                "data_freshness_anchor",
-                "data_freshness_metric",
+                "tick_time",
+                "data_age_seconds",
+                "data_age_anchor",
+                "data_age_metric",
                 "stale_after_seconds",
-                "bar_age_hours",
                 "data_stale",
-                "market_status",
-                "market_status_reason",
-                "freshness_policy_relaxed",
-                "stale_warning",
+                "usable_for_live_trading",
+                "usable_for_live_trading_basis",
+                "freshness_reason",
+                "timestamp_in_future",
+                "timestamp_skew_seconds",
+                "timestamp_warning",
+                "warning",
+                "freshness",
+                "bar_age_seconds",
+                "bar_freshness_anchor",
+                "bar_freshness_metric",
+                "bar_stale_after_seconds",
+                "bar_age_hours",
+                "bar_stale",
+                "bar_market_status",
+                "bar_market_status_reason",
+                "bar_freshness_policy_relaxed",
+                "bar_freshness",
+                "bar_stale_warning",
                 "previous_close",
                 "close",
                 "price_change_pct",
@@ -3497,10 +3627,15 @@ def market_scan(  # noqa: C901
                 "data_source",
                 "time",
                 "data_stale",
-                "market_status",
-                "market_status_reason",
-                "freshness_policy_relaxed",
-                "freshness",
+                "usable_for_live_trading",
+                "freshness_reason",
+                "timestamp_in_future",
+                "timestamp_warning",
+                "bar_stale",
+                "bar_market_status",
+                "bar_market_status_reason",
+                "bar_freshness_policy_relaxed",
+                "bar_freshness",
                 "close",
                 "price_change_pct",
                 "tick_volume",
@@ -3513,9 +3648,11 @@ def market_scan(  # noqa: C901
             if include_sma:
                 compact_headers.append("sma_distance_pct")
             optional_compact_headers = {
-                "market_status",
-                "market_status_reason",
-                "freshness_policy_relaxed",
+                "timestamp_in_future",
+                "timestamp_warning",
+                "bar_market_status",
+                "bar_market_status_reason",
+                "bar_freshness_policy_relaxed",
             }
             compact_headers = [
                 header
@@ -3603,6 +3740,12 @@ def market_scan(  # noqa: C901
                 "offset": int(offset_value),
                 "total_count": int(total_matches),
                 "has_more": bool(offset_value + table_payload["row_count"] < total_matches),
+                "pagination": build_pagination_meta(
+                    total=total_matches,
+                    returned=table_payload["row_count"],
+                    offset=offset_value,
+                    limit=limit_value,
+                ),
                 "universe_size": int(len(selected_symbols)),
                 "summary": {
                     "counts": {

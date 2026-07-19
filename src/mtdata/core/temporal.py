@@ -29,6 +29,7 @@ from ..utils.time import (
     _resolve_client_tz,
 )
 from ..utils.utils import (
+    _parse_end_datetime,
     _parse_start_datetime,
 )
 from ._mcp_instance import mcp
@@ -646,6 +647,7 @@ def _base_temporal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "groups_analyzed",
             "groups_excluded",
             "min_bars_applied",
+            "overall_basis",
             *_PAGINATION_KEYS,
         )
         if key in payload
@@ -855,7 +857,7 @@ def _fetch_rates(
 
     if start and end:
         start_dt = _parse_start_datetime(start)
-        end_dt = _parse_start_datetime(end)
+        end_dt = _parse_end_datetime(end)
         if not start_dt or not end_dt:
             return None, "Invalid start/end date format."
         if start_dt > end_dt:
@@ -875,7 +877,7 @@ def _fetch_rates(
         return rates, None
 
     if end:
-        end_dt = _parse_start_datetime(end)
+        end_dt = _parse_end_datetime(end)
         if not end_dt:
             return None, "Invalid end date format."
         rates = _mt5_copy_rates_from(symbol, mt5_tf, end_dt, int(limit))
@@ -1443,6 +1445,11 @@ def temporal_analyze(  # noqa: C901
                 "end": end_str,
                 "filters": filters,
                 "overall": overall,
+                "overall_basis": (
+                    "full_filtered_sample_before_per_dimension_group_exclusions"
+                    if group_norm == "all"
+                    else "sample_after_group_exclusions"
+                ),
                 "volume_source": volume_col,
             }
             if lookback_defaulted:
@@ -1480,10 +1487,17 @@ def temporal_analyze(  # noqa: C901
                 payload.update(sample_context)
             if excluded_groups:
                 payload["excluded_groups"] = excluded_groups
-                payload["warnings"] = [
-                    "Sparse temporal groups below min_bars were excluded from "
-                    "grouped results and overall summary."
-                ]
+                if group_norm == "all":
+                    payload["warnings"] = [
+                        "Sparse temporal groups below min_bars were excluded from "
+                        "their grouped breakdowns only; overall statistics use the "
+                        "full filtered sample."
+                    ]
+                else:
+                    payload["warnings"] = [
+                        "Sparse temporal groups below min_bars were excluded from "
+                        "grouped results and overall statistics."
+                    ]
             if grouped_dimensions:
                 payload["groups"] = grouped_dimensions
             elif groups_out:

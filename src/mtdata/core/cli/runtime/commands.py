@@ -197,11 +197,55 @@ _SIMPLIFY_METHOD_DESCRIPTIONS = {
 }
 
 
+def friendly_validation_error(exc: ValidationError, *, cmd_name: str) -> str:
+    """Render Pydantic validation failures without framework internals."""
+    try:
+        errors = exc.errors()
+    except Exception:
+        return str(exc)
+    messages: List[str] = []
+    for item in errors:
+        loc = ".".join(str(part) for part in item.get("loc", ()))
+        msg = str(item.get("msg") or "Invalid value.")
+        if cmd_name == "forecast_generate" and loc == "horizon":
+            return "horizon must be between 1 and 500."
+        if cmd_name == "wait_event" and loc.split(".", 1)[0] in {"watch_for", "end_on"}:
+            return (
+                "wait_event watch_for/end_on must be arrays of event objects. "
+                "Example: --watch-for '[{\"type\":\"price_change\","
+                "\"threshold_value\":0.1,\"threshold_mode\":\"fixed_pct\"}]' "
+                "--end-on '[{\"type\":\"candle_close\",\"timeframe\":\"M1\"}]'."
+            )
+        if cmd_name == "trade_stress_test" and loc.split(".", 1)[0] == "shocks":
+            return (
+                "shocks must be a JSON object mapping symbols to percentage shocks. "
+                "Examples: '{\"*\":-2}' or '{\"EURUSD\":-1,\"XAUUSD\":-3}'."
+            )
+        if "indicators" in loc and "params" in loc and any(
+            marker in msg.lower()
+            for marker in ("list", "dict", "dictionary", "mapping", "valid")
+        ):
+            return (
+                "'params' must be a list of numeric values like [14] "
+                'or a named numeric map like {"length": 14}.'
+            )
+        if loc.endswith("simplify.method") and (
+            "input should be" in msg.lower() or "literal" in msg.lower()
+        ):
+            choices = ", ".join(
+                f"{name} ({description})"
+                for name, description in _SIMPLIFY_METHOD_DESCRIPTIONS.items()
+            )
+            return f"simplify.method must be one of: {choices}."
+        messages.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(messages) or str(exc)
+
+
 def create_command_function(  # noqa: C901
     func_info: Dict[str, Any],
     *,
     cmd_name: str,
-    render_cli_result: Callable[..., None],
+    render_cli_result: Callable[..., Any],
     result_has_tool_error: Callable[[Any], bool],
     normalize_cli_list_value: Callable[[Any], Any],
     parse_kv_string: Callable[[str], Optional[Dict[str, Any]]],
@@ -301,39 +345,7 @@ def create_command_function(  # noqa: C901
         return value
 
     def _friendly_validation_error(exc: ValidationError) -> str:
-        try:
-            errors = exc.errors()
-        except Exception:
-            return str(exc)
-        messages: List[str] = []
-        for item in errors:
-            loc = ".".join(str(part) for part in item.get("loc", ()))
-            msg = str(item.get("msg") or "Invalid value.")
-            if cmd_name == "wait_event" and loc.split(".", 1)[0] in {"watch_for", "end_on"}:
-                return (
-                    "wait_event watch_for/end_on must be arrays of event objects. "
-                    "Example: --watch-for '[{\"type\":\"price_change\","
-                    "\"threshold_value\":0.1,\"threshold_mode\":\"fixed_pct\"}]' "
-                    "--end-on '[{\"type\":\"candle_close\",\"timeframe\":\"M1\"}]'."
-                )
-            if "indicators" in loc and "params" in loc and any(
-                marker in msg.lower() for marker in ("list", "dict", "dictionary", "mapping", "valid")
-            ):
-                return (
-                    "'params' must be a list of numeric values like [14] "
-                    'or a named numeric map like {"length": 14}.'
-                )
-            if loc.endswith("simplify.method") and ("input should be" in msg.lower() or "literal" in msg.lower()):
-                choices = ", ".join(
-                    f"{name} ({description})"
-                    for name, description in _SIMPLIFY_METHOD_DESCRIPTIONS.items()
-                )
-                return f"simplify.method must be one of: {choices}."
-            if loc:
-                messages.append(f"{loc}: {msg}")
-            else:
-                messages.append(msg)
-        return "; ".join(messages) or str(exc)
+        return friendly_validation_error(exc, cmd_name=cmd_name)
 
     def command_func(args: Any) -> int:  # noqa: C901
         kwargs: Dict[str, Any] = {}
@@ -374,6 +386,14 @@ def create_command_function(  # noqa: C901
         for param in func_info["params"]:
             param_name = param["name"]
             arg_value = getattr(args, param_name, param["default"])
+
+            if (
+                param_name == "symbols"
+                and cmd_name in {"correlation_matrix", "cointegration_test", "cross_correlation"}
+                and isinstance(arg_value, (list, tuple))
+            ):
+                symbols = [str(value).strip() for value in arg_value if str(value).strip()]
+                arg_value = ",".join(symbols) or None
 
             if param.get("type") is bool and isinstance(arg_value, str):
                 if arg_value.lower() == "true":
@@ -513,7 +533,7 @@ def create_command_function(  # noqa: C901
             )
         else:
             result = func_info["func"](**kwargs)
-        render_cli_result(result, args=args, cmd_name=cmd_name)
-        return 1 if result_has_tool_error(result) else 0
+        rendered_result = render_cli_result(result, args=args, cmd_name=cmd_name)
+        return 1 if result_has_tool_error(rendered_result) else 0
 
     return command_func

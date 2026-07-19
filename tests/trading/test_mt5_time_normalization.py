@@ -81,6 +81,7 @@ def test_adapter_aligns_server_clock_tick_history_to_utc(monkeypatch) -> None:
     )
     Deal = namedtuple("Deal", ["time", "ticket"])
     raw_deal = Deal(time=int(now_epoch + 3 * 60 * 60), ticket=123)
+    position_probe_calls = []
     rows = np.array(
         [(now_epoch + 3 * 60 * 60, 397.4, 397.5)],
         dtype=[("time", float), ("bid", float), ("ask", float)],
@@ -97,10 +98,15 @@ def test_adapter_aligns_server_clock_tick_history_to_utc(monkeypatch) -> None:
         observed_bounds["deals_to"] = dt_to
         return (raw_deal,)
 
+    def positions_get():
+        position_probe_calls.append(True)
+        return ()
+
     module = SimpleNamespace(
         symbol_info_tick=lambda symbol: raw_tick,
         copy_ticks_range=copy_ticks_range,
         history_deals_get=history_deals_get,
+        positions_get=positions_get,
     )
     monkeypatch.setitem(sys.modules, "MetaTrader5", module)
     monkeypatch.setattr(mt5_mod.time, "time", lambda: now_epoch)
@@ -133,7 +139,57 @@ def test_adapter_aligns_server_clock_tick_history_to_utc(monkeypatch) -> None:
     assert float(result[0]["time"]) == now_epoch
     assert observed_bounds["deals_from"] == now_epoch - 60 + 3 * 60 * 60
     assert observed_bounds["deals_to"] == now_epoch + 3 * 60 * 60
+    assert position_probe_calls == []
     assert float(deals[0].time) == now_epoch
+    assert mt5_mod.get_mt5_timestamp_mode("TSLA.NAS-24") == "server_clock"
+
+
+def test_standalone_history_probes_open_position_clock_mode(monkeypatch) -> None:
+    now = datetime(2026, 7, 14, 14, 45, tzinfo=timezone.utc)
+    now_epoch = now.timestamp()
+    Tick = namedtuple("Tick", ["time", "time_msc", "bid", "ask"])
+    Position = namedtuple("Position", ["ticket", "symbol", "time"])
+    Deal = namedtuple("Deal", ["ticket", "symbol", "time"])
+    raw_epoch = int(now_epoch + 3 * 60 * 60)
+    observed_bounds = {}
+
+    def history_deals_get(dt_from, dt_to, **kwargs):
+        observed_bounds["from"] = dt_from
+        observed_bounds["to"] = dt_to
+        return (Deal(2, "TSLA.NAS-24", raw_epoch),)
+
+    module = SimpleNamespace(
+        positions_get=lambda: (Position(1, "TSLA.NAS-24", raw_epoch),),
+        symbol_info_tick=lambda symbol: Tick(
+            raw_epoch,
+            raw_epoch * 1000,
+            397.4,
+            397.5,
+        ),
+        history_deals_get=history_deals_get,
+    )
+    monkeypatch.setitem(sys.modules, "MetaTrader5", module)
+    monkeypatch.setattr(mt5_mod.time, "time", lambda: now_epoch)
+    monkeypatch.setattr(
+        mt5_mod.mt5_config,
+        "get_time_offset_seconds",
+        lambda at_time=None: 3 * 60 * 60,
+    )
+    monkeypatch.setattr(
+        mt5_mod.mt5_config,
+        "get_server_tz",
+        lambda: ZoneInfo("Europe/Nicosia"),
+    )
+    monkeypatch.setattr(mt5_mod.mt5_config, "time_offset_minutes", 0)
+
+    deals = mt5_mod.MT5Adapter().history_deals_get(
+        now_epoch - 60,
+        now_epoch,
+    )
+
+    assert observed_bounds["from"] == now_epoch - 60 + 3 * 60 * 60
+    assert observed_bounds["to"] == now_epoch + 3 * 60 * 60
+    assert deals[0].time == now_epoch
     assert mt5_mod.get_mt5_timestamp_mode("TSLA.NAS-24") == "server_clock"
 
 

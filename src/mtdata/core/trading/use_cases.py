@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from ...bootstrap.settings import trade_guardrails_config
 from ...shared.constants import BROKER_VOLUME_UNIT, TIMEFRAME_MAP
+from ...shared.market_units import price_delta_ticks
 from ...shared.result import Err, Ok, Result, to_dict
 from ...shared.validators import invalid_timeframe_error
 from ...utils.barriers import normalize_trade_direction
@@ -32,12 +33,12 @@ from ..execution_logging import (
 )
 from ..output_contract import resolve_output_contract
 from . import validation
+from .common import build_trade_quote_context
 from .idempotency import (
     IdempotencyStore,
     SQLiteIdempotencyStore,
     create_default_idempotency_store,
 )
-from .sizing import _floor_volume_steps
 from .requests import (
     TradeCloseRequest,
     TradeGetOpenRequest,
@@ -54,7 +55,11 @@ from .safety import (
     evaluate_trade_guardrails,
     preview_trade_guardrails,
 )
-from .sizing import _resolve_risk_tick_value, compute_kelly_sizing_context
+from .sizing import (
+    _floor_volume_steps,
+    _resolve_risk_tick_value,
+    compute_kelly_sizing_context,
+)
 
 logger = logging.getLogger(__name__)
 _DEFAULT_TRADE_HISTORY_LOOKBACK_DAYS = 7
@@ -88,10 +93,7 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "error",
     "error_code",
     "dry_run",
-    "no_action",
     "no_action_reason",
-    "would_send_order",
-    "dry_run_simulated",
     "symbol",
     "order_type",
     "pending",
@@ -119,12 +121,7 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "message",
     "dry_run_note",
     "preview_ok",
-    "validation_passed",
     "validation_scope",
-    "actionability",
-    "validation",
-    "preview_checks_performed",
-    "broker_validation_not_performed",
     "require_sl_tp",
     "auto_close_on_sl_tp_fail",
     "guardrails_enabled",
@@ -135,6 +132,7 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "requested_tp",
     "expiration",
     "expiration_normalized",
+    "quote_context",
 )
 
 
@@ -167,8 +165,15 @@ def _linearized_account_currency_notional(
         return None
     return abs(float(volume)) * float(price) * tick_value / tick_size
 _TRADE_PLACE_BASIC_KEYS = _TRADE_PLACE_PREVIEW_KEYS + (
+    "no_action",
+    "would_send_order",
+    "dry_run_simulated",
+    "validation_passed",
     "actionability",
     "actionability_reason",
+    "validation",
+    "preview_checks_performed",
+    "broker_validation_not_performed",
     "preview_scope_summary",
     "validation_not_performed",
     "warnings",
@@ -528,13 +533,17 @@ def _resolve_live_trade_risk_entry(
     gateway: Any,
     symbol: str,
     direction: Any,
-) -> tuple[float | None, str | None]:
+) -> tuple[float | None, str | None, Dict[str, Any]]:
     try:
         tick = gateway.symbol_info_tick(symbol)
     except Exception:
-        return None, None
+        return None, None, {}
     if tick is None:
-        return None, None
+        return None, None, {}
+
+    quote_context = build_trade_quote_context(symbol, tick)
+    if quote_context.get("usable_for_live_trading") is not True:
+        return None, None, quote_context
 
     bid = _positive_trade_price(getattr(tick, "bid", None))
     ask = _positive_trade_price(getattr(tick, "ask", None))
@@ -546,22 +555,22 @@ def _resolve_live_trade_risk_entry(
 
     if direction_norm == "long":
         if ask is not None:
-            return ask, "live_tick_ask"
+            return ask, "live_tick_ask", quote_context
         if bid is not None:
-            return bid, "live_tick_bid_fallback"
+            return bid, "live_tick_bid_fallback", quote_context
     elif direction_norm == "short":
         if bid is not None:
-            return bid, "live_tick_bid"
+            return bid, "live_tick_bid", quote_context
         if ask is not None:
-            return ask, "live_tick_ask_fallback"
+            return ask, "live_tick_ask_fallback", quote_context
 
     if bid is not None and ask is not None:
-        return (bid + ask) / 2.0, "live_tick_mid"
+        return (bid + ask) / 2.0, "live_tick_mid", quote_context
     if bid is not None:
-        return bid, "live_tick_bid_only"
+        return bid, "live_tick_bid_only", quote_context
     if ask is not None:
-        return ask, "live_tick_ask_only"
-    return None, None
+        return ask, "live_tick_ask_only", quote_context
+    return None, None, quote_context
 
 
 def _validate_trade_risk_levels(
@@ -679,7 +688,9 @@ def _build_trade_evaluation(
         tick_value_loss=tick_value_loss,
     )
     if math.isfinite(tick_size) and tick_size > 0:
-        sl_distance_ticks = sl_distance / tick_size
+        sl_distance_ticks = abs(
+            price_delta_ticks(float(entry), float(stop_loss), tick_size) or 0
+        )
         out["tick_size"] = tick_size
         out["sl_distance_ticks"] = round(sl_distance_ticks, 4)
         if math.isfinite(risk_tick_value) and risk_tick_value > 0:
@@ -720,9 +731,14 @@ _COMPACT_POSITION_SIZING_FIELDS = (
     "status",
     "sizing_method",
     "suggested_volume",
+    "requested_risk_currency",
+    "requested_risk_pct",
     "risk_currency",
     "risk_pct",
+    "risk_shortfall_currency",
+    "risk_shortfall_pct",
     "risk_compliance",
+    "volume_rounding",
     "min_viable_volume",
     "min_viable_risk_currency",
     "min_viable_risk_pct",
@@ -763,6 +779,59 @@ def _compact_trade_risk_position_sizing(
     return compact
 
 
+def _compact_unconfigured_flat_trade_risk_payload(
+    result: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return a direct next-step response for a flat book with no sizing request."""
+    position_sizing = result.get("position_sizing")
+    if not isinstance(position_sizing, dict):
+        return None
+    if position_sizing.get("status") != "parameters_missing":
+        return None
+    if position_sizing.get("provided"):
+        return None
+    required = position_sizing.get("required_for_sizing")
+    missing = position_sizing.get("missing")
+    if not isinstance(required, list) or not isinstance(missing, list):
+        return None
+    if set(required) != set(missing):
+        return None
+
+    scope = result.get("scope")
+    if not isinstance(scope, dict):
+        return None
+    scope_mode = str(scope.get("mode") or "")
+    if scope_mode == "symbol" and scope.get("other_positions") != 0:
+        return None
+    if scope_mode not in {"symbol", "portfolio"}:
+        return None
+
+    risk = result.get("scoped_risk") or result.get("portfolio_risk")
+    if not isinstance(risk, dict):
+        return None
+    if int(risk.get("positions_count") or 0) != 0:
+        return None
+    if int(risk.get("pending_orders_count") or 0) != 0:
+        return None
+    if not isinstance(result.get("positions"), list) or result.get("positions"):
+        return None
+    if not isinstance(result.get("pending_orders"), list) or result.get("pending_orders"):
+        return None
+    if result.get("risk_calculation_failures") or result.get("scope_warning"):
+        return None
+
+    return {
+        key: result[key]
+        for key in ("success", "account", "scope", "risk_visibility")
+        if key in result
+    } | {
+        "book_state": "flat",
+        "book_state_scope": scope_mode,
+        "message": "No open positions or pending orders in the analyzed scope.",
+        "position_sizing": _compact_trade_risk_position_sizing(position_sizing),
+    }
+
+
 def _shape_trade_risk_analyze_payload(
     result: Dict[str, Any],
     *,
@@ -772,6 +841,9 @@ def _shape_trade_risk_analyze_payload(
         return result
     if str(detail).strip().lower() != "compact":
         return result
+    flat_unconfigured = _compact_unconfigured_flat_trade_risk_payload(result)
+    if flat_unconfigured is not None:
+        return flat_unconfigured
     shaped = dict(result)
     position_sizing = shaped.get("position_sizing")
     if isinstance(position_sizing, dict):
@@ -1292,6 +1364,32 @@ def run_trade_place(  # noqa: C901
                         take_profit=request.take_profit,
                     )
                 )
+            quote_context = preview.get("quote_context")
+            if (
+                isinstance(quote_context, dict)
+                and quote_context.get("usable_for_live_trading") is not True
+            ):
+                validation_payload = preview.get("validation")
+                if isinstance(validation_payload, dict):
+                    validation_payload["live_submission_eligible"] = False
+                    blockers = validation_payload.setdefault("blockers", [])
+                    if "quote_not_live_ready" not in blockers:
+                        blockers.append("quote_not_live_ready")
+                preview["validation_passed"] = False
+                preview["preview_ok"] = False
+                preview["actionability"] = "blocked_by_quote_freshness"
+                preview["actionability_reason"] = (
+                    "Quote freshness is not verified as live; refresh the quote "
+                    "before using this preview for submission."
+                )
+                quote_warning = str(
+                    quote_context.get("timestamp_warning")
+                    or quote_context.get("warning")
+                    or "Quote is not usable for live trading."
+                )
+                warnings_out = preview.setdefault("warnings", [])
+                if quote_warning not in warnings_out:
+                    warnings_out.append(quote_warning)
             sl_tp_valid = preview.get("sl_tp_valid")
             try:
                 sl_tp_invalid = sl_tp_valid is not None and not bool(sl_tp_valid)
@@ -2405,6 +2503,7 @@ def run_trade_history(  # noqa: C901
     format_time_minimal: Any,
     format_time_minimal_local: Any,
     mt5_epoch_to_utc: Any,
+    parse_end_datetime: Any,
     parse_start_datetime: Any,
     normalize_limit: Any,
     comment_row_metadata: Any,
@@ -2529,7 +2628,7 @@ def run_trade_history(  # noqa: C901
                 return {"error": minutes_back_error}
 
             if request.end:
-                to_dt = parse_start_datetime(request.end)
+                to_dt = parse_end_datetime(request.end)
                 if not to_dt:
                     return {"error": "Invalid end time."}
             else:
@@ -3088,11 +3187,11 @@ def run_trade_risk_analyze(  # noqa: C901
 
                     if sl_price and tick_size > 0 and tick_value_valid:
                         risk_ticks = (
-                            (entry_price - sl_price) / tick_size
+                            price_delta_ticks(entry_price, sl_price, tick_size)
                             if is_buy_position
-                            else (sl_price - entry_price) / tick_size
+                            else price_delta_ticks(sl_price, entry_price, tick_size)
                         )
-                        risk_ticks = max(0.0, risk_ticks)
+                        risk_ticks = max(0, risk_ticks or 0)
                         risk_currency = risk_ticks * risk_tick_value * abs(volume)
                         risk_pct = (
                             (risk_currency / equity) * 100.0 if equity > 0 else 0.0
@@ -3102,11 +3201,11 @@ def run_trade_risk_analyze(  # noqa: C901
 
                         if tp_price:
                             reward_ticks = (
-                                (tp_price - entry_price) / tick_size
+                                price_delta_ticks(tp_price, entry_price, tick_size)
                                 if is_buy_position
-                                else (entry_price - tp_price) / tick_size
+                                else price_delta_ticks(entry_price, tp_price, tick_size)
                             )
-                            if reward_ticks > 0:
+                            if reward_ticks is not None and reward_ticks > 0:
                                 reward_currency = (
                                     reward_ticks * tick_value * abs(volume)
                                 )
@@ -3263,21 +3362,21 @@ def run_trade_risk_analyze(  # noqa: C901
                         risk_status = "undefined"
                         if entry_price > 0 and sl_price and tick_size > 0 and tick_value_valid and direction_label != "UNKNOWN":
                             risk_ticks = (
-                                (entry_price - sl_price) / tick_size
+                                price_delta_ticks(entry_price, sl_price, tick_size)
                                 if is_buy_order
-                                else (sl_price - entry_price) / tick_size
+                                else price_delta_ticks(sl_price, entry_price, tick_size)
                             )
-                            risk_currency = abs(risk_ticks * risk_tick_value * volume)
+                            risk_currency = abs((risk_ticks or 0) * risk_tick_value * volume)
                             risk_pct = (risk_currency / equity) * 100.0 if equity > 0 else 0.0
                             total_pending_risk_currency += risk_currency
                             risk_status = "defined"
                             if tp_price:
                                 reward_ticks = (
-                                    (tp_price - entry_price) / tick_size
+                                    price_delta_ticks(tp_price, entry_price, tick_size)
                                     if is_buy_order
-                                    else (entry_price - tp_price) / tick_size
+                                    else price_delta_ticks(entry_price, tp_price, tick_size)
                                 )
-                                if reward_ticks > 0:
+                                if reward_ticks is not None and reward_ticks > 0:
                                     reward_currency = (
                                         reward_ticks * tick_value * abs(volume)
                                     )
@@ -3437,9 +3536,8 @@ def run_trade_risk_analyze(  # noqa: C901
                     "contract_price_product": "contract_size_times_price",
                 },
             }
-            portfolio_sizing_blocked = False
+            other_positions_count: Optional[int] = None
             if request.symbol:
-                other_positions_count = None
                 if portfolio_positions_total is not None:
                     other_positions_count = max(
                         0,
@@ -3466,7 +3564,6 @@ def run_trade_risk_analyze(  # noqa: C901
                     "partial" if other_positions_count else "symbol_scope"
                 )
                 if other_positions_count:
-                    portfolio_sizing_blocked = True
                     scoped_risk["overall_risk_status"] = "partial"
                     scoped_risk["quantified_risk_level"] = "unknown"
                     result["scope_warning"] = (
@@ -3478,6 +3575,21 @@ def run_trade_risk_analyze(  # noqa: C901
                             f"{int(other_positions_count)} open position(s) exist on other symbols."
                         )
                     )
+                result["sizing_risk_policy"] = {
+                    "mode": "incremental_candidate_risk",
+                    "risk_target_basis": "percent_of_account_equity",
+                    "candidate_symbol": str(request.symbol),
+                    "account_margin_context_included": True,
+                    "existing_portfolio_stop_risk_included": not bool(
+                        other_positions_count
+                    ),
+                    "portfolio_positions": int(portfolio_positions_total or 0),
+                    "other_positions": int(other_positions_count or 0),
+                    "note": (
+                        "Suggested volume limits this candidate trade's stop risk; "
+                        "it does not cap aggregate portfolio stop risk."
+                    ),
+                }
             else:
                 result["risk_visibility"] = "portfolio"
                 result["scope"] = {
@@ -3502,16 +3614,23 @@ def run_trade_risk_analyze(  # noqa: C901
             )
 
             entry_source = None
+            live_quote_context: Dict[str, Any] = {}
             if (
                 request.entry is None
                 and request.symbol
                 and request.stop_loss is not None
             ):
-                live_entry, live_entry_source = _resolve_live_trade_risk_entry(
+                (
+                    live_entry,
+                    live_entry_source,
+                    live_quote_context,
+                ) = _resolve_live_trade_risk_entry(
                     gateway=gateway,
                     symbol=request.symbol,
                     direction=request.direction,
                 )
+                if live_quote_context:
+                    result["quote_context"] = live_quote_context
                 if live_entry is not None:
                     request.entry = float(live_entry)
                     entry_source = live_entry_source or "live_tick"
@@ -3596,7 +3715,7 @@ def run_trade_risk_analyze(  # noqa: C901
                         if value is not None
                     ]
                     _missing_msg = (
-                        "Portfolio risk analysis completed. Position sizing is "
+                        "Risk analysis completed. Position sizing is "
                         "available when you provide "
                         + _human_join(
                             [
@@ -3679,15 +3798,8 @@ def run_trade_risk_analyze(  # noqa: C901
                     )
                 )
             )
-            if sizing_ready and (
-                portfolio_sizing_blocked
-                or margin_stress["status"] == "critical"
-            ):
-                block_reason = (
-                    "Symbol scope hides open positions on other symbols."
-                    if portfolio_sizing_blocked
-                    else "Account margin stress is critical."
-                )
+            if sizing_ready and margin_stress["status"] == "critical":
+                block_reason = "Account margin stress is critical."
                 result["position_sizing_error"] = _build_position_sizing_error(
                     code="portfolio_safety_block",
                     reason=block_reason,
@@ -3696,7 +3808,6 @@ def run_trade_risk_analyze(  # noqa: C901
                         "before sizing a new trade."
                     ),
                     details={
-                        "risk_visibility": result.get("risk_visibility"),
                         "margin_stress": margin_stress,
                     },
                 )
@@ -3784,13 +3895,20 @@ def run_trade_risk_analyze(  # noqa: C901
                     return result
 
                 if entry_was_omitted:
-                    directional_entry, directional_source = (
+                    (
+                        directional_entry,
+                        directional_source,
+                        directional_quote_context,
+                    ) = (
                         _resolve_live_trade_risk_entry(
                             gateway=gateway,
                             symbol=request.symbol,
                             direction=direction_norm,
                         )
                     )
+                    if directional_quote_context:
+                        live_quote_context = directional_quote_context
+                        result["quote_context"] = directional_quote_context
                     if directional_entry is not None:
                         request.entry = float(directional_entry)
                         entry_source = directional_source or "live_tick"
@@ -3820,14 +3938,18 @@ def run_trade_risk_analyze(  # noqa: C901
                     return result
 
                 if direction_norm == "long":
-                    sl_distance_ticks = (
-                        request.entry - request.stop_loss
-                    ) / tick_size
+                    sl_distance_ticks = price_delta_ticks(
+                        request.entry,
+                        request.stop_loss,
+                        tick_size,
+                    )
                 else:
-                    sl_distance_ticks = (
-                        request.stop_loss - request.entry
-                    ) / tick_size
-                if sl_distance_ticks > 0:
+                    sl_distance_ticks = price_delta_ticks(
+                        request.stop_loss,
+                        request.entry,
+                        tick_size,
+                    )
+                if sl_distance_ticks is not None and sl_distance_ticks > 0:
                     kelly_context = None
                     if sizing_method == "kelly":
                         effective_risk_pct_raw, kelly_context = (
@@ -4041,15 +4163,19 @@ def run_trade_risk_analyze(  # noqa: C901
                     reward_currency = None
                     if request.take_profit is not None and not strict_risk_blocked:
                         if direction_norm == "long":
-                            tp_distance_ticks = (
-                                request.take_profit - request.entry
-                            ) / tick_size
+                            tp_distance_ticks = price_delta_ticks(
+                                request.take_profit,
+                                request.entry,
+                                tick_size,
+                            )
                         else:
-                            tp_distance_ticks = (
-                                request.entry - request.take_profit
-                            ) / tick_size
+                            tp_distance_ticks = price_delta_ticks(
+                                request.entry,
+                                request.take_profit,
+                                tick_size,
+                            )
                         reward_currency = (
-                            tp_distance_ticks * tick_value * suggested_volume
+                            (tp_distance_ticks or 0) * tick_value * suggested_volume
                         )
                         if actual_risk > 0:
                             rr_ratio = reward_currency / actual_risk
@@ -4103,6 +4229,12 @@ def run_trade_risk_analyze(  # noqa: C901
                             else "within_requested_risk"
                         )
                     )
+                    shortfall_pct = max(
+                        0.0, effective_risk_pct - float(actual_risk_pct)
+                    )
+                    shortfall_currency = max(
+                        0.0, float(risk_amount) - float(actual_risk)
+                    )
                     result["position_sizing"] = {
                         "symbol": request.symbol,
                         "direction": direction_norm,
@@ -4137,6 +4269,8 @@ def run_trade_risk_analyze(  # noqa: C901
                         "risk_compliance": risk_compliance,
                         "risk_overshoot_pct": round(overshoot_pct, 2),
                         "risk_overshoot_currency": round(overshoot_currency, 2),
+                        "risk_shortfall_pct": round(shortfall_pct, 2),
+                        "risk_shortfall_currency": round(shortfall_currency, 2),
                         "risk_over_target_reason": overshoot_reason,
                         "raw_volume": round(raw_volume, 8),
                         "volume_step": volume_step,
@@ -4175,6 +4309,11 @@ def run_trade_risk_analyze(  # noqa: C901
                         **({"margin_impact": margin_impact} if margin_impact else {}),
                         "sizing_notes": sizing_notes,
                     }
+                    if other_positions_count:
+                        result["position_sizing"]["sizing_notes"].append(
+                            "Other-symbol positions are present; this is incremental "
+                            "candidate sizing, not an aggregate portfolio risk cap."
+                        )
                     if strict_risk_blocked:
                         result["position_sizing"].update(
                             {
