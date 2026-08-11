@@ -1,0 +1,6 @@
+Prompt
+
+Read mtdata_EA_Research_Plan.md in full before doing anything — it governs this entire project, especially the hard boundary and the kill-criteria. Confirm you've read it by summarising the boundary rule and the six kill criteria back to me in your own words.
+The MCP is connected to a confirmed demo account. Even though trade_* write tools are available, do not use any of them for this entire project — this is a research pipeline, and every finding must come from historical analysis, not from placed trades. Demo fills don't model real slippage or spread, so a live trade would tell us less than a properly-costed backtest, and a handful of trades can't clear the statistical-significance bar the plan requires. Use only data_*, regime_*, temporal_*, correlation_*, cointegration_*, forecast_*, patterns_*, market_scan.
+Now do just Stage 1: help me define the constraints — propose an instrument set, and walk me through picking one target strategy family for this first pass. The plan recommends statistical pairs (cointegration); tell me whether you agree given what tooling mtdata actually exposes, and why. Stop after Stage 1 — don't run scans or touch Stage 2+ until I approve the constraints.
+
