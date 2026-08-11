@@ -53,7 +53,7 @@ from .forecast_validation import (
     attach_denoise_causality_disclosure,
     format_invalid_method_error,
 )
-from .interface import ForecastCallContext
+from .interface import ArtifactCompatibilityError, ForecastCallContext
 
 if TYPE_CHECKING:
     from .interface import ForecastMethod
@@ -68,7 +68,10 @@ class _AsyncTrainingStarted(Exception):
         super().__init__("async training started")
 
 
-from .forecast_registry import ForecastRegistry
+from .forecast_registry import (
+    ForecastRegistry,
+    get_forecast_method_availability_snapshot,
+)
 from .target_builder import build_target_series, resolve_alias_base
 
 _ENSEMBLE_BASE_METHODS = (
@@ -235,7 +238,12 @@ def _prepare_ensemble_cv(
 
 # Supported forecast methods - dynamically fetch from registry
 def _get_available_methods():
-    return tuple(ForecastRegistry.get_all_method_names())
+    availability = get_forecast_method_availability_snapshot()
+    return tuple(
+        method
+        for method in ForecastRegistry.get_all_method_names()
+        if availability.get(method, False)
+    )
 
 
 
@@ -266,6 +274,23 @@ def _calculate_lookback_bars(method_l: str, horizon: int, lookback: Optional[int
     if lookback is not None and lookback > 0:
         return int(lookback) + 2
 
+    if method_l == 'ensemble':
+        p = dict(params or {})
+        mode = str(p.get('mode', 'average')).lower().strip()
+        if mode in ('rmse_weighted', 'stacking'):
+            methods = p.get('methods')
+            if isinstance(methods, str):
+                method_count = len(
+                    [item for item in methods.split(',') if item.strip()]
+                )
+            elif isinstance(methods, (list, tuple)):
+                method_count = len(methods)
+            else:
+                method_count = 3
+            cv_points = int(p.get('cv_points', max(6, method_count * 2)))
+            min_train = int(p.get('min_train_size', max(30, int(horizon) * 3)))
+            return max(100, min_train + int(horizon) + cv_points + 2)
+        return max(100, int(horizon) + 10)
     if method_l == 'seasonal_naive':
         return max(3 * seasonality, int(horizon) + seasonality + 2)
     elif method_l in ('theta', 'fourier_ols'):
@@ -293,15 +318,12 @@ def _resolve_history_context(
         base_col = prefetched_base_col or ('close_dn' if 'close_dn' in df.columns else 'close')
         dn_spec_used = None
         if prefetched_denoise_spec:
-            try:
-                dn_spec_used = _normalize_denoise_spec(prefetched_denoise_spec, default_when='pre_ti')
-            except Exception:
-                dn_spec_used = None
+            dn_spec_used = _normalize_denoise_spec(
+                prefetched_denoise_spec,
+                default_when='pre_ti',
+            )
         elif denoise:
-            try:
-                normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
-            except Exception:
-                normalized = None
+            normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
             added = apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
             dn_spec_used = normalized
             if len(added) > 0 and base_col == 'close' and f"{base_col}_dn" in added:
@@ -320,10 +342,7 @@ def _resolve_history_context(
     base_col = 'close'
     dn_spec_used = None
     if denoise:
-        try:
-            normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
-        except Exception:
-            normalized = None
+        normalized = _normalize_denoise_spec(denoise, default_when='pre_ti')
         added = apply_denoise(df, normalized, default_when='pre_ti') if normalized else []
         dn_spec_used = normalized
         if len(added) > 0 and f"{base_col}_dn" in added:
@@ -422,6 +441,80 @@ def _reconstruct_prices_from_target(
     return np.asarray(reconstructed, dtype=float)
 
 
+def _reconstruct_price_intervals_from_target(
+    forecast_values: np.ndarray,
+    ci_values: Tuple[np.ndarray, np.ndarray],
+    reconstructed_prices: np.ndarray,
+    price_history: Optional[np.ndarray],
+    target_info: Optional[Dict[str, Any]],
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Map marginal target intervals to cumulative price uncertainty.
+
+    Return/difference bounds describe uncertainty at each forecast step. Treating
+    every lower (or upper) bound as a path compounds the same confidence tail at
+    every horizon and greatly overstates long-horizon width. Independent marginal
+    errors instead accumulate in variance space along each transform lag chain.
+    """
+    point = np.asarray(forecast_values, dtype=float).reshape(-1)
+    lower = np.asarray(ci_values[0], dtype=float).reshape(-1)
+    upper = np.asarray(ci_values[1], dtype=float).reshape(-1)
+    prices = np.asarray(reconstructed_prices, dtype=float).reshape(-1)
+    if not (point.size == lower.size == upper.size == prices.size):
+        return None
+
+    transform = str((target_info or {}).get("transform", "none")).strip().lower()
+    base_transform = transform.split("(", 1)[0]
+    if base_transform in {"none", "log"}:
+        lower_prices = _reconstruct_prices_from_target(
+            lower, price_history, target_info
+        )
+        upper_prices = _reconstruct_prices_from_target(
+            upper, price_history, target_info
+        )
+        if lower_prices is None or upper_prices is None:
+            return None
+        return lower_prices, upper_prices
+
+    lag = 1
+    if "(k=" in transform:
+        try:
+            lag = max(1, int(transform.rsplit("(k=", 1)[1].rstrip(") ")))
+        except Exception:
+            lag = 1
+
+    if base_transform == "log_return":
+        lower_step = point - lower
+        upper_step = upper - point
+        multiplicative = True
+    elif base_transform in {"return", "pct_change", "pct"}:
+        scale = 100.0 if base_transform == "pct" else 1.0
+        point_factor = 1.0 + point / scale
+        lower_factor = 1.0 + lower / scale
+        upper_factor = 1.0 + upper / scale
+        if np.any(point_factor <= 0) or np.any(lower_factor <= 0) or np.any(upper_factor <= 0):
+            return None
+        lower_step = np.log(point_factor / lower_factor)
+        upper_step = np.log(upper_factor / point_factor)
+        multiplicative = True
+    elif base_transform == "diff":
+        lower_step = point - lower
+        upper_step = upper - point
+        multiplicative = False
+    else:
+        return None
+
+    lower_variance = np.square(np.maximum(lower_step, 0.0))
+    upper_variance = np.square(np.maximum(upper_step, 0.0))
+    for index in range(lag, point.size):
+        lower_variance[index] += lower_variance[index - lag]
+        upper_variance[index] += upper_variance[index - lag]
+    lower_width = np.sqrt(lower_variance)
+    upper_width = np.sqrt(upper_variance)
+    if multiplicative:
+        return prices * np.exp(-lower_width), prices * np.exp(upper_width)
+    return prices - lower_width, prices + upper_width
+
+
 def _inverse_log_return(anchor: float, value: float) -> float:
     """log_return: price = anchor * exp(value)"""
     return anchor * float(np.exp(value))
@@ -462,6 +555,7 @@ def _prepare_feature_context(
     target_series: pd.Series,
     dimred_method: Optional[str],
     dimred_params: Optional[Dict[str, Any]],
+    timeframe: str = "",
     symbol: Optional[str] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]:
     """Prepare training and future exogenous features if requested."""
@@ -474,6 +568,7 @@ def _prepare_feature_context(
             int(tf_secs),
             int(horizon),
             skip_weekends=uses_standard_weekend_projection(symbol, int(tf_secs)),
+            timeframe=timeframe,
         )
         try:
             X, built_future_exog, feat_info = _forecast_preprocessing.prepare_features(
@@ -564,6 +659,7 @@ def build_training_context(
         tf_secs=int(tf_secs),
         horizon=int(horizon),
         target_series=target_series,
+        timeframe=timeframe,
         dimred_method=dimred_method,
         dimred_params=dimred_params,
         symbol=symbol,
@@ -578,6 +674,7 @@ def build_training_context(
         df=df,
         target_series=target_series,
         base_col=base_col,
+        quantity=quantity_l,
         denoise=denoise,
         features=features,
         target_spec=target_spec,
@@ -635,6 +732,31 @@ def _build_engine_diagnostics(
     return diagnostics
 
 
+def _forecast_history_sample_quality(
+    *,
+    method: str,
+    horizon: int,
+    history_bars: int,
+) -> Dict[str, Any]:
+    recommended = max(30, 3 * max(1, int(horizon)))
+    bars = max(0, int(history_bars))
+    sample_ok = bars >= recommended
+    out: Dict[str, Any] = {
+        "history_sample_ok": sample_ok,
+        "forecast_reliability": "adequate" if sample_ok else "low",
+        "recommended_history_bars": recommended,
+    }
+    if not sample_ok:
+        out["forecast_reliability_reason"] = "below_recommended_history"
+        out["history_shortfall_bars"] = recommended - bars
+        out["warning"] = (
+            f"Low-history forecast: method '{method}' used {bars} bars; at least "
+            f"{recommended} are recommended for horizon {int(horizon)}. Treat the "
+            "result as exploratory and validate it with forecast_backtest_run."
+        )
+    return out
+
+
 def _compute_model_key(
     forecaster: "ForecastMethod",
     method_l: str,
@@ -674,12 +796,13 @@ def _training_context_fingerprint(
     df: pd.DataFrame,
     target_series: pd.Series,
     base_col: str,
+    quantity: str,
     denoise: Any,
     features: Any,
     target_spec: Any,
     exog: Optional[np.ndarray],
 ) -> Dict[str, Any]:
-    return {
+    fingerprint = {
         "target_points": int(len(target_series)),
         "history_start_epoch": float(df["time"].iloc[0]),
         "training_end_epoch": float(df["time"].iloc[-1]),
@@ -687,8 +810,22 @@ def _training_context_fingerprint(
         "denoise": _stable_training_value(denoise),
         "features": _stable_training_value(features),
         "target_spec": _stable_training_value(target_spec),
-        "exog_shape": list(exog.shape) if exog is not None else None,
+        "exog_columns": int(exog.shape[1]) if exog is not None and exog.ndim > 1 else 0,
     }
+    target_transform = (
+        str(target_spec.get("transform") or "").strip().lower()
+        if isinstance(target_spec, dict)
+        else ""
+    )
+    if str(quantity).strip().lower() == "return" or target_transform in {
+        "log",
+        "log_return",
+        "pct",
+        "pct_change",
+        "return",
+    }:
+        fingerprint["invalid_target_value_policy"] = "mask_v1"
+    return fingerprint
 
 
 def _params_hash_from_model_id(
@@ -712,7 +849,7 @@ def _params_hash_from_model_id(
     return params_hash
 
 
-def _try_predict_with_stored_model(
+def _try_predict_with_stored_model(  # noqa: C901
     forecaster: "ForecastMethod",
     method_l: str,
     data_scope: str,
@@ -724,6 +861,11 @@ def _try_predict_with_stored_model(
     future_exog: Optional[np.ndarray],
     call_kwargs: Dict[str, Any],
     current_anchor_epoch: Optional[float] = None,
+    *,
+    require_exact_anchor: bool = False,
+    timeframe_seconds: Optional[int] = None,
+    max_staleness_bars: Optional[int] = None,
+    rejection: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]]:
     """Attempt to load a trained model and predict. Returns None if no model found."""
     try:
@@ -731,20 +873,79 @@ def _try_predict_with_stored_model(
         from .model_store import model_store as _store
         handle = _store.find(method_l, data_scope, params_hash)
         if handle is None:
+            if rejection is not None:
+                rejection.update({"reason": "not_found"})
             return None
+        trained_anchor: Optional[float] = None
         if current_anchor_epoch is not None:
             training_context = handle.metadata.get("training_context")
             if not isinstance(training_context, dict):
-                return None
-            trained_anchor = training_context.get("training_end_epoch")
-            try:
-                anchor_matches = abs(
-                    float(trained_anchor) - float(current_anchor_epoch)
-                ) < 1e-6
-            except (TypeError, ValueError):
-                anchor_matches = False
-            if not anchor_matches:
-                return None
+                if require_exact_anchor:
+                    if rejection is not None:
+                        rejection.update(
+                            {
+                                "reason": "missing_training_anchor",
+                                "model_id": handle.model_id,
+                            }
+                        )
+                    return None
+            else:
+                try:
+                    trained_anchor = float(training_context.get("training_end_epoch"))
+                    requested_anchor = float(current_anchor_epoch)
+                except (TypeError, ValueError):
+                    trained_anchor = None
+                if trained_anchor is None:
+                    if require_exact_anchor:
+                        if rejection is not None:
+                            rejection.update(
+                                {
+                                    "reason": "missing_training_anchor",
+                                    "model_id": handle.model_id,
+                                }
+                            )
+                        return None
+                elif trained_anchor > requested_anchor + 1e-6:
+                    if rejection is not None:
+                        rejection.update(
+                            {
+                                "reason": "trained_after_requested_anchor",
+                                "model_id": handle.model_id,
+                                "trained_anchor_epoch": trained_anchor,
+                                "requested_anchor_epoch": requested_anchor,
+                            }
+                        )
+                    return None
+                elif require_exact_anchor and abs(trained_anchor - requested_anchor) >= 1e-6:
+                    if rejection is not None:
+                        rejection.update(
+                            {
+                                "reason": "historical_anchor_mismatch",
+                                "model_id": handle.model_id,
+                                "trained_anchor_epoch": trained_anchor,
+                                "requested_anchor_epoch": requested_anchor,
+                            }
+                        )
+                    return None
+                elif (
+                    not require_exact_anchor
+                    and timeframe_seconds is not None
+                    and int(timeframe_seconds) > 0
+                    and max_staleness_bars is not None
+                    and (requested_anchor - trained_anchor) / float(timeframe_seconds)
+                    > float(max_staleness_bars)
+                ):
+                    if rejection is not None:
+                        rejection.update(
+                            {
+                                "reason": "model_staleness_limit_exceeded",
+                                "model_id": handle.model_id,
+                                "trained_anchor_epoch": trained_anchor,
+                                "requested_anchor_epoch": requested_anchor,
+                                "max_staleness_bars": int(max_staleness_bars),
+                            }
+                        )
+                    return None
         raw = _store.load_bytes(handle.model_id)
         if raw is None:
             return None
@@ -758,6 +959,7 @@ def _try_predict_with_stored_model(
             exog_future=future_exog,
             **call_kwargs,
         )
+        _store.mark_used(handle.model_id)
         metadata = res.metadata or {}
         metadata['params_used'] = res.params_used
         model_info = {
@@ -765,7 +967,18 @@ def _try_predict_with_stored_model(
             'trained_at': handle.created_at,
             'data_scope': handle.data_scope,
             'source': 'model_store',
+            'reuse_policy': (
+                'exact_training_anchor' if require_exact_anchor else 'live_latest_artifact'
+            ),
         }
+        if trained_anchor is not None and current_anchor_epoch is not None:
+            staleness_seconds = max(0.0, float(current_anchor_epoch) - trained_anchor)
+            model_info["training_end_epoch"] = trained_anchor
+            model_info["model_staleness_seconds"] = staleness_seconds
+            if timeframe_seconds is not None and int(timeframe_seconds) > 0:
+                model_info["model_staleness_bars"] = round(
+                    staleness_seconds / float(timeframe_seconds), 4
+                )
         try:
             compatibility = describe_store_metadata_compatibility(handle.store_metadata)
         except Exception as compat_exc:
@@ -788,6 +1001,21 @@ def _try_predict_with_stored_model(
                     metadata["warnings"] = warnings
         metadata['model_info'] = model_info
         return res.forecast, res.ci_values, metadata
+    except ArtifactCompatibilityError as exc:
+        logger.warning(
+            "Stored model rejected for %s/%s: %s",
+            method_l,
+            data_scope,
+            exc,
+        )
+        if rejection is not None:
+            rejection.update(
+                {
+                    "reason": "artifact_runtime_incompatible",
+                    "message": str(exc),
+                }
+            )
+        return None
     except Exception as exc:
         logger.debug("Model store predict failed for %s/%s: %s", method_l, data_scope, exc)
         return None
@@ -866,10 +1094,20 @@ def _run_registered_forecast_method(
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, Any]]:
     forecaster = ForecastRegistry.get(method_l)
     method_params = dict(params)
-    if ci_alpha is not None and 'ci_alpha' not in method_params:
+    declared_params = getattr(forecaster, "PARAMS", ())
+    accepts_ci_param = any(
+        isinstance(spec, dict) and spec.get("name") == "ci_alpha"
+        for spec in declared_params
+    )
+    if ci_alpha is not None and accepts_ci_param and 'ci_alpha' not in method_params:
         method_params['ci_alpha'] = ci_alpha
     requested_model_id = str(model_id or "").strip()
     supports_training = bool(getattr(forecaster, 'supports_training', False))
+    if async_mode and not supports_training:
+        raise ValueError(
+            f"async_mode is not supported for non-trainable method '{method_l}'. "
+            "Omit async_mode or select a trainable method."
+        )
     if requested_model_id and not supports_training:
         raise ValueError(
             f"model_id '{requested_model_id}' was provided, but method "
@@ -921,37 +1159,70 @@ def _run_registered_forecast_method(
             df=df,
             target_series=target_series,
             base_col=base_col,
+            quantity=quantity_l,
             denoise=denoise_spec_used,
             features=features,
             target_spec=target_spec,
             exog=X,
         )
-        params_hash = (
-            _params_hash_from_model_id(
+        expected_params_hash = _compute_model_key(
+            forecaster, method_l, horizon, seasonality,
+            training_params, str(timeframe), has_exog,
+        )
+        if requested_model_id:
+            supplied_params_hash = _params_hash_from_model_id(
                 requested_model_id,
                 method=method_l,
                 data_scope=data_scope,
             )
-            if requested_model_id
-            else _compute_model_key(
-                forecaster, method_l, horizon, seasonality,
-                training_params, str(timeframe), has_exog,
-            )
-        )
+            if supplied_params_hash != expected_params_hash:
+                raise ValueError(
+                    f"model_id '{requested_model_id}' is incompatible with the "
+                    "current horizon, seasonality, timeframe, target, features, "
+                    "or training parameters."
+                )
+            params_hash = supplied_params_hash
+        else:
+            params_hash = expected_params_hash
 
+        model_rejection: Dict[str, Any] = {}
+        live_model_update = (
+            as_of is None
+            and bool(getattr(forecaster, "supports_live_model_update", False))
+        )
         stored_result = _try_predict_with_stored_model(
             forecaster, method_l, data_scope, params_hash,
             target_series, horizon, seasonality,
             method_params, future_exog, call_kwargs,
             float(df["time"].iloc[-1]),
+            require_exact_anchor=not live_model_update,
+            timeframe_seconds=TIMEFRAME_SECONDS.get(str(timeframe)),
+            max_staleness_bars=max(1, int(seasonality)),
+            rejection=model_rejection,
         )
         if stored_result is not None:
             return stored_result
         if requested_model_id:
+            reason = str(model_rejection.get("reason") or "unloadable")
+            if reason != "not_found":
+                anchor_detail = ""
+                if model_rejection.get("trained_anchor_epoch") is not None:
+                    anchor_detail = (
+                        f" Trained anchor={model_rejection['trained_anchor_epoch']}; "
+                        f"requested anchor={model_rejection.get('requested_anchor_epoch')}."
+                    )
+                anchor_policy = (
+                    "Historical forecasts and methods without live history refresh "
+                    "require an exact training anchor; live forecasts reject artifacts "
+                    "trained after the request."
+                )
+                raise ValueError(
+                    f"Model with ID '{requested_model_id}' exists but was rejected: "
+                    f"{reason}.{anchor_detail} {anchor_policy}"
+                )
             raise ValueError(
-                f"Model with ID '{requested_model_id}' was not found "
-                "in the model store or could not be loaded. Use forecast_models_list "
-                "to see available models, or omit model_id for an on-the-fly forecast."
+                f"Model with ID '{requested_model_id}' was not found in the model store. "
+                "Use forecast_models_list to see available models."
             )
 
         # No stored model — async route for any trainable method when requested
@@ -965,7 +1236,55 @@ def _run_registered_forecast_method(
             )
             raise _AsyncTrainingStarted(async_resp)
 
-    # --- Default synchronous path (backward compatible) ---
+    # --- Default synchronous path ---
+    if supports_training:
+        training_context = training_params.pop("_training_context", None)
+        trained = forecaster.train(
+            target_series,
+            horizon,
+            seasonality,
+            training_params,
+            exog=X,
+            timeframe=str(timeframe),
+        )
+        from .model_store import model_store as _store
+
+        handle = _store.save(
+            method=method_l,
+            data_scope=data_scope,
+            params_hash=params_hash,
+            artifact_bytes=trained.artifact_bytes,
+            metadata={
+                **(trained.metadata or {}),
+                "params_used": trained.params_used,
+                "source_task_id": None,
+                "training_context": training_context,
+            },
+        )
+        artifact = forecaster.deserialize_artifact(trained.artifact_bytes)
+        res = forecaster.predict_with_model(
+            artifact,
+            target_series,
+            horizon,
+            seasonality,
+            method_params,
+            exog_future=future_exog,
+            **call_kwargs,
+        )
+        metadata = {**(trained.metadata or {}), **(res.metadata or {})}
+        metadata["params_used"] = res.params_used
+        metadata["model_info"] = {
+            "model_id": handle.model_id,
+            "trained_at": handle.created_at,
+            "data_scope": handle.data_scope,
+            "source": "synchronous_training",
+            "reuse_policy": "live_latest_artifact",
+            "training_end_epoch": float(df["time"].iloc[-1]),
+            "model_staleness_seconds": 0.0,
+            "model_staleness_bars": 0.0,
+        }
+        return res.forecast, res.ci_values, metadata
+
     res = forecaster.forecast(
         target_series,
         horizon,
@@ -1052,6 +1371,57 @@ def _last_price_freshness_fields(
     return out
 
 
+def _forecast_direction_threshold_from_history(
+    price_anchors: Any,
+    horizon: int,
+) -> Tuple[float, str]:
+    minimum_pct = 0.05
+    anchor_values = np.asarray(price_anchors, dtype=float)
+    if anchor_values.size <= 1:
+        return minimum_pct, "minimum_effect_size_0.05_pct"
+    previous_values = anchor_values[:-1]
+    valid_returns = np.isfinite(previous_values) & (previous_values != 0.0)
+    if not np.any(valid_returns):
+        return minimum_pct, "minimum_effect_size_0.05_pct"
+    absolute_returns_pct = np.abs(
+        (anchor_values[1:][valid_returns] - previous_values[valid_returns])
+        / previous_values[valid_returns]
+        * 100.0
+    )
+    median_bar_move_pct = float(np.median(absolute_returns_pct))
+    horizon_noise_pct = median_bar_move_pct * float(
+        np.sqrt(max(1, int(horizon)))
+    )
+    return (
+        max(minimum_pct, horizon_noise_pct),
+        "max(0.05_pct,median_abs_bar_return_pct*sqrt(horizon))",
+    )
+
+
+def _forecast_target_bar_states(
+    future_epochs: List[float],
+    tf_secs: int,
+    *,
+    now_epoch: Optional[float] = None,
+) -> List[str]:
+    current_epoch = (
+        datetime.now(timezone.utc).timestamp()
+        if now_epoch is None
+        else float(now_epoch)
+    )
+    step_seconds = max(1, int(tf_secs))
+    states: List[str] = []
+    for value in future_epochs:
+        bar_open = float(value)
+        if current_epoch < bar_open:
+            states.append("future")
+        elif current_epoch < bar_open + step_seconds:
+            states.append("forming")
+        else:
+            states.append("closed")
+    return states
+
+
 def _format_forecast_output(
     forecast_values: np.ndarray,
     last_epoch: float,
@@ -1071,6 +1441,8 @@ def _format_forecast_output(
     reconstructed_price_ci: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     symbol: Optional[str] = None,
     timeframe: Optional[str] = None,
+    target_info: Optional[Dict[str, Any]] = None,
+    now_epoch: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Format forecast output with proper structure."""
     # Generate future time indices
@@ -1079,6 +1451,7 @@ def _format_forecast_output(
         tf_secs,
         horizon,
         skip_weekends=uses_standard_weekend_projection(symbol, tf_secs),
+        timeframe=timeframe,
     )
     use_client_tz = _use_client_tz()
     client_tz = _resolve_client_tz() if use_client_tz else None
@@ -1088,12 +1461,21 @@ def _format_forecast_output(
         client_tz=client_tz,
     )
     forecast_times = [fmt_time(float(epoch)) for epoch in future_epochs]
-    last_observation_time = fmt_time(float(last_epoch))
-    calendar_gaps, skipped_bars = _forecast_calendar_gap_rows(
+    forecast_bar_states = _forecast_target_bar_states(
         future_epochs,
         tf_secs,
-        fmt_time,
+        now_epoch=now_epoch,
     )
+    last_observation_time = fmt_time(float(last_epoch))
+    calendar_timeframe = str(timeframe or "").upper() in {"D1", "W1", "MN1"}
+    if calendar_timeframe:
+        calendar_gaps, skipped_bars = [], 0
+    else:
+        calendar_gaps, skipped_bars = _forecast_calendar_gap_rows(
+            [float(last_epoch), *future_epochs],
+            tf_secs,
+            fmt_time,
+        )
     price_anchor_series = df["close"] if "close" in df.columns else df[base_col]
     price_anchor_numeric = pd.to_numeric(price_anchor_series, errors="coerce")
     finite_price_anchors = price_anchor_numeric[np.isfinite(price_anchor_numeric)]
@@ -1102,11 +1484,16 @@ def _format_forecast_output(
         if len(finite_price_anchors) > 0
         else None
     )
+    direction_threshold_pct, direction_threshold_basis = (
+        _forecast_direction_threshold_from_history(finite_price_anchors, horizon)
+    )
 
     # Build base result
     forecast_start_epoch = float(future_epochs[0]) if future_epochs else None
     forecast_start_gap_bars = (
-        float(forecast_start_epoch - float(last_epoch)) / float(tf_secs)
+        1.0
+        if calendar_timeframe and forecast_start_epoch is not None
+        else float(forecast_start_epoch - float(last_epoch)) / float(tf_secs)
         if forecast_start_epoch is not None and tf_secs
         else None
     )
@@ -1130,15 +1517,30 @@ def _format_forecast_output(
             "1.0 means the next timeframe bar."
         ),
         "forecast_anchor": "next_timeframe_bar_after_last_observation",
-        "forecast_step_seconds": int(tf_secs),
+        "forecast_step_seconds": None if calendar_timeframe else int(tf_secs),
         "forecast_epoch": future_epochs,
         "forecast_time": forecast_times,
+        "forecast_bar_states": forecast_bar_states,
+        "forecast_time_semantics": "target_bar_open_time",
+        "forecast_value_semantics": (
+            "target_bar_log_return_and_reconstructed_close"
+            if quantity == "return"
+            else "target_bar_close"
+            if quantity == "price"
+            else "target_bar_value"
+        ),
         "last_price": last_price,
         "last_price_source": "candle_close" if last_price is not None else None,
+        "direction_threshold_pct": float(round(direction_threshold_pct, 6)),
+        "direction_threshold_basis": direction_threshold_basis,
         "calendar_treatment": (
-            "forex_weekend_skipped"
-            if uses_standard_weekend_projection(symbol, tf_secs)
-            else "continuous_no_weekend_skip"
+            "broker_calendar_boundaries"
+            if calendar_timeframe
+            else (
+                "forex_weekend_skipped"
+                if uses_standard_weekend_projection(symbol, tf_secs)
+                else "continuous_no_weekend_skip"
+            )
         ),
     }
     if calendar_gaps:
@@ -1156,8 +1558,26 @@ def _format_forecast_output(
                 "Confirm the instrument trades during those periods."
             )
 
-    # Choose which arrays to expose
-    if quantity == 'return':
+    # Choose which arrays to expose. Custom targets retain their own semantic
+    # identity instead of being mislabeled as close prices or returns.
+    custom_target = str((target_info or {}).get("mode") or "") == "custom"
+    if custom_target:
+        result.pop("last_price", None)
+        result.pop("last_price_source", None)
+        result.pop("direction_threshold_pct", None)
+        result.pop("direction_threshold_basis", None)
+        result["forecast_target"] = [float(v) for v in forecast_values]
+        result["target"] = {
+            "base": (target_info or {}).get("base"),
+            "transform": (target_info or {}).get("transform"),
+            "mode": "custom",
+        }
+        target_numeric = pd.to_numeric(df[base_col], errors="coerce")
+        target_numeric = target_numeric[np.isfinite(target_numeric)]
+        result["last_target"] = (
+            float(target_numeric.iloc[-1]) if len(target_numeric) else None
+        )
+    elif quantity == 'return':
         if forecast_return_values is None:
             forecast_return_values = forecast_values
         result["forecast_return"] = [float(v) for v in forecast_return_values]
@@ -1187,7 +1607,12 @@ def _format_forecast_output(
             result["ci_available"] = True
             lower_vals = [float(v) for v in ci_values[0]]
             upper_vals = [float(v) for v in ci_values[1]]
-            if quantity == 'return':
+            if custom_target:
+                result["lower_target"] = lower_vals
+                result["upper_target"] = upper_vals
+                result["lower"] = lower_vals
+                result["upper"] = upper_vals
+            elif quantity == 'return':
                 result["lower_return"] = lower_vals
                 result["upper_return"] = upper_vals
                 # Keep generic keys for lightweight renderers expecting non-price intervals.
@@ -1389,6 +1814,7 @@ def forecast_engine(  # noqa: C901
             tf_secs=tf_secs,
             horizon=horizon,
             target_series=target_series,
+            timeframe=timeframe,
             dimred_method=dimred_method,
             dimred_params=dimred_params,
             symbol=symbol,
@@ -1414,6 +1840,18 @@ def forecast_engine(  # noqa: C901
             quantity_l=quantity_l,
             base_col=base_col,
             target_series=target_series,
+        )
+        sample_quality = _forecast_history_sample_quality(
+            method=method_l,
+            horizon=horizon,
+            history_bars=len(df),
+        )
+        engine_diagnostics.update(
+            {
+                key: value
+                for key, value in sample_quality.items()
+                if key != "warning"
+            }
         )
         if feature_info:
             engine_diagnostics["feature_preparation"] = feature_info
@@ -1497,8 +1935,10 @@ def forecast_engine(  # noqa: C901
         reconstructed_prices = None
         reconstructed_price_ci = None
         target_transform = str(target_info.get("transform") or "none").strip().lower()
+        custom_target = str(target_info.get("mode") or "") == "custom"
         needs_price_reconstruction = (
-            quantity_l == "return" or target_transform != "none"
+            not custom_target
+            and (quantity_l == "return" or target_transform != "none")
         )
         if quantity_l == 'return':
             forecast_return_vals = np.asarray(forecast_values, dtype=float)
@@ -1516,18 +1956,22 @@ def forecast_engine(  # noqa: C901
                     )
                 }
             if ci_values is not None and len(ci_values) == 2:
-                lower_prices = _reconstruct_prices_from_target(
-                    np.asarray(ci_values[0], dtype=float),
+                reconstructed_price_ci = _reconstruct_price_intervals_from_target(
+                    np.asarray(forecast_values, dtype=float),
+                    (
+                        np.asarray(ci_values[0], dtype=float),
+                        np.asarray(ci_values[1], dtype=float),
+                    ),
+                    reconstructed_prices,
                     price_anchor_history,
                     target_info,
                 )
-                upper_prices = _reconstruct_prices_from_target(
-                    np.asarray(ci_values[1], dtype=float),
-                    price_anchor_history,
-                    target_info,
-                )
-                if lower_prices is not None and upper_prices is not None:
-                    reconstructed_price_ci = (lower_prices, upper_prices)
+                if target_transform.split("(", 1)[0] in {
+                    "log_return", "return", "pct_change", "pct", "diff"
+                }:
+                    metadata["price_interval_reconstruction"] = (
+                        "independent_step_variance_from_marginal_target_intervals"
+                    )
 
         # Format and return output
         denoise_used = dn_spec_used is not None
@@ -1550,7 +1994,23 @@ def forecast_engine(  # noqa: C901
             reconstructed_price_ci=reconstructed_price_ci,
             symbol=symbol,
             timeframe=timeframe,
+            target_info=target_info,
         )
+        result.update(
+            {
+                key: value
+                for key, value in sample_quality.items()
+                if key != "warning"
+            }
+        )
+        sample_warning = sample_quality.get("warning")
+        if sample_warning:
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            if sample_warning not in warnings:
+                warnings.append(str(sample_warning))
+            result["warnings"] = warnings
         if broker_time_check_result and broker_time_check_result.get("status") == "misaligned":
             warning_text = str(broker_time_check_result.get("warning") or "").strip()
             if warning_text:

@@ -20,19 +20,20 @@ from ..shared.parameter_contracts import (
     OUTPUT_EXTRAS,
     PUBLIC_OUTPUT_PARAMS,
 )
-from ..utils.coercion import UNPARSED_BOOL, parse_bool_like
-from ..utils.utils import coerce_scalar
+from ..utils.coercion import UNPARSED_BOOL, coerce_scalar, parse_bool_like
 from .error_envelope import (
     build_error_payload,
     log_transport_exception,
     normalize_error_payload,
 )
 from .output_contract import (
-    attach_success_guidance,
+    OutputContractState,
     apply_output_verbosity,
+    attach_success_guidance,
     normalize_output_extras,
     resolve_output_contract,
 )
+from .request_context import ensure_request_id_scope
 
 _ORIG_TOOL_DECORATOR: Any = None
 _REGISTRY_UNSET = object()
@@ -647,6 +648,7 @@ _FIELD_SELECTION_META_KEYS = frozenset(
         "count",
         "total",
         "truncated",
+        "pagination",
     }
 )
 
@@ -791,6 +793,8 @@ def _select_output_fields(value: Any, fields: Any) -> Any:
                 value,
                 tuple(part for part in requested_field.split(".") if part),
             )
+        elif requested_field in value:
+            filtered, matched = {requested_field: value[requested_field]}, True
         else:
             filtered, matched = _filter_output_fields(
                 value,
@@ -860,6 +864,68 @@ def _update_supplied_request_model_field(
     return False
 
 
+def _prepare_public_tool_call(
+    func: Any,
+    kwargs: Dict[str, Any],
+    *,
+    json_output: Any = False,
+    extras: Any = None,
+) -> OutputContractState:
+    """Apply shared public output arguments before invoking a raw tool callable."""
+    normalized_extras = normalize_output_extras(extras)
+    if normalized_extras and _callable_exposes_kwarg(func, "extras"):
+        # Preserve tool-local section semantics (for example an extras request
+        # that intentionally removes a row cap).
+        if not _update_supplied_request_model_field(
+            func, kwargs, "extras", normalized_extras
+        ):
+            kwargs["extras"] = normalized_extras
+    if (
+        normalized_extras
+        and "detail" not in kwargs
+        and _callable_exposes_kwarg(func, "detail")
+    ):
+        if not _update_supplied_request_model_field(func, kwargs, "detail", "full"):
+            kwargs["detail"] = "full"
+    _coerce_kwargs_for_callable(func, kwargs)
+    return resolve_output_contract(
+        kwargs,
+        json=json_output,
+        extras=normalized_extras,
+    )
+
+
+def _shape_public_tool_output(
+    result: Any,
+    *,
+    tool_name: str,
+    contract_state: OutputContractState,
+    fields: Any = None,
+) -> Any:
+    """Apply shared structured-output shaping used by public transports."""
+    if not isinstance(result, dict):
+        return result
+    public_out = result
+    if tool_name.strip().lower() == "news":
+        from .news import normalize_news_output
+
+        public_out = normalize_news_output(
+            public_out,
+            detail=contract_state.detail,
+        )
+    if "guidance" in contract_state.extras:
+        public_out = attach_success_guidance(
+            public_out,
+            tool_name=tool_name,
+        )
+    public_out = apply_output_verbosity(
+        public_out,
+        tool_name=tool_name,
+        detail=contract_state.shape_detail,
+    )
+    return _select_output_fields(public_out, fields)
+
+
 def _recording_tool_decorator(*dargs, **dkwargs):  # type: ignore[override]  # noqa: C901
     if _ORIG_TOOL_DECORATOR is None:
         def _noop(func):
@@ -902,44 +968,29 @@ def _recording_tool_decorator(*dargs, **dkwargs):  # type: ignore[override]  # n
             to_methods_availability_toon as _fmt_methods,
         )
 
-        @_wraps(func)
-        def _wrapped(*a, **kw):
+        def _invoke_wrapped(*a, **kw):
             raw_output = kw.pop("__cli_raw", False)
             precision = kw.pop("precision", None)
             json_output = kw.pop("json", False)
             extras = kw.pop("extras", None)
             fields = kw.pop("fields", None)
-            contract_state = resolve_output_contract({})
+            # Resolve the requested representation before any fallible argument
+            # normalization so wrapper-generated errors keep the same contract.
+            contract_state = resolve_output_contract({}, json=json_output)
 
             try:
-                normalized_extras = normalize_output_extras(extras)
-                if normalized_extras and _callable_exposes_kwarg(func, "extras"):
-                    # Preserve tool-local section semantics (for example an
-                    # extras request that intentionally removes a row cap).
-                    if not _update_supplied_request_model_field(
-                        func, kw, "extras", normalized_extras
-                    ):
-                        kw["extras"] = normalized_extras
-                if normalized_extras and "detail" not in kw and _callable_exposes_kwarg(func, "detail"):
-                    if not _update_supplied_request_model_field(
-                        func, kw, "detail", "full"
-                    ):
-                        kw["detail"] = "full"
-                _coerce_kwargs_for_callable(func, kw)
-                contract_state = resolve_output_contract(
+                contract_state = _prepare_public_tool_call(
+                    func,
                     kw,
-                    json=json_output,
-                    extras=normalized_extras,
+                    json_output=json_output,
+                    extras=extras,
                 )
-                try:
-                    if "denoise" in kw:
-                        from ..utils.denoise import (
-                            normalize_denoise_spec as _norm_dn,  # type: ignore
-                        )
+                if "denoise" in kw:
+                    from ..utils.denoise import (
+                        normalize_denoise_spec as _norm_dn,  # type: ignore
+                    )
 
-                        kw["denoise"] = _norm_dn(kw.get("denoise"))
-                except Exception:
-                    pass
+                    kw["denoise"] = _norm_dn(kw.get("denoise"))
 
                 out = func(*a, **kw)
             except Exception as exc:
@@ -975,30 +1026,21 @@ def _recording_tool_decorator(*dargs, **dkwargs):  # type: ignore[override]  # n
                     operation=getattr(func, "__name__", "tool"),
                 )
 
+            if raw_output and isinstance(out, dict) and "guidance" in contract_state.extras:
+                out = attach_success_guidance(
+                    out,
+                    tool_name=getattr(func, "__name__", ""),
+                )
             if raw_output:
                 return out
 
             fname = getattr(func, "__name__", "")
-            public_out = out
-            if isinstance(public_out, dict):
-                if fname.strip().lower() == "news":
-                    from .news import normalize_news_output
-
-                    public_out = normalize_news_output(
-                        public_out,
-                        detail=contract_state.detail,
-                    )
-                if "guidance" in contract_state.extras:
-                    public_out = attach_success_guidance(
-                        public_out,
-                        tool_name=fname,
-                    )
-                public_out = apply_output_verbosity(
-                    public_out,
-                    tool_name=fname,
-                    detail=contract_state.shape_detail,
-                )
-                public_out = _select_output_fields(public_out, fields)
+            public_out = _shape_public_tool_output(
+                out,
+                tool_name=fname,
+                contract_state=contract_state,
+                fields=fields,
+            )
 
             if contract_state.json:
                 return public_out
@@ -1022,6 +1064,11 @@ def _recording_tool_decorator(*dargs, **dkwargs):  # type: ignore[override]  # n
                 )
             except Exception:
                 return str(out) if out is not None else ""
+
+        @_wraps(func)
+        def _wrapped(*a, **kw):
+            with ensure_request_id_scope():
+                return _invoke_wrapped(*a, **kw)
 
         try:
             cleaned = _sanitize_annotations(func)
@@ -1054,7 +1101,16 @@ def _recording_tool_decorator(*dargs, **dkwargs):  # type: ignore[override]  # n
         # imply that broker or analysis work had stopped.
         @_wraps(func)
         async def _async_wrapped(*a, **kw):
-            return await asyncio.to_thread(_wrapped, *a, **kw)
+            worker = asyncio.create_task(asyncio.to_thread(_wrapped, *a, **kw))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # The thread cannot be stopped safely. Keep this handler
+                # attached until the operation reaches a terminal state so a
+                # cancellation acknowledgement cannot imply that a mutating
+                # broker call was aborted.
+                await worker
+                raise
 
         try:
             _async_wrapped.__annotations__ = getattr(_wrapped, "__annotations__", {})

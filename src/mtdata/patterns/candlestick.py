@@ -106,8 +106,14 @@ class CandlestickRuntime:
             ):
                 from ..utils.mt5 import (
                     _mt5_copy_rates_from as copy_rates_from,
+                )
+                from ..utils.mt5 import (
                     _mt5_copy_rates_range as copy_rates_range,
+                )
+                from ..utils.mt5 import (
                     _rates_to_df as rates_to_df,
+                )
+                from ..utils.mt5 import (
                     _symbol_ready_guard as symbol_ready_guard,
                 )
 
@@ -206,7 +212,7 @@ _CANDLESTICK_REDUNDANCY_SUPPRESSORS = {
 
 
 def _normalize_candlestick_name(pattern_name: str) -> str:
-    nm = str(pattern_name).strip()
+    nm = _candlestick_display_name(pattern_name)
     while nm:
         parts = nm.replace("_", " ").replace("-", " ").split()
         if len(parts) > 1 and parts[0].lower() in {"bullish", "bearish", "neutral"}:
@@ -220,6 +226,18 @@ def _normalize_candlestick_name(pattern_name: str) -> str:
             continue
         break
     return "".join(ch for ch in nm.lower() if ch.isalnum())
+
+
+def _candlestick_display_name(pattern_name: str) -> str:
+    """Return a detector name without pandas-ta's encoded numeric parameters."""
+    parts = str(pattern_name).strip().replace("_", " ").replace("-", " ").split()
+    while len(parts) > 1:
+        try:
+            float(parts[-1])
+        except (TypeError, ValueError):
+            break
+        parts.pop()
+    return " ".join(parts)
 
 
 def _candlestick_detector_label(pattern_name: str) -> str:
@@ -260,11 +278,11 @@ def _candlestick_base_strength(
     deprioritize: set[str],
 ) -> float:
     normalized = _normalize_candlestick_name(pattern_name)
-    base = 0.75
+    base = 0.50
     if normalized in robust_set:
-        base += 0.15
+        base += 0.20
     if normalized in deprioritize:
-        base -= 0.20
+        base -= 0.10
     return float(max(0.0, min(1.0, base)))
 
 
@@ -274,6 +292,7 @@ def _candlestick_strength_score(
     *,
     robust_set: set[str],
     deprioritize: set[str],
+    geometry_score: float = 0.5,
 ) -> float:
     raw = abs(float(raw_signal))
     if not np.isfinite(raw) or raw <= 0.0:
@@ -285,9 +304,11 @@ def _candlestick_strength_score(
         deprioritize=deprioritize,
     )
     span_bonus = min(0.10, 0.05 * max(0, span_bars - 1))
-    # pandas_ta CDL outputs are typically in [-100, 100]; scale magnitude into [0, 0.20].
-    raw_signal_bonus = min(0.20, 0.20 * min(raw, 100.0) / 100.0)
-    return float(max(0.0, min(1.0, base + span_bonus + raw_signal_bonus)))
+    detector_bonus = 0.05
+    geometry = float(np.clip(float(geometry_score), 0.0, 1.0))
+    return float(
+        max(0.0, min(1.0, base + span_bonus + detector_bonus + 0.40 * geometry))
+    )
 
 
 def _candlestick_span_bars(pattern_name: str) -> int:
@@ -478,6 +499,45 @@ def _extract_candlestick_rows(
     span_values = np.asarray(
         [_candlestick_span_bars(str(name)) for name in base_names.tolist()], dtype=int
     )
+    geometry_available = all(
+        column in df_tail.columns for column in ("open", "high", "low", "close")
+    )
+    if geometry_available:
+        open_values = pd.to_numeric(df_tail["open"], errors="coerce").to_numpy(
+            dtype=float, copy=False
+        )
+        high_values = pd.to_numeric(df_tail["high"], errors="coerce").to_numpy(
+            dtype=float, copy=False
+        )
+        low_values = pd.to_numeric(df_tail["low"], errors="coerce").to_numpy(
+            dtype=float, copy=False
+        )
+        close_geometry_values = pd.to_numeric(
+            df_tail["close"], errors="coerce"
+        ).to_numpy(dtype=float, copy=False)
+        candle_range = high_values - low_values
+        valid_range = np.isfinite(candle_range) & (candle_range > 0.0)
+        body_ratio = np.divide(
+            np.abs(close_geometry_values - open_values),
+            candle_range,
+            out=np.full(len(df_tail), 0.5, dtype=float),
+            where=valid_range,
+        )
+        range_series = pd.Series(candle_range).where(valid_range)
+        typical_range = (
+            range_series.shift(1).rolling(20, min_periods=1).median().to_numpy()
+        )
+        range_expansion = np.divide(
+            candle_range,
+            typical_range,
+            out=np.ones(len(df_tail), dtype=float),
+            where=np.isfinite(typical_range) & (typical_range > 0.0),
+        )
+        range_expansion = np.clip(range_expansion / 2.0, 0.0, 1.0)
+    else:
+        high_values = low_values = close_geometry_values = candle_range = None
+        valid_range = body_ratio = range_expansion = None
+
     for col_idx, name in enumerate(base_names.tolist()):
         base_strength = _candlestick_base_strength(
             str(name),
@@ -486,11 +546,48 @@ def _extract_candlestick_rows(
         )
         span_bars = int(span_values[col_idx])
         span_bonus = min(0.10, 0.05 * max(0, span_bars - 1))
-        raw_bonus = (
-            np.clip(np.abs(values[:, col_idx]) / 100.0, 0.0, 1.0) * 0.20
-        )
+        geometry_score = np.full(len(df_tail), 0.5, dtype=float)
+        normalized_name = str(normalized_names[col_idx])
+        if geometry_available:
+            assert high_values is not None
+            assert low_values is not None
+            assert close_geometry_values is not None
+            assert candle_range is not None
+            assert valid_range is not None
+            assert body_ratio is not None
+            assert range_expansion is not None
+            bullish_location = np.divide(
+                close_geometry_values - low_values,
+                candle_range,
+                out=np.full(len(df_tail), 0.5, dtype=float),
+                where=valid_range,
+            )
+            bearish_location = np.divide(
+                high_values - close_geometry_values,
+                candle_range,
+                out=np.full(len(df_tail), 0.5, dtype=float),
+                where=valid_range,
+            )
+            directional_location = np.where(
+                values[:, col_idx] >= 0.0,
+                bullish_location,
+                bearish_location,
+            )
+            if normalized_name in deprioritize:
+                geometry_score = (
+                    0.70 * (1.0 - np.clip(body_ratio, 0.0, 1.0))
+                    + 0.30 * range_expansion
+                )
+            else:
+                geometry_score = (
+                    0.50 * np.clip(body_ratio, 0.0, 1.0)
+                    + 0.30 * np.clip(directional_location, 0.0, 1.0)
+                    + 0.20 * range_expansion
+                )
         strength_values[:, col_idx] = np.clip(
-            base_strength + span_bonus + raw_bonus, 0.0, 1.0
+            base_strength + span_bonus + 0.05 + 0.40 * geometry_score,
+            0.0,
+            1.0,
         )
 
     active_mask = (
@@ -555,7 +652,7 @@ def _extract_candlestick_rows(
         for col_idx in chosen_idx.tolist():
             name = str(base_names[col_idx])
             value = float(values[i, col_idx])
-            label_core = name.replace("_", " ").strip().upper()
+            label_core = _candlestick_display_name(name).strip().upper()
             dir_title = "Bullish" if value > 0 else "Bearish"
             if include_metrics:
                 span_bars = int(span_values[col_idx])
@@ -857,8 +954,8 @@ def detect_candlestick_patterns(  # noqa: C901
             "candles": int(limit),
             "mode": "candlestick",
             "min_strength": float(thr),
-            "strength_scale": "semantic_pattern_conviction_v2",
-            "signal_scale": "pandas_ta_signal_x100",
+            "strength_scale": "ohlc_geometry_and_pattern_reliability_v3",
+            "signal_scale": "backend_native_cdl_signal",
         }
     )
     if warnings_out:

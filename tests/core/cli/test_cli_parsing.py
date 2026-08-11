@@ -76,7 +76,7 @@ def test_non_bar_commands_do_not_receive_global_timeframe() -> None:
     }.issubset(cli_api._TIMEFRAMELESS_GLOBAL_COMMANDS)
 
 
-def test_required_symbol_is_not_bracketed_in_help() -> None:
+def test_required_symbol_help_shows_positional_and_flag_forms() -> None:
     from mtdata.core.cli import api as cli_api
 
     def sample_tool(symbol: str) -> None:
@@ -93,7 +93,7 @@ def test_required_symbol_is_not_bracketed_in_help() -> None:
     )
 
     help_text = parser.format_help()
-    assert "usage: mtdata-cli sample_tool [-h] symbol" in help_text
+    assert "usage: mtdata-cli sample_tool [-h] [--symbol SYMBOL] [symbol]" in help_text
     assert "Trading symbol (e.g. EURUSD). (required)" in help_text
 
 
@@ -232,12 +232,11 @@ class TestAddForecastGenerateArgs:
         assert args.detail == "compact"
         assert args.print_config is True
 
-    def test_symbol_is_required_and_has_no_flag_alias(self):
+    def test_symbol_accepts_flag_alias(self):
         parser = argparse.ArgumentParser()
         _add_forecast_generate_args(parser)
-        with pytest.raises(SystemExit) as exc_info:
-            parser.parse_args(["--symbol", "GBPUSD"])
-        assert exc_info.value.code == 2
+        args = parser.parse_args(["--symbol", "GBPUSD"])
+        assert args.symbol == "GBPUSD"
 
     def test_detail_accepts_summary(self):
         parser = argparse.ArgumentParser()
@@ -419,10 +418,46 @@ class TestAddDynamicArguments:
 
         help_text = _strip_ansi(parser.format_help())
 
-        assert "--symbols" in help_text
+        assert "--symbols" not in help_text
         assert "Comma-separated MT5 symbols" in help_text
-        assert parser.parse_args(["--symbols", "EURUSD,GBPUSD"]).symbols == "EURUSD,GBPUSD"
         assert parser.parse_args(["EURUSD,GBPUSD"]).symbols == "EURUSD,GBPUSD"
+
+    def test_non_positional_required_parameters_are_required_options(self):
+        parser = argparse.ArgumentParser()
+        func_info = {
+            "params": [
+                {
+                    "name": "spot",
+                    "type": float,
+                    "required": True,
+                    "default": None,
+                },
+                {
+                    "name": "strike",
+                    "type": float,
+                    "required": True,
+                    "default": None,
+                },
+                {
+                    "name": "barrier",
+                    "type": float,
+                    "required": True,
+                    "default": None,
+                },
+            ]
+        }
+
+        add_dynamic_arguments(parser, func_info, cmd_name="options_barrier_price")
+
+        help_text = _strip_ansi(parser.format_help())
+        assert "--strike STRIKE" in help_text
+        assert "--barrier BARRIER" in help_text
+        assert help_text.count("(required)") == 3
+        with pytest.raises(SystemExit):
+            parser.parse_args(["100"])
+        parsed = parser.parse_args(["100", "--strike", "105", "--barrier", "90"])
+        assert parsed.strike == 105.0
+        assert parsed.barrier == 90.0
 
     def test_list_param(self):
         parser = argparse.ArgumentParser()
@@ -479,7 +514,7 @@ class TestAddDynamicArguments:
         assert "--set" in help_text
         assert "--params-params" not in help_text
 
-    def test_first_required_param_rejects_flag_alias(self):
+    def test_first_required_param_accepts_flag_alias(self):
         parser = argparse.ArgumentParser()
         func_info = {
             "params": [
@@ -488,11 +523,11 @@ class TestAddDynamicArguments:
             ]
         }
         add_dynamic_arguments(parser, func_info)
-        with pytest.raises(SystemExit) as exc_info:
-            parser.parse_args(["--symbol", "EURUSD", "--count", "20"])
-        assert exc_info.value.code == 2
+        args = parser.parse_args(["--symbol", "EURUSD", "--count", "20"])
+        assert args.symbol == "EURUSD"
+        assert args.count == 20
 
-    def test_first_required_param_has_only_positional_action(self):
+    def test_first_required_param_has_positional_and_flag_actions(self):
         parser = argparse.ArgumentParser()
         func_info = {
             "params": [
@@ -503,8 +538,9 @@ class TestAddDynamicArguments:
         symbol_actions = [
             action for action in parser._actions if action.dest == "symbol"
         ]
-        assert len(symbol_actions) == 1
-        assert symbol_actions[0].option_strings == []
+        assert len(symbol_actions) == 2
+        assert any(action.option_strings == [] for action in symbol_actions)
+        assert any(action.option_strings == ["--symbol"] for action in symbol_actions)
 
     def test_single_word_flag_is_not_duplicated(self):
         parser = argparse.ArgumentParser()
@@ -810,6 +846,32 @@ class TestParseKvString:
 
 
 class TestResolveParamKwargs:
+    @pytest.mark.parametrize(
+        ("command", "parameter", "expected"),
+        [
+            ("volatility_term_structure", "horizons", "horizons in bars"),
+            ("market_relative_strength", "weights", "matching --horizons"),
+            ("market_relative_strength", "limit", "ranked symbols"),
+            ("options_chain", "limit", "option contracts"),
+            ("volume_profile_levels", "limit", "Historical bar count"),
+            ("outliers_detect", "limit", "anomalous bars"),
+            ("temporal_analyze", "limit", "time buckets"),
+            ("temporal_analyze", "session_calendar", "auto, fx, or equity"),
+            ("options_heston_calibrate", "valuation_date", "YYYY-MM-DD"),
+            ("seasonality_detect", "max_period", "period in bars"),
+        ],
+    )
+    def test_command_help_explains_reported_units_and_objects(
+        self, command, parameter, expected
+    ):
+        kwargs, _ = _resolve_param_kwargs(
+            {"name": parameter, "type": str, "required": False, "default": None},
+            None,
+            cmd_name=command,
+        )
+
+        assert expected in kwargs["help"]
+
     def test_basic_str_param(self):
         param = {"name": "symbol", "type": str, "required": True, "default": None}
         kwargs, is_mapping = _resolve_param_kwargs(param, None)
@@ -864,6 +926,21 @@ class TestResolveParamKwargs:
         }
         kwargs, is_mapping = _resolve_param_kwargs(param, None)
         assert kwargs["choices"] == ["a", "b", "c"]
+        assert kwargs["type"]("B") == "b"
+
+    def test_literal_type_preserves_canonical_choice_case(self):
+        param = {
+            "name": "timeframe",
+            "type": Literal["M1", "H1", "D1"],
+            "required": False,
+            "default": "H1",
+        }
+
+        kwargs, _ = _resolve_param_kwargs(param, None)
+
+        assert kwargs["type"]("h1") == "H1"
+        assert kwargs["type"]("D1") == "D1"
+        assert kwargs["type"]("bad") == "bad"
 
     def test_patterns_mode_choices_are_explicit(self):
         param = {
@@ -882,6 +959,97 @@ class TestResolveParamKwargs:
             "elliott",
         ]
         assert "fractals" not in kwargs["choices"]
+
+    def test_static_method_and_transform_choices_are_exposed_per_command(self):
+        method_param = {
+            "name": "method",
+            "type": str,
+            "required": False,
+            "default": "pearson",
+        }
+        correlation, _ = _resolve_param_kwargs(
+            method_param,
+            None,
+            cmd_name="correlation_matrix",
+        )
+        assert correlation["choices"] == ["pearson", "spearman"]
+        assert correlation["type"]("SPEARMAN") == "spearman"
+
+        var_method, _ = _resolve_param_kwargs(
+            method_param,
+            None,
+            cmd_name="trade_var_cvar_calculate",
+        )
+        assert var_method["choices"] == [
+            "historical",
+            "hist",
+            "parametric",
+            "gaussian",
+            "normal",
+        ]
+
+        transform_param = {
+            "name": "transform",
+            "type": str,
+            "required": False,
+            "default": "log_return",
+        }
+        transform, _ = _resolve_param_kwargs(
+            transform_param,
+            None,
+            cmd_name="cross_correlation",
+        )
+        assert transform["choices"] == [
+            "log_return",
+            "pct",
+            "diff",
+            "level",
+            "log_level",
+        ]
+
+    def test_dynamic_and_comma_composed_choices_explain_discovery_in_help(self):
+        tests_param = {
+            "name": "tests",
+            "type": str,
+            "required": False,
+            "default": "adf,kpss,pp",
+        }
+        stationarity, _ = _resolve_param_kwargs(
+            tests_param,
+            None,
+            cmd_name="stationarity_test",
+        )
+        assert "adf, kpss, pp" in stationarity["help"]
+        assert "choices" not in stationarity
+
+        method_param = {
+            "name": "method",
+            "type": str,
+            "required": True,
+            "default": None,
+        }
+        denoise, _ = _resolve_param_kwargs(
+            method_param,
+            None,
+            cmd_name="denoise_describe",
+        )
+        assert "denoise_list_methods" in denoise["help"]
+
+    def test_var_cvar_symbol_help_explains_it_requires_open_exposure(self):
+        symbol_param = {
+            "name": "symbol",
+            "type": Optional[str],
+            "required": False,
+            "default": None,
+        }
+        kwargs, _ = _resolve_param_kwargs(
+            symbol_param,
+            None,
+            cmd_name="trade_var_cvar_calculate",
+        )
+
+        assert "currently open positions" in kwargs["help"]
+        assert "full open portfolio" in kwargs["help"]
 
     def test_report_template_choices_are_explicit(self):
         from mtdata.core.report.requests import ReportTemplateLiteral
@@ -932,6 +1100,7 @@ class TestResolveParamKwargs:
         kwargs, _ = _resolve_param_kwargs(param, None)
         assert kwargs["choices"] == ["a", "b"]
         assert kwargs["nargs"] == "+"
+        assert kwargs["type"]("A") == "a"
 
     def test_forecast_method_help_avoids_massive_choices(self):
         param = {"name": "method", "type": str, "required": False, "default": None}
@@ -959,7 +1128,7 @@ class TestResolveParamKwargs:
         param = {"name": "method", "type": str, "required": False, "default": None}
         kwargs, _ = _resolve_param_kwargs(param, None, cmd_name="correlation_matrix")
 
-        assert kwargs["help"] == "Method/algorithm for this tool."
+        assert kwargs["help"] == "Correlation coefficient: pearson or spearman."
         assert "forecast_list_methods" not in kwargs["help"]
 
     def test_common_analysis_params_have_specific_help(self):
@@ -999,7 +1168,7 @@ class TestResolveParamKwargs:
             cmd_name="regime_detect",
         )
 
-        assert "Preprocessing transform" in transform_kwargs["help"]
+        assert "Price transform" in transform_kwargs["help"]
         assert transform_kwargs["help"] != "transform parameter"
         assert "Minimum bars a detected regime must span" in min_regime_kwargs["help"]
         assert min_regime_kwargs["help"] != "min_regime_bars parameter"
@@ -1075,10 +1244,10 @@ class TestResolveParamKwargs:
             cmd_name="labels_triple_barrier",
         )
 
-        assert "fetched for labeling" in limit_kwargs["help"]
-        assert "not an output row limit" in limit_kwargs["help"]
-        assert "Recent labeled entries" in lookback_kwargs["help"]
-        assert "limit controls fetched history" in lookback_kwargs["help"]
+        assert "sampled rows" in limit_kwargs["help"]
+        assert "full returns the complete labeled series" in limit_kwargs["help"]
+        assert "labeled entries to calculate" in lookback_kwargs["help"]
+        assert "lookback plus horizon" in lookback_kwargs["help"]
 
     def test_patterns_engine_help_names_mode_scope(self):
         kwargs, _ = _resolve_param_kwargs(
@@ -1393,6 +1562,31 @@ class TestNormalizeCliArgvAliases:
 
         assert out == ["--help", "trade_place"]
 
+    def test_maps_confluence_command_timeframe_to_pivot_timeframe(self):
+        functions = {"confluence_levels": {"func": lambda: None}}
+
+        out = _normalize_cli_argv_aliases(
+            ["confluence_levels", "EURUSD", "--timeframe", "H1"],
+            functions,
+        )
+
+        assert out == [
+            "confluence_levels",
+            "EURUSD",
+            "--pivot-timeframe",
+            "H1",
+        ]
+
+    def test_keeps_global_confluence_timeframe_for_global_override(self):
+        functions = {"confluence_levels": {"func": lambda: None}}
+
+        out = _normalize_cli_argv_aliases(
+            ["--timeframe=H1", "confluence_levels", "EURUSD"],
+            functions,
+        )
+
+        assert out == ["--timeframe=H1", "confluence_levels", "EURUSD"]
+
 
 # ========================================================================
 # _example_value
@@ -1495,6 +1689,11 @@ class TestNormalizeCliListValue:
 
     def test_string_comma_separated(self):
         assert _normalize_cli_list_value("a,b,c") == ["a", "b", "c"]
+
+    def test_nested_commas_are_not_split(self):
+        assert _normalize_cli_list_value(
+            'rsi(14),macd(12,26,9),label="fast,slow"'
+        ) == ["rsi(14)", "macd(12,26,9)", 'label="fast,slow"']
 
     def test_string_space_separated(self):
         assert _normalize_cli_list_value("a b c") == ["a", "b", "c"]

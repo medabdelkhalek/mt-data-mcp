@@ -15,6 +15,12 @@ from ..report.utils import (
     resolve_report_context_indicators,
     summarize_barrier_grid,
 )
+from ..report.utils import (
+    current_only_section_omission as _current_only_section_omission,
+)
+from ..report.utils import (
+    is_bounded_report_window as _is_bounded_report_window,
+)
 from ..tool_calling import call_tool_sync_structured
 
 _TREND_COMPACT_LEGEND: Dict[str, str] = {
@@ -25,33 +31,10 @@ _TREND_COMPACT_LEGEND: Dict[str, str] = {
     "regime_code": "Regime code: 0=neutral, 1=uptrend, 2=downtrend, 3=breakout_up, 4=breakout_down.",
     "bars_since_swing_high": "Bars since most recent swing high (within lookback window).",
     "bars_since_swing_low": "Bars since most recent swing low (within lookback window).",
+    "bars_analyzed": "Consecutive source-timeframe bars used by the calculations.",
+    "input_resolution": "Input spacing used by bar-window calculations.",
     "data_quality": "Missing-input summary when close/high/low values were imputed for trend calculations.",
 }
-
-_CURRENT_ONLY_OMISSION_REASON = "current_only_section_omitted"
-
-
-def _is_bounded_report_window(start: Any, end: Any) -> bool:
-    return start not in (None, "") or end not in (None, "")
-
-
-def _current_only_section_omission(
-    section: str,
-    *,
-    start: Any,
-    end: Any,
-) -> Dict[str, Any]:
-    return {
-        "status": "omitted",
-        "reason": _CURRENT_ONLY_OMISSION_REASON,
-        "section": section,
-        "requested_window": {"start": start, "end": end},
-        "message": (
-            f"{section} was omitted because it cannot currently honor the "
-            "report's bounded market window."
-        ),
-    }
-
 
 def _get_raw_result(
     func: Any,
@@ -240,14 +223,14 @@ def _compute_compact_trend(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
 
     # Slope windows
     wins = [5, 20, 60]
-    s_vals: List[int] = []
-    r_vals: List[int] = []
+    s_vals: List[Optional[int]] = []
+    r_vals: List[Optional[int]] = []
     for w in wins:
-        seg = clean_close[-w:] if len(clean_close) >= w else clean_close
-        if len(seg) < 2:
-            s_vals.append(0)
-            r_vals.append(0)
+        if len(clean_close) < w:
+            s_vals.append(None)
+            r_vals.append(None)
             continue
+        seg = clean_close[-w:]
         # Use log price for scale invariance
         import math
         logs = [math.log(max(1e-12, v)) for v in seg]
@@ -284,8 +267,9 @@ def _compute_compact_trend(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
         q = _percentile_rank(widths, curr_width)
 
     # Regime code
-    s5, s20 = s_vals[0], s_vals[1] if len(s_vals) > 1 else (s_vals[0] if s_vals else 0)
-    r20 = r_vals[1] if len(r_vals) > 1 else 0
+    s5 = s_vals[0] if s_vals[0] is not None else 0
+    s20 = s_vals[1] if s_vals[1] is not None else 0
+    r20 = r_vals[1] if r_vals[1] is not None else 0
     # Donchian breakout check
     g = 0
     if len(clean_high) >= 21 and len(clean_low) >= 21:
@@ -326,6 +310,8 @@ def _compute_compact_trend(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any
         'regime_code': int(g),   # regime code
         'bars_since_swing_high': int(h_idx),
         'bars_since_swing_low': int(l_idx),
+        'bars_analyzed': int(len(clean_close)),
+        'input_resolution': 'consecutive_timeframe_bars',
     }
     if imputed_bars:
         out['data_quality'] = {
@@ -350,7 +336,9 @@ def _extract_forecast_values(payload: Dict[str, Any]) -> Optional[List[float]]:
 
 def _is_degenerate_forecast_payload(payload: Dict[str, Any]) -> bool:
     vals = _extract_forecast_values(payload)
-    if not isinstance(vals, list) or len(vals) < 3:
+    if not vals:
+        return True
+    if len(vals) < 3:
         return False
     first = vals[0]
     span = max(vals) - min(vals)
@@ -363,6 +351,8 @@ def template_basic(  # noqa: C901
     horizon: int,
     denoise: Optional[DenoiseSpec],
     params: Optional[Dict[str, Any]],
+    *,
+    include_default_timeframes: bool = True,
 ) -> Dict[str, Any]:
     p = dict(params or {})
     tf = str(p.get('timeframe', 'H1'))
@@ -381,8 +371,7 @@ def template_basic(  # noqa: C901
         'sections': {},
     }
 
-    # Request-scoped cache: avoids re-fetching the same (symbol, timeframe)
-    # across attach_multi_timeframes and the fallback MTF block.
+    # Request-scoped cache avoids re-fetching the same symbol/timeframe.
     _fetch_cache: Dict = {}
 
     # Context
@@ -401,7 +390,6 @@ def template_basic(  # noqa: C901
             end=end,
             indicators=indicators,  # type: ignore[arg-type]
             denoise=denoise,
-            simplify={'mode': 'select', 'method': 'lttb', 'ratio': 0.2},  # type: ignore[arg-type]
         )
         if report_section_enabled(p, 'context')
         else {'error': 'context section not requested'}
@@ -410,15 +398,20 @@ def template_basic(  # noqa: C901
     if 'error' in ctx:
         report['sections']['context'] = attach_candle_freshness_diagnostics({'error': ctx['error']}, ctx)
     else:
-        # Extract a tail window of candle rows
+        # Metrics require consecutive source bars. Only the snapshot is
+        # projected to the requested display tail.
+        context_limit = int(p.get('context_limit', 300))
+        context_rows = parse_table_tail(ctx, tail=context_limit)
         tail_n = int(p.get('context_tail', 40))
-        tail_rows = parse_table_tail(ctx, tail=tail_n)
+        tail_rows = context_rows[-tail_n:]
         if not tail_rows:
             # Fallbacks when calling through minimal formatter
             if isinstance(ctx, dict) and isinstance(ctx.get('data'), list):     
-                tail_rows = ctx.get('data')[-tail_n:]  # type: ignore[index]    
+                context_rows = list(ctx.get('data'))  # type: ignore[arg-type]
+                tail_rows = context_rows[-tail_n:]
             elif isinstance(ctx, list):
-                tail_rows = ctx
+                context_rows = ctx
+                tail_rows = context_rows[-tail_n:]
             else:
                 tail_rows = []
 
@@ -429,7 +422,7 @@ def template_basic(  # noqa: C901
             )
         else:
             last = tail_rows[-1] if tail_rows else {}
-            compact = _compute_compact_trend(tail_rows)
+            compact = _compute_compact_trend(context_rows)
             ctx_obj: Dict[str, Any] = {
                 'symbol': symbol,
                 'timeframe': tf,
@@ -445,8 +438,12 @@ def template_basic(  # noqa: C901
             report['sections']['context'] = attach_candle_freshness_diagnostics(ctx_obj, ctx)
 
     pivot_enabled = report_section_enabled(p, 'pivot')
-    contexts_multi_enabled = report_section_enabled(p, 'contexts_multi')
-    pivot_multi_enabled = report_section_enabled(p, 'pivot_multi')
+    contexts_multi_enabled = include_default_timeframes and report_section_enabled(
+        p, 'contexts_multi'
+    )
+    pivot_multi_enabled = include_default_timeframes and report_section_enabled(
+        p, 'pivot_multi'
+    )
 
     # Pivots use the current completed source bar and cannot honor a report
     # window. Keep bounded reports temporally coherent by omitting them.
@@ -472,86 +469,29 @@ def template_basic(  # noqa: C901
                 'timezone': piv.get('timezone'),
             }
 
-    if contexts_multi_enabled or pivot_multi_enabled:
-        try:
-            attach_multi_timeframes(
-                report,
-                symbol,
-                denoise,
-                extra_timeframes=(
-                    ['M15','H1','H4','D1'] if contexts_multi_enabled else []
-                ),
-                pivot_timeframes=(
-                    ['H4','D1']
-                    if pivot_multi_enabled and not bounded_window
-                    else []
-                ),
-                context_indicators=indicators,
-                start=start,
-                end=end,
-                _fetch_cache=_fetch_cache,
-            )
-        except Exception:
-            pass
+    if pivot_multi_enabled and bounded_window:
+        report['sections']['pivot_multi'] = _current_only_section_omission(
+            'pivot_multi', start=start, end=end
+        )
 
-
-    # Fallback: if MTF sections missing, build minimal ones inline
-    try:
-        secs = report.setdefault('sections', {})
-        if contexts_multi_enabled and 'contexts_multi' not in secs:
-            from ..report.utils import _extract_base_timeframe, context_for_tf
-            base_tf = _extract_base_timeframe(report)
-            tf_list = ['M15','H1','H4','D1']
-            ctxs: Dict[str, Any] = {}
-            for tf_i in tf_list:
-                if base_tf and tf_i.upper() == base_tf:
-                    continue
-                snap = context_for_tf(
-                    symbol,
-                    tf_i,
-                    denoise,
-                    limit=200,
-                    start=start,
-                    end=end,
-                    tail=30,
-                    indicators=indicators,
-                    _fetch_cache=_fetch_cache,
-                )
-                if snap and any(v is not None for v in snap.values()):
-                    ctxs[tf_i] = snap
-            if ctxs:
-                secs['contexts_multi'] = ctxs
-        if pivot_multi_enabled and bounded_window:
-            secs['pivot_multi'] = _current_only_section_omission(
-                'pivot_multi', start=start, end=end
-            )
-        elif pivot_multi_enabled and 'pivot_multi' not in secs:
-            from ..pivot import pivot_compute_points as _compute_pivot_points
-            pivs: Dict[str, Any] = {}
-            pivot_sec = secs.get('pivot')
-            base_tf = None
-            if isinstance(pivot_sec, dict) and pivot_sec.get('timeframe'):
-                base_tf = str(pivot_sec.get('timeframe')).upper()
-            for tfp in ['H4','D1']:
-                tfp_upper = str(tfp).upper()
-                if base_tf and tfp_upper == base_tf:
-                    continue
-                res = _get_raw_result(_compute_pivot_points, symbol=symbol, timeframe=tfp)
-                if isinstance(res, dict) and not res.get('error'):
-                    pivs[tfp] = {
-                        'levels': res.get('levels'),
-                        'methods': res.get('methods'),
-                        'period': res.get('period'),
-                        'timeframe': tfp,
-                        'calculation_basis': res.get('calculation_basis'),
-                        'timezone': res.get('timezone'),
-                    }
-            if pivs:
-                if base_tf:
-                    pivs['__base_timeframe__'] = base_tf
-                secs['pivot_multi'] = pivs
-    except Exception:
-        pass
+    if contexts_multi_enabled or (pivot_multi_enabled and not bounded_window):
+        attach_multi_timeframes(
+            report,
+            symbol,
+            denoise,
+            extra_timeframes=(
+                ['M15','H1','H4','D1'] if contexts_multi_enabled else []
+            ),
+            pivot_timeframes=(
+                ['H4','D1']
+                if pivot_multi_enabled and not bounded_window
+                else []
+            ),
+            context_indicators=indicators,
+            start=start,
+            end=end,
+            _fetch_cache=_fetch_cache,
+        )
 
     # Volatility (EWMA)
     from ..forecast import forecast_volatility_estimate
@@ -576,7 +516,7 @@ def template_basic(  # noqa: C901
     vol_errors: List[Dict[str, Any]] = []
     for hh in vol_horizons:
         row: Dict[str, Any] = {'horizon': int(hh)}
-        vals: List[float] = []
+        contributors: List[Dict[str, Any]] = []
         for m in methods:
             vres = _get_raw_result(
                 forecast_volatility_estimate,
@@ -614,46 +554,16 @@ def template_basic(  # noqa: C901
             except Exception:
                 use_val = None
             if use_val is None:
-                # fallback: rolling_std proxy
-                proxy_res = _get_raw_result(
-                    forecast_volatility_estimate,
-                    symbol=symbol,
-                    timeframe=tf,
-                    horizon=int(hh),
-                    method='rolling_std',
-                    start=start,
-                    end=end,
-                    detail='full',
-                )
-                psh = _first_volatility_value(
-                    proxy_res,
-                    ('volatility_horizon', 'horizon_sigma_price'),
-                )
-                try:
-                    pf = float(psh) if psh is not None else None
-                    if pf is not None and pf == pf and pf >= 0.0:
-                        row[m] = pf
-                        row[m + '_note'] = 'std proxy'
-                        vals.append(pf)
-                    else:
-                        error_text = str(proxy_res.get('error') or 'no value')
-                        row[m + '_err'] = error_text
-                        vol_errors.append({
-                            'horizon': int(hh),
-                            'method': m,
-                            'error': error_text,
-                        })
-                except Exception:
-                    error_text = str(proxy_res.get('error') or 'invalid proxy value')
-                    row[m + '_err'] = error_text
-                    vol_errors.append({
-                        'horizon': int(hh),
-                        'method': m,
-                        'error': error_text,
-                    })
+                error_text = 'requested estimator returned no usable horizon value'
+                row[m + '_err'] = error_text
+                vol_errors.append({
+                    'horizon': int(hh),
+                    'method': m,
+                    'error': error_text,
+                })
             else:
                 row[m] = use_val
-                vals.append(use_val)
+                contributors.append({'method': m, 'value': use_val, 'weight': 1.0})
             # store bar sigma too in case renderer wants it later
             if sb is not None:
                 try:
@@ -664,15 +574,50 @@ def template_basic(  # noqa: C901
                         row[m + '_bar_err'] = 'nan bar sigma'
                 except Exception:
                     row[m + '_bar_err'] = 'invalid bar sigma value'
-        if len(vals) > 0:
+        if not contributors:
+            proxy_res = _get_raw_result(
+                forecast_volatility_estimate,
+                symbol=symbol,
+                timeframe=tf,
+                horizon=int(hh),
+                method='rolling_std',
+                start=start,
+                end=end,
+                detail='full',
+            )
+            proxy_value = _first_volatility_value(
+                proxy_res,
+                ('volatility_horizon', 'horizon_sigma_price'),
+            )
             try:
-                row['avg'] = sum(vals) / len(vals)
+                proxy_float = float(proxy_value) if proxy_value is not None else None
             except Exception:
-                pass
+                proxy_float = None
+            if proxy_float is not None and isfinite(proxy_float) and proxy_float >= 0.0:
+                row['rolling_std_proxy'] = proxy_float
+                contributors.append({
+                    'method': 'rolling_std_proxy',
+                    'value': proxy_float,
+                    'weight': 1.0,
+                    'provenance': 'fallback_when_all_requested_estimators_unavailable',
+                })
+        if contributors:
+            values = [float(item['value']) for item in contributors]
+            row['avg'] = sum(values) / len(values)
+            row['avg_method'] = (
+                contributors[0]['method']
+                if len(contributors) == 1
+                else 'ensemble_mean'
+            )
+            equal_weight = 1.0 / len(contributors)
+            for contributor in contributors:
+                contributor['weight'] = equal_weight
+            row['contributors'] = contributors
             matrix_rows.append(row)
     if matrix_rows:
         report['sections']['volatility'] = {
             'methods': methods,
+            'aggregate_method': 'ensemble_mean',
             'matrix': matrix_rows,
         }
     else:
@@ -779,6 +724,35 @@ def template_basic(  # noqa: C901
                 if isinstance(method_stats, dict):
                     stats_by_method[str(method_name)] = method_stats
 
+        quality_candidates: List[tuple[str, float]] = []
+        for method_name, method_stats in stats_by_method.items():
+            if method_stats.get('success') is not True:
+                continue
+            try:
+                method_rmse = float(method_stats.get('avg_rmse'))
+            except Exception:
+                continue
+            if not isfinite(method_rmse):
+                continue
+            if min_dir_acc is not None:
+                try:
+                    method_da = float(method_stats.get('avg_directional_accuracy'))
+                except Exception:
+                    continue
+                if not isfinite(method_da) or method_da < float(min_dir_acc):
+                    continue
+            quality_candidates.append((method_name, method_rmse))
+        quality_best_rmse = min(
+            (item[1] for item in quality_candidates),
+            default=float('inf'),
+        )
+        quality_limit = quality_best_rmse * (1.0 + max(0.0, float(rmse_tol)))
+        eligible_methods = {
+            method_name
+            for method_name, method_rmse in quality_candidates
+            if method_rmse <= quality_limit
+        }
+
         ranked_methods: List[str] = []
         for row in ranking:
             if not isinstance(row, dict):
@@ -789,10 +763,7 @@ def template_basic(  # noqa: C901
 
         candidate_methods: List[str] = [best_name]
         for method_name in ranked_methods:
-            if method_name not in candidate_methods:
-                candidate_methods.append(method_name)
-        for method_name in stats_by_method.keys():
-            if method_name not in candidate_methods:
+            if method_name in eligible_methods and method_name not in candidate_methods:
                 candidate_methods.append(method_name)
 
         selected_method = best_name
@@ -800,8 +771,7 @@ def template_basic(  # noqa: C901
         selected_forecast: Optional[Dict[str, Any]] = None
         fallback_notes: List[str] = []
         first_error: Optional[str] = None
-        first_degenerate: Optional[Dict[str, Any]] = None
-        first_degenerate_method: Optional[str] = None
+        failure_causes: Dict[str, Dict[str, str]] = {}
 
         if not report_section_enabled(p, 'forecast'):
             candidate_methods = []
@@ -819,12 +789,17 @@ def template_basic(  # noqa: C901
             if 'error' in fc:
                 if first_error is None:
                     first_error = str(fc.get('error') or '')
+                failure_causes[method_name] = {
+                    'code': 'forecast_error',
+                    'message': str(fc.get('error') or 'forecast generation failed'),
+                }
                 fallback_notes.append(f"{method_name}: forecast error ({fc.get('error')})")
                 continue
             if _is_degenerate_forecast_payload(fc):
-                if first_degenerate is None:
-                    first_degenerate = fc
-                    first_degenerate_method = method_name
+                failure_causes[method_name] = {
+                    'code': 'degenerate_forecast',
+                    'message': 'forecast values were degenerate',
+                }
                 fallback_notes.append(f"{method_name}: degenerate forecast")
                 continue
             selected_method = method_name
@@ -832,15 +807,11 @@ def template_basic(  # noqa: C901
             selected_forecast = fc
             break
 
-        if selected_forecast is None and first_degenerate is not None:
-            selected_method = first_degenerate_method or best_name
-            selected_stats = dict(stats_by_method.get(selected_method) or best_stats or {})
-            selected_forecast = first_degenerate
-
         if selected_forecast is None and report_section_enabled(p, 'forecast'):
             report['sections']['forecast'] = {
-                'error': first_error or 'No usable forecast generated.',
+                'error': first_error or 'No quality-eligible method produced a usable forecast.',
                 'method': best_name,
+                'eligible_methods': sorted(eligible_methods),
             }
         elif selected_forecast is not None and report_section_enabled(p, 'forecast'):
             report['sections']['forecast'] = {
@@ -848,8 +819,13 @@ def template_basic(  # noqa: C901
                 **adapt_forecast_payload_for_report(selected_forecast),
             }
             if selected_method != best_name:
+                initial_cause = failure_causes.get(best_name) or {
+                    'code': 'forecast_fallback',
+                    'message': 'initial method did not produce a usable forecast',
+                }
                 report['sections']['forecast']['fallback_from'] = best_name
-                report['sections']['forecast']['fallback_reason'] = 'initial best method produced a degenerate forecast'
+                report['sections']['forecast']['fallback_reason_code'] = initial_cause['code']
+                report['sections']['forecast']['fallback_reason'] = initial_cause['message']
                 report['fallback_applied'] = True
                 report['original_method'] = best_name
                 report['fallback_method'] = selected_method
@@ -895,12 +871,20 @@ def template_basic(  # noqa: C901
         except Exception:
             pass
         if selected_forecast is not None and selected_method != best_name:
+            initial_cause = failure_causes.get(best_name) or {
+                'code': 'forecast_fallback',
+                'message': 'initial method did not produce a usable forecast',
+            }
             selection_basis['fallback_applied'] = True
-            selection_basis['fallback_reason'] = 'initial best method produced a degenerate forecast'
+            selection_basis['fallback_reason_code'] = initial_cause['code']
+            selection_basis['fallback_reason'] = initial_cause['message']
         best_method_payload['selection_basis'] = selection_basis
         if selected_forecast is not None and selected_method != best_name:
             best_method_payload['initial_method'] = best_name
-            best_method_payload['selection_warning'] = 'Initial best method forecast was degenerate; fallback applied.'
+            best_method_payload['selection_warning'] = (
+                f"Initial best method failed ({initial_cause['code']}): "
+                f"{initial_cause['message']}; fallback applied."
+            )
         if fallback_notes:
             best_method_payload['selection_warnings'] = fallback_notes
         report['sections']['backtest']['best_method'] = best_method_payload

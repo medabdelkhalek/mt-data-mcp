@@ -7,7 +7,7 @@ forecasting models to reduce code duplication and improve maintainability.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -46,7 +46,7 @@ def adjust_forecast_length(
     method_name: str = "forecast"
 ) -> np.ndarray:
     """
-    Adjust forecast length to match requested horizon by padding or truncating.
+    Validate that forecast length matches the requested horizon.
     
     Args:
         values: Forecast values array
@@ -54,7 +54,7 @@ def adjust_forecast_length(
         method_name: Name of the forecasting method for error messages
         
     Returns:
-        Adjusted forecast values array
+        Validated forecast values array
     """
     return _edge_pad_to_length(values, int(fh))
 
@@ -75,15 +75,27 @@ def process_quantile_levels(
     """
     if quantiles is None:
         return None
-    
+
     if not isinstance(quantiles, (list, tuple)):
+        raise ValueError(f"{method_name} quantiles must be a list or tuple")
+
+    if not quantiles:
         return None
-    
+
     try:
-        q_levels = [float(q) for q in quantiles if q is not None]
-        return q_levels if q_levels else None
-    except Exception:
-        return None
+        q_levels = [float(q) for q in quantiles]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{method_name} quantiles must contain only numeric levels between 0 and 1"
+        ) from exc
+
+    invalid = [q for q in q_levels if not np.isfinite(q) or not 0.0 < q < 1.0]
+    if invalid:
+        raise ValueError(
+            f"{method_name} quantiles must be finite levels strictly between 0 and 1; "
+            f"invalid levels: {invalid}"
+        )
+    return q_levels
 
 
 def build_params_used(

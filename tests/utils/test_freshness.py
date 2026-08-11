@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 
+from mtdata.utils import time as time_utils
 from mtdata.utils.freshness import (
     closed_session_context,
     format_freshness_label,
     is_standard_weekend_closure,
 )
 from mtdata.utils.market_metadata import build_tick_freshness_context
+from mtdata.utils.time import bar_close_epoch
 
 
 def test_closed_session_context_marks_weekend_fx_but_not_crypto():
@@ -28,23 +30,67 @@ def test_closed_session_context_marks_other_non_crypto_weekend_markets() -> None
 
 
 def test_closed_session_context_allows_fx_after_sunday_utc_reopen() -> None:
-    sunday_reopen = datetime(2026, 6, 14, 22, 0, tzinfo=timezone.utc).timestamp()
+    sunday_reopen = datetime(2026, 6, 14, 21, 0, tzinfo=timezone.utc).timestamp()
 
     assert closed_session_context("EURUSD", now_epoch=sunday_reopen) is None
 
 
-def test_standard_weekend_closure_uses_22_utc_boundaries() -> None:
+def test_weekend_boundary_tracks_new_york_daylight_saving_time() -> None:
+    winter_before_reopen = datetime(2026, 1, 4, 21, 30, tzinfo=timezone.utc)
+    winter_after_reopen = datetime(2026, 1, 4, 22, 30, tzinfo=timezone.utc)
+
+    assert is_standard_weekend_closure(winter_before_reopen)
+    assert not is_standard_weekend_closure(winter_after_reopen)
+
+
+def test_monthly_bar_close_uses_calendar_month_boundary(monkeypatch) -> None:
+    monkeypatch.setattr(time_utils, "_broker_calendar_timezone", lambda at_time: timezone.utc)
+    opened = datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp()
+    expected = datetime(2026, 3, 1, tzinfo=timezone.utc).timestamp()
+
+    assert bar_close_epoch(opened, "MN1") == expected
+
+
+def test_daily_bar_close_uses_broker_calendar_across_dst(monkeypatch) -> None:
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(
+        time_utils,
+        "_broker_calendar_timezone",
+        lambda at_time: ZoneInfo("Europe/Helsinki"),
+    )
+    opened = datetime(2026, 3, 28, 22, 0, tzinfo=timezone.utc).timestamp()
+    expected = datetime(2026, 3, 29, 21, 0, tzinfo=timezone.utc).timestamp()
+
+    assert bar_close_epoch(opened, "D1") == expected
+
+
+def test_monthly_bar_close_uses_broker_local_month(monkeypatch) -> None:
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(
+        time_utils,
+        "_broker_calendar_timezone",
+        lambda at_time: ZoneInfo("Europe/Helsinki"),
+    )
+    opened = datetime(2026, 2, 28, 22, 0, tzinfo=timezone.utc).timestamp()
+    expected = datetime(2026, 3, 31, 21, 0, tzinfo=timezone.utc).timestamp()
+
+    assert bar_close_epoch(opened, "MN1") == expected
+
+
+def test_standard_weekend_closure_uses_new_york_close_boundaries() -> None:
     assert is_standard_weekend_closure(
-        datetime(2026, 6, 14, 21, 59, tzinfo=timezone.utc)
+        datetime(2026, 6, 14, 20, 59, tzinfo=timezone.utc)
     )
     assert not is_standard_weekend_closure(
-        datetime(2026, 6, 14, 22, 0, tzinfo=timezone.utc)
+        datetime(2026, 6, 14, 21, 0, tzinfo=timezone.utc)
     )
     assert not is_standard_weekend_closure(
-        datetime(2026, 6, 12, 21, 59, tzinfo=timezone.utc)
+        datetime(2026, 6, 12, 20, 59, tzinfo=timezone.utc)
     )
     assert is_standard_weekend_closure(
-        datetime(2026, 6, 12, 22, 0, tzinfo=timezone.utc)
+        datetime(2026, 6, 12, 21, 0, tzinfo=timezone.utc)
     )
 
 
@@ -59,6 +105,9 @@ def test_closed_session_context_does_not_relax_very_old_data():
 
     assert result is not None
     assert result["freshness_policy_relaxed"] is False
+    assert result["assumed_closure_start"] == "2026-06-05T21:00:00Z"
+    assert result["assumed_closure_end"] == "2026-06-07T21:00:00Z"
+    assert result["assumed_closure_seconds"] == 48 * 60 * 60
 
 
 def test_weekend_tick_keeps_absolute_stale_flag() -> None:
@@ -86,11 +135,13 @@ def test_future_tick_is_not_accepted_as_fresh() -> None:
         stale_after_seconds=300,
     )
 
-    assert result["data_age_seconds"] == 0.0
+    assert result["data_age_seconds"] is None
     assert result["data_stale"] is True
     assert result["usable_for_live_trading"] is False
     assert result["timestamp_in_future"] is True
     assert result["timestamp_skew_seconds"] == 10_800.0
+    assert result["freshness_state"] == "clock_skew"
+    assert result["freshness"] == "clock skew, tick timestamp 3h 0m ahead of wall clock"
 
 
 def test_quote_at_shared_execution_threshold_is_live() -> None:

@@ -11,6 +11,7 @@ from ...bootstrap.settings import mt5_config
 from ...utils.coercion import round_finite
 from ...utils.mt5 import (
     MT5ConnectionError,
+    account_currency_from_gateway,
     ensure_mt5_connection_or_raise,
     mt5_adapter,
 )
@@ -19,6 +20,8 @@ from ...utils.time import (
     _format_time_minimal,
     _format_time_minimal_local,
     _use_client_tz,
+    format_datetime_utc,
+    format_epoch_utc,
 )
 from ...utils.utils import (
     _normalize_limit,
@@ -31,7 +34,7 @@ from ..output_contract import (
     ensure_common_meta,
     resolve_output_contract,
 )
-from . import comments, validation
+from . import comments, safety, validation
 from .gateway import create_trading_gateway
 from .positions import normalize_trade_history_output
 from .requests import TradeHistoryRequest, TradeJournalAnalyzeRequest
@@ -65,11 +68,27 @@ _TRADE_ACCOUNT_COMPACT_KEYS = (
     "currency",
     "leverage",
     "trade_allowed",
+    "broker_trade_allowed",
+    "account_risk_status",
+    "account_risk_reasons",
     "trade_expert",
 )
 _TRADE_JOURNAL_UNITS: Dict[str, str] = {
     "win_rate": "fraction",
     "win_rate_pct": "percentage_points",
+    "net_pnl": "account_currency",
+    "gross_profit": "account_currency",
+    "gross_loss": "account_currency",
+    "expectancy": "account_currency_per_closed_deal",
+    "avg_win": "account_currency_per_winning_deal",
+    "avg_loss": "account_currency_per_losing_deal",
+    "best_trade": "account_currency",
+    "worst_trade": "account_currency",
+    "profit": "account_currency",
+    "commission": "account_currency",
+    "swap": "account_currency",
+    "fee": "account_currency",
+    "volume": "broker_lot",
 }
 
 
@@ -78,13 +97,13 @@ def _utc_epoch_identity(value: Any) -> float:
 
 
 def _run_trade_history_request(request: TradeHistoryRequest) -> Any:
+    gateway = create_trading_gateway(
+        adapter=mt5_adapter,
+        ensure_connection_impl=ensure_mt5_connection_or_raise,
+    )
     result = run_trade_history(
         request,
-        gateway=create_trading_gateway(
-            include_trade_preflight=True,
-            adapter=mt5_adapter,
-            ensure_connection_impl=ensure_mt5_connection_or_raise,
-        ),
+        gateway=gateway,
         use_client_tz=_use_client_tz,
         format_time_minimal=_format_time_minimal,
         format_time_minimal_local=_format_time_minimal_local,
@@ -98,7 +117,62 @@ def _run_trade_history_request(request: TradeHistoryRequest) -> Any:
         decode_mt5_enum_label=decode_mt5_enum_label,
         mt5_config=mt5_config,
     )
-    return normalize_trade_history_output(result, request=request)
+    out = normalize_trade_history_output(
+        result,
+        request=request,
+        account_currency=account_currency_from_gateway(gateway),
+    )
+    if (
+        isinstance(out, dict)
+        and out.get("success") is not False
+        and request.start is None
+        and request.end is None
+        and request.minutes_back is None
+    ):
+        cutoff = datetime.now(timezone.utc).timestamp() - (
+            _DEFAULT_TRADE_HISTORY_LOOKBACK_DAYS * 86400
+        )
+        try:
+            position_rows = (
+                gateway.positions_get(symbol=request.symbol)
+                if request.symbol
+                else gateway.positions_get()
+            )
+            open_positions = list(position_rows or [])
+        except Exception:
+            open_positions = []
+        older: List[Dict[str, Any]] = []
+        for position in open_positions:
+            try:
+                opened_epoch = float(getattr(position, "time", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if opened_epoch <= 0 or opened_epoch >= cutoff:
+                continue
+            if (
+                request.position_ticket is not None
+                and str(getattr(position, "ticket", ""))
+                != str(request.position_ticket)
+            ):
+                continue
+            older.append(
+                {
+                    "ticket": getattr(position, "ticket", None),
+                    "symbol": getattr(position, "symbol", None),
+                    "opened_at": _format_time_minimal(opened_epoch),
+                }
+            )
+        if older:
+            out["history_incomplete_for_open_positions"] = True
+            out["open_positions_outside_history_window_count"] = len(older)
+            out["open_positions_outside_history_window"] = older[:20]
+            warnings_out = list(out.get("warnings") or [])
+            warnings_out.append(
+                f"The default {_DEFAULT_TRADE_HISTORY_LOOKBACK_DAYS}-day history window "
+                "does not include the opening event for one or more current positions."
+            )
+            out["warnings"] = warnings_out
+    return out
 
 
 def _safe_trade_journal_float(value: Any) -> Optional[float]:
@@ -197,7 +271,13 @@ def _trade_journal_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return metrics
 
 
-def _attach_trade_journal_units(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _attach_trade_journal_units(
+    payload: Dict[str, Any],
+    *,
+    currency: Optional[str] = None,
+) -> Dict[str, Any]:
+    if currency:
+        payload["currency"] = currency
     payload["units"] = dict(_TRADE_JOURNAL_UNITS)
     return payload
 
@@ -352,6 +432,7 @@ def _run_trade_journal_request(request: TradeJournalAnalyzeRequest) -> Dict[str,
         return {"error": "Unexpected trade_history response shape."}
     if history_result.get("error"):
         return history_result
+    currency = str(history_result.get("currency") or "").strip() or None
 
     raw_rows = history_result.get("items")
     if not isinstance(raw_rows, list):
@@ -399,7 +480,7 @@ def _run_trade_journal_request(request: TradeJournalAnalyzeRequest) -> Dict[str,
         }
         if breakdowns:
             payload["breakdowns"] = breakdowns
-        return _attach_trade_journal_units(payload)
+        return _attach_trade_journal_units(payload, currency=currency)
 
     rows = [row for row in raw_rows if isinstance(row, dict)]
     analyzed_rows: List[Dict[str, Any]] = []
@@ -470,7 +551,7 @@ def _run_trade_journal_request(request: TradeJournalAnalyzeRequest) -> Dict[str,
         }
         if breakdowns:
             payload["breakdowns"] = breakdowns
-        return _attach_trade_journal_units(payload)
+        return _attach_trade_journal_units(payload, currency=currency)
 
     sample_quality = _trade_journal_sample_quality(len(analyzed_rows), minimum=minimum_sample)
     if request.check_only:
@@ -538,7 +619,7 @@ def _run_trade_journal_request(request: TradeJournalAnalyzeRequest) -> Dict[str,
             _trade_journal_trade_snapshot(row)
             for row in ranked_worst[: min(5, len(ranked_worst))]
         ]
-    return _attach_trade_journal_units(payload)
+    return _attach_trade_journal_units(payload, currency=currency)
 
 
 def _trade_journal_sample_quality(exit_deals: int, *, minimum: int = 30) -> Dict[str, Any]:
@@ -629,6 +710,7 @@ def lookup_trade_ticket_history(ticket: Any) -> Optional[Dict[str, Any]]:
             message += f" ({reason_label})"
         message += ". No action taken."
         return {
+            "success": True,
             "message": message,
             "no_action": True,
             "checked_scopes": ["positions", "pending_orders", "history_deals"],
@@ -657,6 +739,7 @@ def lookup_trade_ticket_history(ticket: Any) -> Optional[Dict[str, Any]]:
             message += f" at {time_label}"
         message += ". No action taken."
         return {
+            "success": True,
             "message": message,
             "no_action": True,
             "checked_scopes": ["positions", "pending_orders", "history_orders"],
@@ -687,12 +770,7 @@ def _trade_account_iso_from_epoch(value: Any, *, milliseconds: bool = False) -> 
     if milliseconds or epoch > 10_000_000_000:
         epoch /= 1000.0
     try:
-        return (
-            datetime.fromtimestamp(epoch, tz=timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        return format_epoch_utc(epoch)
     except Exception:
         return None
 
@@ -762,7 +840,6 @@ def trade_account_info(
         requested_mode = contract.detail
 
         mt5 = create_trading_gateway(
-            include_trade_preflight=True,
             adapter=mt5_adapter,
             ensure_connection_impl=ensure_mt5_connection_or_raise,
         )
@@ -783,6 +860,18 @@ def trade_account_info(
             account_info=info,
             terminal_info=terminal_info,
         )
+        margin_stress = safety.assess_margin_stress(info)
+        broker_trade_allowed = validation._coerce_optional_bool(
+            getattr(info, "trade_allowed", None)
+        )
+        strict_execution_ready = preflight.get("execution_ready_strict")
+        if strict_execution_ready is None:
+            strict_execution_ready = preflight.get("execution_ready")
+        actionable_trade_allowed = bool(
+            broker_trade_allowed is True
+            and margin_stress.get("status") != "critical"
+            and strict_execution_ready is True
+        )
         login = preflight.get("login")
         if login is None:
             login = getattr(info, "login", None)
@@ -802,12 +891,7 @@ def trade_account_info(
             pass
 
         retrieved_dt = datetime.now(timezone.utc).replace(microsecond=0)
-        retrieved_at = (
-            retrieved_dt
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        retrieved_at = format_datetime_utc(retrieved_dt)
         payload = {
             "success": True,
             "source": "mt5_account_snapshot",
@@ -829,7 +913,10 @@ def trade_account_info(
             "margin_level": margin_level,
             "currency": info.currency,
             "leverage": info.leverage,
-            "trade_allowed": info.trade_allowed,
+            "trade_allowed": actionable_trade_allowed,
+            "broker_trade_allowed": broker_trade_allowed,
+            "account_risk_status": margin_stress.get("status"),
+            "account_risk_reasons": margin_stress.get("reasons"),
             "trade_expert": info.trade_expert,
             "server": preflight.get("server"),
             "company": preflight.get("company"),
@@ -841,7 +928,8 @@ def trade_account_info(
             "terminal_tradeapi_disabled": preflight.get("terminal_tradeapi_disabled"),
             "terminal_connected": preflight.get("terminal_connected"),
             "auto_trading_enabled": preflight.get("auto_trading_enabled"),
-            "execution_ready": preflight.get("execution_ready"),
+            "execution_ready": strict_execution_ready,
+            "execution_ready_relaxed": preflight.get("execution_ready"),
             "execution_ready_strict": preflight.get("execution_ready_strict"),
             "execution_hard_blockers": preflight.get("execution_hard_blockers"),
             "execution_soft_blockers": preflight.get("execution_soft_blockers"),

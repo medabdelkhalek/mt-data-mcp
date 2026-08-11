@@ -10,8 +10,8 @@ from ...shared.market_units import (
     quote_points_per_pip,
     snap_to_increment,
 )
-from ...utils.coercion import coerce_finite_float
-from ...utils.utils import coerce_scalar
+from ...utils.coercion import coerce_finite_float, coerce_scalar
+from ...utils.quote import tick_value
 from .gateway import MT5TradingGateway, create_trading_gateway, trading_connection_error
 from .sizing import _floor_volume_steps
 
@@ -36,6 +36,61 @@ _SUPPORTED_ORDER_TYPES = {
     "SELL_LIMIT",
     "SELL_STOP",
 }
+
+
+def _protection_level_tolerance(*, point: float) -> float:
+    """Return the absolute tolerance used for broker SL/TP readbacks."""
+    if math.isfinite(point) and point > 0.0:
+        return float(point) * 0.1
+    return 1e-9
+
+
+def _normalize_protection_level(
+    value: Optional[float], *, tol: float
+) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(numeric) or math.isclose(
+        numeric,
+        0.0,
+        rel_tol=0.0,
+        abs_tol=tol,
+    ):
+        return None
+    return numeric
+
+
+def _protection_levels_match(
+    lhs: Optional[float], rhs: Optional[float], *, tol: float
+) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is None and rhs is None
+    return math.isclose(float(lhs), float(rhs), rel_tol=0.0, abs_tol=tol)
+
+
+def _position_protection_levels(
+    position: Any,
+) -> tuple[Optional[float], Optional[float]]:
+    sl = _safe_float_attr(position, "sl")
+    tp = _safe_float_attr(position, "tp")
+    return (
+        float(sl) if sl is not None and math.isfinite(sl) and sl != 0.0 else None,
+        float(tp) if tp is not None and math.isfinite(tp) and tp != 0.0 else None,
+    )
+
+
+def _tick_bid_ask(tick: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Read finite quotes from MT5 objects, mappings, or structured rows."""
+    return (
+        coerce_finite_float(tick_value(tick, "bid")),
+        coerce_finite_float(tick_value(tick, "ask")),
+    )
+
+
 def _normalize_order_type_input(order_type: Any) -> Tuple[Optional[str], Optional[str]]:
     """Normalize order_type inputs from MCP clients into canonical MT5 order names."""
     if order_type is None:
@@ -283,7 +338,7 @@ def _time_sort_key(obj: Any, fields: tuple[str, ...]) -> float:
 def _resolve_position_side(position: Any, mt5: Any = None) -> Optional[str]:
     """Resolve an MT5 position type to ``BUY`` or ``SELL``."""
     try:
-        raw_type = getattr(position, "type")
+        raw_type = position.type
     except Exception:
         return None
 
@@ -315,7 +370,7 @@ def _resolve_position_side(position: Any, mt5: Any = None) -> Optional[str]:
     return None
 
 
-def _trade_done_codes(mt5: Any) -> set[int]:
+def _trade_accepted_codes(mt5: Any) -> set[int]:
     return {
         _safe_int_attr(mt5, "TRADE_RETCODE_PLACED", 10008),
         _safe_int_attr(mt5, "TRADE_RETCODE_DONE", 10009),
@@ -323,17 +378,32 @@ def _trade_done_codes(mt5: Any) -> set[int]:
     }
 
 
-def _retcode_is_done(
+def _retcode_is_accepted(
     mt5: Any,
     retcode: Any,
-    done_codes: Optional[set[int]] = None,
+    accepted_codes: Optional[set[int]] = None,
 ) -> bool:
     try:
-        if done_codes is None:
-            done_codes = _trade_done_codes(mt5)
-        return int(retcode) in done_codes
+        if accepted_codes is None:
+            accepted_codes = _trade_accepted_codes(mt5)
+        return int(retcode) in accepted_codes
     except Exception:
         return False
+
+
+def _trade_execution_status(mt5: Any, retcode: Any) -> str:
+    """Classify an accepted MT5 response without overstating completion."""
+    try:
+        value = int(retcode)
+    except Exception:
+        return "rejected"
+    if value == _safe_int_attr(mt5, "TRADE_RETCODE_DONE", 10009):
+        return "complete"
+    if value == _safe_int_attr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010):
+        return "partial"
+    if value == _safe_int_attr(mt5, "TRADE_RETCODE_PLACED", 10008):
+        return "queued"
+    return "rejected"
 
 
 def _candidate_fill_modes(mt5: Any, symbol_info: Any = None) -> list[int]:
@@ -547,15 +617,8 @@ def _validate_pending_order_levels(  # noqa: C901
     mt5: Any,
 ) -> Optional[Dict[str, Any]]:
     """Validate pending entry and protection levels against quotes and broker distances."""
-    try:
-        bid = float(getattr(tick, "bid", float("nan")) or float("nan"))
-    except Exception:
-        bid = float("nan")
-    try:
-        ask = float(getattr(tick, "ask", float("nan")) or float("nan"))
-    except Exception:
-        ask = float("nan")
-    if not math.isfinite(bid) or not math.isfinite(ask):
+    bid, ask = _tick_bid_ask(tick)
+    if bid is None or ask is None:
         return {"error": "Failed to get valid current bid/ask for pending-order validation."}
 
     distance = _broker_distance_metadata(symbol_info)
@@ -747,15 +810,8 @@ def _validate_live_protection_levels(
     if side_norm not in {"BUY", "SELL"}:
         return None
 
-    try:
-        bid = float(getattr(tick, "bid", float("nan")) or float("nan"))
-    except Exception:
-        bid = float("nan")
-    try:
-        ask = float(getattr(tick, "ask", float("nan")) or float("nan"))
-    except Exception:
-        ask = float("nan")
-    if not math.isfinite(bid) or not math.isfinite(ask):
+    bid, ask = _tick_bid_ask(tick)
+    if bid is None or ask is None:
         return {"error": "Failed to get valid current bid/ask for SL/TP validation."}
 
     reference_price = bid if side_norm == "BUY" else ask
@@ -855,6 +911,47 @@ def _validate_live_protection_levels(
     return None
 
 
+def snapshot_unavailable_error(
+    mt5: Any,
+    *,
+    snapshot: str,
+    context: str,
+    guardrail_blocked: bool = False,
+) -> Dict[str, Any]:
+    """Build an actionable error for a failed MT5 collection snapshot."""
+    normalized_snapshot = str(snapshot or "positions").strip().lower()
+    labels = {
+        "positions": "open positions",
+        "orders": "pending orders",
+        "history_deals": "deal history",
+        "history_orders": "order history",
+    }
+    label = labels.get(normalized_snapshot, normalized_snapshot.replace("_", " "))
+    payload: Dict[str, Any] = {
+        "success": False,
+        "error": (
+            f"Unable to read the current {label} snapshot from MT5; "
+            f"cannot safely {context}."
+        ),
+        "error_code": f"{normalized_snapshot}_snapshot_unavailable",
+        "snapshot": normalized_snapshot,
+        "remediation": (
+            "Confirm the MT5 terminal and account connection, then retry. An empty "
+            "book is returned as an empty tuple/list; None indicates a read failure."
+        ),
+    }
+    last_error = _safe_last_error(mt5)
+    if (
+        isinstance(last_error, (str, int, float, list, tuple, dict))
+        and last_error not in (None, False, (0, ""))
+    ):
+        payload["last_error"] = last_error
+    if guardrail_blocked:
+        payload["guardrail_blocked"] = True
+        payload["guardrail_rule"] = "snapshot_integrity"
+    return payload
+
+
 def _validate_basic_protection_levels(
     *,
     side: str,
@@ -884,6 +981,7 @@ def _validate_basic_protection_levels(
 
     sl = normalized["stop_loss"]
     tp = normalized["take_profit"]
+    side_norm = str(side or "").strip().upper()
     if sl is not None and tp is not None and math.isclose(sl, tp, rel_tol=1e-12):
         return {
             "error": "stop_loss and take_profit must be different prices.",
@@ -891,6 +989,21 @@ def _validate_basic_protection_levels(
             "stop_loss": sl,
             "take_profit": tp,
         }
+    if sl is not None and tp is not None:
+        if side_norm.startswith("BUY") and tp < sl:
+            return {
+                "error": "take_profit must be above stop_loss for BUY orders.",
+                "error_code": "invalid_protection_levels",
+                "stop_loss": sl,
+                "take_profit": tp,
+            }
+        if side_norm.startswith("SELL") and sl < tp:
+            return {
+                "error": "stop_loss must be above take_profit for SELL orders.",
+                "error_code": "invalid_protection_levels",
+                "stop_loss": sl,
+                "take_profit": tp,
+            }
 
     if entry_price in (None, 0):
         return None
@@ -901,7 +1014,6 @@ def _validate_basic_protection_levels(
     if not math.isfinite(entry) or entry <= 0.0:
         return None
 
-    side_norm = str(side or "").strip().upper()
     if side_norm.startswith("BUY"):
         if sl is not None and sl >= entry:
             return {

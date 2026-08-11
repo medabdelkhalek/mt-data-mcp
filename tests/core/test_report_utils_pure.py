@@ -23,12 +23,14 @@ from mtdata.core.report.utils import (
     _indicator_key_variants,
     apply_market_gates,
     attach_candle_freshness_diagnostics,
+    attach_market_and_timeframes,
     attach_multi_timeframes,
     context_for_tf,
     extract_candle_freshness_diagnostics,
     format_number,
     market_snapshot,
     merge_params,
+    normalize_report_methods,
     now_utc_iso,
     parse_table_tail,
     pick_best_forecast_method,
@@ -53,6 +55,62 @@ class TestNowUtcIso:
         before = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:")
         result = now_utc_iso()
         assert result.startswith(before[:11])  # at least same date
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (["theta", "arima"], ["theta", "arima"]),
+        ("theta,arima", ["theta", "arima"]),
+        ("theta arima", ["theta", "arima"]),
+        (["theta arima", "theta"], ["theta", "arima"]),
+    ],
+)
+def test_normalize_report_methods_accepts_documented_input_shapes(value, expected):
+    assert normalize_report_methods(value) == expected
+
+
+def test_bounded_market_sections_are_omitted_without_live_snapshot():
+    report = {"sections": {}}
+    with (
+        patch("mtdata.core.report.utils.market_snapshot") as snapshot,
+        patch("mtdata.core.report.utils.attach_report_timeframes"),
+    ):
+        result = attach_market_and_timeframes(
+            report,
+            "EURUSD",
+            None,
+            {"start": "2024-01-01", "end": "2024-01-31"},
+            default_extra=[],
+        )
+
+    assert result == {}
+    snapshot.assert_not_called()
+    assert report["sections"]["market"]["reason"] == "current_only_section_omitted"
+    assert (
+        report["sections"]["execution_gates"]["reason"]
+        == "current_only_section_omitted"
+    )
+
+
+def test_unbounded_market_sections_still_use_live_snapshot():
+    report = {"sections": {}}
+    live = {"bid": 1.1, "ask": 1.2, "spread_ticks": 2.0}
+    with (
+        patch("mtdata.core.report.utils.market_snapshot", return_value=live) as snapshot,
+        patch("mtdata.core.report.utils.attach_report_timeframes"),
+    ):
+        result = attach_market_and_timeframes(
+            report,
+            "EURUSD",
+            None,
+            {},
+            default_extra=[],
+        )
+
+    assert result == live
+    snapshot.assert_called_once_with("EURUSD")
+    assert report["sections"]["market"] == live
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +594,7 @@ class TestApplyMarketGates:
 
 class TestMarketSnapshot:
     @patch("mtdata.core.report.utils.get_symbol_info_cached", return_value=SimpleNamespace(point=0.00001, digits=5))
-    @patch("mtdata.core.report.utils._get_pip_size", return_value=0.00001)
+    @patch("mtdata.core.report.utils._get_tick_size", return_value=0.00001)
     def test_spread_pips_uses_true_pip_units(self, mock_pip, mock_symbol_info):
         with patch(
             "mtdata.core.market_depth.market_depth_fetch",
@@ -555,7 +613,7 @@ class TestMarketSnapshot:
         assert snap["pip_size"] == pytest.approx(0.0001)
 
     @patch("mtdata.core.report.utils.get_symbol_info_cached", return_value=SimpleNamespace(point=0.1, digits=1))
-    @patch("mtdata.core.report.utils._get_pip_size", return_value=0.5)
+    @patch("mtdata.core.report.utils._get_tick_size", return_value=0.5)
     def test_spread_pips_are_omitted_for_non_forex_symbols(self, mock_pip, mock_symbol_info):
         with patch(
             "mtdata.core.market_depth.market_depth_fetch",

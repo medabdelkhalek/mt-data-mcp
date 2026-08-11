@@ -10,32 +10,39 @@ import pytest
 from mtdata.forecast import common as fc
 
 
-def test_extract_forecast_values_handles_standard_alt_and_padding():
-    yf_standard = pd.DataFrame({"pred": [1.0, 2.0, 3.0]})
+def test_extract_forecast_values_requires_exact_horizon():
+    yf_standard = pd.DataFrame({"pred": [1.0, 2.0]})
     out = fc._extract_forecast_values(yf_standard, fh=2, method_name="m")
     assert out.tolist() == [1.0, 2.0]
 
     yf_alt = pd.DataFrame({"unique_id": ["ts"], "ds": [0], "pred": [9.0]})
-    out = fc._extract_forecast_values(yf_alt, fh=3, method_name="m")
-    assert out.tolist() == [9.0, 9.0, 9.0]
+    with pytest.raises(ValueError, match="requested 3, received 1"):
+        fc._extract_forecast_values(yf_alt, fh=3, method_name="m")
 
-    yf_with_actuals = pd.DataFrame({"unique_id": ["ts"], "ds": [0], "y": [1.0], "pred": [9.0]})
+    yf_with_actuals = pd.DataFrame(
+        {
+            "unique_id": ["ts"] * 2,
+            "ds": [0, 1],
+            "y": [1.0, 2.0],
+            "pred": [9.0, 10.0],
+        }
+    )
     out = fc._extract_forecast_values(yf_with_actuals, fh=2, method_name="m")
-    assert out.tolist() == [9.0, 9.0]
+    assert out.tolist() == [9.0, 10.0]
 
     with pytest.raises(RuntimeError, match="refusing to use actuals column 'y'"):
         fc._extract_forecast_values(pd.DataFrame({"y": [1.0, 2.0]}), fh=2, method_name="m")
 
     yf_with_auxiliary = pd.DataFrame(
         {
-            "unique_id": ["ts"],
-            "ds": [0],
-            "cutoff": ["2026-04-09T00:00:00Z"],
-            "NHITS": [7.5],
+            "unique_id": ["ts"] * 2,
+            "ds": [0, 1],
+            "cutoff": ["2026-04-09T00:00:00Z"] * 2,
+            "NHITS": [7.5, 8.0],
         }
     )
     out = fc._extract_forecast_values(yf_with_auxiliary, fh=2, method_name="nhits")
-    assert out.tolist() == [7.5, 7.5]
+    assert out.tolist() == [7.5, 8.0]
 
     with pytest.raises(RuntimeError, match="prediction columns not found"):
         fc._extract_forecast_values(pd.DataFrame({"unique_id": ["ts"], "ds": [0]}), fh=1, method_name="demo")
@@ -126,23 +133,23 @@ def test_fetch_history_as_of_and_drop_last_live_paths(monkeypatch):
 
     rates = [
         {"time": 100.0, "open": 1.0},
-        {"time": 200.0, "open": 2.0},
-        {"time": 300.0, "open": 3.0},
-        {"time": 400.0, "open": 4.0},
+        {"time": 3700.0, "open": 2.0},
+        {"time": 7300.0, "open": 3.0},
+        {"time": 10900.0, "open": 4.0},
     ]
 
     monkeypatch.setattr(fc, "_mt5_copy_rates_from", lambda symbol, tf, to_dt, count: rates)
     monkeypatch.setattr(fc, "_mt5_copy_rates_from_pos", lambda symbol, tf, start, count: rates)
     monkeypatch.setattr(fc, "_parse_start_datetime", lambda _as_of: datetime(2024, 1, 1))
-    monkeypatch.setattr(fc, "_utc_epoch_seconds", lambda _dt: 300.0)
+    monkeypatch.setattr(fc, "_utc_epoch_seconds", lambda _dt: 7300.0)
 
     out = fc.fetch_history("EURUSD", "H1", need=2, as_of="2024-01-01")
-    assert out["time"].tolist() == [200.0, 300.0]
+    assert out["time"].tolist() == [100.0, 3700.0]
     assert ("EURUSD", False) in symbol_select_calls
 
     monkeypatch.setattr(fc, "_is_last_bar_forming", lambda rates, timeframe: True)
     out = fc.fetch_history("EURUSD", "H1", need=4, as_of=None, drop_last_live=True)
-    assert out["time"].tolist() == [100.0, 200.0, 300.0]
+    assert out["time"].tolist() == [100.0, 3700.0, 7300.0]
 
 
 def test_fetch_history_as_of_anchors_directly_not_latest_window(monkeypatch):
@@ -158,7 +165,7 @@ def test_fetch_history_as_of_anchors_directly_not_latest_window(monkeypatch):
     monkeypatch.setattr(fc, "_mt5_copy_rates_from_pos", lambda symbol, tf, start, count: newest_rates)
     monkeypatch.setattr(fc, "_mt5_copy_rates_from", lambda symbol, tf, to_dt, count: asof_rates)
     monkeypatch.setattr(fc, "_parse_start_datetime", lambda _as_of: datetime(2020, 1, 1))
-    monkeypatch.setattr(fc, "_utc_epoch_seconds", lambda _dt: 250.0)
+    monkeypatch.setattr(fc, "_utc_epoch_seconds", lambda _dt: 3800.0)
 
     out = fc.fetch_history("EURUSD", "H1", need=2, as_of="2020-01-01")
     assert out["time"].tolist() == [100.0, 200.0]
@@ -188,7 +195,7 @@ def test_fetch_history_start_end_uses_range_without_lookback_trim(monkeypatch):
         "_parse_start_datetime",
         lambda value: datetime(2024, 1, 1) if value == "2024-01-01" else datetime(2024, 1, 2),
     )
-    monkeypatch.setattr(fc, "_utc_epoch_seconds", lambda _dt: 350.0)
+    monkeypatch.setattr(fc, "_utc_epoch_seconds", lambda _dt: 3950.0)
 
     out = fc.fetch_history(
         "EURUSD",
@@ -201,6 +208,41 @@ def test_fetch_history_start_end_uses_range_without_lookback_trim(monkeypatch):
     assert captured["symbol"] == "EURUSD"
     assert captured["tf"] == 1
     assert out["time"].tolist() == [100.0, 200.0, 300.0]
+
+
+def test_fetch_history_end_bound_excludes_bar_not_closed_by_cutoff(monkeypatch):
+    monkeypatch.setattr(fc, "TIMEFRAME_MAP", {"H1": 1})
+    monkeypatch.setattr(fc, "_ensure_symbol_ready", lambda _symbol: None)
+    monkeypatch.setattr(
+        fc,
+        "get_symbol_info_cached",
+        lambda _symbol: SimpleNamespace(visible=True),
+    )
+    monkeypatch.setattr(fc.mt5, "last_error", lambda: (1, "err"))
+    rates = [
+        {"time": 100.0, "open": 1.0},
+        {"time": 3700.0, "open": 2.0},
+        {"time": 7300.0, "open": 3.0},
+    ]
+    monkeypatch.setattr(
+        fc,
+        "_mt5_copy_rates_from",
+        lambda symbol, tf, to_dt, count: rates,
+    )
+    monkeypatch.setattr(fc, "_parse_end_datetime", lambda _end: datetime(2024, 1, 1))
+    monkeypatch.setattr(fc, "_utc_epoch_seconds", lambda _dt: 7300.0)
+
+    closed = fc.fetch_history("EURUSD", "H1", need=3, end="2024-01-01T02:00:00Z")
+    including_live = fc.fetch_history(
+        "EURUSD",
+        "H1",
+        need=3,
+        end="2024-01-01T02:00:00Z",
+        drop_last_live=False,
+    )
+
+    assert closed["time"].tolist() == [100.0, 3700.0]
+    assert including_live["time"].tolist() == [100.0, 3700.0, 7300.0]
 
 
 def test_fetch_history_preserves_live_native_utc_epochs(monkeypatch):

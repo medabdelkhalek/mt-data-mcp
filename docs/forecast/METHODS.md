@@ -61,7 +61,7 @@ Fast, dependency-free references and solid intraday baselines.
 | `naive` | — | Last value carried forward |
 | `drift` | — | Last value plus average drift |
 | `seasonal_naive` | requires `seasonality` | Repeats the last seasonal cycle |
-| `theta` | `alpha=0.2` | Robust, fast general-purpose baseline |
+| `theta` | — (no user-settable method parameters) | Robust, fast general-purpose baseline; fitted alpha is reported in `params_used` |
 | `fourier_ols` | `terms=auto` (≈`min(3, m/2)`), `trend=true` | OLS on Fourier terms; good for periodic series |
 
 ```bash
@@ -80,8 +80,8 @@ mtdata-cli forecast_generate EURUSD --method fourier_ols --params "terms=4,trend
 | `holt_winters_add` | `damped=false`; `alpha`,`beta`,`gamma`=auto; requires `seasonality` | Additive seasonality |
 | `holt_winters_mul` | `damped=false`; `alpha`,`beta`,`gamma`=auto; requires `seasonality` | Multiplicative seasonality |
 | `ets` | `trend=add`, `seasonal=auto`, `damped=false`; smoothing params auto | State-space ETS |
-| `arima` | order auto-selected when omitted | Non-seasonal ARIMA |
-| `sarima` | seasonal order auto-selected when omitted | Seasonal ARIMA |
+| `arima` | `(p,d,q)=(1,1,1)`, `trend=c` when omitted | Non-seasonal ARIMA |
+| `sarima` | `(p,d,q)=(1,1,1)`; seasonal order defaults to `(0,1,1,m)` when `seasonality > 1` | Seasonal ARIMA |
 
 ```bash
 mtdata-cli forecast_generate EURUSD --method ets --params "trend=add,damped=true"

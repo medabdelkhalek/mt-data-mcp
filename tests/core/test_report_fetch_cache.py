@@ -55,6 +55,28 @@ class TestContextForTfCache:
         assert r2 is not None
         assert r1["close"] == r2["close"]
 
+    def test_trend_uses_full_resolution_fetch_not_display_tail(self, monkeypatch):
+        rows = [
+            {"close": float(index), "high": float(index + 1), "low": float(index - 1)}
+            for index in range(1, 81)
+        ]
+        analyzed_lengths = []
+
+        monkeypatch.setattr(
+            "mtdata.core.data.data_fetch_candles",
+            lambda **_kwargs: {"data": rows},
+        )
+        monkeypatch.setattr(
+            "mtdata.core.report_templates.basic._compute_compact_trend",
+            lambda values: analyzed_lengths.append(len(values)) or {"bars": len(values)},
+        )
+
+        result = context_for_tf("EURUSD", "H1", None, limit=80, tail=1)
+
+        assert analyzed_lengths == [80]
+        assert result["trend_compact"] == {"bars": 80}
+        assert result["close"] == 80.0
+
     def test_cache_is_case_insensitive(self, monkeypatch):
         """'h1' and 'H1' should share the same cache entry."""
         call_count = 0
@@ -175,7 +197,7 @@ class TestAttachMultiTimeframesCacheThreading:
     """attach_multi_timeframes should thread _fetch_cache to context_for_tf."""
 
     def test_shared_cache_prevents_duplicate_fetches(self, monkeypatch):
-        """Calling attach_multi_timeframes + fallback with same cache => no dupes."""
+        """Repeated timeframe collection with the same cache avoids duplicate fetches."""
         fetched_tfs = []
 
         def _tracking_fetch(**kwargs):
@@ -199,7 +221,7 @@ class TestAttachMultiTimeframesCacheThreading:
         )
         first_pass_count = len(fetched_tfs)
 
-        # Second pass: simulate fallback calling context_for_tf for same TFs
+        # A repeated consumer can reuse the same cached timeframe snapshots.
         for tf in ["M15", "H4", "D1"]:
             context_for_tf("EURUSD", tf, None, limit=200, tail=30, _fetch_cache=cache)
 

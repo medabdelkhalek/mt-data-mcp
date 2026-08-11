@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from mtdata.core.finviz import (
+    _normalize_finviz_market_payload,
     finviz_calendar,
     finviz_earnings,
     finviz_filters_list,
@@ -55,9 +56,15 @@ def test_filters_list_defaults_to_index_and_supports_exact_lookup():
         searched = _unwrap(finviz_filters_list)(search="exchange")
 
     assert index["count"] == 1
-    assert index["total"] == 2
-    assert index["limit"] == 1
-    assert index["has_more"] is True
+    assert index["pagination"] == {
+        "total": 2,
+        "returned": 1,
+        "offset": 0,
+        "limit": 1,
+        "has_more": True,
+        "more_available": 1,
+    }
+    assert not {"total", "limit", "offset", "has_more"} & index.keys()
     assert "values" not in index["items"][0]
     assert exact["items"] == [
         {
@@ -74,6 +81,73 @@ def test_filters_list_defaults_to_index_and_supports_exact_lookup():
         {"value": "NASDAQ", "token": "exch_nasd"},
         {"value": "NYSE", "token": "exch_nyse"},
     ]
+
+
+def test_screen_pagination_uses_unknown_total_lower_bound() -> None:
+    result = _normalize_finviz_market_payload(
+        {
+            "success": True,
+            "stocks": [{"Ticker": f"TEST{index}"} for index in range(5)],
+            "total": None,
+            "total_lower_bound": 6,
+            "has_more": True,
+            "truncated": True,
+        },
+        rows_key="stocks",
+        tool="finviz_screen",
+        request={"view": "overview"},
+        detail="compact",
+        limit=5,
+    )
+
+    assert result["pagination"] == {
+        "total": 6,
+        "returned": 5,
+        "offset": 0,
+        "limit": 5,
+        "has_more": True,
+        "more_available": 1,
+        "total_is_lower_bound": True,
+    }
+
+
+def test_market_rows_keep_canonical_price_and_performance_fields_in_full_detail():
+    payload = {
+        "success": True,
+        "pairs": [
+            {
+                "Pair": "EUR/USD",
+                "Price": "1.10",
+                "Perf Day": "0.14%",
+                "Perf Week": "0.73%",
+                "Perf 5Min": "0.02%",
+            }
+        ],
+    }
+
+    compact = _normalize_finviz_market_payload(
+        payload,
+        rows_key="pairs",
+        tool="finviz_forex",
+        request={},
+        detail="compact",
+    )
+    full = _normalize_finviz_market_payload(
+        payload,
+        rows_key="pairs",
+        tool="finviz_forex",
+        request={},
+        detail="full",
+    )
+
+    assert compact["items"][0]["price"] == full["items"][0]["price"] == 1.1
+    assert compact["items"][0]["perf_day_pct"] == full["items"][0]["perf_day_pct"] == 0.14
+    assert compact["items"][0]["perf_week_pct"] == full["items"][0]["perf_week_pct"] == 0.73
+    assert full["items"][0]["perf_5min_pct"] == 0.02
+    assert "delayed_price" not in compact["items"][0]
+    assert "perf_day" not in full["items"][0]
+    assert full["performance_format"] == "percentage_points"
+    assert full["units"]["perf_day_pct"] == "percentage_points (1.0 = 1%)"
 
 
 class TestFinvizEarningsOutputContract:
@@ -105,9 +179,15 @@ class TestFinvizEarningsOutputContract:
         }
         assert result["count"] == 2
         assert result["row_key"] == "items"
-        assert result["page"] == 2
-        assert result["total"] == 6
-        assert result["pages"] == 3
+        assert result["pagination"] == {
+            "total": 6,
+            "returned": 2,
+            "offset": 2,
+            "limit": 2,
+            "has_more": True,
+            "more_available": 2,
+        }
+        assert not {"page", "pages", "total", "has_more"} & result.keys()
         assert "data" not in result
         assert "summary" not in result
         assert "meta" not in result
@@ -132,12 +212,14 @@ class TestFinvizEarningsOutputContract:
         assert result["detail"] == "full"
         assert result["meta"]["tool"] == "finviz_earnings"
         assert "request" not in result["meta"]
-        assert result["meta"]["pagination"] == {
-            "page": 2,
+        assert "pagination" not in result["meta"]
+        assert result["pagination"] == {
             "total": 6,
-            "pages": 3,
-            "has_more": False,
-            "truncated": False,
+            "returned": 1,
+            "offset": 2,
+            "limit": 2,
+            "has_more": True,
+            "more_available": 3,
         }
         assert result["meta"]["stats"]["truncated"] is False
 
@@ -162,11 +244,23 @@ class TestFinvizEarningsOutputContract:
         result = self._unwrapped()(period="This Week", limit=2, page=1)
 
         assert result["success"] is True
-        assert result["omitted_item_count"] is None
-        assert result["has_more"] is True
-        assert result["truncated"] is True
-        assert result["total_lower_bound"] == 3
-        assert result["next_page"] == 2
+        assert result["pagination"] == {
+            "total": 3,
+            "returned": 2,
+            "offset": 0,
+            "limit": 2,
+            "has_more": True,
+            "more_available": 1,
+            "total_is_lower_bound": True,
+        }
+        assert not {
+            "omitted_item_count",
+            "has_more",
+            "truncated",
+            "total_lower_bound",
+            "next_page",
+        } & result.keys()
+
 
     @patch("mtdata.core.finviz.get_earnings_calendar")
     def test_full_includes_numeric_market_cap(self, mock_get):
@@ -208,6 +302,9 @@ class TestFinvizCalendarOutputContract:
             "success": True,
             "dateFrom": "2026-01-05",
             "dateTo": "2026-01-12",
+            "total": 3,
+            "page": 2,
+            "pages": 3,
             "items": [
                 {
                     "date": "2026-01-06T13:30:00",
@@ -219,11 +316,25 @@ class TestFinvizCalendarOutputContract:
             ],
         }
 
-        result = _unwrap(finviz_calendar)(start="2026-01-05", end="2026-01-12")
+        result = _unwrap(finviz_calendar)(
+            start="2026-01-05",
+            end="2026-01-12",
+            limit=1,
+            page=2,
+        )
 
         assert result["date_from"] == "2026-01-05"
         assert result["date_to"] == "2026-01-12"
         assert result["timezone"] == "UTC"
+        assert result["pagination"] == {
+            "total": 3,
+            "returned": 1,
+            "offset": 1,
+            "limit": 1,
+            "has_more": True,
+            "more_available": 1,
+        }
+        assert not {"total", "page", "pages", "has_more"} & result.keys()
         assert result["items"] == [
             {
                 "date": "2026-01-06T18:30:00Z",
@@ -264,8 +375,11 @@ class TestFinvizCalendarOutputContract:
 
         assert result["items"] == [
             {
-                "earnings_date": "2026-04-29T08:30:00",
+                "earnings_date": "2026-04-29T12:30:00Z",
                 "symbol": "ABBV",
+                "date": "2026-04-29T12:30:00Z",
+                "local_time": "2026-04-29T08:30:00-04:00",
+                "local_timezone": "America/New_York",
                 "eps_estimate": 2.59,
                 "eps_actual": 2.65,
                 "eps_surprise": 2.23,
@@ -309,6 +423,7 @@ class TestFinvizCalendarOutputContract:
                 "impact": "medium",
             }
         ]
+        assert result["timezone"] == "UTC"
 
     @patch("mtdata.core.finviz.get_economic_calendar")
     def test_calendar_economic_filters_by_currency(self, mock_get):
@@ -444,7 +559,7 @@ class TestFinvizInsiderActivityOutputContract:
 
         assert result["detail"] == "compact"
         assert "insider_trades" not in result
-        assert len(result["items"]) == 5
+        assert len(result["items"]) == 6
         assert result["items"][0]["symbol"] == "AAPL"
         assert result["items"][0] == {
             "symbol": "AAPL",
@@ -464,7 +579,8 @@ class TestFinvizInsiderActivityOutputContract:
             "shares": 15.0,
             "value_usd": 1600.0,
         }
-        assert result["omitted_item_count"] == 1
+        assert result["pagination"]["returned"] == 6
+        assert result["pagination"]["more_available"] == 0
 
     @patch("mtdata.core.finviz.get_insider_activity")
     def test_full_keeps_all_normalized_rows_including_urls(self, mock_get):
@@ -518,7 +634,8 @@ class TestFinvizInsiderOutputContract:
             "value_usd": "421850",
         }
         assert result["summary"]["sell_transactions"] == 3
-        assert result["omitted_item_count"] == 1
+        assert result["pagination"]["returned"] == 4
+        assert result["pagination"]["more_available"] == 0
 
     @patch("mtdata.core.finviz.get_stock_insider_trades")
     def test_full_normalizes_items(self, mock_get):
@@ -541,7 +658,7 @@ class TestFinvizInsiderOutputContract:
 
 class TestFinvizProgressiveDisclosure:
     @patch("mtdata.core.finviz.get_stock_insider_trades")
-    def test_insider_compact_truncates_rows_and_adds_counts(self, mock_get):
+    def test_insider_compact_keeps_page_and_adds_counts(self, mock_get):
         mock_get.return_value = {
             "success": True,
             "symbol": "AAPL",
@@ -557,11 +674,12 @@ class TestFinvizProgressiveDisclosure:
         result = _unwrap(finviz_insider)("AAPL", detail="compact")
 
         assert result["detail"] == "compact"
-        assert len(result["items"]) == 3
+        assert len(result["items"]) == 4
         assert "insider_trades" not in result
         assert result["summary"]["buy_transactions"] == 2
         assert result["summary"]["sell_transactions"] == 1
-        assert result["omitted_item_count"] == 1
+        assert result["pagination"]["returned"] == 4
+        assert result["pagination"]["more_available"] == 0
 
     @patch("mtdata.core.finviz.get_stock_ratings")
     def test_ratings_compact_returns_latest_rows_and_summary(self, mock_get):
@@ -580,8 +698,14 @@ class TestFinvizProgressiveDisclosure:
         assert result["detail"] == "compact"
         assert result["ratings"] == expected_rows
         assert result["count"] == 3
-        assert result["available_count"] == 5
-        assert result["truncated"] is True
+        assert result["pagination"] == {
+            "total": 5,
+            "returned": 3,
+            "offset": 0,
+            "limit": 3,
+            "has_more": True,
+            "more_available": 2,
+        }
         assert result["summary"]["latest"] == expected_rows[0]
         assert result["show_all_hint"] == "Set extras='metadata' or limit=5 to view all ratings."
 
@@ -595,9 +719,8 @@ class TestFinvizProgressiveDisclosure:
         assert result["detail"] == "compact"
         assert len(result["ratings"]) == 2
         assert result["count"] == 2
-        assert result["available_count"] == 5
-        assert result["truncated"] is True
-        assert result["omitted_item_count"] == 3
+        assert result["pagination"]["total"] == 5
+        assert result["pagination"]["more_available"] == 3
 
     @patch("mtdata.core.finviz.get_stock_ratings")
     def test_ratings_compact_removes_duplicate_price_target_strings(self, mock_get):
@@ -633,8 +756,8 @@ class TestFinvizProgressiveDisclosure:
 
         assert result["detail"] == "full"
         assert result["count"] == 5
-        assert result["available_count"] == 5
-        assert result["truncated"] is False
+        assert result["pagination"]["returned"] == 5
+        assert result["pagination"]["more_available"] == 0
 
     @patch("mtdata.core.finviz.get_stock_ratings")
     def test_ratings_normalizes_mixed_date_formats(self, mock_get):
@@ -664,10 +787,14 @@ class TestFinvizProgressiveDisclosure:
         assert result["detail"] == "compact"
         assert result["peers"] == peers[:5]
         assert result["count"] == 5
-        assert result["available_count"] == 6
-        assert result["omitted_item_count"] == 1
-        assert result["has_more"] is True
-        assert result["offset"] == 0
+        assert result["pagination"] == {
+            "total": 6,
+            "returned": 5,
+            "offset": 0,
+            "limit": 5,
+            "has_more": True,
+            "more_available": 1,
+        }
 
     @patch("mtdata.core.finviz.get_stock_peers")
     def test_peers_limit_controls_returned_rows(self, mock_get):
@@ -678,9 +805,8 @@ class TestFinvizProgressiveDisclosure:
 
         assert result["peers"] == ["MSFT", "GOOGL"]
         assert result["count"] == 2
-        assert result["available_count"] == 3
-        assert result["omitted_item_count"] == 1
-        assert result["has_more"] is True
+        assert result["pagination"]["total"] == 3
+        assert result["pagination"]["more_available"] == 1
 
     @patch("mtdata.core.finviz.get_stock_peers")
     def test_peers_offset_fetches_followup_page(self, mock_get):
@@ -690,9 +816,14 @@ class TestFinvizProgressiveDisclosure:
         result = _unwrap(finviz_peers)("AAPL", limit=2, offset=4)
 
         assert result["peers"] == ["NVDA", "ORCL"]
-        assert result["offset"] == 4
-        assert result["has_more"] is False
-        assert result["omitted_item_count"] == 0
+        assert result["pagination"] == {
+            "total": 6,
+            "returned": 2,
+            "offset": 4,
+            "limit": 2,
+            "has_more": False,
+            "more_available": 0,
+        }
 
     @patch("mtdata.core.finviz.get_stock_ratings")
     def test_finviz_detail_accepts_standard_alias_as_compact(self, mock_get):

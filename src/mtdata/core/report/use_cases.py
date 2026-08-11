@@ -4,13 +4,15 @@ import logging
 import math
 import time
 import warnings
+from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from ...utils.time import format_datetime_utc
 from ..execution_logging import log_operation_exception, run_logged_operation
 from ..output_contract import normalize_output_detail
 from .requests import ReportGenerateRequest
-from .utils import extract_report_forecast_values
+from .utils import extract_report_forecast_values, normalize_report_methods
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +103,7 @@ def _parse_report_timestamp(value: Any) -> datetime | None:
 
 
 def _format_report_timestamp(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return format_datetime_utc(value)
 
 
 _REPORT_TIMESTAMP_KEYS = frozenset(
@@ -216,11 +218,31 @@ def _is_user_facing_report_warning(warning_obj: Any) -> bool:
     return bool(warning_text)
 
 
-def _build_sections_status(sections: Dict[str, Any]) -> Dict[str, Any]:
+def _build_sections_status(
+    sections: Dict[str, Any],
+    *,
+    expected_sections: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     statuses: Dict[str, str] = {}
     details: Dict[str, Dict[str, Any]] = {}
     summary = {"ok": 0, "partial": 0, "error": 0, "omitted": 0}
-    for name, payload in sections.items():
+    ordered_names = list(dict.fromkeys([*(expected_sections or []), *sections.keys()]))
+    for name in ordered_names:
+        if name not in sections:
+            statuses[str(name)] = "error"
+            summary["error"] += 1
+            details[str(name)] = {
+                "status": "error",
+                "reason": "scheduled section returned no payload",
+                "errors": [
+                    {
+                        "path": str(name),
+                        "message": "Scheduled report section was not returned by the template.",
+                    }
+                ],
+            }
+            continue
+        payload = sections[name]
         declared_status = (
             str(payload.get("status") or "").strip().lower()
             if isinstance(payload, dict)
@@ -283,7 +305,8 @@ def _build_sections_status(sections: Dict[str, Any]) -> Dict[str, Any]:
 def _prioritize_report_payload(report: Dict[str, Any]) -> Dict[str, Any]:
     preferred_keys = (
         "success",
-        "completeness",
+        "section_run_status",
+        "content_detail",
         "as_of",
         "generated_at",
         "timezone",
@@ -382,6 +405,104 @@ _COMPACT_SUMMARY_STRUCTURED_KEYS = (
 )
 
 
+def _round_compact_summary_value(value: Any, *, significant_digits: int = 6) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or value == 0.0:
+            return value
+        decimals = (
+            int(significant_digits)
+            - int(math.floor(math.log10(abs(value))))
+            - 1
+        )
+        return round(value, decimals)
+    if isinstance(value, dict):
+        return {
+            key: _round_compact_summary_value(item, significant_digits=significant_digits)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _round_compact_summary_value(item, significant_digits=significant_digits)
+            for item in value
+        ]
+    return value
+
+
+def _build_barrier_best_summary(
+    best: Dict[str, Any],
+    *,
+    direction: Any = None,
+    include_direction_field: bool = False,
+    format_number: Callable[[Any], str],
+) -> tuple[List[str], Dict[str, Any]]:
+    """Build matching text and structured summaries for one barrier candidate."""
+    details: List[str] = []
+    entry: Dict[str, Any] = {}
+    if direction:
+        direction_text = str(direction)
+        details.append(f"dir={direction_text}")
+        if include_direction_field:
+            entry["direction"] = direction_text
+
+    metrics = (
+        ("tp", "tp_pct", "tp", "tp_pct", "%"),
+        ("sl", "sl_pct", "sl", "sl_pct", "%"),
+        ("ev", "ev", "ev", "ev", ""),
+        ("edge", "edge", "probability_edge", "probability_edge", ""),
+        (
+            "edge_vs_breakeven",
+            "edge_vs_breakeven",
+            "edge_vs_breakeven",
+            "edge_vs_breakeven",
+            "",
+        ),
+    )
+    for source_key, metric_name, detail_key, output_key, suffix in metrics:
+        value = best.get(source_key)
+        if value is None:
+            continue
+        rounded = _round_report_barrier_metric(metric_name, value)
+        details.append(f"{detail_key}={format_number(rounded)}{suffix}")
+        entry[output_key] = rounded
+
+    ev = best.get("ev")
+    edge_vs_breakeven = best.get("edge_vs_breakeven")
+    conflict_metric = (
+        "edge_vs_breakeven" if edge_vs_breakeven is not None else "edge"
+    )
+    conflict_value = (
+        edge_vs_breakeven
+        if edge_vs_breakeven is not None
+        else best.get("edge")
+    )
+    try:
+        if ev is not None and conflict_value is not None:
+            ev_num = float(ev)
+            edge_num = float(conflict_value)
+            if (ev_num > 0 and edge_num < 0) or (
+                ev_num < 0 and edge_num > 0
+            ):
+                reason = f"ev and {conflict_metric} have opposite signs"
+                details.extend(
+                    (
+                        "ev_edge_conflict=true",
+                        f"ev_edge_conflict_reason={reason}",
+                    )
+                )
+                entry.update(
+                    {
+                        "ev_edge_conflict": True,
+                        "conflict_reason": reason,
+                        "trading_note": _BARRIER_EV_EDGE_CONFLICT_NOTE,
+                    }
+                )
+    except Exception:
+        pass
+    return details, entry
+
+
 def _compact_summary_structured(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
@@ -402,7 +523,7 @@ def _compact_summary_structured(value: Any) -> Any:
                 barriers[str(name)] = entry_out
             section = barriers
         if section not in (None, "", [], {}):
-            out[key] = section
+            out[key] = _round_compact_summary_value(section)
     if not out:
         return value
     omitted = [str(key) for key in value if key not in out]
@@ -511,9 +632,13 @@ def _compact_report_payload(  # noqa: C901
         and report.get("generated_at") != report.get("as_of")
     ):
         compact["generated_at"] = report.get("generated_at")
-    completeness = report.get("completeness")
-    if completeness not in (None, "", [], {}):
-        compact["completeness"] = completeness
+    for key in ("section_run_status", "content_detail"):
+        value = report.get(key)
+        if value not in (None, "", [], {}):
+            compact[key] = value
+    sections_to_retry = report.get("sections_to_retry")
+    if sections_to_retry not in (None, "", [], {}):
+        compact["sections_to_retry"] = sections_to_retry
     assessment = report.get("overall_assessment")
     if assessment not in (None, "", [], {}):
         compact["assessment"] = _compact_report_assessment(assessment)
@@ -654,7 +779,7 @@ def _resolve_report_section_plan(
     while dependency_index < len(execution):
         section = execution[dependency_index]
         for dependency in _REPORT_SECTION_DEPENDENCIES.get(section, ()):
-            if dependency not in execution:
+            if dependency in available and dependency not in execution:
                 execution.append(dependency)
         dependency_index += 1
     if template == "scalping" and "barriers" in execution and "market" not in execution:
@@ -774,6 +899,42 @@ def _build_overall_report_assessment(report: Dict[str, Any]) -> Dict[str, Any]:
         recommended_action = "review_key_levels_and_risk"
         summary_text = "Report sections completed successfully; review levels, forecast, and risk context before acting."
 
+    stale_sections: List[str] = []
+    closed_session = False
+    report_sections = report.get("sections")
+    if isinstance(report_sections, dict):
+        for section_name in ("context", "forecast"):
+            section = report_sections.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            freshness = section.get("freshness")
+            freshness = freshness if isinstance(freshness, dict) else {}
+            is_stale = any(
+                value is True
+                for value in (
+                    section.get("last_observation_stale"),
+                    section.get("data_stale"),
+                    freshness.get("data_stale"),
+                    freshness.get("last_observation_stale"),
+                )
+            )
+            market_status = str(
+                section.get("market_status")
+                or freshness.get("market_status")
+                or freshness.get("market_session_status")
+                or ""
+            ).lower()
+            if is_stale or market_status == "closed":
+                stale_sections.append(section_name)
+            closed_session = closed_session or market_status == "closed"
+    if stale_sections:
+        trust_reason = "closed-session" if closed_session else "stale"
+        summary_text += (
+            f" Market inputs include {trust_reason} data; verify freshness before acting."
+        )
+        if recommended_action == "review_key_levels_and_risk":
+            recommended_action = "review_stale_or_closed_session_data"
+
     assessment: Dict[str, Any] = {
         "is_trade_signal": False,
         "recommended_action": recommended_action,
@@ -794,6 +955,11 @@ def _build_overall_report_assessment(report: Dict[str, Any]) -> Dict[str, Any]:
         assessment["partial_sections"] = partial_sections[:6]
     if omitted_sections:
         assessment["omitted_sections"] = omitted_sections[:6]
+    if stale_sections:
+        assessment["data_trust"] = {
+            "status": "closed_session" if closed_session else "stale",
+            "affected_sections": stale_sections,
+        }
     return assessment
 
 
@@ -816,7 +982,8 @@ def _build_report_executive_summary(
         "recommended_action": assessment.get("recommended_action"),
         "assembly_confidence": assessment.get("assembly_confidence"),
         "assembly_confidence_basis": assessment.get("assembly_confidence_basis"),
-        "completeness": report.get("completeness"),
+        "section_run_status": report.get("section_run_status"),
+        "content_detail": report.get("content_detail"),
     }
     section_health = assessment.get("section_health")
     if isinstance(section_health, dict):
@@ -828,6 +995,9 @@ def _build_report_executive_summary(
     sections_with_issues = report.get("sections_with_issues")
     if sections_with_issues not in (None, "", [], {}):
         out["sections_with_issues"] = sections_with_issues
+    sections_to_retry = report.get("sections_to_retry")
+    if sections_to_retry not in (None, "", [], {}):
+        out["sections_to_retry"] = sections_to_retry
     return {key: value for key, value in out.items() if value not in (None, "", [], {})}
 
 
@@ -901,7 +1071,7 @@ def run_report_generate(  # noqa: C901
             if request.end:
                 params["end"] = request.end
             if request.methods is not None:
-                params["methods"] = request.methods
+                params["methods"] = normalize_report_methods(request.methods)
             section_plan = _resolve_report_section_plan(
                 name,
                 include_sections=request.include_sections,
@@ -955,7 +1125,15 @@ def run_report_generate(  # noqa: C901
                 eff_horizon = default_horizon.get(name, 12)
 
             captured_warnings: List[str] = []
-            with warnings.catch_warnings(record=True) as warning_records:
+            volatility_context: Any = nullcontext()
+            if "volatility" in section_plan["execution"]:
+                from ...forecast.volatility import volatility_rates_cache
+
+                volatility_context = volatility_rates_cache()
+            with (
+                volatility_context,
+                warnings.catch_warnings(record=True) as warning_records,
+            ):
                 warnings.simplefilter("always")
                 if name == "basic":
                     rep = _t_basic(request.symbol, eff_horizon, request.denoise, params)
@@ -1003,8 +1181,11 @@ def run_report_generate(  # noqa: C901
             template_sections = (
                 rep.get("sections") if isinstance(rep.get("sections"), dict) else None
             )
-            if summary_mode and isinstance(rep.get("sections"), dict):
-                source_sections_status = _build_sections_status(rep["sections"])
+            if isinstance(rep.get("sections"), dict):
+                source_sections_status = _build_sections_status(
+                    rep["sections"],
+                    expected_sections=section_plan["execution"],
+                )
             if not summary_mode:
                 _apply_report_section_controls(
                     rep,
@@ -1154,6 +1335,8 @@ def run_report_generate(  # noqa: C901
                                 if int(row.get("horizon") or 0) != int(eff_horizon):
                                     continue
                                 hs = row.get("avg")
+                                if hs is not None:
+                                    vol_method = row.get("avg_method")
                                 if hs is None:
                                     for key, value in row.items():
                                         if key in {"horizon", "avg"} or str(key).endswith(("_bar", "_err", "_note")):
@@ -1162,10 +1345,6 @@ def run_report_generate(  # noqa: C901
                                             hs = value
                                             vol_method = str(key)
                                             break
-                                if hs is not None and vol_method is None:
-                                    methods = vol.get("methods")
-                                    if isinstance(methods, list) and methods:
-                                        vol_method = str(methods[0])
                                 break
                     if hs is not None:
                         summ.append(f"h{eff_horizon} sigma={format_number(hs)}")
@@ -1262,7 +1441,13 @@ def run_report_generate(  # noqa: C901
                         initial = best_payload.get("initial_method")
                         chosen = best_payload.get("method")
                         if initial and chosen and str(initial) != str(chosen):
-                            line += ", fallback=degenerate-initial-forecast"
+                            basis = best_payload.get("selection_basis")
+                            reason_code = (
+                                basis.get("fallback_reason_code")
+                                if isinstance(basis, dict)
+                                else None
+                            )
+                            line += f", fallback={reason_code or 'forecast_fallback'}"
                     forecast_summary = summary_structured.setdefault("forecast", {})
                     if isinstance(forecast_summary, dict):
                         forecast_summary["selection"] = {
@@ -1335,55 +1520,11 @@ def run_report_generate(  # noqa: C901
                         best = sub.get("best") if isinstance(sub, dict) else None
                         if not best:
                             continue
-                        tp = best.get("tp")
-                        sl = best.get("sl")
-                        ev = best.get("ev")
-                        edge = best.get("edge")
-                        edge_vs_breakeven = best.get("edge_vs_breakeven")
-                        details: List[str] = [f"dir={dname}"]
-                        barrier_entry: Dict[str, Any] = {}
-                        if tp is not None:
-                            tp_out = _round_report_barrier_metric("tp_pct", tp)
-                            details.append(f"tp={format_number(tp_out)}%")
-                            barrier_entry["tp_pct"] = tp_out
-                        if sl is not None:
-                            sl_out = _round_report_barrier_metric("sl_pct", sl)
-                            details.append(f"sl={format_number(sl_out)}%")
-                            barrier_entry["sl_pct"] = sl_out
-                        if ev is not None:
-                            ev_out = _round_report_barrier_metric("ev", ev)
-                            details.append(f"ev={format_number(ev_out)}")
-                            barrier_entry["ev"] = ev_out
-                        if edge is not None:
-                            edge_out = _round_report_barrier_metric("edge", edge)
-                            details.append(f"probability_edge={format_number(edge_out)}")
-                            barrier_entry["probability_edge"] = edge_out
-                        if edge_vs_breakeven is not None:
-                            edge_be_out = _round_report_barrier_metric(
-                                "edge_vs_breakeven",
-                                edge_vs_breakeven,
-                            )
-                            details.append(
-                                f"edge_vs_breakeven={format_number(edge_be_out)}"
-                            )
-                            barrier_entry["edge_vs_breakeven"] = edge_be_out
-                        try:
-                            conflict_metric = (
-                                "edge_vs_breakeven" if edge_vs_breakeven is not None else "edge"
-                            )
-                            conflict_value = edge_vs_breakeven if edge_vs_breakeven is not None else edge
-                            if ev is not None and conflict_value is not None:
-                                ev_num = float(ev)
-                                edge_num = float(conflict_value)
-                                if (ev_num > 0 and edge_num < 0) or (ev_num < 0 and edge_num > 0):
-                                    reason = f"ev and {conflict_metric} have opposite signs"
-                                    details.append("ev_edge_conflict=true")
-                                    details.append(f"ev_edge_conflict_reason={reason}")
-                                    barrier_entry["ev_edge_conflict"] = True
-                                    barrier_entry["conflict_reason"] = reason
-                                    barrier_entry["trading_note"] = _BARRIER_EV_EDGE_CONFLICT_NOTE
-                        except Exception:
-                            pass
+                        details, barrier_entry = _build_barrier_best_summary(
+                            best,
+                            direction=dname,
+                            format_number=format_number,
+                        )
                         if details:
                             summ.append("barrier best " + " ".join(details))
                         if barrier_entry:
@@ -1395,58 +1536,12 @@ def run_report_generate(  # noqa: C901
                     best = bar.get("best") if isinstance(bar, dict) else None
                     direction = bar.get("direction") if isinstance(bar, dict) else None
                     if best:
-                        tp = best.get("tp")
-                        sl = best.get("sl")
-                        ev = best.get("ev")
-                        edge = best.get("edge")
-                        edge_vs_breakeven = best.get("edge_vs_breakeven")
-                        details: List[str] = []
-                        barrier_entry: Dict[str, Any] = {}
-                        if direction:
-                            details.append(f"dir={str(direction)}")
-                            barrier_entry["direction"] = str(direction)
-                        if tp is not None:
-                            tp_out = _round_report_barrier_metric("tp_pct", tp)
-                            details.append(f"tp={format_number(tp_out)}%")
-                            barrier_entry["tp_pct"] = tp_out
-                        if sl is not None:
-                            sl_out = _round_report_barrier_metric("sl_pct", sl)
-                            details.append(f"sl={format_number(sl_out)}%")
-                            barrier_entry["sl_pct"] = sl_out
-                        if ev is not None:
-                            ev_out = _round_report_barrier_metric("ev", ev)
-                            details.append(f"ev={format_number(ev_out)}")
-                            barrier_entry["ev"] = ev_out
-                        if edge is not None:
-                            edge_out = _round_report_barrier_metric("edge", edge)
-                            details.append(f"probability_edge={format_number(edge_out)}")
-                            barrier_entry["probability_edge"] = edge_out
-                        if edge_vs_breakeven is not None:
-                            edge_be_out = _round_report_barrier_metric(
-                                "edge_vs_breakeven",
-                                edge_vs_breakeven,
-                            )
-                            details.append(
-                                f"edge_vs_breakeven={format_number(edge_be_out)}"
-                            )
-                            barrier_entry["edge_vs_breakeven"] = edge_be_out
-                        try:
-                            conflict_metric = (
-                                "edge_vs_breakeven" if edge_vs_breakeven is not None else "edge"
-                            )
-                            conflict_value = edge_vs_breakeven if edge_vs_breakeven is not None else edge
-                            if ev is not None and conflict_value is not None:
-                                ev_num = float(ev)
-                                edge_num = float(conflict_value)
-                                if (ev_num > 0 and edge_num < 0) or (ev_num < 0 and edge_num > 0):
-                                    reason = f"ev and {conflict_metric} have opposite signs"
-                                    details.append("ev_edge_conflict=true")
-                                    details.append(f"ev_edge_conflict_reason={reason}")
-                                    barrier_entry["ev_edge_conflict"] = True
-                                    barrier_entry["conflict_reason"] = reason
-                                    barrier_entry["trading_note"] = _BARRIER_EV_EDGE_CONFLICT_NOTE
-                        except Exception:
-                            pass
+                        details, barrier_entry = _build_barrier_best_summary(
+                            best,
+                            direction=direction,
+                            include_direction_field=True,
+                            format_number=format_number,
+                        )
                         if details:
                             summ.append("barrier best " + " ".join(details))
                         if barrier_entry:
@@ -1491,6 +1586,7 @@ def run_report_generate(  # noqa: C901
                 rep["sections_status"] = sections_status
                 summary_counts = sections_status.get("summary", {})
                 error_count = int(summary_counts.get("error", 0))
+                ok_count = int(summary_counts.get("ok", 0))
                 partial_count = int(summary_counts.get("partial", 0))
                 omitted_count = int(summary_counts.get("omitted", 0))
                 controls = rep.get("section_controls")
@@ -1505,16 +1601,26 @@ def run_report_generate(  # noqa: C901
                     and missing_requested
                     and not summary_mode
                 )
-                rep["completeness"] = (
+                usable_section_count = ok_count + partial_count
+                hard_failed = bool(
+                    selection_failed
+                    or (error_count > 0 and usable_section_count == 0)
+                )
+                rep["section_run_status"] = (
                     "failed"
-                    if error_count > 0 or selection_failed
+                    if hard_failed
                     else "partial"
-                    if partial_count > 0 or omitted_count > 0
-                    else "summary_only"
-                    if summary_mode
+                    if partial_count > 0 or error_count > 0 or omitted_count > 0
                     else "complete"
                 )
-                rep["success"] = bool(error_count == 0 and not selection_failed)
+                rep["content_detail"] = (
+                    "summary_only"
+                    if detail_value in {"compact", "summary"}
+                    else "selected_sections"
+                    if request.include_sections or request.max_sections is not None
+                    else "full_sections"
+                )
+                rep["success"] = not hard_failed
                 if selection_failed:
                     rep["error_code"] = "report_sections_not_found"
                     rep["error"] = (
@@ -1530,10 +1636,42 @@ def run_report_generate(  # noqa: C901
                     sections_with_issues["partial"] = partial_section_names
                 if error_section_names:
                     sections_with_issues["error"] = error_section_names
+                    rep["sections_to_retry"] = error_section_names
                 if omitted_section_names:
                     sections_with_issues["omitted"] = omitted_section_names
                 if sections_with_issues:
                     rep["sections_with_issues"] = sections_with_issues
+                if partial_section_names or error_section_names:
+                    error_summaries: List[str] = []
+                    status_details = sections_status.get("details")
+                    if isinstance(status_details, dict):
+                        for section_name in [
+                            *partial_section_names,
+                            *error_section_names,
+                        ]:
+                            detail = status_details.get(section_name)
+                            errors = detail.get("errors") if isinstance(detail, dict) else None
+                            if not isinstance(errors, list):
+                                continue
+                            for error_item in errors[:2]:
+                                message = (
+                                    error_item.get("message")
+                                    if isinstance(error_item, dict)
+                                    else error_item
+                                )
+                                text = " ".join(str(message or "").split())[:200]
+                                if text:
+                                    error_summaries.append(f"{section_name}:{text}")
+                    logger.warning(
+                        "event=report_sections_degraded operation=report_generate "
+                        "symbol=%s template=%s partial_sections=%s "
+                        "error_sections=%s errors=%s",
+                        request.symbol,
+                        template_name,
+                        ",".join(partial_section_names) or "-",
+                        ",".join(error_section_names) or "-",
+                        " | ".join(error_summaries)[:600] or "-",
+                    )
                 rep["overall_assessment"] = _build_overall_report_assessment(rep)
                 rep["executive_summary"] = _build_report_executive_summary(
                     rep,

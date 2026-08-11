@@ -55,6 +55,13 @@ Larger geometric patterns formed over multiple bars.
 mtdata-cli patterns_detect EURUSD --timeframe H1 --mode classic --limit 500
 ```
 
+The default classic detector evaluates patterns at the right edge of the input
+window and excludes pivots that do not yet have the configured right-hand
+confirmation gap. Results report `available_at_index`, `available_at_time`,
+`pivot_confirmation_bars`, and `detection_scope`. Set
+`config.scan_historical=true` to run the slower causal prefix scan when you need
+older patterns labeled at their first detection window.
+
 **Patterns detected:**
 | Pattern | Description |
 |---------|-------------|
@@ -69,11 +76,11 @@ mtdata-cli patterns_detect EURUSD --timeframe H1 --mode classic --limit 500
 
 Fibonacci-ratio patterns built from alternating pivot legs.
 
-The harmonic detector reports completed XABCD/ABCD structures rather than
-forming candidates. These completions are the primary harmonic findings and
-are therefore returned even when the shared `--include-completed` flag is
-false. That flag continues to control historical visibility for lifecycle-aware
-classic, Elliott, and fractal modes.
+The harmonic detector reports both forming and completed XABCD/ABCD candidates.
+Those lifecycle states are both primary harmonic findings and are therefore
+returned even when the shared `--include-completed` flag is false. That flag
+continues to control historical visibility for classic, Elliott, and fractal
+modes.
 
 ```bash
 mtdata-cli patterns_detect EURUSD --timeframe H1 --mode harmonic --limit 500
@@ -141,7 +148,7 @@ use `--include-completed true` to include broken levels as well.
 | `--limit` | 150 | Bars to analyze |
 | `--robust-only` | false | Restrict detection to a curated subset of established multi-bar candlestick types. This is a name preset, not a confidence threshold. |
 | `--whitelist` | — | Comma-separated list of specific patterns |
-| `--min-strength` | 0.70 | Minimum semantic candlestick conviction score (0.0-1.0) |
+| `--min-strength` | 0.70 | Minimum OHLC-geometry and pattern-reliability strength score (0.0-1.0) |
 | `--config` | — | Detector-specific overrides. Fractals support `left_bars`, `right_bars`, `breakout_basis`, `min_prominence_pct`, and `confidence_prominence_cap_pct`. Harmonics support `pattern_types`, `ratio_tolerance`, `min_confidence`, and pivot controls. |
 
 Pattern names listed in this guide describe detector coverage, not a promise
@@ -149,6 +156,10 @@ that every pattern is returned at the default threshold. `robust_only=true`
 restricts which candlestick methods run based on pattern name, while
 `min_strength` independently filters their conviction scores. Lower-strength
 and deprioritized formations such as many dojis may be absent by default.
+The score uses body/range geometry, directional close location, range expansion,
+pattern span, and the curated reliability tier. Raw detector magnitudes remain
+in `raw_signal` but do not alter strength because pandas-ta backends use
+different native signal scales.
 
 ### Filtering Patterns
 
@@ -200,7 +211,7 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
 | `top_k` | 20 | Number of similar patterns to use |
 | `metric` | euclidean | Distance metric |
 | `scale` | zscore | Normalization: zscore, minmax, none |
-| `refine_metric` | none | Refinement: dtw, softdtw, affine, ncc |
+| `refine_metric` | dtw | Refinement: dtw, softdtw, affine, ncc, none |
 | `search_engine` | ckdtree | Search algorithm |
 
 ### Scaling Options
@@ -241,7 +252,7 @@ This first finds candidates with fast Euclidean distance, then refines ranking u
 | Engine | Description |
 |--------|-------------|
 | `ckdtree` | Scipy KD-tree (default, fast) |
-| `hnsw` | Approximate nearest neighbor (scalable, optional `hnswlib` backend; not part of the default Python 3.14 environment, but available through the opt-in native/source-build path in [../SETUP.md](../SETUP.md)) |
+| `hnsw` | Approximate nearest neighbor (scalable `hnswlib` backend; included in `[all]`, or add to lean installs through the source-build path in [../SETUP.md](../SETUP.md)) |
 | `matrix_profile` | STUMPY-based (specialized for time series) |
 | `mass` | Mueen's MASS algorithm |
 

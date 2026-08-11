@@ -15,8 +15,10 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any, Dict, Iterator, Optional, Tuple
+from uuid import uuid4
 
 from ..bootstrap.settings import mt5_config
+from .quote import tick_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +29,25 @@ _MT5_TIMESTAMP_MODE_NATIVE = "native_utc"
 _MT5_TIMESTAMP_MODE_SERVER = "server_clock"
 _MT5_TIMESTAMP_MODE_TTL_SECONDS = 60.0
 _MT5_TIMESTAMP_MODE_FRESH_TOLERANCE_SECONDS = 15 * 60.0
+_MT5_TIMESTAMP_MODE_CLOSED_MARKET_MAX_AGE_SECONDS = 4 * 24 * 60 * 60.0
 _mt5_timestamp_mode_cache: Dict[str, Tuple[str, float, int]] = {}
 _mt5_terminal_timestamp_mode: Optional[Tuple[str, float, int]] = None
 
 
 class MT5ConnectionError(RuntimeError):
     """Raised when the MT5 adapter cannot establish a usable connection."""
+
+
+def _safe_mt5_error_code(error: Any) -> str:
+    """Return the diagnostic code from ``last_error`` without logging its text."""
+    if (
+        isinstance(error, (tuple, list))
+        and error
+        and isinstance(error[0], int)
+        and not isinstance(error[0], bool)
+    ):
+        return str(error[0])
+    return "unknown"
 
 
 def _data_ready_timing() -> tuple[float, float]:
@@ -339,6 +354,23 @@ def symbol_price_currency(*infos: Any) -> Optional[str]:
     return None
 
 
+def account_currency_from_gateway(gateway: Any) -> Optional[str]:
+    """Return the MT5 deposit currency used by tick-value money fields."""
+    try:
+        account = gateway.account_info()
+    except Exception:
+        return None
+    try:
+        value = getattr(account, "currency", None)
+    except Exception:
+        return None
+    if isinstance(value, str):
+        currency = value.strip()
+        if currency and not currency.startswith("<") and len(currency) <= 16:
+            return currency
+    return None
+
+
 def symbol_price_currency_for(symbol: Any) -> Optional[str]:
     """Look up price currency via cached symbol info for a symbol name."""
     symbol_text = str(symbol or "").strip()
@@ -405,26 +437,6 @@ def clear_mt5_timestamp_mode_cache() -> None:
     _mt5_terminal_timestamp_mode = None
 
 
-def _tick_epoch_seconds(tick: Any) -> Optional[float]:
-    if tick is None:
-        return None
-    for name, divisor in (("time", 1.0), ("time_msc", 1000.0)):
-        try:
-            value = getattr(tick, name)
-        except Exception:
-            try:
-                value = tick[name]
-            except Exception:
-                continue
-        try:
-            epoch = float(value) / divisor
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(epoch) and epoch > 0.0:
-            return epoch
-    return None
-
-
 def _configured_server_offset_seconds(at_epoch: float) -> int:
     try:
         at_time = datetime.fromtimestamp(float(at_epoch), tz=timezone.utc)
@@ -481,8 +493,8 @@ def _timestamp_mode_from_tick(
     """
     observed_now = float(time.time() if now_epoch is None else now_epoch)
     offset_seconds = _configured_server_offset_seconds(observed_now)
-    tick_epoch = _tick_epoch_seconds(tick)
-    if tick_epoch is None:
+    tick_time = tick_epoch(tick)
+    if tick_time is None:
         return _valid_cached_timestamp_mode(symbol) or _MT5_TIMESTAMP_MODE_NATIVE
     if offset_seconds == 0:
         return _cache_timestamp_mode(
@@ -491,8 +503,8 @@ def _timestamp_mode_from_tick(
             offset_seconds=offset_seconds,
         )
 
-    native_distance = abs(float(tick_epoch) - observed_now)
-    server_distance = abs((float(tick_epoch) - float(offset_seconds)) - observed_now)
+    native_distance = abs(float(tick_time) - observed_now)
+    server_distance = abs((float(tick_time) - float(offset_seconds)) - observed_now)
     tolerance = _MT5_TIMESTAMP_MODE_FRESH_TOLERANCE_SECONDS
     if (
         server_distance <= tolerance
@@ -507,6 +519,17 @@ def _timestamp_mode_from_tick(
         return _cache_timestamp_mode(
             symbol,
             _MT5_TIMESTAMP_MODE_NATIVE,
+            offset_seconds=offset_seconds,
+        )
+    normalized_tick_epoch = float(tick_time) - float(offset_seconds)
+    if (
+        float(tick_time) > observed_now + tolerance
+        and normalized_tick_epoch <= observed_now + tolerance
+        and server_distance <= _MT5_TIMESTAMP_MODE_CLOSED_MARKET_MAX_AGE_SECONDS
+    ):
+        return _cache_timestamp_mode(
+            symbol,
+            _MT5_TIMESTAMP_MODE_SERVER,
             offset_seconds=offset_seconds,
         )
     return _valid_cached_timestamp_mode(symbol) or _MT5_TIMESTAMP_MODE_NATIVE
@@ -792,11 +815,14 @@ def _normalize_times_in_struct(
             out[field] = normalized
         return out
     except Exception as exc:
-        logger.warning(
-            "Failed to normalize MT5 server-clock rows; preserving raw epochs: %s",
+        logger.error(
+            "Failed to normalize MT5 server-clock rows: %s",
             exc,
         )
-        return arr
+        raise RuntimeError(
+            "Failed to normalize MT5 server-clock rows to UTC; raw server epochs "
+            "cannot be returned safely."
+        ) from exc
 
 
 def _normalize_object_times(
@@ -842,8 +868,11 @@ def _normalize_object_times(
                 pass
         return SimpleNamespace(**data)
     except Exception as exc:
-        logger.debug("Failed to normalize MT5 object timestamps: %s", exc)
-        return obj
+        logger.error("Failed to normalize MT5 object timestamps: %s", exc)
+        raise RuntimeError(
+            "Failed to normalize MT5 object timestamps to UTC; raw server epochs "
+            "cannot be returned safely."
+        ) from exc
 
 
 def _normalize_object_time_rows(
@@ -860,8 +889,11 @@ def _normalize_object_time_rows(
         return [_normalize_object_times(row, mode=mode) for row in rows]
     try:
         return type(rows)(_normalize_object_times(row, mode=mode) for row in rows)
-    except Exception:
-        return rows
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to preserve the MT5 row collection while normalizing server-clock "
+            "timestamps to UTC."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -884,7 +916,52 @@ def _enforce_read_spacing() -> None:
     _mt5_last_read_ts = time.monotonic()
 
 
-def _mt5_read_with_retry(fn, *args, max_retries: int = _MT5_READ_MAX_RETRIES):
+def _recover_dropped_read_connection(
+    *,
+    read_id: Optional[str] = None,
+    operation: Optional[str] = None,
+    symbol: Optional[str] = None,
+    attempt: Optional[int] = None,
+    max_attempts: Optional[int] = None,
+) -> bool:
+    """Reconnect a session that was established before an MT5 read failed."""
+    connection = globals().get("mt5_connection")
+    if connection is None or not bool(getattr(connection, "connected", False)):
+        return False
+    try:
+        if connection.is_connected():
+            return False
+        logger.warning(
+            "event=mt5_read_reconnect read_id=%s operation=%s symbol=%s "
+            "attempt=%s max_attempts=%s",
+            read_id,
+            operation,
+            symbol,
+            attempt,
+            max_attempts,
+        )
+        return bool(connection._ensure_connection())
+    except Exception as exc:
+        logger.warning(
+            "event=mt5_read_reconnect_failed read_id=%s operation=%s symbol=%s "
+            "attempt=%s max_attempts=%s error=%s",
+            read_id,
+            operation,
+            symbol,
+            attempt,
+            max_attempts,
+            exc,
+        )
+        return False
+
+
+def _mt5_read_with_retry(
+    fn,
+    *args,
+    max_retries: int = _MT5_READ_MAX_RETRIES,
+    operation: Optional[str] = None,
+    symbol: Optional[str] = None,
+):
     """Execute a read-only MT5 operation with bounded retry and backoff.
 
     Only for **idempotent** read calls (``copy_rates_*``, ``copy_ticks_*``).
@@ -893,54 +970,118 @@ def _mt5_read_with_retry(fn, *args, max_retries: int = _MT5_READ_MAX_RETRIES):
 
     Returns the first non-``None`` result, or ``None`` if all attempts fail.
     """
-    for attempt in range(max_retries + 1):
+    max_attempts = max_retries + 1
+    operation_name = str(operation or getattr(fn, "__name__", "mt5_read"))
+    read_id: Optional[str] = None
+    for attempt in range(max_attempts):
         with _mt5_lock:
             _enforce_read_spacing()
             result = fn(*args)
         if result is not None:
             return result
         if attempt < max_retries:
+            if read_id is None:
+                read_id = uuid4().hex[:12]
+            attempt_number = attempt + 1
+            _recover_dropped_read_connection(
+                read_id=read_id,
+                operation=operation_name,
+                symbol=symbol,
+                attempt=attempt_number,
+                max_attempts=max_attempts,
+            )
             delay = _MT5_READ_BASE_DELAY * (2 ** attempt)
             logger.warning(
-                "MT5 read returned None (attempt %d/%d), retrying in %.1fs",
-                attempt + 1, max_retries + 1, delay,
+                "event=mt5_read_retry read_id=%s operation=%s symbol=%s "
+                "attempt=%d max_attempts=%d delay_seconds=%.1f",
+                read_id,
+                operation_name,
+                symbol,
+                attempt_number,
+                max_attempts,
+                delay,
             )
             time.sleep(delay)
+    if read_id is None:
+        read_id = uuid4().hex[:12]
     logger.warning(
-        "MT5 read exhausted %d attempt(s) — returning None",
-        max_retries + 1,
+        "event=mt5_read_exhausted read_id=%s operation=%s symbol=%s attempts=%d",
+        read_id,
+        operation_name,
+        symbol,
+        max_attempts,
     )
     return None
 
 
 def _mt5_copy_rates_from(symbol: str, timeframe, to_dt_utc: datetime, count: int):
     dt_srv = _to_server_query_dt(to_dt_utc)
-    data = _mt5_read_with_retry(mt5.copy_rates_from, symbol, timeframe, dt_srv, count)
+    data = _mt5_read_with_retry(
+        mt5.copy_rates_from,
+        symbol,
+        timeframe,
+        dt_srv,
+        count,
+        operation="copy_rates_from",
+        symbol=symbol,
+    )
     return _normalize_times_in_struct(data)
 
 
 def _mt5_copy_rates_range(symbol: str, timeframe, from_dt_utc: datetime, to_dt_utc: datetime):
     dt_from = _to_server_query_dt(from_dt_utc)
     dt_to = _to_server_query_dt(to_dt_utc)
-    data = _mt5_read_with_retry(mt5.copy_rates_range, symbol, timeframe, dt_from, dt_to)
+    data = _mt5_read_with_retry(
+        mt5.copy_rates_range,
+        symbol,
+        timeframe,
+        dt_from,
+        dt_to,
+        operation="copy_rates_range",
+        symbol=symbol,
+    )
     return _normalize_times_in_struct(data)
 
 
 def _mt5_copy_ticks_from(symbol: str, from_dt_utc: datetime, count: int, flags: int):
     dt_from = _to_server_query_dt(from_dt_utc)
-    data = _mt5_read_with_retry(mt5.copy_ticks_from, symbol, dt_from, count, flags)
+    data = _mt5_read_with_retry(
+        mt5.copy_ticks_from,
+        symbol,
+        dt_from,
+        count,
+        flags,
+        operation="copy_ticks_from",
+        symbol=symbol,
+    )
     return _normalize_times_in_struct(data)
 
 
 def _mt5_copy_rates_from_pos(symbol: str, timeframe, start_pos: int, count: int):
-    data = _mt5_read_with_retry(mt5.copy_rates_from_pos, symbol, timeframe, start_pos, count)
+    data = _mt5_read_with_retry(
+        mt5.copy_rates_from_pos,
+        symbol,
+        timeframe,
+        start_pos,
+        count,
+        operation="copy_rates_from_pos",
+        symbol=symbol,
+    )
     return _normalize_times_in_struct(data)
 
 
 def _mt5_copy_ticks_range(symbol: str, from_dt_utc: datetime, to_dt_utc: datetime, flags: int):
     dt_from = _to_server_query_dt(from_dt_utc)
     dt_to = _to_server_query_dt(to_dt_utc)
-    data = _mt5_read_with_retry(mt5.copy_ticks_range, symbol, dt_from, dt_to, flags)
+    data = _mt5_read_with_retry(
+        mt5.copy_ticks_range,
+        symbol,
+        dt_from,
+        dt_to,
+        flags,
+        operation="copy_ticks_range",
+        symbol=symbol,
+    )
     return _normalize_times_in_struct(data)
 
 
@@ -995,6 +1136,33 @@ class MT5Connection:
         with self._lock:
             if self.is_connected():
                 self._refresh_connection_identity()
+                configured_login = mt5_config.get_login()
+                connected_login = (
+                    self._connection_identity[0]
+                    if self._connection_identity is not None
+                    else None
+                )
+                if (
+                    configured_login is not None
+                    and (
+                        connected_login is None
+                        or int(connected_login) != int(configured_login)
+                    )
+                ):
+                    logger.error(
+                        "Connected MT5 account changed and no longer matches the "
+                        "configured account. "
+                        "Refusing to continue on a different account."
+                    )
+                    try:
+                        mt5.shutdown()
+                    except Exception:
+                        pass
+                    self.connected = False
+                    self._connection_identity = None
+                    clear_symbol_info_cache()
+                    clear_mt5_time_alignment_cache()
+                    return False
                 return True
             try:
                 if mt5_config.has_credentials():
@@ -1003,15 +1171,15 @@ class MT5Connection:
                     server = mt5_config.get_server()
                     if not mt5.initialize(login=login, password=password, server=server):
                         logger.error(
-                            "Failed to initialize MT5 with configured credentials: "
-                            f"{mt5.last_error()}"
+                            "Failed to initialize MT5 with configured credentials "
+                            "(error_code=%s)",
+                            _safe_mt5_error_code(mt5.last_error()),
                         )
                         return False
                     connected_login, _connected_server = self._read_connection_identity()
                     if connected_login is None or int(connected_login) != int(login):
                         logger.error(
-                            "Connected MT5 account does not match configured login "
-                            f"{login}; connected_login={connected_login}."
+                            "Connected MT5 account does not match the configured account."
                         )
                         try:
                             mt5.shutdown()
@@ -1019,18 +1187,24 @@ class MT5Connection:
                             pass
                         return False
                     else:
-                        logger.debug(f"Connected to MT5 with account {login}")
+                        logger.debug("Connected to the configured MT5 account")
                 else:
                     if not mt5.initialize():
-                        logger.error(f"Failed to initialize MT5: {mt5.last_error()}")
+                        logger.error(
+                            "Failed to initialize MT5 (error_code=%s)",
+                            _safe_mt5_error_code(mt5.last_error()),
+                        )
                         return False
                     else:
                         logger.debug("Connected to MT5 using terminal's current login")
                 self.connected = True
                 self._refresh_connection_identity()
                 return True
-            except Exception as e:
-                logger.error(f"Error connecting to MT5: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Error connecting to MT5 (exception_type=%s)",
+                    type(exc).__name__,
+                )
                 return False
 
     def disconnect(self):
@@ -1087,14 +1261,15 @@ def _compact_symbol_name(value: Any) -> str:
     return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
 
 
-def resolve_broker_symbol_name(symbol: str) -> str:
+def resolve_broker_symbol_name(symbol: str, *, gateway: Any = None) -> str:
     query = str(symbol or "").strip()
     if not query:
         return query
+    symbol_source = gateway if gateway is not None else mt5
     try:
         names = [
             str(getattr(info, "name", "") or "").strip()
-            for info in (mt5.symbols_get() or [])
+            for info in (symbol_source.symbols_get() or [])
         ]
     except Exception:
         return query
@@ -1289,7 +1464,7 @@ def inspect_mt5_time_alignment(
             symbol=symbol,
             now_epoch=now_utc_epoch,
         )
-        raw_tick_epoch = _tick_epoch_seconds(tick)
+        raw_tick_epoch = tick_epoch(tick)
     except Exception:
         raw_tick_epoch = None
 
@@ -1334,8 +1509,52 @@ def inspect_mt5_time_alignment(
         out["error"] = str(exc)
         return out
 
-    expected_current_bar_open_epoch = math.floor(now_utc_epoch / float(tf_secs)) * float(tf_secs)
-    expected_last_closed_bar_open_epoch = expected_current_bar_open_epoch - float(tf_secs)
+    server_offset_seconds = _configured_server_offset_seconds(now_utc_epoch)
+    shifted_now_epoch = now_utc_epoch + float(server_offset_seconds)
+    if tf_name == "W1":
+        shifted_now = datetime.fromtimestamp(shifted_now_epoch, tz=timezone.utc)
+        shifted_open = shifted_now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        ) - timedelta(days=shifted_now.weekday())
+        expected_current_bar_open_epoch = (
+            shifted_open.timestamp() - float(server_offset_seconds)
+        )
+        expected_last_closed_bar_open_epoch = (
+            expected_current_bar_open_epoch - 7 * 24 * 60 * 60
+        )
+    elif tf_name == "MN1":
+        shifted_now = datetime.fromtimestamp(shifted_now_epoch, tz=timezone.utc)
+        shifted_open = shifted_now.replace(
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if shifted_open.month == 1:
+            previous_open = shifted_open.replace(
+                year=shifted_open.year - 1,
+                month=12,
+            )
+        else:
+            previous_open = shifted_open.replace(month=shifted_open.month - 1)
+        expected_current_bar_open_epoch = (
+            shifted_open.timestamp() - float(server_offset_seconds)
+        )
+        expected_last_closed_bar_open_epoch = (
+            previous_open.timestamp() - float(server_offset_seconds)
+        )
+    else:
+        expected_current_bar_open_epoch = (
+            math.floor(shifted_now_epoch / float(tf_secs)) * float(tf_secs)
+            - float(server_offset_seconds)
+        )
+        expected_last_closed_bar_open_epoch = (
+            expected_current_bar_open_epoch - float(tf_secs)
+        )
     current_bar_delta_seconds = float(current_bar_open_epoch - expected_current_bar_open_epoch)
     last_closed_bar_delta_seconds = float(last_closed_bar_open_epoch - expected_last_closed_bar_open_epoch)
 
@@ -1351,6 +1570,7 @@ def inspect_mt5_time_alignment(
             "expected_last_closed_bar_open_utc_epoch": expected_last_closed_bar_open_epoch,
             "expected_last_closed_bar_open_utc_time": format_epoch_utc(expected_last_closed_bar_open_epoch),
             "last_closed_bar_delta_seconds": last_closed_bar_delta_seconds,
+            "bar_boundary_server_utc_offset_seconds": server_offset_seconds,
         }
     )
 

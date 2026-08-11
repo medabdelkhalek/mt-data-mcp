@@ -4,7 +4,7 @@ import math
 import os
 import re
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -17,7 +17,7 @@ from ..shared.symbols import (
     is_probably_crypto_symbol,
     is_probably_forex_symbol,
 )
-from ..utils.freshness import is_standard_weekend_closure
+from ..utils.freshness import is_standard_weekend_closure, standard_weekend_window
 from ..utils.mt5 import (
     _ensure_symbol_ready,
     _mt5_copy_rates_from,
@@ -26,6 +26,7 @@ from ..utils.mt5 import (
     get_symbol_info_cached,
     mt5,
 )
+from ..utils.time import bar_close_epoch
 from ..utils.utils import _parse_end_datetime, _parse_start_datetime, _utc_epoch_seconds
 
 _FORECAST_RESERVED_COLUMNS = {"unique_id", "ds", "y"}
@@ -38,16 +39,14 @@ _NF_ENV_LOCK = threading.RLock()
 
 
 def edge_pad_to_length(values: np.ndarray, length: int) -> np.ndarray:
-    """Trim or edge-pad a 1D array to exactly `length` elements."""
+    """Validate that a 1D forecast array exactly matches `length`."""
     target = max(0, int(length))
     vals = np.asarray(values, dtype=float).ravel()
-    if target == 0:
-        return np.array([], dtype=float)
-    if vals.size >= target:
-        return vals[:target].astype(float, copy=False)
-    if vals.size == 0:
-        return np.full(target, np.nan, dtype=float)
-    return np.pad(vals, (0, target - vals.size), mode='edge').astype(float, copy=False)
+    if vals.size != target:
+        raise ValueError(
+            f"Forecast output length mismatch: requested {target}, received {vals.size}"
+        )
+    return vals.astype(float, copy=False)
 
 
 def build_ci_diagnostics(
@@ -112,10 +111,10 @@ def _normalize_weights(weights: Any, size: int) -> Optional[np.ndarray]:
         return None
     vals: List[float] = []
     if isinstance(weights, (list, tuple)):
-        vals = [float(v) for v in list(weights)[:size]]
+        vals = [float(v) for v in weights]
     elif isinstance(weights, str):
         parts = [p.strip() for p in weights.split(",") if p.strip()]
-        vals = [float(p) for p in parts[:size]]
+        vals = [float(p) for p in parts]
     else:
         return None
     if len(vals) != size:
@@ -427,23 +426,10 @@ def uses_standard_weekend_projection(symbol: Optional[str], tf_secs: int) -> boo
 
 def _next_standard_weekend_open_epoch(epoch: float) -> float:
     dt_utc = datetime.fromtimestamp(float(epoch), tz=timezone.utc)
-    weekday = dt_utc.weekday()
-    if weekday == 6:
-        open_dt = dt_utc.replace(hour=22, minute=0, second=0, microsecond=0)
-    else:
-        days_until_sunday = (6 - weekday) % 7
-        open_date = (dt_utc + timedelta(days=days_until_sunday)).date()
-        open_dt = datetime(
-            open_date.year,
-            open_date.month,
-            open_date.day,
-            22,
-            0,
-            0,
-            tzinfo=timezone.utc,
-        )
-    open_epoch = float(open_dt.timestamp())
-    return open_epoch if open_epoch > float(epoch) else float(epoch)
+    window = standard_weekend_window(dt_utc)
+    if window is None:
+        return float(epoch)
+    return float(window[1].timestamp())
 
 
 def next_times_from_last(
@@ -452,9 +438,18 @@ def next_times_from_last(
     horizon: int,
     *,
     skip_weekends: bool = False,
+    timeframe: Optional[str] = None,
 ) -> List[float]:
     base = float(last_epoch)
     step = float(tf_secs)
+    normalized_timeframe = str(timeframe or "").upper()
+    if normalized_timeframe in {"D1", "W1", "MN1"}:
+        out: List[float] = []
+        current = base
+        for _ in range(int(horizon)):
+            current = bar_close_epoch(current, normalized_timeframe)
+            out.append(current)
+        return out
     if not skip_weekends:
         return [base + step * (i + 1) for i in range(int(horizon))]
     out: List[float] = []
@@ -1095,8 +1090,16 @@ def fetch_history(
         )
         if to_dt:
             cutoff = _utc_epoch_seconds(to_dt)
-            # Filter: include the bar exactly AT the cutoff if it exists
-            df = df[df['time'] <= cutoff]
+            if as_of or drop_last_live:
+                # Analysis defaults to closed bars. An as-of anchor is always
+                # information-available-at-instant; bounded ranges apply the
+                # same rule unless the caller explicitly requests live bars.
+                completed = df['time'].map(
+                    lambda value: bar_close_epoch(value, timeframe) <= cutoff
+                )
+                df = df[completed]
+            else:
+                df = df[df['time'] <= cutoff]
             # Bounded ranges keep the full requested window; end-only mirrors as_of.
             if not start and len(df) > need:
                 df = df.iloc[-int(need):]

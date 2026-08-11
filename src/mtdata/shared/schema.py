@@ -76,7 +76,7 @@ def reject_removed_field(values: Any, *, field_name: str, replacement: str) -> A
 PARAM_HINTS = {
     **PARAMETER_HELP,
     "direction": "Trade direction (long/short).",
-    "limit": "Max rows/bars to return.",
+    "limit": "Maximum count; see command help for what is counted.",
     "offset": "Rows to skip before returning paginated results.",
     "start": "Start time (dateparser).",
     "end": "End time (dateparser).",
@@ -96,7 +96,10 @@ PARAM_HINTS = {
     "indicators": "Indicators as compact specs like 'rsi_14', 'rsi(length=14)', 'macd(12,26,9)', or 'macd(fast=12,slow=26,signal=9)', or JSON like '[{\"name\":\"rsi\",\"params\":{\"length\":14}}]'. Bare names such as 'rsi' are also accepted.",
     "denoise": "Denoise preset name or JSON spec. Examples: --denoise kalman or --denoise '{\"method\":\"kalman\",\"params\":{\"lookback\":100}}'.",
     "simplify": "Simplify preset name or JSON spec. Examples: --simplify select, --simplify '{\"mode\":\"select\",\"method\":\"lttb\",\"ratio\":0.2}', or --simplify select --simplify-params \"ratio=0.2\".",
-    "include_spread": "Append MT5 historical candle spread values when available; defaults to false.",
+    "include_spread": (
+        "Request MT5 historical per-bar spread values; when unavailable, the result "
+        "reports a single non-historical reference or spread_mode=unavailable."
+    ),
     "include_incomplete": "Include the latest forming candle; defaults to false, so responses expose has_forming_candle/incomplete_candles_skipped while returned rows stay on closed bars.",
     "allow_stale": "Return the latest available closed bars when freshness checks would otherwise fail; defaults to false.",
     "explain_indicators": "Add compact latest-value interpretation notes for requested indicators; defaults to false.",
@@ -139,7 +142,7 @@ PARAM_HINTS = {
     "segments": "Segment count.",
     "bucket_seconds": "Resample bucket size in seconds.",
     "buffer_seconds": "Extra seconds to wait after the candle close before returning.",
-    "max_wait_seconds": "Maximum seconds this tool may block before returning timing metadata instead.",
+    "max_wait_seconds": "Maximum seconds to block before returning a failed timeout payload with wait timing fields.",
     "schema": "Encoding schema (e.g. delta).",
     "bits": "Bits per symbol for encoding schemas.",
     "paa": "PAA segments for symbolic representation.",
@@ -172,7 +175,7 @@ PARAM_HINTS = {
     "auto_close_on_sl_tp_fail": "If a filled market order cannot attach TP/SL, immediately try to close the unprotected position. Defaults to true.",
     "ticket": "Ticket/order ID.",
     "expiration": "Expiration time/date. For trade orders accepts a dateparser string, UTC epoch seconds, or GTC token; for option tools accepts YYYY-MM-DD.",
-    "idempotency_key": "Optional in-process dedupe key for retrying the same request.",
+    "idempotency_key": "Optional durable SQLite dedupe key for retrying the same request. Completed outcomes persist across processes and restarts for the configured TTL (24 hours by default).",
     "dry_run": "Preview the action without applying changes.",
     "check_only": "Return sample sufficiency/status checks without running the full analysis.",
     "profit_only": "Close only profitable positions when true.",
@@ -185,8 +188,8 @@ PARAM_HINTS = {
     "sizing_method": "Position sizing method: fixed_fraction or kelly.",
     "kelly_metrics": "Kelly sizing inputs as a JSON map; flat kelly_* fields override matching keys.",
     "kelly_win_rate": "Kelly win probability as a fraction in [0, 1].",
-    "kelly_avg_win": "Average winning return for Kelly sizing.",
-    "kelly_avg_loss": "Average losing return magnitude for Kelly sizing.",
+    "kelly_avg_win": "Average winning stake-normalized return for Kelly sizing.",
+    "kelly_avg_loss": "Average losing stake-normalized return magnitude for Kelly sizing.",
     "kelly_fraction_multiplier": "Multiplier applied to raw Kelly fraction; half-Kelly is 0.5.",
     "kelly_max_risk_pct": "Maximum account risk percentage allowed for Kelly sizing.",
     "strict_risk": "Block positive suggested volume when broker minimum volume would exceed requested risk.",
@@ -198,6 +201,8 @@ PARAM_HINTS = {
     "minutes_back": "Look back this many minutes from end/now instead of using start.",
     "min_strength": (
         "Candlestick strength threshold 0.0-1.0, default 0.70. "
+        "Strength uses the detected candle's OHLC geometry plus pattern "
+        "reliability and span. "
         "Use 0.30-0.50 for exploratory scans, 0.50-0.70 for broader "
         "trading context, and 0.70+ for stricter high-conviction detections."
     ),
@@ -412,7 +417,21 @@ def _load_indicator_doc_choices(
     return categories, []
 
 
-_CATEGORY_CHOICES, _INDICATOR_NAME_CHOICES = _load_indicator_doc_choices()
+# pandas-ta-classic categories are part of this public request contract. Keep
+# the small, stable vocabulary local so importing shared schemas does not import
+# pandas and the full indicator registry on every CLI/server process start.
+_CATEGORY_CHOICES = [
+    "candles",
+    "cycles",
+    "momentum",
+    "overlap",
+    "performance",
+    "statistics",
+    "trend",
+    "volatility",
+    "volume",
+]
+_INDICATOR_NAME_CHOICES: List[str] = []
 
 if _CATEGORY_CHOICES:
     # Create a Literal type alias dynamically

@@ -527,15 +527,14 @@ class TestReduceFeatureFrame:
         _, info = _reduce_feature_frame(X, "x", {"k": 5}, reducer_factory=factory)
         assert info.get("dimred_params") == {"k": 5}
 
-    def test_reducer_exception_fallback(self):
-        """Lines 495-496: reducer raises → return cleaned X."""
+    def test_reducer_exception_is_rejected(self):
         class _BadReducer:
             def fit_transform(self, X):
                 raise ValueError("fail")
         factory = lambda m, p: (_BadReducer(), {})
         X = pd.DataFrame(np.random.randn(10, 3))
-        out, info = _reduce_feature_frame(X, "bad", None, reducer_factory=factory)
-        assert "dimred_error" in info
+        with pytest.raises(ValueError, match="dimensionality reduction.*failed"):
+            _reduce_feature_frame(X, "bad", None, reducer_factory=factory)
 
     def test_reducer_does_not_backfill_indicator_warmup(self):
         captured = {}
@@ -572,10 +571,65 @@ class TestPrepareFeatures:
     def test_ohlcv_features(self):
         df = _make_df(20)
         ft = [float(df["time"].iloc[-1]) + 3600 * i for i in range(1, 4)]
-        tr, tf, info = prepare_features(df, {"include": "ohlcv"}, ft, 3,
+        tr, tf, info = prepare_features(
+                                         df, {"include": "ohlcv", "observed_future_policy": "carry_forward"}, ft, 3,
                                          parse_kv_or_json=lambda x: x)
         assert tr is not None
         assert tf.shape[0] == 3
+
+    def test_observed_future_uses_latest_unshifted_value(self):
+        df = pd.DataFrame(
+            {
+                "time": [1.0, 2.0, 3.0],
+                "close": [1.0, 2.0, 3.0],
+                "open": [10.0, 20.0, 30.0],
+            }
+        )
+
+        tr, tf, info = prepare_features(
+            df,
+            {"include": ["open"], "observed_future_policy": "carry_forward"},
+            [4.0, 5.0],
+            2,
+            parse_kv_or_json=lambda value: value,
+        )
+
+        assert tr[:, 0].tolist() == [0.0, 10.0, 20.0]
+        assert tf[:, 0].tolist() == [30.0, 30.0]
+        assert info["observed_feature_lag_bars"] == 1
+
+    def test_observed_future_transforms_latest_value_with_fitted_reducer(self):
+        class _Reducer:
+            def fit_transform(self, values):
+                return values[:, :1]
+
+            def transform(self, values):
+                return values[:, :1]
+
+        df = pd.DataFrame(
+            {
+                "time": [1.0, 2.0, 3.0],
+                "close": [1.0, 2.0, 3.0],
+                "open": [10.0, 20.0, 30.0],
+                "high": [11.0, 21.0, 31.0],
+            }
+        )
+
+        tr, tf, _ = prepare_features(
+            df,
+            {
+                "include": ["open", "high"],
+                "observed_future_policy": "carry_forward",
+                "dimred_method": "capture",
+            },
+            [4.0, 5.0],
+            2,
+            parse_kv_or_json=lambda value: value,
+            reducer_factory=lambda _method, _params: (_Reducer(), {}),
+        )
+
+        assert tr[:, 0].tolist() == [0.0, 10.0, 20.0]
+        assert tf[:, 0].tolist() == [30.0, 30.0]
 
     def test_calendar_only_no_cols(self):
         """Lines 587-588, 593-594: only calendar features, no include cols."""
@@ -592,7 +646,7 @@ class TestPrepareFeatures:
         df = _make_df(20)
         ft = [float(df["time"].iloc[-1]) + 3600 * i for i in range(1, 4)]
         tr, tf, info = prepare_features(
-            df, {"include": "ohlcv", "future_covariates": "hour"}, ft, 3,
+            df, {"include": "ohlcv", "future_covariates": "hour", "observed_future_policy": "carry_forward"}, ft, 3,
             parse_kv_or_json=lambda x: x,
         )
         assert tr.shape[1] > 2
@@ -628,19 +682,19 @@ class TestApplyPreprocessing:
         assert col == "close_dn"
 
     def test_denoise_normalize_exception(self):
-        """Lines 615-616: normalize raises."""
+        """Invalid denoise configuration is not replaced by raw data."""
         df = _make_df(20)
         with patch("mtdata.forecast.forecast_preprocessing._normalize_denoise_spec", side_effect=RuntimeError):
-            col = apply_preprocessing(df, "price", "close", {"method": "bad"})
-        assert col == "close"
+            with pytest.raises(RuntimeError):
+                apply_preprocessing(df, "price", "close", {"method": "bad"})
 
     def test_denoise_apply_exception(self):
-        """Lines 619-620: apply raises."""
+        """Denoise application failures are not replaced by raw data."""
         df = _make_df(20)
         with patch("mtdata.forecast.forecast_preprocessing._normalize_denoise_spec", return_value={"m": "x"}), \
              patch("mtdata.forecast.forecast_preprocessing.apply_denoise", side_effect=RuntimeError):
-            col = apply_preprocessing(df, "price", "close", {"method": "ema"})
-        assert col == "close"
+            with pytest.raises(RuntimeError):
+                apply_preprocessing(df, "price", "close", {"method": "ema"})
 
     def test_denoise_no_dn_column(self):
         """Line 621: _dn column not in added list."""

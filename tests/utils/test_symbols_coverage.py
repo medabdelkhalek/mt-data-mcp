@@ -2,6 +2,7 @@
 
 Covers lines 20-199 by mocking MT5.
 """
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,6 +61,14 @@ _NORM_LIMIT = "mtdata.core.symbols._normalize_limit"
 
 class TestSymbolsListNoSearch:
 
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_rejects_nonpositive_limit(self, limit):
+        result = _get_symbols_list()(limit=limit)
+
+        assert result == {
+            "error": "limit must be a positive integer when provided."
+        }
+
     @patch(_NORM_LIMIT, return_value=25)
     @patch(_TABLE, side_effect=lambda h, r: {"headers": h, "data": r})
     @patch(_GROUP_PATH, return_value="Forex\\Majors")
@@ -115,6 +124,29 @@ class TestSymbolsListNoSearch:
 
     @patch(_NORM_LIMIT, return_value=25)
     @patch(_TABLE, side_effect=lambda h, r: {"headers": h, "data": r})
+    @patch(_GROUP_PATH, return_value="Stock CFD's\\Nasdaq")
+    @patch(f"{_MT5}.symbols_get")
+    def test_descriptions_replace_invalid_unicode_surrogates(
+        self,
+        mock_get,
+        mock_gp,
+        mock_tbl,
+        mock_lim,
+    ):
+        mock_get.return_value = [
+            _make_symbol(
+                "CRSH.US",
+                description="YieldMax\u00b4\udc90\u00a2 Short TSLA ETF CFD",
+            )
+        ]
+
+        res = _get_symbols_list()(search_term=None, limit=25, detail="standard")
+
+        assert res["data"][0][2] == "YieldMax\u00b4\ufffd\u00a2 Short TSLA ETF CFD"
+        res["data"][0][2].encode("utf-8")
+
+    @patch(_NORM_LIMIT, return_value=25)
+    @patch(_TABLE, side_effect=lambda h, r: {"headers": h, "data": r})
     @patch(_GROUP_PATH, return_value="Forex\\Majors")
     @patch(f"{_MT5}.symbols_get")
     def test_compact_detail_includes_static_identification_fields(
@@ -159,10 +191,6 @@ class TestSymbolsListNoSearch:
         res = fn(search_term=None, limit=2, offset=1)
 
         assert [row[0] for row in res["data"]] == ["GBPUSD", "USDJPY"]
-        assert res["total_count"] == 4
-        assert res["offset"] == 1
-        assert res["limit"] == 2
-        assert res["has_more"] is True
         assert res["pagination"] == {
             "total": 4,
             "returned": 2,
@@ -171,6 +199,7 @@ class TestSymbolsListNoSearch:
             "has_more": True,
             "more_available": 1,
         }
+        assert not {"total_count", "offset", "limit", "has_more"} & res.keys()
 
     @patch(_NORM_LIMIT, return_value=25)
     @patch(_GROUP_PATH, return_value="Forex\\Majors")
@@ -186,7 +215,7 @@ class TestSymbolsListNoSearch:
         assert res["count"] == 2
         assert res["search_term"] is None
         assert res["search_mode"] == "auto"
-        assert res["limit"] == 25
+        assert res["pagination"]["limit"] == 25
         assert res["universe"] == "visible"
         assert res["visible_count"] == 2
         assert res["broker_symbol_count"] == 2
@@ -607,10 +636,15 @@ class TestListSymbolGroups:
         res = _list_symbol_groups(limit=1, offset=1)
 
         assert res["data"] == [["G2", 1, 1, ["B1"]]]
-        assert res["total_count"] == 3
-        assert res["offset"] == 1
-        assert res["limit"] == 1
-        assert res["has_more"] is True
+        assert res["pagination"] == {
+            "total": 3,
+            "returned": 1,
+            "offset": 1,
+            "limit": 1,
+            "has_more": True,
+            "more_available": 1,
+        }
+        assert not {"total_count", "offset", "limit", "has_more"} & res.keys()
 
     @patch(_TABLE, side_effect=lambda h, r: {"headers": h, "data": r})
     @patch(_NORM_LIMIT, return_value=25)
@@ -701,6 +735,24 @@ class TestSymbolsDescribe:
         assert sd.get("digits") == 5
         assert "spread" not in sd  # excluded
 
+    @patch(f"{_MT5}.symbols_get")
+    @patch(f"{_MT5}.symbol_info")
+    def test_describe_resolves_punctuated_broker_symbol(
+        self, mock_info, mock_symbols_get
+    ):
+        info = MagicMock()
+        info.__dir__ = lambda self: ["name", "digits"]
+        info.name = "EURUSD"
+        info.digits = 5
+        mock_info.return_value = info
+        mock_symbols_get.return_value = [SimpleNamespace(name="EURUSD")]
+
+        result = _get_symbols_describe()("EUR/USD")
+
+        mock_info.assert_called_once_with("EURUSD")
+        assert result["symbol"] == "EURUSD"
+        assert result["symbol_input"] == "EUR/USD"
+
     @patch(f"{_MT5}.symbol_info")
     def test_skip_none_values(self, mock_info):
         info = MagicMock()
@@ -723,6 +775,21 @@ class TestSymbolsDescribe:
         res = fn("X")
         assert res["symbol"] == "X"
         assert "description" not in res["details"]
+
+    @patch(f"{_MT5}.symbol_info")
+    def test_describe_replaces_invalid_unicode_surrogates(self, mock_info):
+        info = MagicMock()
+        info.__dir__ = lambda self: ["name", "description"]
+        info.name = "CRSH.US"
+        info.description = "YieldMax\u00b4\udc90\u00a2 Short TSLA ETF CFD"
+        mock_info.return_value = info
+
+        res = _get_symbols_describe()("CRSH.US", detail="full")
+
+        assert res["details"]["description"] == (
+            "YieldMax\u00b4\ufffd\u00a2 Short TSLA ETF CFD"
+        )
+        res["details"]["description"].encode("utf-8")
 
     @patch(f"{_MT5}.symbol_info")
     def test_keeps_zero_numeric(self, mock_info):

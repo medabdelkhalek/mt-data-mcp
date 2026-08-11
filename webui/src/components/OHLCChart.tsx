@@ -1,4 +1,13 @@
-import { createChart, IChartApi, ISeriesApi, LineStyle, Time, IPriceLine } from 'lightweight-charts'
+import {
+  CandlestickSeries,
+  createChart,
+  IChartApi,
+  IPriceLine,
+  ISeriesApi,
+  LineSeries,
+  LineStyle,
+  Time,
+} from 'lightweight-charts'
 import { useEffect, useRef } from 'react'
 import type { HistoryBar, ChartOverlay } from '../types'
 
@@ -15,14 +24,47 @@ export type OHLCChartProps = {
   overlays?: ChartOverlay[]
   priceLines?: PriceLineSpec[]
   anchorTime?: number
+  timeZone?: string
 }
 
-export function OHLCChart({ data, onAnchor, onNeedMoreLeft, overlays, priceLines, anchorTime }: OHLCChartProps) {
+const chartTimeFormatters = new Map<string, Intl.DateTimeFormat>()
+
+function formatChartTime(time: Time, timeZone: string, detailed: boolean): string {
+  const epoch = Number(time)
+  if (!Number.isFinite(epoch)) return String(time)
+  const key = `${timeZone}:${detailed ? 'detailed' : 'tick'}`
+  let formatter = chartTimeFormatters.get(key)
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(undefined, {
+      timeZone,
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: detailed ? '2-digit' : undefined,
+      hourCycle: 'h23',
+    })
+    chartTimeFormatters.set(key, formatter)
+  }
+  return formatter.format(new Date(epoch * 1000))
+}
+
+export function OHLCChart({
+  data,
+  onAnchor,
+  onNeedMoreLeft,
+  overlays,
+  priceLines,
+  anchorTime,
+  timeZone = 'UTC',
+}: OHLCChartProps) {
   const ref = useRef<HTMLDivElement | null>(null)
   const apiRef = useRef<IChartApi | null>(null)
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const anchorRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const priceLinesRef = useRef<IPriceLine[]>([])
+  const timeZoneRef = useRef(timeZone)
+  timeZoneRef.current = timeZone
 
   // Keep refs up to date for event handlers
   const dataRef = useRef(data)
@@ -41,13 +83,21 @@ export function OHLCChart({ data, onAnchor, onNeedMoreLeft, overlays, priceLines
     const chart = createChart(ref.current, {
       autoSize: true,
       layout: { background: { color: '#0f172a' }, textColor: '#a3b3c7' },
+      localization: {
+        timeFormatter: (time: Time) => formatChartTime(time, timeZoneRef.current, true),
+      },
       grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
       crosshair: { mode: 1 },
       rightPriceScale: { borderColor: '#1f2937' },
-      timeScale: { borderColor: '#1f2937', timeVisible: true, secondsVisible: true },
+      timeScale: {
+        borderColor: '#1f2937',
+        timeVisible: true,
+        secondsVisible: true,
+        tickMarkFormatter: (time: Time) => formatChartTime(time, timeZoneRef.current, false),
+      },
     })
 
-    const series = chart.addCandlestickSeries({
+    const series = chart.addSeries(CandlestickSeries, {
       upColor: '#22c55e',
       downColor: '#ef4444',
       borderVisible: false,
@@ -97,6 +147,17 @@ export function OHLCChart({ data, onAnchor, onNeedMoreLeft, overlays, priceLines
   }, [])
 
   useEffect(() => {
+    apiRef.current?.applyOptions({
+      localization: {
+        timeFormatter: (time: Time) => formatChartTime(time, timeZoneRef.current, true),
+      },
+      timeScale: {
+        tickMarkFormatter: (time: Time) => formatChartTime(time, timeZoneRef.current, false),
+      },
+    })
+  }, [timeZone])
+
+  useEffect(() => {
     if (!candleRef.current) return
     const series = candleRef.current
     const points = data.map(b => ({
@@ -131,7 +192,7 @@ export function OHLCChart({ data, onAnchor, onNeedMoreLeft, overlays, priceLines
           ? LineStyle.Dotted
           : LineStyle.Solid
 
-      const series = chart.addLineSeries({
+      const series = chart.addSeries(LineSeries, {
         color: ov.color || '#60a5fa',
         lineWidth: (ov.lineWidth ?? 2) as 1 | 2 | 3 | 4,
         lineStyle: style,
@@ -213,7 +274,7 @@ export function OHLCChart({ data, onAnchor, onNeedMoreLeft, overlays, priceLines
     const maxHigh = Math.max(...data.map(d => d.high))
     const center = (minLow + maxHigh) / 2
 
-    const s = chart.addCandlestickSeries({
+    const s = chart.addSeries(CandlestickSeries, {
       upColor: '#facc15',
       downColor: '#facc15',
       borderVisible: false,

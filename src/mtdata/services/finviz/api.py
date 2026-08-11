@@ -12,11 +12,12 @@ from .client import (
     get_finviz_screener_max_rows,
 )
 from .dates import (
+    FINVIZ_CALENDAR_TIMEZONE,
     align_to_next_monday_if_weekend,
     normalize_finviz_dates_in_rows,
     resolve_date_range,
 )
-from .symbols import looks_like_non_equity_symbol
+from .symbols import looks_like_non_equity_symbol, normalize_finviz_equity_symbol
 from .utils import (
     apply_finvizfinance_timeout_patch,
     crypto_day_week_identical,
@@ -35,42 +36,6 @@ _FINVIZ_HTTP_TIMEOUT = get_finviz_http_timeout()
 _FINVIZ_SCREENER_MAX_ROWS = get_finviz_screener_max_rows()
 _FINVIZ_PAGE_LIMIT_MAX = get_finviz_page_limit_max()
 
-_MT5_EQUITY_SUFFIXES = {
-    "AMEX",
-    "ARCA",
-    "ASE",
-    "BATS",
-    "NAS",
-    "NASDAQ",
-    "NQ",
-    "NYSE",
-    "NYS",
-    "NYQ",
-    "US",
-}
-
-
-def _normalize_finviz_equity_symbol(symbol: str) -> str:
-    normalized = str(symbol or "").strip().upper()
-    if not normalized:
-        return normalized
-
-    for separator in (".", "_", "-"):
-        if separator not in normalized:
-            continue
-        base, suffix = normalized.split(separator, 1)
-        suffix_token = suffix.split(".", 1)[0].split("_", 1)[0].split("-", 1)[0]
-        if (
-            base
-            and len(base) <= 6
-            and base.replace(".", "").isalnum()
-            and not looks_like_non_equity_symbol(base)
-            and suffix_token in _MT5_EQUITY_SUFFIXES
-        ):
-            return base
-    return normalized
-
-
 def _sanitize_error_message(exc: Exception, *, symbol: str | None = None) -> str:
     """Sanitize exception messages to hide internal implementation details.
     
@@ -86,6 +51,9 @@ def _sanitize_error_message(exc: Exception, *, symbol: str | None = None) -> str
     """
     error_str = str(exc)
     error_lower = error_str.lower()
+
+    if isinstance(exc, ValueError) and error_lower.startswith("invalid"):
+        return f"Invalid Finviz parameter: {error_str}"
     
     # Check for HTTP error patterns and replace with user-friendly message
     if "404" in error_str and "Client Error" in error_str:
@@ -133,6 +101,8 @@ def _finviz_error_kind(message: str) -> tuple[str, bool]:
         return "finviz_connection_error", True
     if "could not be parsed" in low:
         return "finviz_parse_error", False
+    if "invalid finviz parameter" in low:
+        return "finviz_invalid_parameter", False
     if "adjust filters" in low or "available" in low:
         return "finviz_no_data", False
     return "finviz_unavailable", True
@@ -304,7 +274,7 @@ def _load_finviz_attr(module_name: str, attr_name: str) -> Any:
 def _get_finviz_stock_quote(symbol: str) -> tuple[str, Any]:
     _apply_finvizfinance_timeout_patch()
     finvizfinance = _load_finviz_attr("finvizfinance.quote", "finvizfinance")
-    symbol_norm = _normalize_finviz_equity_symbol(symbol)
+    symbol_norm = normalize_finviz_equity_symbol(symbol)
     return symbol_norm, finvizfinance(symbol_norm)
 
 
@@ -366,6 +336,42 @@ def _fetch_finviz_futures_performance_rows() -> List[Dict[str, Any]]:
     return rows
 
 
+def _parse_stock_fundamentals_from_quote_page(stock: Any) -> Dict[str, Any]:
+    """Parse the current Finviz quote layout when finvizfinance lags it."""
+    soup = getattr(stock, "soup", None)
+    if soup is None:
+        return {}
+
+    fundamentals: Dict[str, Any] = {}
+    company = soup.select_one("h2.quote-header_ticker-wrapper_company")
+    if company is not None:
+        fundamentals["Company"] = company.get_text(" ", strip=True)
+
+    category_keys = {
+        "sec_": "Sector",
+        "ind_": "Industry",
+        "geo_": "Country",
+        "exch_": "Exchange",
+    }
+    for link in soup.select(".quote-header_categories .quote-header_category"):
+        href = str(link.get("href") or "").lower()
+        value = link.get_text(" ", strip=True)
+        if not value:
+            continue
+        for token, key in category_keys.items():
+            if token in href:
+                fundamentals[key] = value
+                break
+
+    for table in soup.select("table.snapshot-table2"):
+        cells = [cell.get_text(" ", strip=True) for cell in table.select("td")]
+        for index in range(0, len(cells) - 1, 2):
+            key = cells[index].strip()
+            if key:
+                fundamentals[key] = cells[index + 1].strip()
+    return fundamentals
+
+
 def get_stock_fundamentals(symbol: str) -> Dict[str, Any]:
     """
     Get fundamental data for a stock symbol.
@@ -374,7 +380,10 @@ def get_stock_fundamentals(symbol: str) -> Dict[str, Any]:
     """
     try:
         symbol_norm, stock = _get_finviz_stock_quote(symbol)
-        fundament = stock.ticker_fundament()
+        try:
+            fundament = stock.ticker_fundament()
+        except AttributeError:
+            fundament = _parse_stock_fundamentals_from_quote_page(stock)
         if fundament is None:
             return {
                 "success": False,
@@ -397,11 +406,23 @@ def get_stock_fundamentals(symbol: str) -> Dict[str, Any]:
         logger.exception(f"Error fetching fundamentals for {symbol}")
         message = _sanitize_error_message(e, symbol=symbol)
         error_code, retryable = _finviz_error_kind(message)
-        remediation = (
-            "Retry after the provider recovers."
-            if retryable
-            else "Check the equity ticker and provider compatibility before retrying."
-        )
+        if error_code == "finviz_unavailable":
+            error_code = "finviz_endpoint_failed"
+            message = (
+                f"Finviz fundamentals failed for "
+                f"{normalize_finviz_equity_symbol(symbol)}. Other Finviz endpoints "
+                "may still be available."
+            )
+            remediation = (
+                "Retry this endpoint or use finviz_screen valuation fields as an "
+                "alternative fundamentals source."
+            )
+        else:
+            remediation = (
+                "Retry this endpoint after the upstream condition clears."
+                if retryable
+                else "Check the equity ticker and provider compatibility before retrying."
+            )
         return {
             "success": False,
             "error": message,
@@ -411,7 +432,7 @@ def get_stock_fundamentals(symbol: str) -> Dict[str, Any]:
             "provider": "finviz",
             "endpoint": "fundamentals",
             "stage": "ticker_fundament",
-            "symbol": _normalize_finviz_equity_symbol(symbol),
+            "symbol": normalize_finviz_equity_symbol(symbol),
         }
 
 
@@ -631,7 +652,13 @@ def screen_stocks(
         }
     except Exception as e:
         logger.warning("Error running stock screener: %s", e)
-        return {"error": _sanitize_error_message(e)}
+        message = _sanitize_error_message(e)
+        error_code, retryable = _finviz_error_kind(message)
+        return {
+            "error": message,
+            "error_code": error_code,
+            "retryable": retryable,
+        }
 
 
 def get_general_news(news_type: str = "news", limit: int = 20, page: int = 1) -> Dict[str, Any]:
@@ -774,12 +801,25 @@ def get_crypto_performance() -> Dict[str, Any]:
             empty_error="No crypto performance data available",
         )
         warnings_out: List[str] = []
+        rounded_zero_symbols: List[str] = []
         for row in items_list:
             if not isinstance(row, dict) or "Price" not in row:
                 continue
             price_display = crypto_price_display(row.get("Price"))
-            if price_display is not None:
+            if price_display is not None and float(price_display) == 0.0:
+                row["Price"] = None
+                row["Price Status"] = "unavailable_provider_rounded_zero"
+                symbol = str(row.get("Ticker") or row.get("Name") or "unknown")
+                rounded_zero_symbols.append(symbol)
+            elif price_display is not None:
                 row["Price"] = price_display
+        if rounded_zero_symbols:
+            warnings_out.append(
+                "Finviz returned zero for crypto prices that its feed cannot "
+                "represent at sub-penny precision; omitted those prices for: "
+                + ", ".join(rounded_zero_symbols)
+                + "."
+            )
         if _drop_duplicate_day_week_performance(items_list):
             warnings_out.append(
                 "Finviz returned identical 'Perf Day' and 'Perf Week' values; "
@@ -938,6 +978,7 @@ def get_economic_calendar(
             "impact": impact_norm,
             "dateFrom": date_from,
             "dateTo": date_to,
+            "calendarTimezone": FINVIZ_CALENDAR_TIMEZONE,
             "count": len(items_list),
             "total": total,
             "page": safe_page,
@@ -980,6 +1021,7 @@ def get_earnings_calendar_api(
             "calendar": "earnings",
             "dateFrom": date_from,
             "dateTo": date_to,
+            "calendarTimezone": FINVIZ_CALENDAR_TIMEZONE,
             "count": len(items),
             "total": total,
             "page": int(payload.get("page") or safe_page),
@@ -1021,6 +1063,7 @@ def get_dividends_calendar_api(
             "calendar": "dividends",
             "dateFrom": date_from,
             "dateTo": date_to,
+            "calendarTimezone": FINVIZ_CALENDAR_TIMEZONE,
             "count": len(items),
             "total": total,
             "page": int(payload.get("page") or safe_page),

@@ -41,6 +41,8 @@ def test_contract_inventory_assigns_expected_owners() -> None:
     assert matrix["forecast_backtest"]["trade_threshold"] == "strategy"
     assert matrix["forecast_backtest"]["spacing"] == "evaluation"
     assert matrix["strategy_backtest"]["fast_period"] == "strategy"
+    assert matrix["strategy_backtest"]["cost_model"] == "evaluation"
+    assert matrix["strategy_backtest"]["spread_bps"] == "evaluation"
     assert matrix["forecast_optimize_hints"]["timeframes"] == "data_preparation"
 
 
@@ -91,6 +93,8 @@ def test_forecast_generate_default_horizon_matches_forecast_tooling() -> None:
     assert ForecastGenerateRequest(symbol="EURUSD").horizon == 12
     assert ForecastGenerateRequest(symbol="EURUSD").ci_alpha == 0.05
     assert ForecastGenerateRequest(symbol="EURUSD", ci_alpha=None).ci_alpha is None
+    with pytest.raises(ValidationError):
+        ForecastGenerateRequest(symbol="EURUSD", ci_alpha=0.0)
 
 
 def test_forecast_tool_requests_default_to_price_quantity() -> None:

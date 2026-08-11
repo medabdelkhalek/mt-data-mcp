@@ -210,12 +210,44 @@ class TestFetchTicks(unittest.TestCase):
     @patch(_RESOLVE_CTZ, return_value=None)
     @patch(_GUARD, _mock_symbol_guard)
     def test_recent_ticks_expand_lookback_until_limit_is_met(self, mock_ctz, mock_info, mock_ticks):
-        mock_ticks.side_effect = [_make_ticks(2), _make_ticks(10)]
+        counts = iter((2, 10))
+
+        def ticks_for_range(symbol, from_date, to_date, flags):
+            return _make_ticks(next(counts), base_ts=from_date.timestamp() + 1.0)
+
+        mock_ticks.side_effect = ticks_for_range
         result = fetch_ticks('EURUSD', limit=5, format='rows')
 
         self.assertTrue(result.get('success'))
         self.assertEqual(result['count'], 5)
         self.assertEqual(mock_ticks.call_count, 2)
+
+    @patch(f'{_DS}.FETCH_RETRY_DELAY', 0)
+    @patch(f'{_DS}.FETCH_RETRY_ATTEMPTS', 1)
+    @patch(_TICKS_RANGE)
+    @patch(_CACHED_INFO, return_value=MagicMock())
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_explicit_range_uses_bounded_backward_pages(
+        self, mock_ctz, mock_info, mock_ticks
+    ):
+        mock_ticks.return_value = _make_ticks(5)
+
+        result = fetch_ticks(
+            'EURUSD',
+            limit=5,
+            start='2020-01-01',
+            end='2026-01-01',
+            format='rows',
+        )
+
+        self.assertTrue(result.get('success'))
+        self.assertEqual(result['count'], 5)
+        self.assertTrue(result['history_window_truncated'])
+        self.assertEqual(mock_ticks.call_count, 1)
+        provider_from = mock_ticks.call_args.args[1]
+        provider_to = mock_ticks.call_args.args[2]
+        self.assertLessEqual((provider_to - provider_from).days, 1)
 
     @patch(_TICKS_RANGE)
     @patch(_CACHED_INFO, return_value=MagicMock())
@@ -230,6 +262,44 @@ class TestFetchTicks(unittest.TestCase):
         stats = result['stats']
         self.assertEqual(set(stats), {'spread'})
         self.assertEqual(set(stats['spread']), {'low', 'high', 'mean'})
+
+    @patch(_TICKS_RANGE)
+    @patch(_CACHED_INFO, return_value=SimpleNamespace(digits=5))
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_summary_spread_statistics_use_consistent_precision(
+        self, mock_ctz, mock_info, mock_ticks
+    ):
+        ticks = _make_ticks(20)
+        for idx, tick in enumerate(ticks):
+            tick["bid"] = 1.1
+            tick["ask"] = 1.1 + (0.000004 if idx == 0 else 0.000006)
+            tick["flags"] = 6
+        mock_ticks.return_value = ticks
+
+        result = fetch_ticks("EURUSD", limit=20, format="summary")
+
+        spread = result["stats"]["spread"]
+        self.assertLessEqual(spread["low"], spread["mean"])
+        self.assertLessEqual(spread["mean"], spread["high"])
+        self.assertEqual(spread["low"], 0.000004)
+
+    @patch(_TICKS_RANGE)
+    @patch(_CACHED_INFO, return_value=SimpleNamespace(digits=5))
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_summary_marks_spread_unavailable_without_coherent_quotes(
+        self, mock_ctz, mock_info, mock_ticks
+    ):
+        ticks = _make_ticks(20)
+        for tick in ticks:
+            tick["ask"] = tick["bid"]
+            tick["flags"] = 6
+        mock_ticks.return_value = ticks
+
+        result = fetch_ticks("EURUSD", limit=20, format="summary")
+
+        self.assertEqual(result["stats"]["spread"], {"available": False})
 
     @patch(_TICKS_RANGE)
     @patch(_CACHED_INFO, return_value=MagicMock())
@@ -314,7 +384,7 @@ class TestFetchTicks(unittest.TestCase):
     def test_tick_rows_keep_optional_columns_when_values_absent(self, mock_ctz, mock_info, mock_ticks):
         ticks = _make_ticks(2)
         for tick in ticks:
-            tick.update({"last": 0.0, "volume": 0.0, "volume_real": 0.0, "flags": 1028})
+            tick.update({"last": 0.0, "volume": 0.0, "volume_real": 0.0, "flags": 4})
         mock_ticks.return_value = ticks
 
         result = fetch_ticks('EURUSD', limit=2, format='full_rows')
@@ -326,8 +396,8 @@ class TestFetchTicks(unittest.TestCase):
         self.assertIsNone(row["last"])
         self.assertEqual(row["volume"], 0.0)
         self.assertEqual(row["volume_real"], 0.0)
-        self.assertEqual(row["flags"], 1028)
-        self.assertIn("volume_real", row["flags_decoded"])
+        self.assertEqual(row["flags"], 4)
+        self.assertEqual(row["flags_decoded"], ["ask"])
         self.assertEqual(result["trade_event_count"], 0)
         self.assertEqual(result["quote_update_count"], 2)
 
@@ -359,7 +429,16 @@ class TestFetchTicks(unittest.TestCase):
         self.assertFalse(result['data'][2]['spread_sample_eligible'])
         self.assertEqual(result['data'][0]['spread_basis'], 'unavailable')
         self.assertFalse(result['last_quote']['spread_valid'])
-        self.assertEqual(result['last_quote']['spread_basis'], 'unavailable')
+        self.assertEqual(result['last_quote']['spread_basis'], 'quote_snapshot_locked')
+        self.assertEqual(result['last_quote']['spread_quality'], 'locked')
+        self.assertFalse(result['usable_for_live_trading'])
+        self.assertEqual(
+            result['usable_for_live_trading_basis'],
+            'quote_age_market_session_and_positive_spread',
+        )
+        self.assertIn('latest_quote_locked', result['execution_blockers'])
+        self.assertEqual(result['last_quote']['mid'], 1.1003)
+        self.assertEqual(result['last_quote']['spread'], 0.0)
         self.assertIsNone(result['data'][0]['mid'])
         self.assertIsNone(result['data'][0]['spread'])
         self.assertIsNone(result['data'][2]['mid'])
@@ -497,6 +576,26 @@ class TestFetchTicks(unittest.TestCase):
         mock_range.return_value = _make_ticks(10)
         result = fetch_ticks('EURUSD', limit=5, start='2025-01-01', end='2025-01-02', format='rows')
         self.assertTrue(result.get('success'))
+
+    @patch(_TICKS_RANGE)
+    @patch(_CACHED_INFO, return_value=MagicMock())
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_end_only_anchors_backward_fetch_at_end(
+        self, mock_ctz, mock_info, mock_range,
+    ):
+        mock_range.return_value = _make_ticks(10)
+
+        result = fetch_ticks(
+            "EURUSD", limit=5, end="2025-01-02T12:00:00Z", format="rows"
+        )
+
+        self.assertTrue(result.get("success"))
+        called_end = mock_range.call_args.args[2]
+        self.assertEqual(
+            called_end.replace(tzinfo=called_end.tzinfo or timezone.utc),
+            datetime(2025, 1, 2, 12, 0, tzinfo=timezone.utc),
+        )
 
     # ------------------------------------------------------------------ #
     # Error paths                                                        #
@@ -679,6 +778,29 @@ class TestFetchTicks(unittest.TestCase):
         self.assertEqual(result["tick_count"], 5)
         self.assertEqual(result["trade_event_count"], 1)
         self.assertEqual(result["stats"]["volume"]["sum"], 7.0)
+
+    @patch(_TICKS_RANGE)
+    @patch(_CACHED_INFO, return_value=MagicMock())
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_resample_does_not_sum_repeated_snapshot_volume(
+        self, mock_ctz, mock_info, mock_ticks,
+    ):
+        ticks = _make_ticks(5)
+        for tick in ticks:
+            tick.update({"last": 1.101, "volume": 7.0, "flags": 6})
+        ticks[0]["flags"] = 24
+        mock_ticks.return_value = ticks
+
+        result = fetch_ticks(
+            "EURUSD",
+            limit=5,
+            format="rows",
+            simplify={"mode": "resample", "bucket_seconds": 60},
+        )
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(result["data"][0]["volume"], 7.0)
 
     # ------------------------------------------------------------------ #
     # Simplify for ticks                                                  #

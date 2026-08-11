@@ -2,11 +2,53 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from mtdata.core.trading.requests import TradeVarCvarRequest
 from mtdata.core.trading.use_cases import (
     _calculate_var_cvar_from_pnl,
+    _position_mark_freshness,
     run_trade_var_cvar_calculate,
 )
+
+
+def test_position_mark_freshness_fetches_each_symbol_once() -> None:
+    calls = []
+    gateway = SimpleNamespace(
+        symbol_info_tick=lambda symbol: calls.append(symbol)
+        or SimpleNamespace(bid=1.0, ask=1.1, time=1_700_000_000),
+    )
+
+    out = _position_mark_freshness(
+        gateway,
+        [
+            SimpleNamespace(symbol="EURUSD"),
+            SimpleNamespace(symbol="EURUSD"),
+            SimpleNamespace(symbol="GBPUSD"),
+        ],
+    )
+
+    assert calls == ["EURUSD", "GBPUSD"]
+    assert out["mark_freshness"][0]["positions"] == 2
+    assert out["mark_freshness"][1]["positions"] == 1
+
+
+def test_position_mark_freshness_rejects_live_label_for_entry_fallback() -> None:
+    gateway = SimpleNamespace(
+        symbol_info_tick=lambda _symbol: SimpleNamespace(
+            bid=99.0, ask=101.0, time=4_102_444_800
+        )
+    )
+
+    out = _position_mark_freshness(
+        gateway,
+        [SimpleNamespace(symbol="EURUSD", price_current=0.0, price_open=100.0)],
+    )
+
+    assert out["mark_freshness_status"] == "entry_price_fallback"
+    assert out["valuation_basis"] == "entry_price_fallback"
+    assert out["usable_for_live_trading"] is False
+    assert out["entry_price_fallback_positions"] == 1
 
 
 def _symbol_info(**overrides):
@@ -58,6 +100,11 @@ def test_run_trade_var_cvar_calculate_summarizes_open_position_portfolio() -> No
         account_info=lambda: SimpleNamespace(equity=1000.0, currency="USD"),
         positions_get=lambda symbol=None: [position],
         symbol_info=lambda symbol: _symbol_info(),
+        symbol_info_tick=lambda symbol: SimpleNamespace(
+            bid=99.0,
+            ask=101.0,
+            time=1,
+        ),
         copy_rates_from_pos=lambda symbol, timeframe, start, count: [
             {"time": 1, "close": 100.0},
             {"time": 2, "close": 95.0},
@@ -99,6 +146,66 @@ def test_run_trade_var_cvar_calculate_summarizes_open_position_portfolio() -> No
     assert out["symbol_exposures"][0]["symbol"] == "EURUSD"
     assert out["positions"][0]["signed_notional"] == 100.0
     assert out["worst_observations"][0]["simulated_pnl"] == -14.29
+    assert out["mark_freshness_status"] == "stale_or_unverified"
+    assert out["usable_for_live_trading"] is False
+    assert out["data_stale"] is True
+    assert out["valuation_time"] == "1970-01-01T00:00:01Z"
+    assert out["history_policy"] == "completed_bars_only"
+    assert out["forming_candle_status"] == "none_detected"
+
+
+def test_run_trade_var_cvar_excludes_forming_return_by_default(monkeypatch) -> None:
+    position = SimpleNamespace(
+        ticket=21,
+        symbol="EURUSD",
+        type=0,
+        volume=1.0,
+        price_current=100.0,
+        price_open=99.0,
+        profit=1.0,
+    )
+    requested_counts = []
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        account_info=lambda: SimpleNamespace(equity=1000.0, currency="USD"),
+        positions_get=lambda symbol=None: [position],
+        symbol_info=lambda symbol: _symbol_info(),
+        symbol_info_tick=lambda symbol: SimpleNamespace(bid=99.0, ask=101.0, time=1),
+        copy_rates_from_pos=lambda symbol, timeframe, start, count: requested_counts.append(count)
+        or [
+            {"time": 1, "close": 100.0},
+            {"time": 2, "close": 95.0},
+            {"time": 3, "close": 105.0},
+            {"time": 4, "close": 90.0},
+            {"time": 5, "close": 110.0},
+            {"time": 6, "close": 1.0},
+        ],
+        POSITION_TYPE_BUY=0,
+        POSITION_TYPE_SELL=1,
+        ORDER_TYPE_BUY=0,
+        ORDER_TYPE_SELL=1,
+    )
+    monkeypatch.setattr(
+        "mtdata.core.trading.use_cases._is_last_bar_forming",
+        lambda *_args, **_kwargs: True,
+    )
+
+    out = run_trade_var_cvar_calculate(
+        TradeVarCvarRequest(
+            lookback=5,
+            confidence=75,
+            transform="pct",
+            min_observations=4,
+            detail="full",
+        ),
+        gateway=gateway,
+    )
+
+    assert requested_counts == [6]
+    assert out["success"] is True
+    assert out["summary"]["observations"] == 4
+    assert out["forming_candle_status"] == "excluded"
+    assert out["worst_observations"][0]["time"] != "1970-01-01T00:00:06Z"
 
 
 def test_run_trade_var_cvar_uses_account_currency_tick_sensitivity() -> None:
@@ -182,10 +289,70 @@ def test_run_trade_var_cvar_rejects_position_without_tick_economics() -> None:
         gateway=gateway,
     )
 
+    assert out["success"] is False
+    assert out["error_code"] == "portfolio_var_incomplete"
     assert out["error"] == (
-        "No usable open positions available for VaR/CVaR calculation."
+        "Portfolio VaR/CVaR requires account-currency valuation for every open "
+        "position; refusing a partial calculation."
     )
-    assert "cannot be included" in out["warnings"][0]["warning"]
+    assert out["valuation_failures"] == [
+        {
+            "ticket": 13,
+            "symbol": "USDJPY",
+            "error": (
+                "Symbol tick value/tick size is unavailable for account-currency "
+                "VaR/CVaR."
+            ),
+        }
+    ]
+
+
+def test_run_trade_var_cvar_rejects_mixed_portfolio_with_unvalued_position() -> None:
+    positions = [
+        SimpleNamespace(
+            ticket=11,
+            symbol="EURUSD",
+            type=0,
+            volume=1.0,
+            price_current=100.0,
+            price_open=99.0,
+            profit=1.0,
+        ),
+        SimpleNamespace(
+            ticket=12,
+            symbol="BROKENCFD",
+            type=0,
+            volume=2.0,
+            price_current=50.0,
+            price_open=49.0,
+            profit=1.0,
+        ),
+    ]
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        account_info=lambda: SimpleNamespace(equity=10_000.0, currency="USD"),
+        positions_get=lambda symbol=None: positions,
+        symbol_info=lambda symbol: (
+            _symbol_info()
+            if symbol == "EURUSD"
+            else _symbol_info(trade_tick_size=0.0, trade_tick_value=0.0)
+        ),
+        copy_rates_from_pos=lambda *args: pytest.fail(
+            "history must not be fetched for an incomplete valuation"
+        ),
+        POSITION_TYPE_BUY=0,
+        POSITION_TYPE_SELL=1,
+        ORDER_TYPE_BUY=0,
+        ORDER_TYPE_SELL=1,
+    )
+
+    out = run_trade_var_cvar_calculate(TradeVarCvarRequest(), gateway=gateway)
+
+    assert out["success"] is False
+    assert out["error_code"] == "portfolio_var_incomplete"
+    assert out["omitted_symbols"] == ["BROKENCFD"]
+    assert out["valuation_failures"][0]["ticket"] == 12
+    assert out["valuation_failures"][0]["symbol"] == "BROKENCFD"
 
 
 def test_run_trade_var_cvar_calculate_converts_log_returns_to_price_changes() -> None:
@@ -355,6 +522,60 @@ def test_run_trade_var_cvar_calculate_returns_empty_when_no_open_positions() -> 
     assert out["currency"] == "USD"
     assert "symbol_exposures" not in out
     assert "worst_observations" not in out
+
+
+def test_run_trade_var_cvar_rejects_failed_position_snapshot() -> None:
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        account_info=lambda: SimpleNamespace(equity=1000.0, currency="USD"),
+        positions_get=lambda symbol=None: None,
+    )
+
+    out = run_trade_var_cvar_calculate(TradeVarCvarRequest(), gateway=gateway)
+
+    assert out["success"] is False
+    assert out["error_code"] == "positions_snapshot_unavailable"
+
+
+def test_run_trade_var_cvar_rejects_partial_symbol_history() -> None:
+    positions = [
+        SimpleNamespace(
+            ticket=1,
+            symbol=symbol,
+            type=0,
+            volume=1.0,
+            price_current=100.0,
+            price_open=99.0,
+            profit=1.0,
+        )
+        for symbol in ("EURUSD", "GBPUSD")
+    ]
+    rates = [
+        {"time": index + 1, "close": 100.0 + index}
+        for index in range(6)
+    ]
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        account_info=lambda: SimpleNamespace(equity=1000.0, currency="USD"),
+        positions_get=lambda symbol=None: positions,
+        symbol_info=lambda symbol: _symbol_info(),
+        copy_rates_from_pos=lambda symbol, timeframe, start, count: (
+            rates if symbol == "EURUSD" else None
+        ),
+        POSITION_TYPE_BUY=0,
+        POSITION_TYPE_SELL=1,
+        ORDER_TYPE_BUY=0,
+        ORDER_TYPE_SELL=1,
+    )
+
+    out = run_trade_var_cvar_calculate(
+        TradeVarCvarRequest(lookback=6, min_observations=5),
+        gateway=gateway,
+    )
+
+    assert out["success"] is False
+    assert out["error_code"] == "portfolio_var_incomplete"
+    assert out["omitted_symbols"] == ["GBPUSD"]
 
 
 def test_run_trade_var_cvar_calculate_reports_account_info_failure() -> None:

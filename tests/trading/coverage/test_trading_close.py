@@ -274,6 +274,31 @@ class TestTradeClose:
         assert out["requested_volume"] == 0.2
         assert out["position_volume"] == 0.1
 
+    def test_dry_run_missing_ticket_does_not_select_unrelated_trade(self):
+        adapter = MagicMock()
+
+        def positions_get(**kwargs):
+            if kwargs.get("ticket") == 999:
+                return ()
+            return [_position(ticket=123, symbol="EURUSD", volume=0.1)]
+
+        def orders_get(**kwargs):
+            if kwargs.get("ticket") == 999:
+                return ()
+            return [_pending_order(ticket=456, symbol="EURUSD")]
+
+        adapter.positions_get.side_effect = positions_get
+        adapter.orders_get.side_effect = orders_get
+        gateway = MT5TradingGateway(
+            adapter=adapter,
+            ensure_connection_impl=lambda: None,
+        )
+
+        out = _resolve_close_dry_run_target(ticket=999, gateway=gateway)
+
+        assert "not found" in out["error"]
+        assert out["checked_scopes"] == ["positions", "pending_orders"]
+
     @patch("mtdata.core.trading._cancel_pending")
     @patch("mtdata.core.trading._close_positions")
     def test_profit_only_routes_to_positions_only(self, mock_close, mock_cancel):
@@ -351,6 +376,9 @@ class TestTradeClose:
             "resolved_ticket": 123,
             "target_symbol": "EURUSD",
             "target_volume": 0.1,
+            "preview_ok": True,
+            "matched_count": 1,
+            "market_readiness": {"usable_for_live_trading": True},
         }
 
         out = trade_close(ticket=123, volume=0.05, dry_run=True, __cli_raw=True)
@@ -365,8 +393,19 @@ class TestTradeClose:
         assert out["target_scope"] == "positions"
         assert out["target_kind"] == "open_position"
         assert out["resolved_ticket"] == 123
+        assert out["preview_ok"] is True
+        assert out["matched_count"] == 1
+        assert out["market_readiness"]["usable_for_live_trading"] is True
         assert "realized_pnl" in out["not_estimated"]
-        mock_resolve.assert_called_once_with(ticket=123, symbol=None, volume=0.05)
+        mock_resolve.assert_called_once_with(
+            ticket=123,
+            symbol=None,
+            volume=0.05,
+            magic=None,
+            profit_only=False,
+            loss_only=False,
+            close_priority=None,
+        )
         mock_close.assert_not_called()
         mock_cancel.assert_not_called()
 
@@ -385,7 +424,15 @@ class TestTradeClose:
 
         assert out["error"] == "Ticket 999 not found as position or pending order."
         assert out["checked_scopes"] == ["positions", "pending_orders"]
-        mock_resolve.assert_called_once_with(ticket=999, symbol=None, volume=None)
+        mock_resolve.assert_called_once_with(
+            ticket=999,
+            symbol=None,
+            volume=None,
+            magic=None,
+            profit_only=False,
+            loss_only=False,
+            close_priority=None,
+        )
         mock_close.assert_not_called()
         mock_cancel.assert_not_called()
 
@@ -561,6 +608,18 @@ class TestClosePositions:
         from mtdata.core.trading import _close_positions
         result = _close_positions()
         assert "message" in result
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_snapshot_failure_is_not_reported_as_flat(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.positions_get.return_value = None
+        from mtdata.core.trading import _close_positions
+
+        result = _close_positions()
+
+        assert result["success"] is False
+        assert result["error_code"] == "positions_snapshot_unavailable"
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_profit_only_filter(self):
@@ -746,10 +805,46 @@ class TestClosePositions:
         from mtdata.core.trading import _close_positions
         result = _close_positions(ticket=77)
         assert result["ticket"] == 77
-        assert result["error"] == "Failed to send close order"
+        assert "outcome is unknown" in result["error"]
+        assert result["error_code"] == "order_send_ambiguous"
+        assert result["ambiguous"] is True
         assert isinstance(result.get("attempts"), list)
         assert len(result.get("attempts") or []) == 1
         assert mt5.order_send.call_count == 1
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_partial_close_does_not_resubmit_after_ambiguous_comment_fallback(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.positions_get.return_value = [_position(ticket=77, volume=1.0)]
+        mt5.symbol_info.return_value = SimpleNamespace(
+            volume_min=0.01,
+            volume_step=0.01,
+        )
+        mt5.symbol_info_tick.return_value = _tick()
+        mt5.order_send.side_effect = [
+            _order_result(retcode=10013, comment="Invalid comment"),
+            None,
+            _order_result(volume=0.5),
+        ]
+        mt5.last_error.side_effect = [(0, ""), (1, "IPC timeout")]
+        from mtdata.core.trading import _close_positions
+
+        result = _close_positions(
+            ticket=77,
+            volume=0.5,
+            comment="broker-rejected",
+        )
+
+        assert "outcome is unknown" in result["error"]
+        assert result["error_code"] == "order_send_ambiguous"
+        assert result["ambiguous"] is True
+        assert result["comment_fallback"]["ambiguous"] is True
+        assert mt5.order_send.call_count == 2
+        assert all(
+            call.args[0]["volume"] == pytest.approx(0.5)
+            for call in mt5.order_send.call_args_list
+        )
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_close_retries_only_after_invalid_fill(self):
@@ -805,6 +900,7 @@ class TestClosePositions:
         mt5.order_send.return_value = _order_result()
         from mtdata.core.trading import _close_positions
         result = _close_positions(ticket=42)
+        assert result["success"] is True
         assert result["ticket"] == 42
         assert result["open_price"] == 1.1
         assert result["close_price"] == 1.1
@@ -864,6 +960,9 @@ class TestClosePositions:
         assert result["filled_volume"] == 0.03
         assert result["position_volume_remaining_estimate"] == pytest.approx(0.07)
         assert result["partial_fill"] is True
+        assert result["success"] is False
+        assert result["execution_status"] == "partial"
+        assert result["remaining_volume"] == pytest.approx(0.02)
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_partial_close_rejects_volume_greater_than_position(self):
@@ -921,7 +1020,7 @@ class TestClosePositions:
         mt5.symbol_info_tick.return_value = _tick(bid=1.05000, ask=1.05010)
 
         gw = create_trading_gateway(
-            adapter=mt5, include_retcode_name=True,
+            adapter=mt5,
             ensure_connection_impl=lambda: None,
         )
         fill_modes = [mt5.ORDER_FILLING_IOC]
@@ -965,7 +1064,7 @@ class TestClosePositions:
         ]
 
         gw = create_trading_gateway(
-            adapter=mt5, include_retcode_name=True,
+            adapter=mt5,
             ensure_connection_impl=lambda: None,
         )
 
@@ -1001,7 +1100,7 @@ class TestClosePositions:
         mt5.last_error.return_value = (10006, "No tick")
 
         gw = create_trading_gateway(
-            adapter=mt5, include_retcode_name=True,
+            adapter=mt5,
             ensure_connection_impl=lambda: None,
         )
         fill_modes = [1]
@@ -1030,7 +1129,6 @@ class TestClosePositions:
         )
         gw = create_trading_gateway(
             adapter=mt5,
-            include_retcode_name=True,
             ensure_connection_impl=lambda: None,
         )
 
@@ -1060,7 +1158,7 @@ class TestClosePositions:
         )
 
         gw = create_trading_gateway(
-            adapter=mt5, include_retcode_name=True,
+            adapter=mt5,
             ensure_connection_impl=lambda: None,
         )
 
@@ -1087,7 +1185,7 @@ class TestClosePositions:
         position = SimpleNamespace(ticket=42, symbol="EURUSD", volume=0.1, magic=100)
 
         gw = create_trading_gateway(
-            adapter=mt5, include_retcode_name=True,
+            adapter=mt5,
             ensure_connection_impl=lambda: None,
         )
         fill_modes = [1]
@@ -1178,8 +1276,8 @@ class TestClosePositions:
     # -----------------------------------------------------------------
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
-    def test_aborts_after_consecutive_failures(self):
-        """Bulk close skips remaining positions after 3 consecutive failures."""
+    def test_attempts_every_position_after_consecutive_failures(self):
+        """Bulk close keeps trying distinct positions after earlier failures."""
         mt5 = sys.modules["MetaTrader5"]
         self._setup_mt5(mt5)
 
@@ -1206,10 +1304,9 @@ class TestClosePositions:
         res = _close_positions(symbol="EURUSD")
 
         results = res.get("results", [res])
-        aborted = [r for r in results if r.get("aborted")]
-        # Positions 4 and 5 should be aborted (after 3 consecutive failures on 1,2,3)
-        assert len(aborted) == 2
-        assert all("consecutive" in r["error"].lower() for r in aborted)
+        assert len(results) == 5
+        assert mt5.order_send.call_count == 5
+        assert not any(r.get("aborted") for r in results)
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_single_ticket_exception_returns_structured_error(self):
@@ -1376,6 +1473,18 @@ class TestCancelPending:
         assert "message" in result
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_snapshot_failure_is_not_reported_as_no_pending_orders(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.orders_get.return_value = None
+        from mtdata.core.trading import _cancel_pending
+
+        result = _cancel_pending()
+
+        assert result["success"] is False
+        assert result["error_code"] == "orders_snapshot_unavailable"
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_single_cancel_success(self):
         mt5 = sys.modules["MetaTrader5"]
         self._setup_mt5(mt5)
@@ -1383,7 +1492,25 @@ class TestCancelPending:
         mt5.order_send.return_value = _order_result()
         from mtdata.core.trading import _cancel_pending
         result = _cancel_pending(ticket=100)
+        assert result["success"] is True
         assert result["ticket"] == 100
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_single_cancel_rejection_is_not_success(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.orders_get.return_value = [_pending_order(ticket=100)]
+        mt5.order_send.return_value = _order_result(
+            retcode=10006,
+            comment="Rejected",
+        )
+        from mtdata.core.trading import _cancel_pending
+
+        result = _cancel_pending(ticket=100)
+
+        assert result["success"] is False
+        assert result["execution_status"] == "rejected"
+        assert "not completed" in result["error"]
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_cancel_order_send_none(self):

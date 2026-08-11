@@ -12,10 +12,21 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 
-from mtdata.forecast.interface import ForecastMethod, ForecastResult, TrainedModelHandle, TrainingProgress, TrainResult
+from mtdata.forecast.interface import (
+    ForecastMethod,
+    ForecastResult,
+    TrainedModelHandle,
+    TrainingProgress,
+    TrainResult,
+)
 from mtdata.forecast.job_store import JobRecord, JobStore
 from mtdata.forecast.model_store import ModelStore
-from mtdata.forecast.task_manager import TaskManager, TrainingTask, _TrainingSpec, _snapshot
+from mtdata.forecast.task_manager import (
+    TaskManager,
+    TrainingTask,
+    _snapshot,
+    _TrainingSpec,
+)
 
 
 def _make_series(n: int = 100) -> pd.Series:
@@ -91,11 +102,36 @@ class _TaskManagerTestCase(unittest.TestCase):
 
 class TestSnapshot(unittest.TestCase):
     def test_snapshot_returns_copy(self):
-        task = TrainingTask(task_id="x", method="m", data_scope="s", params_hash="h")
+        task = TrainingTask(
+            task_id="x",
+            method="m",
+            data_scope="s",
+            params_hash="h",
+            progress=TrainingProgress(
+                step=1,
+                total_steps=2,
+                metrics={"loss": 0.5},
+            ),
+            result=TrainedModelHandle(
+                model_id="m/s/h",
+                method="m",
+                data_scope="s",
+                params_hash="h",
+                created_at=1.0,
+                metadata={"nested": {"value": 1}},
+                store_metadata={"labels": ["stable"]},
+            ),
+        )
         snap = _snapshot(task)
         self.assertEqual(snap.task_id, "x")
         snap.status = "failed"
+        snap.progress.metrics["loss"] = 1.0
+        snap.result.metadata["nested"]["value"] = 2
+        snap.result.store_metadata["labels"].append("mutated")
         self.assertEqual(task.status, "pending")
+        self.assertEqual(task.progress.metrics, {"loss": 0.5})
+        self.assertEqual(task.result.metadata, {"nested": {"value": 1}})
+        self.assertEqual(task.result.store_metadata, {"labels": ["stable"]})
 
 
 class TestTaskManagerBasic(_TaskManagerTestCase):
@@ -107,8 +143,8 @@ class TestTaskManagerBasic(_TaskManagerTestCase):
             data_scope="EURUSD_H1",
             params_hash="old",
             status="completed",
-            completed_at=time.time() - 7200.0,
-            created_at=time.time() - 7300.0,
+            completed_at=time.time() - 90000.0,
+            created_at=time.time() - 90100.0,
         )
         self._job_store.upsert(old_completed)
 
@@ -137,6 +173,35 @@ class TestTaskManagerBasic(_TaskManagerTestCase):
             self.assertIsInstance(final.result, TrainedModelHandle)
             self.assertIsNotNone(final.started_at)
             self.assertIsNotNone(final.completed_at)
+            deadline = time.time() + 1.0
+            while task_id in self.tm._futures and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertNotIn(task_id, self.tm._futures)
+
+    def test_mutation_holds_manager_lock_through_persistence(self):
+        task = self.tm._create_task("fake", "EURUSD_H1", "hash-lock")
+        original_persist = self.tm._persist_task
+        competing_acquired = threading.Event()
+        contender_done = threading.Event()
+
+        def _contend_for_lock():
+            with self.tm._lock:
+                competing_acquired.set()
+            contender_done.set()
+
+        def _persist_while_observing_lock(snapshot):
+            contender = threading.Thread(target=_contend_for_lock)
+            contender.start()
+            self.assertFalse(competing_acquired.wait(0.05))
+            original_persist(snapshot)
+
+        with patch.object(self.tm, "_persist_task", side_effect=_persist_while_observing_lock):
+            self.tm._mutate_task(task.task_id, status="completed", completed_at=time.time())
+
+        self.assertTrue(contender_done.wait(1.0))
+        persisted = self._job_store.get(task.task_id)
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted.status, "completed")
 
     def test_failed_task_persists_error(self):
         fake = _FakeMethod(delay=0.01, fail=True)

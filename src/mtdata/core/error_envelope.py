@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
+from .request_context import current_request_id
 
 _ERROR_GUIDANCE: Dict[str, Dict[str, Any]] = {
     "mt5_connection_error": {
@@ -18,18 +19,6 @@ _ERROR_GUIDANCE: Dict[str, Dict[str, Any]] = {
             "symbol."
         ),
         "related_tools": ["symbols_list"],
-    },
-    "unsupported_method": {
-        "remediation": "Run forecast_list_methods and choose an available method.",
-        "related_tools": ["forecast_list_methods"],
-    },
-    "invalid_method": {
-        "remediation": "Run forecast_list_methods and choose an available method.",
-        "related_tools": ["forecast_list_methods"],
-    },
-    "method_unavailable": {
-        "remediation": "Run forecast_list_methods and choose an available method.",
-        "related_tools": ["forecast_list_methods"],
     },
     "dependency_missing": {
         "remediation": (
@@ -71,10 +60,20 @@ _GUIDANCE_KEYS = {
     "example",
     "documentation",
 }
+_GENERIC_ERROR_CODES = {
+    "",
+    "error",
+    "internal_error",
+    "tool_error",
+    "unknown_error",
+}
+_METHOD_ERROR_CODES = frozenset(
+    {"invalid_method", "unsupported_method", "method_unavailable"}
+)
 
 
 def new_request_id() -> str:
-    return uuid4().hex[:12]
+    return current_request_id() or uuid4().hex[:12]
 
 
 def _default_error_guidance(
@@ -88,6 +87,20 @@ def _default_error_guidance(
         return dict(_ERROR_GUIDANCE[code_text])
     if code_text.endswith("_connection_error"):
         return dict(_ERROR_GUIDANCE["mt5_connection_error"])
+    if code_text in _METHOD_ERROR_CODES:
+        return {
+            "remediation": (
+                "Use this operation's --help and choose one of the listed method values."
+            )
+        }
+    if operation_text == "forecast_train":
+        return {
+            "remediation": (
+                "Choose a trainable method with forecast_list_methods "
+                "--supports-training true, then retry forecast_train."
+            ),
+            "related_tools": ["forecast_list_methods"],
+        }
     if operation_text.startswith("forecast_") or code_text.startswith("forecast_"):
         return {
             "remediation": (
@@ -148,6 +161,8 @@ def _error_payload_text(value: Any) -> list[str]:
 
 
 def _canonical_error_code(payload: Dict[str, Any], current_code: str) -> str:
+    if str(current_code or "").strip().lower() not in _GENERIC_ERROR_CODES:
+        return current_code
     evidence = " ".join(
         _error_payload_text(
             {

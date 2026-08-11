@@ -8,15 +8,20 @@ Covers:
 import unittest
 from unittest.mock import MagicMock, patch
 
-from ._helpers import (
-    _mock_symbol_guard,
-    _make_rates,
-    _DS, _GUARD, _RATES_FROM,
-    _CACHED_INFO, _RESOLVE_CTZ,
-    _ESTIMATE_WARMUP, _SIMPLIFY_EXT, _MT5_CONFIG,
-)
-
 from mtdata.services.data_service import fetch_candles
+
+from ._helpers import (
+    _CACHED_INFO,
+    _DS,
+    _ESTIMATE_WARMUP,
+    _GUARD,
+    _MT5_CONFIG,
+    _RATES_FROM,
+    _RESOLVE_CTZ,
+    _SIMPLIFY_EXT,
+    _make_rates,
+    _mock_symbol_guard,
+)
 
 
 class TestFetchCandlesAdvanced(unittest.TestCase):
@@ -73,6 +78,46 @@ class TestFetchCandlesAdvanced(unittest.TestCase):
         self.assertFalse(result['equal_interval'])
         self.assertFalse(result['analysis_compatible'])
         self.assertIn('irregular time gaps', result['warnings'][0])
+
+    @patch(_MT5_CONFIG)
+    @patch(_SIMPLIFY_EXT)
+    @patch(_RATES_FROM)
+    @patch(_CACHED_INFO, return_value=MagicMock())
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_ESTIMATE_WARMUP, return_value=0)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_approximate_simplify_discloses_segment_mean_columns(
+        self, mock_warmup, mock_ctz, mock_info, mock_from, mock_simp, mock_cfg
+    ):
+        mock_cfg.get_time_offset_seconds.return_value = 0
+        mock_from.return_value = _make_rates(20)
+
+        def reduce_rows(df, hdrs, spec):
+            reduced = df.iloc[:3].copy()
+            reduced["RSI_14"] = [40.0, 50.0, 60.0]
+            return reduced, {
+                "mode": "approximate",
+                "method": "uniform",
+                "original_rows": len(df),
+                "returned_rows": 3,
+                "segment_mean_columns": ["RSI_14"],
+                "non_ohlc_numeric_aggregation": "segment_mean",
+            }
+
+        mock_simp.side_effect = reduce_rows
+
+        result = fetch_candles(
+            "EURUSD",
+            limit=10,
+            simplify={"mode": "approximate", "points": 3},
+        )
+
+        self.assertFalse(result["analysis_compatible"])
+        self.assertEqual(
+            result["simplify"]["non_ohlc_numeric_aggregation"],
+            "segment_mean",
+        )
+        self.assertIn("not recomputed analytical values", result["warnings"][0])
 
     @patch(_MT5_CONFIG)
     @patch(_SIMPLIFY_EXT)

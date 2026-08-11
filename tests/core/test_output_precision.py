@@ -29,6 +29,18 @@ def test_json_auto_precision_keeps_full_numbers():
     assert policy.simplify_numbers is False
 
 
+@pytest.mark.parametrize("precision", ["auto", "compact", "display", "full", "raw"])
+def test_json_precision_modes_never_rewrite_numbers(precision):
+    policy = resolve_output_precision(
+        None,
+        tool_name="data_fetch_candles",
+        fmt="json",
+        precision=precision,
+    )
+
+    assert policy.simplify_numbers is False
+
+
 def test_auto_precision_compacts_large_tables_but_not_trading_tools():
     compact = resolve_output_precision(None, tool_name="data_fetch_candles")
     trading = resolve_output_precision(None, tool_name="trade_positions")
@@ -59,7 +71,7 @@ def test_full_precision_rendering_does_not_display_round_price_fields():
 
 def test_finviz_forex_auto_precision_preserves_fx_prices():
     result = format_result_minimal(
-        {"items": [{"symbol": "EURUSD", "delayed_price": 1.1446}]},
+        {"items": [{"symbol": "EURUSD", "price": 1.1446}]},
         verbose=False,
         tool_name="finviz_forex",
     )

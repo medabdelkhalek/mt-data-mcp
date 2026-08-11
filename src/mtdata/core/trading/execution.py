@@ -9,40 +9,28 @@ from typing import Any, Dict, List, Optional, Union
 from ...bootstrap.settings import trade_guardrails_config
 from ...utils.mt5 import _to_mt5_history_epoch_seconds
 from . import comments, time, validation
+from .common import build_trade_quote_context
 from .gateway import MT5TradingGateway, create_trading_gateway, trading_connection_error
 from .positions import _resolve_open_position, _resolve_pending_order
-from .safety import evaluate_trade_guardrails, pending_order_risk_increased
+from .safety import (
+    _build_guardrail_block,
+    _resolve_pending_order_side,
+    evaluate_trade_guardrails,
+    load_guardrail_book_snapshots,
+    pending_order_risk_increased,
+)
 from .time import ExpirationValue
+from .validation import (
+    _normalize_protection_level,
+    _protection_level_tolerance,
+    _protection_levels_match,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _resolve_position_side(position: Any, mt5: Any) -> Optional[str]:
     return validation._resolve_position_side(position, mt5)
-
-
-def _normalize_protection_level(value: Optional[float], *, tol: float) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        numeric = float(value)
-    except Exception:
-        return None
-    if not math.isfinite(numeric) or math.isclose(numeric, 0.0, abs_tol=tol):
-        return None
-    return numeric
-
-
-def _protection_levels_match(lhs: Optional[float], rhs: Optional[float], *, tol: float) -> bool:
-    if lhs is None or rhs is None:
-        return lhs is None and rhs is None
-    return math.isclose(float(lhs), float(rhs), abs_tol=tol)
-
-
-def _protection_level_tolerance(*, point: float) -> float:
-    if math.isfinite(point) and point > 0.0:
-        return point * 0.1
-    return 1e-9
 
 
 def _position_matches_any_ticket(position: Any, ticket_values: set[int]) -> bool:
@@ -53,6 +41,113 @@ def _position_matches_any_ticket(position: Any, ticket_values: set[int]) -> bool
         if value is not None and value in ticket_values:
             return True
     return False
+
+
+def _exact_ticket_row(rows: Any, ticket: Optional[int]) -> Optional[Any]:
+    expected = validation._safe_int_ticket(ticket)
+    if expected is None:
+        return None
+    for row in list(rows or []):
+        if validation._safe_int_ticket(getattr(row, "ticket", None)) == expected:
+            return row
+    return None
+
+
+def _position_modify_readback(
+    mt5: Any,
+    *,
+    resolved_ticket: Optional[int],
+    price_increment: float,
+    digits: int,
+    price_tol: float,
+) -> Optional[Dict[str, Optional[float]]]:
+    try:
+        row = _exact_ticket_row(
+            mt5.positions_get(ticket=resolved_ticket),
+            resolved_ticket,
+        )
+    except Exception:
+        row = None
+    if row is None:
+        return None
+    actual_sl = validation._normalize_price_for_symbol(
+        getattr(row, "sl", None),
+        point=price_increment,
+        digits=digits,
+    )
+    actual_tp = validation._normalize_price_for_symbol(
+        getattr(row, "tp", None),
+        point=price_increment,
+        digits=digits,
+    )
+    return {
+        "applied_sl": _normalize_protection_level(actual_sl, tol=price_tol),
+        "applied_tp": _normalize_protection_level(actual_tp, tol=price_tol),
+    }
+
+
+def _pending_modify_readback(
+    mt5: Any,
+    *,
+    resolved_ticket: Optional[int],
+    price_increment: float,
+    digits: int,
+    price_tol: float,
+) -> Optional[Dict[str, Any]]:
+    try:
+        row = _exact_ticket_row(
+            mt5.orders_get(ticket=resolved_ticket),
+            resolved_ticket,
+        )
+    except Exception:
+        row = None
+    if row is None:
+        return None
+
+    def _price(name: str) -> Optional[float]:
+        normalized = validation._normalize_price_for_symbol(
+            getattr(row, name, None),
+            point=price_increment,
+            digits=digits,
+        )
+        return _normalize_protection_level(normalized, tol=price_tol)
+
+    return {
+        "applied_price": _price("price_open"),
+        "applied_sl": _price("sl"),
+        "applied_tp": _price("tp"),
+        "applied_expiration": validation._safe_int_attr(
+            row,
+            "time_expiration",
+            None,
+        ),
+        "applied_type_time": validation._safe_int_attr(row, "type_time", None),
+    }
+
+
+def _readback_adjustments(
+    requested: Dict[str, Any],
+    applied: Dict[str, Any],
+    *,
+    price_tol: float,
+) -> Dict[str, Dict[str, Any]]:
+    adjustments: Dict[str, Dict[str, Any]] = {}
+    for key, requested_value in requested.items():
+        applied_value = applied.get(key)
+        if key in {"applied_price", "applied_sl", "applied_tp"}:
+            matches = _protection_levels_match(
+                requested_value,
+                applied_value,
+                tol=price_tol,
+            )
+        else:
+            matches = requested_value == applied_value
+        if not matches:
+            adjustments[key.removeprefix("applied_")] = {
+                "requested": requested_value,
+                "applied": applied_value,
+            }
+    return adjustments
 
 
 def _positions_excluding_current(
@@ -76,6 +171,27 @@ def _positions_excluding_current(
     ]
 
 
+def _pending_orders_excluding_current(
+    orders: Optional[List[Any]],
+    *,
+    resolved_ticket: Optional[int],
+    requested_ticket: Optional[int],
+) -> List[Any]:
+    ticket_values = {
+        value
+        for value in (
+            validation._safe_int_ticket(resolved_ticket),
+            validation._safe_int_ticket(requested_ticket),
+        )
+        if value is not None
+    }
+    return [
+        order
+        for order in list(orders or [])
+        if not _position_matches_any_ticket(order, ticket_values)
+    ]
+
+
 def _evaluate_position_modify_guardrails(
     mt5: Any,
     *,
@@ -88,38 +204,56 @@ def _evaluate_position_modify_guardrails(
     candidate_stop_loss: Optional[float],
 ) -> Optional[Dict[str, Any]]:
     position_volume = validation._safe_float_attr(position, "volume")
-    entry_price = validation._safe_float_attr(position, "price_open")
+    entry_price = validation._safe_float_attr(position, "price_current")
+    if entry_price is None or not math.isfinite(float(entry_price)) or entry_price <= 0.0:
+        entry_price = validation._safe_float_attr(position, "price_open")
     if not trade_guardrails_config.is_enabled() or position_volume is None:
         return None
-    risk_increased = pending_order_risk_increased(
-        symbol_info=symbol_info,
-        side=side,
-        volume=abs(float(position_volume)),
-        existing_entry_price=entry_price,
-        existing_stop_loss=current_stop_loss,
-        candidate_entry_price=entry_price,
-        candidate_stop_loss=candidate_stop_loss,
-    )
-    stop_loss_required = bool(
-        trade_guardrails_config.safety_policy.require_stop_loss
-        or any(trade_guardrails_config.wallet_risk_limits.model_dump().values())
+    current_has_stop = bool(
+        current_stop_loss is not None
+        and math.isfinite(float(current_stop_loss))
+        and float(current_stop_loss) > 0.0
     )
     candidate_has_stop = bool(
         candidate_stop_loss is not None
         and math.isfinite(float(candidate_stop_loss))
         and float(candidate_stop_loss) > 0.0
     )
+    if current_has_stop and not candidate_has_stop:
+        risk_increased = True
+    elif not current_has_stop or not candidate_has_stop:
+        risk_increased = False
+    elif side == "BUY":
+        risk_increased = float(candidate_stop_loss) < float(current_stop_loss)
+    else:
+        risk_increased = float(candidate_stop_loss) > float(current_stop_loss)
+    stop_loss_required = bool(
+        trade_guardrails_config.safety_policy.require_stop_loss
+        or any(trade_guardrails_config.wallet_risk_limits.model_dump().values())
+    )
     if not risk_increased and not (stop_loss_required and not candidate_has_stop):
         return None
+    if stop_loss_required and not candidate_has_stop:
+        block = _build_guardrail_block(
+            ["Configured trading safety requires a stop-loss."],
+            rule="safety_policy",
+            context={"symbol": position.symbol, "side": side},
+        )
+        block["position_ticket"] = resolved_ticket
+        block["ticket_requested"] = requested_ticket
+        return block
 
     try:
         account_info = mt5.account_info()
     except Exception:
         account_info = None
-    try:
-        positions = mt5.positions_get()
-    except Exception:
-        positions = None
+    positions, pending_orders, snapshot_error = load_guardrail_book_snapshots(
+        mt5,
+        trade_guardrails_config,
+        account_info=account_info,
+    )
+    if snapshot_error is not None:
+        return snapshot_error
     guardrail_block = evaluate_trade_guardrails(
         trade_guardrails_config,
         symbol=position.symbol,
@@ -130,13 +264,15 @@ def _evaluate_position_modify_guardrails(
         entry_price=entry_price,
         account_info=account_info,
         existing_positions=_positions_excluding_current(
-            list(positions or []),
+            positions,
             resolved_ticket=resolved_ticket,
             requested_ticket=requested_ticket,
         ),
+        existing_pending_orders=pending_orders,
         symbol_info=symbol_info,
         symbol_info_resolver=mt5.symbol_info,
         enforce_symbol_rules=False,
+        enforce_safety_policy=False,
     )
     if guardrail_block is not None:
         guardrail_block["position_ticket"] = resolved_ticket
@@ -292,14 +428,17 @@ def _resolve_closed_deal_from_history(
 
 def _count_done_results(mt5: Any, results: List[Dict[str, Any]]) -> int:
     success_count = 0
-    done_codes = validation._trade_done_codes(mt5)
     for item in results:
-        if validation._retcode_is_done(mt5, item.get("retcode"), done_codes):
+        if (
+            item.get("success") is not False
+            and validation._trade_execution_status(mt5, item.get("retcode"))
+            == "complete"
+        ):
             success_count += 1
     return success_count
 
 
-def _modify_position(
+def _modify_position(  # noqa: C901
     ticket: Union[int, str],
     stop_loss: Optional[Union[int, float]] = None,
     take_profit: Optional[Union[int, float]] = None,
@@ -310,14 +449,13 @@ def _modify_position(
     """Internal helper to modify a position by ticket."""
     mt5 = create_trading_gateway(
         gateway=gateway,
-        include_retcode_name=True,
     )
 
     connection_error = trading_connection_error(mt5)
     if connection_error is not None:
         return connection_error
 
-    def _modify_position():
+    def _modify_position():  # noqa: C901
         try:
             ticket_id = int(ticket)
             position, resolved_ticket, ticket_resolution = _resolve_open_position(
@@ -476,7 +614,21 @@ def _modify_position(
                 request,
             )
             if result is None:
-                return {"error": "Failed to modify position", "last_error": last_error}
+                out = {
+                    "error": (
+                        "Position modification outcome is unknown; the broker may "
+                        "have applied the requested SL/TP changes. Confirm the live "
+                        "position before retrying."
+                    ),
+                    "error_code": "order_send_ambiguous",
+                    "ambiguous": True,
+                    "position_ticket": resolved_ticket,
+                    "ticket_requested": ticket_id,
+                    "last_error": last_error,
+                }
+                if isinstance(comment_fallback, dict):
+                    out["comment_fallback"] = comment_fallback
+                return out
 
             result_retcode = getattr(result, "retcode", None)
             no_change_code = validation._safe_int_attr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025)
@@ -558,6 +710,13 @@ def _modify_position(
                     out["comment_fallback"] = comment_fallback
                 return out
 
+            readback = _position_modify_readback(
+                mt5,
+                resolved_ticket=resolved_ticket,
+                price_increment=price_increment,
+                digits=digits,
+                price_tol=price_tol,
+            )
             out = {
                 "success": True,
                 "retcode": result_retcode,
@@ -569,9 +728,38 @@ def _modify_position(
                 "position_ticket": resolved_ticket,
                 "ticket_requested": ticket_id,
                 "ticket_resolution": ticket_resolution,
-                "applied_sl": desired_sl,
-                "applied_tp": desired_tp,
+                "requested_sl": desired_sl,
+                "requested_tp": desired_tp,
             }
+            if readback is None:
+                out.update(
+                    {
+                        "applied_sl": None,
+                        "applied_tp": None,
+                        "verification_status": "unverified",
+                        "warnings": [
+                            "Broker accepted the position modification, but the live "
+                            "SL/TP values could not be read back."
+                        ],
+                    }
+                )
+            else:
+                out.update(readback)
+                out["verification_status"] = "verified"
+                adjustments = _readback_adjustments(
+                    {
+                        "applied_sl": desired_sl,
+                        "applied_tp": desired_tp,
+                    },
+                    readback,
+                    price_tol=price_tol,
+                )
+                if adjustments:
+                    out["broker_adjusted"] = True
+                    out["adjustment"] = adjustments
+                    out["warnings"] = [
+                        "Broker-reported SL/TP values differ from the requested modification."
+                    ]
             if isinstance(comment_fallback, dict):
                 out["comment_fallback"] = comment_fallback
             return out
@@ -587,7 +775,7 @@ def _modify_position(
     return _modify_position()
 
 
-def _modify_pending_order(
+def _modify_pending_order(  # noqa: C901
     ticket: Union[int, str],
     price: Optional[Union[int, float]] = None,
     stop_loss: Optional[Union[int, float]] = None,
@@ -600,14 +788,13 @@ def _modify_pending_order(
     """Internal helper to modify a pending order by ticket."""
     mt5 = create_trading_gateway(
         gateway=gateway,
-        include_retcode_name=True,
     )
 
     connection_error = trading_connection_error(mt5)
     if connection_error is not None:
         return connection_error
 
-    def _modify_pending_order():
+    def _modify_pending_order():  # noqa: C901
         try:
             ticket_id = int(ticket)
             order, resolved_ticket, ticket_resolution = _resolve_pending_order(
@@ -627,6 +814,13 @@ def _modify_pending_order(
             tick = mt5.symbol_info_tick(order.symbol)
             if tick is None:
                 return {"error": f"Failed to get current price for {order.symbol}"}
+            freshness_error = validation._validate_tick_freshness(
+                tick,
+                symbol=order.symbol,
+                max_age_seconds=_CLOSE_TICK_MAX_AGE_SECONDS,
+            )
+            if freshness_error is not None:
+                return freshness_error
             price_inputs, price_inputs_error = validation._normalize_trade_price_inputs(
                 symbol_info=symbol_info,
                 price=price if price is not None else getattr(order, "price_open", None),
@@ -711,10 +905,12 @@ def _modify_pending_order(
             existing_entry_price = validation._safe_float_attr(order, "price_open")
             candidate_stop_loss = None if request_sl == 0.0 else float(request_sl)
             current_stop_loss = existing_sl
-            side = "BUY" if int(order_type_value) in {
-                validation._safe_int_attr(mt5, "ORDER_TYPE_BUY_LIMIT", 2),
-                validation._safe_int_attr(mt5, "ORDER_TYPE_BUY_STOP", 4),
-            } else "SELL"
+            side = _resolve_pending_order_side(order)
+            if side is None:
+                return {
+                    "error": f"Unsupported pending order type {order_type_value}.",
+                    "error_code": "unsupported_pending_order_type",
+                }
             if (
                 trade_guardrails_config.is_enabled()
                 and order_volume is not None
@@ -732,10 +928,16 @@ def _modify_pending_order(
                     account_info = mt5.account_info()
                 except Exception:
                     account_info = None
-                try:
-                    positions = mt5.positions_get()
-                except Exception:
-                    positions = None
+                positions, pending_orders, snapshot_error = load_guardrail_book_snapshots(
+                    mt5,
+                    trade_guardrails_config,
+                    account_info=account_info,
+                )
+                if snapshot_error is not None:
+                    snapshot_error["pending_order_ticket"] = resolved_ticket
+                    snapshot_error["ticket_requested"] = ticket_id
+                    snapshot_error["ticket_resolution"] = ticket_resolution
+                    return snapshot_error
                 guardrail_block = evaluate_trade_guardrails(
                     trade_guardrails_config,
                     symbol=order.symbol,
@@ -745,7 +947,12 @@ def _modify_pending_order(
                     side=side,
                     entry_price=float(normalized_price),
                     account_info=account_info,
-                    existing_positions=list(positions or []),
+                    existing_positions=positions,
+                    existing_pending_orders=_pending_orders_excluding_current(
+                        pending_orders,
+                        resolved_ticket=resolved_ticket,
+                        requested_ticket=ticket_id,
+                    ),
                     symbol_info=symbol_info,
                     symbol_info_resolver=mt5.symbol_info,
                     enforce_symbol_rules=False,
@@ -816,19 +1023,106 @@ def _modify_pending_order(
                     ],
                 }
 
+            send_tick = mt5.symbol_info_tick(order.symbol)
+            if send_tick is None:
+                return {"error": f"Failed to refresh current price for {order.symbol}"}
+            freshness_error = validation._validate_tick_freshness(
+                send_tick,
+                symbol=order.symbol,
+                max_age_seconds=_CLOSE_TICK_MAX_AGE_SECONDS,
+            )
+            if freshness_error is not None:
+                return freshness_error
+            send_level_error = validation._validate_pending_order_levels(
+                symbol_info=symbol_info,
+                tick=send_tick,
+                order_type_value=order_type_value,
+                price=float(normalized_price),
+                stop_loss=None if request_sl == 0.0 else float(request_sl),
+                take_profit=None if request_tp == 0.0 else float(request_tp),
+                mt5=mt5,
+            )
+            if send_level_error is not None:
+                return send_level_error
+
             result, comment_fallback, last_error = comments._send_order_with_comment_fallback(
                 mt5,
                 request,
             )
             if result is None:
-                out = {"error": "Failed to modify pending order", "last_error": last_error}
+                out = {
+                    "error": (
+                        "Pending-order modification outcome is unknown; the broker "
+                        "may have applied the requested changes. Confirm the live "
+                        "order before retrying."
+                    ),
+                    "error_code": "order_send_ambiguous",
+                    "ambiguous": True,
+                    "pending_order_ticket": resolved_ticket,
+                    "ticket_requested": ticket_id,
+                    "last_error": last_error,
+                }
                 if isinstance(comment_fallback, dict):
                     out["comment_fallback"] = comment_fallback
                 return out
 
             result_retcode = getattr(result, "retcode", None)
             no_change_code = validation._safe_int_attr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025)
+            pending_readback = None
+            pending_requested: Dict[str, Any] = {}
+            pending_adjustments: Dict[str, Dict[str, Any]] = {}
+            if result_retcode in {no_change_code, mt5.TRADE_RETCODE_DONE}:
+                pending_readback = _pending_modify_readback(
+                    mt5,
+                    resolved_ticket=resolved_ticket,
+                    price_increment=price_increment,
+                    digits=digits,
+                    price_tol=_protection_level_tolerance(point=price_increment),
+                )
+                pending_requested = {
+                    "applied_price": float(normalized_price),
+                    "applied_sl": _normalize_protection_level(
+                        request_sl,
+                        tol=_protection_level_tolerance(point=price_increment),
+                    ),
+                    "applied_tp": _normalize_protection_level(
+                        request_tp,
+                        tol=_protection_level_tolerance(point=price_increment),
+                    ),
+                }
+                if "type_time" in request:
+                    pending_requested["applied_type_time"] = validation._safe_int_attr(
+                        request,
+                        "type_time",
+                        request.get("type_time"),
+                    )
+                if "expiration" in request:
+                    pending_requested["applied_expiration"] = validation._safe_int_ticket(
+                        request.get("expiration")
+                    )
+                if pending_readback is not None:
+                    pending_adjustments = _readback_adjustments(
+                        pending_requested,
+                        pending_readback,
+                        price_tol=_protection_level_tolerance(point=price_increment),
+                    )
             if result_retcode == no_change_code:
+                if pending_readback is not None and pending_adjustments:
+                    return {
+                        "error": (
+                            "Broker reported no changes, but the live pending order "
+                            "does not match the requested values."
+                        ),
+                        "retcode": result_retcode,
+                        "retcode_name": mt5.retcode_name(result_retcode),
+                        "pending_order_ticket": resolved_ticket,
+                        "ticket_requested": ticket_id,
+                        "ticket_resolution": ticket_resolution,
+                        "requested": pending_requested,
+                        "actual": pending_readback,
+                        "adjustment": pending_adjustments,
+                        "no_change": True,
+                    }
                 out = {
                     "success": True,
                     "no_change": True,
@@ -836,14 +1130,27 @@ def _modify_pending_order(
                     "retcode_name": mt5.retcode_name(result_retcode),
                     "comment": getattr(result, "comment", None),
                     "request_id": getattr(result, "request_id", None),
-                    "applied_price": request.get("price"),
-                    "applied_sl": request.get("sl"),
-                    "applied_tp": request.get("tp"),
-                    "applied_expiration": request.get("expiration"),
                     "pending_order_ticket": resolved_ticket,
                     "ticket_requested": ticket_id,
                     "ticket_resolution": ticket_resolution,
                 }
+                if pending_readback is None:
+                    out.update(
+                        {
+                            "applied_price": None,
+                            "applied_sl": None,
+                            "applied_tp": None,
+                            "applied_expiration": None,
+                            "verification_status": "unverified",
+                            "warnings": [
+                                "Broker reported no changes, but the pending order "
+                                "could not be read back."
+                            ],
+                        }
+                    )
+                else:
+                    out.update(pending_readback)
+                    out["verification_status"] = "verified"
                 if isinstance(comment_fallback, dict):
                     out["comment_fallback"] = comment_fallback
                 return out
@@ -869,14 +1176,33 @@ def _modify_pending_order(
                 "order": result.order,
                 "comment": result.comment,
                 "request_id": result.request_id,
-                "applied_price": request.get("price"),
-                "applied_sl": request.get("sl"),
-                "applied_tp": request.get("tp"),
-                "applied_expiration": request.get("expiration"),
                 "pending_order_ticket": resolved_ticket,
                 "ticket_requested": ticket_id,
                 "ticket_resolution": ticket_resolution,
             }
+            if pending_readback is None:
+                out.update(
+                    {
+                        "applied_price": None,
+                        "applied_sl": None,
+                        "applied_tp": None,
+                        "applied_expiration": None,
+                        "verification_status": "unverified",
+                        "warnings": [
+                            "Broker accepted the pending-order modification, but the "
+                            "live values could not be read back."
+                        ],
+                    }
+                )
+            else:
+                out.update(pending_readback)
+                out["verification_status"] = "verified"
+                if pending_adjustments:
+                    out["broker_adjusted"] = True
+                    out["adjustment"] = pending_adjustments
+                    out["warnings"] = [
+                        "Broker-reported pending-order values differ from the requested modification."
+                    ]
             if isinstance(comment_fallback, dict):
                 out["comment_fallback"] = comment_fallback
                 if comment_fallback.get("used"):
@@ -896,11 +1222,10 @@ def _modify_pending_order(
     return _modify_pending_order()
 
 
-_CLOSE_ABORT_CONSECUTIVE_FAILURES = 3
 _CLOSE_TICK_MAX_AGE_SECONDS = 10.0
 
 
-def _execute_single_close(
+def _execute_single_close(  # noqa: C901
     mt5: Any,
     position: Any,
     *,
@@ -1044,7 +1369,7 @@ def _execute_single_close(
             attempts.append(attempt)
             if isinstance(attempt_comment_fallback, dict):
                 attempts[-1]["comment_fallback"] = attempt_comment_fallback
-            if validation._retcode_is_done(mt5, retcode_val):
+            if validation._retcode_is_accepted(mt5, retcode_val):
                 break
             if retcode_val in invalid_fill_codes:
                 break
@@ -1067,18 +1392,18 @@ def _execute_single_close(
             tick = refreshed_tick
             price_retry_count += 1
             _stdlib_time.sleep(0.15)
-        if validation._retcode_is_done(mt5, getattr(result, "retcode", None) if result is not None else None):
+        if validation._retcode_is_accepted(mt5, getattr(result, "retcode", None) if result is not None else None):
             break
         if stop_retries:
             break
 
-    close_ok = (
-        validation._retcode_is_done(mt5, getattr(result, "retcode", None))
+    close_accepted = (
+        validation._retcode_is_accepted(mt5, getattr(result, "retcode", None))
         if result is not None
         else False
     )
 
-    if not close_ok:
+    if not close_accepted:
         tick_failures = [
             a for a in attempts if "tick data" in str(a.get("error", "")).lower()
         ]
@@ -1093,6 +1418,18 @@ def _execute_single_close(
             "attempts": attempts,
             "last_error": last_send_error,
         }
+        if result is None and attempts:
+            fail_result.update(
+                {
+                    "error": (
+                        "Close outcome is unknown; the broker may have already "
+                        "closed the requested position. Confirm live positions "
+                        "before retrying."
+                    ),
+                    "error_code": "order_send_ambiguous",
+                    "ambiguous": True,
+                }
+            )
         if isinstance(close_comment_fallback, dict):
             fail_result["comment_fallback"] = close_comment_fallback
         return fail_result
@@ -1177,8 +1514,13 @@ def _execute_single_close(
         and filled_volume + 1e-12 < float(effective_requested_volume)
     ):
         is_partial_fill = True
+    execution_status = validation._trade_execution_status(mt5, result.retcode)
+    if is_partial_fill:
+        execution_status = "partial"
 
     res_dict: Dict[str, Any] = {
+        "success": execution_status == "complete",
+        "execution_status": execution_status,
         "ticket": position.ticket,
         "retcode": result.retcode,
         "retcode_name": mt5.retcode_name(result.retcode),
@@ -1196,6 +1538,14 @@ def _execute_single_close(
         "requested_volume": effective_requested_volume,
         "position_volume_before": position_volume_before,
         "position_volume_remaining_estimate": post_fill_remaining_estimate,
+        "remaining_volume": (
+            max(
+                0.0,
+                float(effective_requested_volume) - float(filled_volume),
+            )
+            if effective_requested_volume is not None and filled_volume is not None
+            else None
+        ),
         "attempts": attempts,
     }
     if is_partial_fill:
@@ -1267,8 +1617,25 @@ def _close_positions_dry_run_preview(
     profit_only: bool,
     loss_only: bool,
     close_priority: Optional[str],
+    mt5: Any,
 ) -> Dict[str, Any]:
     rows = [_close_position_preview_row(position) for position in positions]
+    quote_contexts: List[Dict[str, Any]] = []
+    for row in rows:
+        symbol_value = str(row.get("symbol") or "").strip()
+        if not symbol_value:
+            continue
+        try:
+            tick = mt5.symbol_info_tick(symbol_value)
+        except Exception:
+            tick = None
+        context = build_trade_quote_context(symbol_value, tick)
+        row["quote_context"] = context
+        quote_contexts.append(context)
+    live_ready = bool(quote_contexts) and all(
+        context.get("usable_for_live_trading") is True
+        for context in quote_contexts
+    )
     total_volume = 0.0
     total_profit = 0.0
     for position in positions:
@@ -1295,6 +1662,15 @@ def _close_positions_dry_run_preview(
         "success": True,
         "dry_run": True,
         "actionability": "preview_only",
+        "preview_ok": live_ready,
+        "market_readiness": {
+            "symbols_checked": len(quote_contexts),
+            "usable_for_live_trading": live_ready,
+            "stale_or_unverified": sum(
+                context.get("usable_for_live_trading") is not True
+                for context in quote_contexts
+            ),
+        },
         "matched_count": len(rows),
         "matched_positions": rows,
         "total_volume": round(total_volume, 8),
@@ -1364,7 +1740,6 @@ def _close_positions(  # noqa: C901
     """Internal helper to close open positions."""
     mt5 = create_trading_gateway(
         gateway=gateway,
-        include_retcode_name=True,
     )
 
     connection_error = trading_connection_error(mt5)
@@ -1394,6 +1769,15 @@ def _close_positions(  # noqa: C901
                     require_exact_ticket_match=True,
                 )
                 if position is None:
+                    if (
+                        isinstance(ticket_resolution, dict)
+                        and ticket_resolution.get("snapshot_unavailable")
+                    ):
+                        return validation.snapshot_unavailable_error(
+                            mt5,
+                            snapshot="positions",
+                            context=f"close position {ticket}",
+                        )
                     out = {"error": f"Position {ticket} not found", "checked_scopes": ["positions"]}
                     if isinstance(ticket_resolution, dict):
                         out["ticket_resolution"] = ticket_resolution
@@ -1422,11 +1806,23 @@ def _close_positions(  # noqa: C901
                 positions = [position]
             elif symbol is not None:
                 positions = mt5.positions_get(symbol=symbol)
-                if positions is None or len(positions) == 0:
+                if positions is None:
+                    return validation.snapshot_unavailable_error(
+                        mt5,
+                        snapshot="positions",
+                        context=f"close positions for {symbol}",
+                    )
+                if len(positions) == 0:
                     return {"message": f"No open positions for {symbol}"}
             else:
                 positions = mt5.positions_get()
-                if positions is None or len(positions) == 0:
+                if positions is None:
+                    return validation.snapshot_unavailable_error(
+                        mt5,
+                        snapshot="positions",
+                        context="close positions",
+                    )
+                if len(positions) == 0:
                     return {"message": "No open positions"}
 
             # 2. Filter positions
@@ -1462,25 +1858,12 @@ def _close_positions(  # noqa: C901
                     profit_only=profit_only,
                     loss_only=loss_only,
                     close_priority=close_priority,
+                    mt5=mt5,
                 )
 
             # 3. Close positions
             results.clear()
-            consecutive_failures = 0
             for position in to_close:
-                # Abort early if consecutive transport/broker failures suggest
-                # a connection problem rather than per-position issues.
-                if consecutive_failures >= _CLOSE_ABORT_CONSECUTIVE_FAILURES:
-                    results.append({
-                        "ticket": getattr(position, "ticket", None),
-                        "error": (
-                            f"Skipped: {consecutive_failures} consecutive close failures "
-                            "suggest a broker/transport problem."
-                        ),
-                        "aborted": True,
-                    })
-                    continue
-
                 # Re-read position to check it still exists
                 try:
                     fresh_positions = mt5.positions_get(ticket=position.ticket)
@@ -1495,7 +1878,6 @@ def _close_positions(  # noqa: C901
                     if last_error is not None:
                         error_result["last_error"] = last_error
                     results.append(error_result)
-                    consecutive_failures += 1
                     continue
                 if len(fresh_positions) == 0:
                     results.append(
@@ -1621,12 +2003,6 @@ def _close_positions(  # noqa: C901
                         close_result.setdefault("ticket_resolution", ticket_resolution)
                 results.append(close_result)
 
-                # Track consecutive failures for abort policy
-                if close_result.get("error"):
-                    consecutive_failures += 1
-                else:
-                    consecutive_failures = 0
-
             # If only one position was targeted by ticket, return single result
             if ticket is not None and len(results) == 1:
                 return results[0]
@@ -1685,12 +2061,15 @@ def _resolve_close_dry_run_target(
     ticket: Union[int, str],
     symbol: Optional[str] = None,
     volume: Optional[Union[int, float]] = None,
+    magic: Optional[int] = None,
+    profit_only: bool = False,
+    loss_only: bool = False,
+    close_priority: Optional[str] = None,
     gateway: Optional[MT5TradingGateway] = None,
 ) -> dict:
     """Resolve a close target for dry-run validation without sending trade requests."""
     mt5 = create_trading_gateway(
         gateway=gateway,
-        include_retcode_name=True,
     )
 
     connection_error = trading_connection_error(mt5)
@@ -1705,8 +2084,21 @@ def _resolve_close_dry_run_target(
         mt5,
         ticket_candidates=[requested_ticket],
         symbol=symbol,
+        require_exact_ticket_match=True,
     )
     if position is not None:
+        magic_filter = validation._safe_int_ticket(magic) if magic is not None else None
+        if (
+            magic_filter is not None
+            and validation._safe_int_ticket(getattr(position, "magic", None))
+            != magic_filter
+        ):
+            return {"error": f"Position {ticket} does not match magic={magic_filter}"}
+        position_profit = validation._safe_float_attr(position, "profit", 0.0)
+        if profit_only and position_profit <= 0.0:
+            return {"error": f"Position {ticket} does not match profit_only=true"}
+        if loss_only and position_profit >= 0.0:
+            return {"error": f"Position {ticket} does not match loss_only=true"}
         position_volume = validation._safe_float_attr(position, "volume") or None
         if volume is not None:
             symbol_info = mt5.symbol_info(getattr(position, "symbol", ""))
@@ -1737,7 +2129,16 @@ def _resolve_close_dry_run_target(
                         "requested_volume": requested_volume,
                         "position_volume": position_volume,
                     }
-        return {
+        preview = _close_positions_dry_run_preview(
+            [position],
+            symbol=symbol,
+            magic=magic_filter,
+            profit_only=profit_only,
+            loss_only=loss_only,
+            close_priority=close_priority,
+            mt5=mt5,
+        )
+        preview.update({
             "success": True,
             "target_scope": "positions",
             "target_kind": "open_position",
@@ -1745,7 +2146,21 @@ def _resolve_close_dry_run_target(
             "target_symbol": getattr(position, "symbol", None),
             "target_volume": position_volume,
             "ticket_resolution": position_resolution,
-        }
+        })
+        if volume is not None:
+            preview["requested_close_volume"] = float(requested_volume)
+            preview["would_send_orders"] = 1
+        return preview
+
+    if (
+        isinstance(position_resolution, dict)
+        and position_resolution.get("snapshot_unavailable")
+    ):
+        return validation.snapshot_unavailable_error(
+            mt5,
+            snapshot="positions",
+            context=f"preview close target {ticket}",
+        )
 
     if volume is not None:
         return {
@@ -1760,8 +2175,23 @@ def _resolve_close_dry_run_target(
         mt5,
         ticket_candidates=[requested_ticket],
         symbol=symbol,
+        require_exact_ticket_match=True,
     )
     if pending_order is not None:
+        magic_filter = validation._safe_int_ticket(magic) if magic is not None else None
+        if (
+            magic_filter is not None
+            and validation._safe_int_ticket(getattr(pending_order, "magic", None))
+            != magic_filter
+        ):
+            return {"error": f"Pending order {ticket} does not match magic={magic_filter}"}
+        if profit_only or loss_only:
+            return {
+                "error": (
+                    "profit_only and loss_only filters apply only to open positions; "
+                    f"ticket {ticket} is a pending order."
+                )
+            }
         return {
             "success": True,
             "target_scope": "pending_orders",
@@ -1772,13 +2202,23 @@ def _resolve_close_dry_run_target(
             "ticket_resolution": pending_resolution,
         }
 
+    if (
+        isinstance(pending_resolution, dict)
+        and pending_resolution.get("snapshot_unavailable")
+    ):
+        return validation.snapshot_unavailable_error(
+            mt5,
+            snapshot="orders",
+            context=f"preview pending cancellation {ticket}",
+        )
+
     return {
         "error": f"Ticket {ticket} not found as position or pending order.",
         "checked_scopes": ["positions", "pending_orders"],
     }
 
 
-def _cancel_pending(
+def _cancel_pending(  # noqa: C901
     ticket: Optional[Union[int, str]] = None,
     symbol: Optional[str] = None,
     magic: Optional[int] = None,
@@ -1789,14 +2229,13 @@ def _cancel_pending(
     """Internal helper to cancel pending orders."""
     mt5 = create_trading_gateway(
         gateway=gateway,
-        include_retcode_name=True,
     )
 
     connection_error = trading_connection_error(mt5)
     if connection_error is not None:
         return connection_error
 
-    def _cancel_pending():
+    def _cancel_pending():  # noqa: C901
         try:
             magic_filter = (
                 validation._safe_int_ticket(magic) if magic is not None else None
@@ -1811,6 +2250,15 @@ def _cancel_pending(
                     require_exact_ticket_match=True,
                 )
                 if order is None:
+                    if (
+                        isinstance(ticket_resolution, dict)
+                        and ticket_resolution.get("snapshot_unavailable")
+                    ):
+                        return validation.snapshot_unavailable_error(
+                            mt5,
+                            snapshot="orders",
+                            context=f"cancel pending order {ticket}",
+                        )
                     out = {"error": f"Pending order {ticket} not found", "checked_scopes": ["pending_orders"]}
                     if isinstance(ticket_resolution, dict):
                         out["ticket_resolution"] = ticket_resolution
@@ -1839,11 +2287,23 @@ def _cancel_pending(
                 orders = [order]
             elif symbol is not None:
                 orders = mt5.orders_get(symbol=symbol)
-                if orders is None or len(orders) == 0:
+                if orders is None:
+                    return validation.snapshot_unavailable_error(
+                        mt5,
+                        snapshot="orders",
+                        context=f"cancel pending orders for {symbol}",
+                    )
+                if len(orders) == 0:
                     return {"message": f"No pending orders for {symbol}"}
             else:
                 orders = mt5.orders_get()
-                if orders is None or len(orders) == 0:
+                if orders is None:
+                    return validation.snapshot_unavailable_error(
+                        mt5,
+                        snapshot="orders",
+                        context="cancel pending orders",
+                    )
+                if len(orders) == 0:
                     return {"message": "No pending orders"}
             if magic_filter is not None:
                 orders = [
@@ -1881,14 +2341,25 @@ def _cancel_pending(
                 if result is None:
                     result_entry = {
                         "ticket": order.ticket,
-                        "error": "Failed to send cancel order",
+                        "error": (
+                            "Cancel outcome is unknown; the broker may have already "
+                            "cancelled the pending order. Confirm live pending orders "
+                            "before retrying."
+                        ),
+                        "error_code": "order_send_ambiguous",
+                        "ambiguous": True,
                         "last_error": last_error,
                     }
                     if isinstance(comment_fallback, dict):
                         result_entry["comment_fallback"] = comment_fallback
                     results.append(result_entry)
                 else:
+                    execution_status = validation._trade_execution_status(
+                        mt5, result.retcode
+                    )
                     result_entry = {
+                        "success": execution_status == "complete",
+                        "execution_status": execution_status,
                         "ticket": order.ticket,
                         "retcode": result.retcode,
                         "retcode_name": mt5.retcode_name(result.retcode),
@@ -1896,6 +2367,10 @@ def _cancel_pending(
                         "order": result.order,
                         "comment": result.comment,
                     }
+                    if execution_status != "complete":
+                        result_entry["error"] = (
+                            "Pending order cancellation was not completed by MT5."
+                        )
                     if isinstance(comment_fallback, dict):
                         result_entry["comment_fallback"] = comment_fallback
                     if ticket is not None:
@@ -1910,7 +2385,20 @@ def _cancel_pending(
             if ticket is not None and len(results) == 1:
                 return results[0]
             success_count = _count_done_results(mt5, results)
-            return {"cancelled_count": success_count, "attempted_count": len(results), "results": results}
+            bulk_result: Dict[str, Any] = {
+                "success": bool(results) and success_count == len(results),
+                "cancelled_count": success_count,
+                "attempted_count": len(results),
+                "results": results,
+            }
+            if success_count < len(results):
+                bulk_result["partial_failure"] = success_count > 0
+                bulk_result["error"] = (
+                    "One or more pending orders were not cancelled."
+                    if success_count > 0
+                    else "Failed to cancel any targeted pending orders."
+                )
+            return bulk_result
 
         except Exception as e:
             return {"error": str(e)}

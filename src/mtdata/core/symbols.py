@@ -31,10 +31,18 @@ from ..utils.mt5 import (
     MT5ConnectionError,
     _mt5_copy_rates_from_pos,
     _symbol_ready_guard,
+    account_currency_from_gateway,
     ensure_mt5_connection_or_raise,
     mt5,
+    resolve_broker_symbol_name,
 )
 from ..utils.mt5_enums import decode_mt5_bitmask_labels, decode_mt5_enum_label
+from ..utils.quote import (
+    compute_spread_metrics,
+    resolve_quote_tick,
+    tick_epoch,
+    tick_value,
+)
 from ..utils.symbol import (
     _extract_group_path as _extract_group_path_util,
 )
@@ -46,6 +54,7 @@ from ..utils.time import (
     _format_time_explicit,
     _format_time_explicit_local,
     _resolve_client_tz,
+    bar_close_epoch,
 )
 from ..utils.utils import (
     _normalize_limit,
@@ -64,8 +73,17 @@ from .output_contract import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_broker_text(value: Any) -> Any:
+    """Replace invalid Unicode surrogate code points in broker metadata."""
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"[\ud800-\udfff]", "\ufffd", value)
 _MARKET_SCAN_STALE_BAR_SECONDS = 7 * 24 * 60 * 60
 _MARKET_SCAN_STALE_QUOTE_SECONDS = QUOTE_STALE_SECONDS
+_TOP_MARKETS_MAX_CANDIDATES = 250
+_MARKET_SCAN_MAX_CANDIDATES = _TOP_MARKETS_MAX_CANDIDATES
 _FOREX_SEARCH_PAIR_PRIORITY = {
     pair: idx
     for idx, pair in enumerate(
@@ -782,11 +800,11 @@ def _symbol_suggestion_from_info(symbol_info: Any) -> Dict[str, Any]:
     group = _extract_group_path_util(symbol_info)
     description = getattr(symbol_info, "description", None)
     suggestion: Dict[str, Any] = {
-        "symbol": getattr(symbol_info, "name", None),
-        "group": group,
+        "symbol": _clean_broker_text(getattr(symbol_info, "name", None)),
+        "group": _clean_broker_text(group),
     }
     if description not in (None, ""):
-        suggestion["description"] = description
+        suggestion["description"] = _clean_broker_text(description)
     session_type = _symbol_session_type(
         name=getattr(symbol_info, "name", None),
         group=group,
@@ -808,7 +826,7 @@ def _symbol_list_optional_attr(symbol_info: Any, attr: str) -> Any:
         return None
     if isinstance(value, str) and not value.strip():
         return None
-    return value
+    return _clean_broker_text(value)
 
 
 def _find_symbol_suggestions(
@@ -880,8 +898,14 @@ def symbols_list(  # noqa: C901
     search_mode_value = str(search_mode or "auto").strip().lower()
     universe_value = str(universe or "visible").strip().lower()
 
-    def _run() -> Dict[str, Any]:
+    def _run() -> Dict[str, Any]:  # noqa: C901
         try:
+            if limit is not None:
+                try:
+                    if int(limit) <= 0:
+                        return {"error": "limit must be a positive integer when provided."}
+                except (TypeError, ValueError):
+                    return {"error": "limit must be a positive integer when provided."}
             mt5_gateway = create_mt5_gateway(
                 adapter=mt5,
                 ensure_connection_impl=ensure_mt5_connection_or_raise,
@@ -966,9 +990,9 @@ def symbols_list(  # noqa: C901
                 if category_filter and symbol_category != category_filter:
                     continue
                 row = {
-                    "symbol": symbol.name,
-                    "group": _extract_group_path_util(symbol),
-                    "description": symbol.description,
+                    "symbol": _clean_broker_text(symbol.name),
+                    "group": _clean_broker_text(_extract_group_path_util(symbol)),
+                    "description": _clean_broker_text(symbol.description),
                     "in_marketwatch": bool(getattr(symbol, "visible", False)),
                     "session_type": _symbol_session_type(
                         name=symbol.name,
@@ -1021,7 +1045,6 @@ def symbols_list(  # noqa: C901
                 symbol_list = symbol_list[offset_value:]
             if limit_value:
                 symbol_list = symbol_list[:limit_value]
-            has_more = offset_value + len(symbol_list) < total_count
             if detail_mode == "summary":
                 out = {
                     "success": True,
@@ -1030,7 +1053,6 @@ def symbols_list(  # noqa: C901
                     "search_term": normalized_search_term,
                     "search_mode": search_mode_value,
                     "universe": effective_universe,
-                    "limit": limit_value,
                 }
                 if filters:
                     out["filters"] = filters
@@ -1080,10 +1102,6 @@ def symbols_list(  # noqa: C901
                         )
                 if not normalized_search_term:
                     out["sort"] = "market_overview"
-                if offset_value or has_more:
-                    out["total_count"] = total_count
-                    out["offset"] = offset_value
-                    out["has_more"] = has_more
                 out["pagination"] = build_pagination_meta(
                     total=total_count,
                     returned=len(symbol_list),
@@ -1149,11 +1167,6 @@ def symbols_list(  # noqa: C901
                     )
             if not normalized_search_term:
                 result["sort"] = "market_overview"
-            if offset_value or has_more:
-                result["total_count"] = total_count
-                result["offset"] = offset_value
-                result["limit"] = limit_value
-                result["has_more"] = has_more
             result["pagination"] = build_pagination_meta(
                 total=total_count,
                 returned=len(symbol_list),
@@ -1257,7 +1270,6 @@ def _list_symbol_groups(
             filtered_items = filtered_items[offset_value:]
         if limit_value:
             filtered_items = filtered_items[:limit_value]
-        has_more = offset_value + len(filtered_items) < total_count
 
         detail_mode = normalize_output_detail(detail, default="compact")
         if detail_mode == "summary":
@@ -1266,12 +1278,13 @@ def _list_symbol_groups(
                 "list_mode": "groups",
                 "count": len(filtered_items),
                 "search_term": search_term,
-                "limit": limit_value,
+                "pagination": build_pagination_meta(
+                    total=total_count,
+                    returned=len(filtered_items),
+                    offset=offset_value,
+                    limit=limit_value,
+                ),
             }
-            if offset_value or has_more:
-                out["total_count"] = total_count
-                out["offset"] = offset_value
-                out["has_more"] = has_more
             if group_search_note:
                 out["note"] = group_search_note
             return out
@@ -1295,11 +1308,12 @@ def _list_symbol_groups(
                 ["group", "symbol_count", "visible_count", "sample_symbols"],
                 rows,
             )
-        if offset_value or has_more:
-            result["total_count"] = total_count
-            result["offset"] = offset_value
-            result["limit"] = limit_value
-            result["has_more"] = has_more
+        result["pagination"] = build_pagination_meta(
+            total=total_count,
+            returned=len(filtered_items),
+            offset=offset_value,
+            limit=limit_value,
+        )
         if group_search_note:
             result["note"] = group_search_note
         return attach_collection_contract(
@@ -1312,7 +1326,7 @@ def _list_symbol_groups(
         return {"error": f"Error getting symbol groups: {str(e)}"}
 
 @mcp.tool()
-def symbols_describe(
+def symbols_describe(  # noqa: C901
     symbol: str,
     detail: DetailLiteral = "compact",
 ) -> Dict[str, Any]:
@@ -1333,7 +1347,7 @@ def symbols_describe(
     dict
         Symbol identifier plus requested detail fields
     """
-    def _run() -> Dict[str, Any]:
+    def _run() -> Dict[str, Any]:  # noqa: C901
         try:
             contract = resolve_output_contract(
                 detail=detail,
@@ -1344,7 +1358,11 @@ def symbols_describe(
                 ensure_connection_impl=ensure_mt5_connection_or_raise,
             )
             mt5_gateway.ensure_connection()
-            symbol_info = mt5_gateway.symbol_info(symbol)
+            resolved_symbol = resolve_broker_symbol_name(
+                symbol,
+                gateway=mt5_gateway,
+            )
+            symbol_info = mt5_gateway.symbol_info(resolved_symbol)
             if symbol_info is None:
                 suggestions = _find_symbol_suggestions(mt5_gateway, symbol)
                 details: Dict[str, Any] = {
@@ -1391,6 +1409,8 @@ def symbols_describe(
                     continue
                 if isinstance(value, str) and value == "":
                     continue
+                if isinstance(value, str):
+                    value = _clean_broker_text(value)
                 if attr == "time":
                     try:
                         from ..utils.mt5 import _mt5_epoch_to_utc
@@ -1498,6 +1518,8 @@ def symbols_describe(
                 "timezone": _client_timezone_label(client_tz),
                 "details": symbol_data,
             }
+            if resolved_symbol != str(symbol or "").strip():
+                payload["symbol_input"] = str(symbol)
             warning = symbol_data.get("currency_base_warning")
             if warning not in (None, ""):
                 payload["warnings"] = [warning]
@@ -1534,10 +1556,10 @@ def _market_scan_is_tradable(symbol: Any) -> bool:
 
 def _market_scan_base_row(symbol: Any) -> Dict[str, Any]:
     return {
-        "symbol": getattr(symbol, "name", None),
-        "group": _extract_group_path_util(symbol),
+        "symbol": _clean_broker_text(getattr(symbol, "name", None)),
+        "group": _clean_broker_text(_extract_group_path_util(symbol)),
         "asset_class": _symbol_category(symbol),
-        "description": getattr(symbol, "description", None),
+        "description": _clean_broker_text(getattr(symbol, "description", None)),
     }
 
 
@@ -1592,7 +1614,8 @@ def _market_scan_freshness_fields(
         return {}
     try:
         now_epoch = float(time.time())
-        age_seconds = max(0.0, now_epoch - float(bar_time))
+        close_epoch = bar_close_epoch(bar_time, str(timeframe))
+        age_seconds = max(0.0, now_epoch - close_epoch)
     except Exception:
         return {}
     stale_after_seconds = _market_scan_stale_bar_seconds(timeframe)
@@ -1736,56 +1759,89 @@ def _market_scan_points_per_pip(symbol: Any, *, point: float, digits: int) -> Op
 def _build_market_scan_spread_row(
     symbol: Any,
     mt5_gateway: Any,
+    *,
+    spread_cost_currency: Optional[str] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    tick = mt5_gateway.symbol_info_tick(symbol.name)
+    raw_tick = mt5_gateway.symbol_info_tick(symbol.name)
+    tick, quote_source = resolve_quote_tick(
+        mt5_gateway,
+        symbol.name,
+        raw_tick,
+        now_epoch=time.time(),
+        stale_after_seconds=_MARKET_SCAN_STALE_QUOTE_SECONDS,
+    )
     if tick is None:
         return None, f"Failed to get tick data: {mt5_gateway.last_error()}"
 
-    bid = _market_scan_float(getattr(tick, "bid", None))
-    ask = _market_scan_float(getattr(tick, "ask", None))
-    tick_time = _market_scan_float(getattr(tick, "time", None))
-    if bid is None or ask is None:
-        return None, "Bid/ask quote is unavailable."
-    if ask < bid:
-        return None, "Bid/ask quote is invalid."
-
+    bid = _market_scan_float(tick_value(tick, "bid"))
+    ask = _market_scan_float(tick_value(tick, "ask"))
+    tick_time = tick_epoch(tick)
     point = _market_scan_float(getattr(symbol, "point", 0.0)) or 0.0
     tick_size = _market_scan_float(getattr(symbol, "trade_tick_size", 0.0)) or 0.0
-    tick_value = _market_scan_float(getattr(symbol, "trade_tick_value", 0.0)) or 0.0
+    trade_tick_value = (
+        _market_scan_float(getattr(symbol, "trade_tick_value", 0.0)) or 0.0
+    )
     digits = max(0, int(getattr(symbol, "digits", 0) or 0))
 
-    spread_abs = float(ask - bid)
-    mid = (ask + bid) / 2.0
-    spread_points = (spread_abs / point) if point > 0 else None
     points_per_pip = _market_scan_points_per_pip(symbol, point=point, digits=digits)
-    spread_pips = (
-        (spread_points / points_per_pip)
-        if spread_points is not None and points_per_pip is not None and points_per_pip > 0
-        else None
+    spread_metrics = compute_spread_metrics(
+        bid,
+        ask,
+        point=point,
+        points_per_pip=points_per_pip,
+        tick_size=tick_size,
+        tick_value_money=trade_tick_value,
+        account_currency=spread_cost_currency,
     )
-    spread_pct = ((spread_abs / mid) * 100.0) if mid > 0 else None
-    spread_cost_per_lot = None
-    spread_cost_currency = str(
-        getattr(symbol, "currency_profit", None)
-        or getattr(symbol, "currency_margin", None)
-        or ""
-    ).strip() or None
-    pricing_basis = "quote_only"
-    if tick_size > 0 and tick_value > 0:
-        spread_cost_per_lot = (spread_abs / tick_size) * tick_value
-        pricing_basis = "per_1_lot_estimate"
+    spread_quality = spread_metrics["spread_quality"]
+    if spread_quality == "one_sided":
+        return None, "Bid/ask quote is unavailable."
+    if spread_quality == "inverted":
+        return None, "Bid/ask quote is invalid."
+    spread_valid = spread_metrics["spread_valid"]
+    spread_abs = spread_metrics["spread"]
+    mid = spread_metrics["mid"]
+    spread_points = spread_metrics["spread_points"]
+    spread_pips = spread_metrics["spread_pips"]
+    spread_pct = spread_metrics["spread_pct"]
+    spread_cost_per_lot = spread_metrics["spread_cost_per_lot"]
+    pricing_basis = spread_metrics["pricing_basis"]
+
+    quote_freshness = _market_scan_quote_freshness_fields(
+        tick_time,
+        symbol=symbol.name,
+    )
+    if not spread_valid:
+        quality_warning = "Locked quote (bid equals ask) is not usable for live trading."
+        existing_warning = quote_freshness.get("warning")
+        quote_freshness["warning"] = (
+            f"{existing_warning} {quality_warning}"
+            if existing_warning
+            else quality_warning
+        )
+        quote_freshness["usable_for_live_trading"] = False
+        quote_freshness["usable_for_live_trading_basis"] = (
+            "quote_age_market_session_and_positive_spread"
+        )
 
     row = _market_scan_base_row(symbol)
     row.update(
         {
             "bid": _market_scan_round(bid, digits=digits),
             "ask": _market_scan_round(ask, digits=digits),
-            **_market_scan_quote_freshness_fields(tick_time, symbol=symbol.name),
+            "mid": _market_scan_round(mid, digits=digits),
+            "quote_as_of": (
+                _format_time_explicit(tick_time) if tick_time is not None else None
+            ),
+            **quote_source,
+            **quote_freshness,
             "spread": _market_scan_round(spread_abs, digits=digits),
             "spread_points": _market_scan_points(spread_points),
             "spread_pips": _market_scan_round(spread_pips, digits=4),
             "spread_pct": _market_scan_round(spread_pct, digits=6),
             "spread_cost_per_lot": _market_scan_round(spread_cost_per_lot, digits=6),
+            "spread_valid": spread_valid,
+            "spread_quality": spread_quality,
             "pricing_basis": pricing_basis,
         }
     )
@@ -1805,12 +1861,10 @@ def _market_scan_completed_rates(
     rates = _mt5_copy_rates_from_pos(symbol, mt5_timeframe, 0, requested + 1)
     if rates is None or len(rates) < 1:
         return rates
-    seconds_per_bar = TIMEFRAME_SECONDS.get(str(timeframe).upper())
     latest_time = _market_scan_float(rates[-1]["time"])
     if (
-        seconds_per_bar
-        and latest_time is not None
-        and (latest_time + float(seconds_per_bar)) > time.time()
+        latest_time is not None
+        and bar_close_epoch(latest_time, timeframe) > time.time()
     ):
         rates = rates[:-1]
     if len(rates) > requested:
@@ -1827,18 +1881,22 @@ def _build_market_scan_bar_row(
         symbol.name,
         timeframe=timeframe,
         mt5_timeframe=mt5_timeframe,
-        count=1,
+        count=2,
     )
-    if rates is None or len(rates) < 1:
-        return None, f"No completed {timeframe} bar data returned."
+    if rates is None or len(rates) < 2:
+        return None, f"At least two completed {timeframe} bars are required."
 
     latest_bar = rates[-1]
+    previous_bar = rates[-2]
     open_price = _market_scan_float(latest_bar["open"])
     close_price = _market_scan_float(latest_bar["close"])
+    previous_close = _market_scan_float(previous_bar["close"])
     if open_price is None or close_price is None:
         return None, "Completed bar is missing open/close prices."
-    if open_price == 0:
-        return None, "Completed bar open price is zero."
+    if previous_close is None:
+        return None, "Previous completed bar is missing its close price."
+    if previous_close == 0:
+        return None, "Previous completed bar close price is zero."
 
     digits = max(0, int(getattr(symbol, "digits", 0) or 0))
     bar_time = _market_scan_float(latest_bar["time"])
@@ -1850,15 +1908,32 @@ def _build_market_scan_bar_row(
             "timeframe": timeframe,
             "data_source": f"{timeframe}_bars",
             "time": _format_time_explicit(bar_time) if bar_time is not None else None,
-            **_market_scan_freshness_fields(bar_time, timeframe=timeframe, symbol=symbol),
+            **_market_scan_bar_freshness_fields(
+                bar_time,
+                timeframe=timeframe,
+                symbol=symbol,
+            ),
+            "previous_close": _market_scan_round(previous_close, digits=digits),
             "open": _market_scan_round(open_price, digits=digits),
             "close": _market_scan_round(close_price, digits=digits),
+            "price_currency": str(
+                getattr(symbol, "currency_profit", "") or ""
+            ).strip()
+            or None,
+            "price_basis": "mt5_latest_completed_bar_close",
+            "price_point": _market_scan_float(getattr(symbol, "point", None)),
             "tick_volume": tick_volume,
             "real_volume": real_volume,
             "price_change_pct": _market_scan_round(
-                ((close_price - open_price) / open_price) * 100.0,
+                ((close_price - previous_close) / previous_close) * 100.0,
                 digits=6,
             ),
+            "price_change_basis": "previous_completed_close_to_latest_completed_close",
+            "gap_pct": _market_scan_round(
+                ((open_price - previous_close) / previous_close) * 100.0,
+                digits=6,
+            ),
+            "gap_basis": "previous_completed_close_to_latest_completed_open",
         }
     )
     return row, None
@@ -1916,10 +1991,57 @@ def _project_market_scan_rows(
     return projected
 
 
+def _compact_market_scan_projection(
+    headers: List[str],
+    rows: List[Dict[str, Any]],
+) -> tuple[List[str], Dict[str, Any]]:
+    """Prune empty columns and hoist metadata repeated across scan rows."""
+    projected_headers = [
+        header
+        for header in headers
+        if any(row.get(header) is not None for row in rows)
+    ]
+    shared: Dict[str, Any] = {}
+    if len(rows) > 1:
+        for header in (
+            "price_basis",
+            "bar_market_status_reason",
+            "bar_freshness_policy_relaxed",
+        ):
+            values = [row.get(header) for row in rows]
+            first = values[0]
+            if first is not None and all(value == first for value in values[1:]):
+                shared[header] = first
+                projected_headers = [
+                    candidate
+                    for candidate in projected_headers
+                    if candidate != header
+                ]
+
+        timestamp_warnings = [
+            str(row.get("timestamp_warning"))
+            for row in rows
+            if row.get("timestamp_warning") not in (None, "")
+        ]
+        unique_warnings = list(dict.fromkeys(timestamp_warnings))
+        if len(timestamp_warnings) > len(unique_warnings):
+            shared["warnings"] = unique_warnings
+            projected_headers = [
+                header
+                for header in projected_headers
+                if header != "timestamp_warning"
+            ]
+    return projected_headers, shared
+
+
 _MARKET_SCAN_UNITS = {
+    "bid": "price",
+    "ask": "price",
+    "mid": "price",
     "close": "price",
     "previous_close": "price",
     "price_change_pct": "percentage_points (1.0 = 1%)",
+    "gap_pct": "percentage_points (1.0 = 1%)",
     "tick_volume": "broker_tick_count",
     "real_volume": "traded_volume",
     "spread_points": "broker_points",
@@ -1928,6 +2050,7 @@ _MARKET_SCAN_UNITS = {
     "spread_cost_per_lot": "currency_per_lot_estimate",
     "rsi": "0_100",
     "sma_distance_pct": "percentage_points (1.0 = 1%)",
+    "price_point": "broker_price_increment",
     "data_age_seconds": "seconds",
     "data_freshness_seconds": "seconds",
     "stale_after_seconds": "seconds",
@@ -2036,15 +2159,20 @@ def _market_scan_freshness_summary(
     if not rows:
         return {}
     def _row_stale(row: Dict[str, Any]) -> bool:
-        return bool(row.get("bar_stale")) or bool(row.get("data_stale"))
+        return bool(row.get("bar_stale")) or bool(
+            row.get("quote_stale", row.get("data_stale"))
+        )
 
     stale_count = sum(1 for row in rows if _row_stale(row))
     stale_bar_count = sum(1 for row in rows if bool(row.get("bar_stale")))
     unsafe_quote_count = sum(
         1
         for row in rows
-        if bool(row.get("data_stale"))
-        or row.get("usable_for_live_trading") is False
+        if bool(row.get("quote_stale", row.get("data_stale")))
+        or row.get(
+            "quote_usable_for_live_trading",
+            row.get("usable_for_live_trading"),
+        ) is False
     )
     row_count = len(rows)
     if stale_count == row_count:
@@ -2092,6 +2220,31 @@ def _market_scan_freshness_summary(
     return out
 
 
+def _namespace_market_scan_quote_freshness(row: Dict[str, Any]) -> None:
+    """Keep quote freshness distinct from the bar that supplies scan prices."""
+    field_map = {
+        "tick_time": "quote_time",
+        "data_age_seconds": "quote_age_seconds",
+        "data_age_anchor": "quote_age_anchor",
+        "data_age_metric": "quote_age_metric",
+        "stale_after_seconds": "quote_stale_after_seconds",
+        "data_stale": "quote_stale",
+        "freshness_reason": "quote_freshness_reason",
+        "timestamp_in_future": "quote_timestamp_in_future",
+        "timestamp_skew_seconds": "quote_timestamp_skew_seconds",
+        "timestamp_warning": "quote_timestamp_warning",
+        "warning": "quote_warning",
+        "freshness": "quote_freshness",
+        "usable_for_live_trading": "quote_usable_for_live_trading",
+        "usable_for_live_trading_basis": "quote_usable_for_live_trading_basis",
+    }
+    for source, target in field_map.items():
+        if source in row:
+            row[target] = row.pop(source)
+    row["price_as_of"] = row.get("time")
+    row["price_freshness"] = row.get("bar_freshness")
+
+
 _TOP_MARKETS_COMPACT_BASE_HEADERS = [
     "symbol",
     "group",
@@ -2101,27 +2254,42 @@ _TOP_MARKETS_COMPACT_BASE_HEADERS = [
     "time",
     "data_stale",
     "freshness",
+    "spread_valid",
+    "spread_quality",
+    "usable_for_live_trading",
 ]
 
 _TOP_MARKETS_COMPACT_SPREAD_HEADERS = [
+    "quote_as_of",
     "bid",
     "ask",
+    "mid",
     "spread_pct",
     "spread_points",
     "spread_pips",
 ]
 
 _TOP_MARKETS_COMPACT_BAR_HEADERS = [
+    "bar_stale",
+    "bar_freshness",
     "close",
+    "quote_as_of",
+    "bid",
+    "ask",
+    "mid",
     "tick_volume",
     "price_change_pct",
 ]
 
 _TOP_MARKETS_COMPACT_HEADERS = [
     *_TOP_MARKETS_COMPACT_BASE_HEADERS,
+    "bar_stale",
+    "bar_freshness",
     "close",
+    "quote_as_of",
     "bid",
     "ask",
+    "mid",
     "spread_pct",
     "spread_points",
     "tick_volume",
@@ -2137,18 +2305,26 @@ _TOP_MARKETS_FULL_BASE_HEADERS = [
     "data_source",
     "time",
     "data_age_seconds",
-    "data_freshness_seconds",
+    "data_age_anchor",
+    "data_age_metric",
     "stale_after_seconds",
-    "bar_age_hours",
     "data_stale",
+    "freshness_reason",
+    "timestamp_in_future",
+    "timestamp_skew_seconds",
+    "timestamp_warning",
     "freshness",
     "warning",
-    "stale_warning",
+    "spread_valid",
+    "spread_quality",
+    "usable_for_live_trading",
 ]
 
 _TOP_MARKETS_FULL_SPREAD_HEADERS = [
+    "quote_as_of",
     "bid",
     "ask",
+    "mid",
     "spread",
     "spread_points",
     "spread_pct",
@@ -2158,8 +2334,24 @@ _TOP_MARKETS_FULL_SPREAD_HEADERS = [
 ]
 
 _TOP_MARKETS_FULL_BAR_HEADERS = [
+    "bar_age_seconds",
+    "bar_freshness_anchor",
+    "bar_freshness_metric",
+    "bar_stale_after_seconds",
+    "bar_age_hours",
+    "bar_stale",
+    "bar_market_status",
+    "bar_market_status_reason",
+    "bar_freshness_policy_relaxed",
+    "bar_freshness",
+    "bar_stale_warning",
+    "previous_close",
     "open",
     "close",
+    "quote_as_of",
+    "bid",
+    "ask",
+    "mid",
     "tick_volume",
     "real_volume",
     "price_change_pct",
@@ -2511,6 +2703,12 @@ def _build_market_scan_signal_row(
             "previous_close": _market_scan_round(previous_close, digits=digits),
             "open": _market_scan_round(open_price, digits=digits),
             "close": _market_scan_round(close_price, digits=digits),
+            "price_currency": str(
+                getattr(symbol, "currency_profit", "") or ""
+            ).strip()
+            or None,
+            "price_basis": "mt5_latest_completed_bar_close",
+            "price_point": _market_scan_float(getattr(symbol, "point", None)),
             "tick_volume": tick_volume,
             "real_volume": real_volume,
             "price_change_pct": _market_scan_round(
@@ -2518,6 +2716,11 @@ def _build_market_scan_signal_row(
                 digits=6,
             ),
             "price_change_basis": "previous_completed_close_to_latest_completed_close",
+            "gap_pct": _market_scan_round(
+                ((open_price - previous_close) / previous_close) * 100.0,
+                digits=6,
+            ),
+            "gap_basis": "previous_completed_close_to_latest_completed_open",
         }
     )
     if include_rsi:
@@ -2539,12 +2742,16 @@ def _market_scan_missing_required_metric(
     min_tick_volume: Optional[int],
     min_price_change_pct: Optional[float],
     max_price_change_pct: Optional[float],
+    min_gap_pct: Optional[float] = None,
+    max_gap_pct: Optional[float] = None,
     rsi_length: int,
     sma_period: int,
 ) -> Optional[str]:
     requirements: List[tuple[str, str]] = []
     if rank_by in {"abs_price_change_pct", "price_change_pct"}:
         requirements.append(("price_change_pct", "price-change data is unavailable."))
+    elif rank_by == "gap_pct":
+        requirements.append(("gap_pct", "Gap data is unavailable."))
     elif rank_by == "tick_volume":
         requirements.append(("tick_volume", "Tick-volume data is unavailable."))
     elif rank_by == "rsi":
@@ -2554,6 +2761,8 @@ def _market_scan_missing_required_metric(
 
     if min_price_change_pct is not None or max_price_change_pct is not None:
         requirements.append(("price_change_pct", "price-change data is unavailable."))
+    if min_gap_pct is not None or max_gap_pct is not None:
+        requirements.append(("gap_pct", "Gap data is unavailable."))
     if max_spread_pct is not None:
         requirements.append(("spread_pct", "Spread data is unavailable."))
     if min_tick_volume is not None:
@@ -2579,8 +2788,11 @@ def _market_scan_row_matches_filters(
     rsi_below: Optional[float],
     rsi_above: Optional[float],
     price_vs_sma: Optional[str],
+    min_gap_pct: Optional[float] = None,
+    max_gap_pct: Optional[float] = None,
 ) -> bool:
     price_change_pct = _market_scan_float(row.get("price_change_pct"))
+    gap_pct = _market_scan_float(row.get("gap_pct"))
     spread_pct = _market_scan_float(row.get("spread_pct"))
     tick_volume = _market_scan_bar_int(row.get("tick_volume"))
     rsi_value = _market_scan_float(row.get("rsi"))
@@ -2591,7 +2803,15 @@ def _market_scan_row_matches_filters(
         return False
     if max_price_change_pct is not None and (price_change_pct is None or price_change_pct > float(max_price_change_pct)):
         return False
-    if max_spread_pct is not None and (spread_pct is None or spread_pct > float(max_spread_pct)):
+    if min_gap_pct is not None and (gap_pct is None or gap_pct < float(min_gap_pct)):
+        return False
+    if max_gap_pct is not None and (gap_pct is None or gap_pct > float(max_gap_pct)):
+        return False
+    if max_spread_pct is not None and (
+        row.get("spread_valid") is not True
+        or spread_pct is None
+        or spread_pct > float(max_spread_pct)
+    ):
         return False
     if min_tick_volume is not None and (tick_volume is None or tick_volume < int(min_tick_volume)):
         return False
@@ -2642,6 +2862,7 @@ def _market_scan_sort_rows(
 
     rows.sort(
         key=lambda row: (
+            rank_by == "spread_pct" and row.get("spread_valid") is not True,
             bool(row.get("bar_stale")),
             row.get(rank_by) is None,
             (
@@ -2701,6 +2922,8 @@ def _market_scan_ranking_label(
         return "largest_abs_price_change_pct"
     if rank_by == "price_change_pct":
         return "highest_price_change_pct"
+    if rank_by == "gap_pct":
+        return "largest_gap_pct"
     if rank_by == "tick_volume":
         return "highest_tick_volume"
     if rank_by == "spread_pct":
@@ -2744,13 +2967,20 @@ def symbols_top_markets(  # noqa: C901
     bar on `timeframe`. Uses compact leaderboard rows by default. Set
     `detail="full"` for the expanded row shape and collection metadata. Use
     `market_scan` instead when you need explicit symbol inputs, RSI/SMA filters,
-    or a single flat scanner table.
+    or a single flat scanner table. Locked or invalid quotes are marked unsafe
+    and rank after valid two-sided quotes in spread leaderboards.
     """
 
     detail_mode = normalize_output_verbosity_detail(detail, default="compact")
 
     def _run() -> Dict[str, Any]:  # noqa: C901
         try:
+            if limit is not None:
+                try:
+                    if int(limit) <= 0:
+                        return {"error": "limit must be a positive integer when provided."}
+                except (TypeError, ValueError):
+                    return {"error": "limit must be a positive integer when provided."}
             raw_rank_by_value = str(rank_by or "abs_price_change_pct").strip().lower()
             if raw_rank_by_value == "volume":
                 return {
@@ -2811,6 +3041,11 @@ def symbols_top_markets(  # noqa: C901
                 ensure_connection_impl=ensure_mt5_connection_or_raise,
             )
             mt5_gateway.ensure_connection()
+            spread_cost_currency = (
+                account_currency_from_gateway(mt5_gateway)
+                if rank_kind != "volume"
+                else None
+            )
 
             raw_symbols = mt5_gateway.symbols_get()
             if raw_symbols is None:
@@ -2862,6 +3097,19 @@ def symbols_top_markets(  # noqa: C901
                 key=lambda symbol: _case_insensitive_sort_key(getattr(symbol, "name", "")),
             )
 
+            if len(selected_symbols) > _TOP_MARKETS_MAX_CANDIDATES:
+                return {
+                    "error": (
+                        f"The filtered universe contains {len(selected_symbols)} candidates, "
+                        f"above the safe synchronous cap of {_TOP_MARKETS_MAX_CANDIDATES}. "
+                        "Narrow the exact ranking with group or category."
+                    ),
+                    "error_code": "candidate_universe_too_large",
+                    "candidate_count": len(selected_symbols),
+                    "candidate_cap": _TOP_MARKETS_MAX_CANDIDATES,
+                    "filters": filters,
+                }
+
             limit_value = _normalize_limit(limit) or 10
             started_at = time.perf_counter()
 
@@ -2889,11 +3137,16 @@ def symbols_top_markets(  # noqa: C901
             def _collect_for_symbol(symbol: Any) -> None:
                 symbol_name = str(getattr(symbol, "name", "") or "")
 
-                if rank_kind in {"all", "spread"}:
-                    spread_row, spread_error = _build_market_scan_spread_row(symbol, mt5_gateway)
-                    if spread_error:
+                spread_row = None
+                if rank_kind != "volume":
+                    spread_row, spread_error = _build_market_scan_spread_row(
+                        symbol,
+                        mt5_gateway,
+                        spread_cost_currency=spread_cost_currency,
+                    )
+                    if spread_error and rank_kind in {"all", "spread"}:
                         _record_issue("spread", symbol_name, spread_error)
-                    elif spread_row is not None:
+                    elif spread_row is not None and rank_kind in {"all", "spread"}:
                         spread_rows.append(spread_row)
 
                 if needs_bar_data and mt5_timeframe is not None:
@@ -2912,14 +3165,16 @@ def symbols_top_markets(  # noqa: C901
                         }:
                             _record_issue("price_change", symbol_name, bar_error)
                     elif bar_row is not None:
+                        combined_bar_row = dict(spread_row or {})
+                        combined_bar_row.update(bar_row)
                         if rank_kind in {"all", "volume"}:
-                            volume_rows.append(dict(bar_row))
+                            volume_rows.append(dict(combined_bar_row))
                         if rank_kind in {
                             "all",
                             "price_change",
                             "abs_price_change",
                         }:
-                            price_change_rows.append(dict(bar_row))
+                            price_change_rows.append(dict(combined_bar_row))
 
             for symbol in selected_symbols:
                 symbol_name = str(getattr(symbol, "name", "") or "")
@@ -2944,6 +3199,7 @@ def symbols_top_markets(  # noqa: C901
 
             spread_rows.sort(
                 key=lambda row: (
+                    row.get("spread_valid") is not True,
                     bool(row.get("data_stale")),
                     row.get("spread_pct") is None,
                     row.get("spread_pct") if row.get("spread_pct") is not None else float("inf"),
@@ -2952,7 +3208,7 @@ def symbols_top_markets(  # noqa: C901
             )
             volume_rows.sort(
                 key=lambda row: (
-                    bool(row.get("data_stale")),
+                    bool(row.get("data_stale")) or bool(row.get("bar_stale")),
                     row.get("tick_volume") is None,
                     -(row.get("tick_volume") or 0),
                     row.get("symbol") or "",
@@ -2960,7 +3216,7 @@ def symbols_top_markets(  # noqa: C901
             )
             price_change_rows.sort(
                 key=lambda row: (
-                    bool(row.get("data_stale")),
+                    bool(row.get("data_stale")) or bool(row.get("bar_stale")),
                     row.get("price_change_pct") is None,
                     (
                         -abs(float(row.get("price_change_pct") or 0.0))
@@ -3009,7 +3265,7 @@ def symbols_top_markets(  # noqa: C901
                 if returned_count < int(limit_value):
                     fields["note"] = (
                         f"Requested {int(limit_value)} rows but only "
-                        f"{available_count} symbols had usable {metric_name} data "
+                        f"{available_count} symbols provided {metric_name} data "
                         f"in the {universe_value} universe."
                     )
                 return fields
@@ -3094,6 +3350,9 @@ def symbols_top_markets(  # noqa: C901
                     if rank_kind == "abs_price_change"
                     else "highest_price_change_pct"
                 )
+                out["price_change_basis"] = (
+                    "previous_completed_close_to_latest_completed_close"
+                )
                 out.update(_scope_fields("price_change", price_change_rows))
                 out.update(
                     _market_scan_freshness_summary(
@@ -3125,6 +3384,9 @@ def symbols_top_markets(  # noqa: C901
             )
             out.update(scan_meta)
             out["ranking"] = "all"
+            out["price_change_basis"] = (
+                "previous_completed_close_to_latest_completed_close"
+            )
             out["rank_categories"] = [
                 "lowest_spread",
                 "highest_tick_volume",
@@ -3190,8 +3452,8 @@ _MARKET_SCAN_PRESETS: Dict[str, Dict[str, Any]] = {
     "overbought": {"rsi_above": 70.0, "min_tick_volume": 1000, "rank_by": "rsi"},
     "high_volume": {"rank_by": "tick_volume"},
     "tight_spread": {"max_spread_pct": 0.01, "min_tick_volume": 500, "rank_by": "spread_pct"},
-    "gap_up": {"min_price_change_pct": 2.0, "rank_by": "price_change_pct"},
-    "gap_down": {"max_price_change_pct": -2.0, "rank_by": "price_change_pct"},
+    "gap_up": {"min_gap_pct": 2.0, "rank_by": "gap_pct"},
+    "gap_down": {"max_gap_pct": -2.0, "rank_by": "gap_pct"},
 }
 
 
@@ -3228,13 +3490,16 @@ def market_scan(  # noqa: C901
     for compatibility. Broad scans use the visible universe; `universe="all"`
     must be combined with `symbols` or `group` to avoid unbounded hidden-symbol
     activation. Use `symbols_top_markets` for a quick all-market overview with
-    separate spread, volume, and mover leaderboards.
+    separate spread, volume, and mover leaderboards. Locked or invalid quotes
+    are marked unsafe and cannot satisfy a maximum-spread filter.
     """
 
     detail_mode = normalize_output_verbosity_detail(detail, default="compact")
     preset_value = str(preset or "").strip().lower().replace("-", "_")
     preset_error = None
     preset_config = _MARKET_SCAN_PRESETS.get(preset_value) if preset_value else None
+    min_gap_pct: Optional[float] = None
+    max_gap_pct: Optional[float] = None
     if preset_value and preset_config is None:
         preset_error = (
             "preset must be one of: "
@@ -3242,6 +3507,8 @@ def market_scan(  # noqa: C901
             + "."
         )
     elif preset_config:
+        min_gap_pct = preset_config.get("min_gap_pct")
+        max_gap_pct = preset_config.get("max_gap_pct")
         if min_price_change_pct is None and "min_price_change_pct" in preset_config:
             min_price_change_pct = preset_config["min_price_change_pct"]
         if max_price_change_pct is None and "max_price_change_pct" in preset_config:
@@ -3275,6 +3542,8 @@ def market_scan(  # noqa: C901
                 for key, value in {
                     "min_price_change_pct": min_price_change_pct,
                     "max_price_change_pct": max_price_change_pct,
+                    "min_gap_pct": min_gap_pct,
+                    "max_gap_pct": max_gap_pct,
                     "max_spread_pct": max_spread_pct,
                     "min_tick_volume": min_tick_volume,
                     "rsi_below": rsi_below,
@@ -3330,7 +3599,7 @@ def market_scan(  # noqa: C901
             request["rank_by"] = rank_by_value
             if rank_by_input != rank_by_value:
                 request["rank_by_input"] = rank_by_input
-            if rank_by_value not in {"abs_price_change_pct", "price_change_pct", "tick_volume", "rsi", "spread_pct"}:
+            if rank_by_value not in {"abs_price_change_pct", "price_change_pct", "gap_pct", "tick_volume", "rsi", "spread_pct"}:
                 return _market_scan_error(
                     (
                         "rank_by must be one of: "
@@ -3414,6 +3683,72 @@ def market_scan(  # noqa: C901
                     request=request,
                 )
 
+            if limit is None:
+                limit_value = 10
+            else:
+                try:
+                    limit_value = int(limit)
+                except Exception:
+                    limit_value = 0
+                if limit_value <= 0:
+                    return _market_scan_error(
+                        "limit must be a positive integer.",
+                        code="invalid_input",
+                        request=request,
+                    )
+            request["limit"] = limit_value
+            try:
+                offset_value = int(offset or 0)
+            except Exception:
+                return _market_scan_error(
+                    "offset must be a non-negative integer.",
+                    code="invalid_input",
+                    request=request,
+                )
+            if offset_value < 0:
+                return _market_scan_error(
+                    "offset must be >= 0.",
+                    code="invalid_input",
+                    request=request,
+                )
+            request["offset"] = offset_value
+
+            for filter_name, filter_value in (
+                ("max_spread_pct", max_spread_pct),
+                ("rsi_below", rsi_below),
+                ("rsi_above", rsi_above),
+            ):
+                if filter_value is None:
+                    continue
+                numeric = _market_scan_float(filter_value)
+                invalid = numeric is None
+                if filter_name == "max_spread_pct":
+                    invalid = invalid or numeric < 0.0
+                else:
+                    invalid = invalid or not 0.0 <= numeric <= 100.0
+                if invalid:
+                    expected = (
+                        "a non-negative percentage"
+                        if filter_name == "max_spread_pct"
+                        else "between 0 and 100"
+                    )
+                    return _market_scan_error(
+                        f"{filter_name} must be {expected}.",
+                        code="invalid_input",
+                        request=request,
+                    )
+            if min_tick_volume is not None:
+                try:
+                    min_tick_volume_value = int(min_tick_volume)
+                except Exception:
+                    min_tick_volume_value = -1
+                if min_tick_volume_value < 0:
+                    return _market_scan_error(
+                        "min_tick_volume must be a non-negative integer.",
+                        code="invalid_input",
+                        request=request,
+                    )
+
             include_rsi = (
                 detail_mode != "compact"
                 or rank_by_value == "rsi"
@@ -3428,6 +3763,7 @@ def market_scan(  # noqa: C901
                 ensure_connection_impl=ensure_mt5_connection_or_raise,
             )
             mt5_gateway.ensure_connection()
+            spread_cost_currency = account_currency_from_gateway(mt5_gateway)
 
             raw_symbols = mt5_gateway.symbols_get()
             if raw_symbols is None:
@@ -3454,23 +3790,6 @@ def market_scan(  # noqa: C901
                     request=request,
                 )
 
-            limit_value = _normalize_limit(limit) or 10
-            request["limit"] = limit_value
-            try:
-                offset_value = int(offset or 0)
-            except Exception:
-                return _market_scan_error(
-                    "offset must be a non-negative integer.",
-                    code="invalid_input",
-                    request=request,
-                )
-            if offset_value < 0:
-                return _market_scan_error(
-                    "offset must be >= 0.",
-                    code="invalid_input",
-                    request=request,
-                )
-            request["offset"] = offset_value
             if selection_meta.get("symbols_input") is not None:
                 request["symbols_input"] = selection_meta.get("symbols_input")
             request["scope"] = selection_meta.get("scope")
@@ -3482,6 +3801,20 @@ def market_scan(  # noqa: C901
                 request["requested_symbols"] = selection_meta.get("requested_symbols")
             if selection_meta.get("missing_symbols") is not None:
                 request["missing_symbols"] = selection_meta.get("missing_symbols")
+            if len(selected_symbols) > _MARKET_SCAN_MAX_CANDIDATES:
+                return _market_scan_error(
+                    (
+                        f"The filtered universe contains {len(selected_symbols)} candidates, "
+                        f"above the safe synchronous cap of {_MARKET_SCAN_MAX_CANDIDATES}. "
+                        "Narrow the exact scan with symbols or group."
+                    ),
+                    code="candidate_universe_too_large",
+                    request=request,
+                    stats={
+                        "candidate_count": len(selected_symbols),
+                        "candidate_cap": _MARKET_SCAN_MAX_CANDIDATES,
+                    },
+                )
             started_at = time.perf_counter()
             matched_rows: List[Dict[str, Any]] = []
             skipped_examples: List[Dict[str, str]] = []
@@ -3495,14 +3828,17 @@ def market_scan(  # noqa: C901
                     skipped_examples.append({"symbol": symbol_name, "reason": reason})
 
             for missing_symbol in selection_meta.get("missing_symbols", []):
-                if len(skipped_examples) < 10:
-                    skipped_examples.append({"symbol": missing_symbol, "reason": "Requested symbol not found."})
+                _record_issue(missing_symbol, "Requested symbol not found.")
 
             def _evaluate_symbol(symbol_obj: Any) -> None:
                 nonlocal evaluated_symbols
                 symbol_name = str(getattr(symbol_obj, "name", "") or "")
 
-                spread_row, spread_error = _build_market_scan_spread_row(symbol_obj, mt5_gateway)
+                spread_row, spread_error = _build_market_scan_spread_row(
+                    symbol_obj,
+                    mt5_gateway,
+                    spread_cost_currency=spread_cost_currency,
+                )
                 if spread_error or spread_row is None:
                     _record_issue(symbol_name, spread_error or "Spread data is unavailable.")
                     return
@@ -3523,6 +3859,7 @@ def market_scan(  # noqa: C901
 
                 row = dict(spread_row)
                 row.update(signal_row)
+                _namespace_market_scan_quote_freshness(row)
                 metric_error = _market_scan_missing_required_metric(
                     row,
                     rank_by=rank_by_value,
@@ -3533,6 +3870,8 @@ def market_scan(  # noqa: C901
                     min_tick_volume=min_tick_volume,
                     min_price_change_pct=min_price_change_pct,
                     max_price_change_pct=max_price_change_pct,
+                    min_gap_pct=min_gap_pct,
+                    max_gap_pct=max_gap_pct,
                     rsi_length=rsi_length_value,
                     sma_period=sma_period_value,
                 )
@@ -3550,6 +3889,8 @@ def market_scan(  # noqa: C901
                     rsi_below=rsi_below,
                     rsi_above=rsi_above,
                     price_vs_sma=price_vs_sma_value,
+                    min_gap_pct=min_gap_pct,
+                    max_gap_pct=max_gap_pct,
                 ):
                     return
                 matched_rows.append(row)
@@ -3583,20 +3924,27 @@ def market_scan(  # noqa: C901
                 "description",
                 "timeframe",
                 "time",
-                "tick_time",
-                "data_age_seconds",
-                "data_age_anchor",
-                "data_age_metric",
-                "stale_after_seconds",
-                "data_stale",
-                "usable_for_live_trading",
-                "usable_for_live_trading_basis",
-                "freshness_reason",
-                "timestamp_in_future",
-                "timestamp_skew_seconds",
-                "timestamp_warning",
-                "warning",
-                "freshness",
+                "price_as_of",
+                "price_freshness",
+                "quote_time",
+                "quote_as_of",
+                "bid",
+                "ask",
+                "mid",
+                "quote_age_seconds",
+                "quote_age_anchor",
+                "quote_age_metric",
+                "quote_stale_after_seconds",
+                "quote_stale",
+                "quote_freshness_reason",
+                "quote_timestamp_in_future",
+                "quote_timestamp_skew_seconds",
+                "quote_timestamp_warning",
+                "quote_warning",
+                "quote_freshness",
+                "quote_usable_for_live_trading",
+                "spread_valid",
+                "spread_quality",
                 "bar_age_seconds",
                 "bar_freshness_anchor",
                 "bar_freshness_metric",
@@ -3610,7 +3958,11 @@ def market_scan(  # noqa: C901
                 "bar_stale_warning",
                 "previous_close",
                 "close",
+                "price_currency",
+                "price_basis",
+                "price_point",
                 "price_change_pct",
+                "gap_pct",
                 "tick_volume",
                 "spread_pct",
                 "spread_cost_per_lot",
@@ -3626,18 +3978,31 @@ def market_scan(  # noqa: C901
                 "timeframe",
                 "data_source",
                 "time",
-                "data_stale",
-                "usable_for_live_trading",
-                "freshness_reason",
-                "timestamp_in_future",
-                "timestamp_warning",
+                "price_as_of",
+                "price_freshness",
+                "quote_time",
+                "quote_as_of",
+                "bid",
+                "ask",
+                "mid",
+                "quote_stale",
+                "quote_freshness_reason",
+                "quote_timestamp_in_future",
+                "quote_timestamp_warning",
+                "quote_usable_for_live_trading",
+                "spread_valid",
+                "spread_quality",
                 "bar_stale",
                 "bar_market_status",
                 "bar_market_status_reason",
                 "bar_freshness_policy_relaxed",
                 "bar_freshness",
                 "close",
+                "price_currency",
+                "price_basis",
+                "price_point",
                 "price_change_pct",
+                "gap_pct",
                 "tick_volume",
                 "spread_pct",
                 "spread_points",
@@ -3648,8 +4013,8 @@ def market_scan(  # noqa: C901
             if include_sma:
                 compact_headers.append("sma_distance_pct")
             optional_compact_headers = {
-                "timestamp_in_future",
-                "timestamp_warning",
+                "quote_timestamp_in_future",
+                "quote_timestamp_warning",
                 "bar_market_status",
                 "bar_market_status_reason",
                 "bar_freshness_policy_relaxed",
@@ -3660,6 +4025,11 @@ def market_scan(  # noqa: C901
                 if header not in optional_compact_headers
                 or any(row.get(header) is not None for row in limited_rows)
             ]
+            compact_shared_fields: Dict[str, Any] = {}
+            if detail_mode == "compact":
+                compact_headers, compact_shared_fields = (
+                    _compact_market_scan_projection(compact_headers, limited_rows)
+                )
             headers = compact_headers if detail_mode == "compact" else full_headers
             output_rows = (
                 _project_market_scan_rows(headers, limited_rows)
@@ -3671,6 +4041,8 @@ def market_scan(  # noqa: C901
                 for key, value in {
                     "min_price_change_pct": min_price_change_pct,
                     "max_price_change_pct": max_price_change_pct,
+                    "min_gap_pct": min_gap_pct,
+                    "max_gap_pct": max_gap_pct,
                     "max_spread_pct": max_spread_pct,
                     "min_tick_volume": min_tick_volume,
                     "rsi_below": rsi_below,
@@ -3736,10 +4108,7 @@ def market_scan(  # noqa: C901
                     rsi_below=rsi_below,
                 ),
                 "price_change_basis": "previous_completed_close_to_latest_completed_close",
-                "requested_limit": int(limit_value),
-                "offset": int(offset_value),
-                "total_count": int(total_matches),
-                "has_more": bool(offset_value + table_payload["row_count"] < total_matches),
+                "gap_basis": "previous_completed_close_to_latest_completed_open",
                 "pagination": build_pagination_meta(
                     total=total_matches,
                     returned=table_payload["row_count"],
@@ -3757,6 +4126,10 @@ def market_scan(  # noqa: C901
                 },
                 "meta": _market_scan_contract_meta(request=request, stats=stats),
             }
+            compact_warnings = compact_shared_fields.pop("warnings", None)
+            out.update(compact_shared_fields)
+            if compact_warnings:
+                out["warnings"] = list(compact_warnings)
             if preset_value:
                 out["preset"] = preset_value
                 out["preset_filters"] = {
@@ -3769,6 +4142,14 @@ def market_scan(  # noqa: C901
                 out["returned_count"] = int(table_payload["row_count"])
                 out["summary"]["counts"]["matched_symbols"] = int(
                     stats["matched_symbols"]
+                )
+            missing_symbols = list(selection_meta.get("missing_symbols") or [])
+            if missing_symbols:
+                out["missing_symbols"] = missing_symbols
+                out.setdefault("warnings", []).append(
+                    "Requested symbol(s) not found and excluded from the scan: "
+                    + ", ".join(missing_symbols)
+                    + "."
                 )
             out.update(freshness_summary)
             units = _market_scan_units_for_rows(table_payload["rows"])

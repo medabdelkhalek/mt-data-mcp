@@ -22,6 +22,33 @@ def _unwrap(fn):
     return fn
 
 
+def test_lookup_trade_ticket_history_marks_closed_ticket_as_success(monkeypatch) -> None:
+    responses = iter(
+        [
+            {
+                "items": [
+                    {
+                        "symbol": "EURUSD",
+                        "type": "Buy",
+                        "time": "2026-08-06T12:00:00Z",
+                    }
+                ]
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        core_trading_account,
+        "_run_trade_history_request",
+        lambda _request: next(responses),
+    )
+
+    result = core_trading_account.lookup_trade_ticket_history(123)
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["no_action"] is True
+
+
 def test_trade_account_info_includes_execution_preflight_fields() -> None:
     mt5 = MagicMock()
     prev = sys.modules.get("MetaTrader5")
@@ -75,7 +102,7 @@ def test_trade_account_info_includes_execution_preflight_fields() -> None:
     assert out["terminal_tradeapi_disabled"] is False
     assert out["terminal_connected"] is True
     assert out["auto_trading_enabled"] is False
-    assert out["execution_ready"] is True
+    assert out["execution_ready"] is False
     assert out["execution_ready_strict"] is False
     assert out["execution_hard_blockers"] == []
     assert "Terminal AutoTrading is disabled." in out["execution_soft_blockers"]
@@ -172,8 +199,39 @@ def test_trade_account_info_compact_detail_includes_account_fields_without_diagn
     assert out["is_demo"] is True
     assert out["is_live"] is False
     assert out["trade_allowed"] is True
+    assert out["broker_trade_allowed"] is True
+    assert out["account_risk_status"] == "healthy"
     assert out["trade_expert"] is True
     assert "execution_ready" not in out
+
+
+def test_trade_account_info_blocks_actionable_flag_on_critical_margin() -> None:
+    account = SimpleNamespace(
+        balance=10000.0,
+        equity=1000.0,
+        profit=-9000.0,
+        margin=900.0,
+        margin_free=100.0,
+        margin_level=111.11,
+        currency="USD",
+        leverage=100,
+        trade_allowed=True,
+        trade_expert=True,
+    )
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        account_info=lambda: account,
+        terminal_info=lambda: None,
+        build_trade_preflight=lambda **kwargs: {"execution_ready": True},
+    )
+
+    raw = _unwrap(trade_account_info)
+    with patch.object(core_trading_account, "create_trading_gateway", return_value=gateway):
+        out = raw(detail="compact")
+
+    assert out["broker_trade_allowed"] is True
+    assert out["trade_allowed"] is False
+    assert out["account_risk_status"] == "critical"
 
 
 def test_trade_account_info_includes_terminal_server_clock_when_available() -> None:
@@ -1081,7 +1139,7 @@ def test_open_position_quote_context_discloses_basis_and_staleness() -> None:
     )
 
     row = payload["items"][0]
-    assert row["price_current_basis"] == "ask"
+    assert row["price_current_basis"] == "broker_price_current"
     assert row["quote_time"].endswith("Z")
     assert row["data_age_seconds"] == 600.0
     assert row["data_stale"] is True
@@ -1114,6 +1172,29 @@ def test_open_position_quote_summary_does_not_count_recent_quote_as_live() -> No
         "live_usable_quotes": 0,
         "recent_or_delayed_quotes": 1,
     }
+
+
+def test_open_position_quote_context_accepts_mapping_ticks_and_prefers_milliseconds() -> None:
+    payload = {"items": [{"symbol": "EURUSD", "side": "BUY"}]}
+    gateway = SimpleNamespace(
+        symbol_info_tick=lambda symbol: {
+            "time": 1_000.0,
+            "time_msc": 1_000_750,
+            "bid": 1.1,
+            "ask": 1.1002,
+        }
+    )
+
+    core_trading_positions._attach_open_position_quote_context(
+        payload,
+        gateway,
+        now_epoch=1_001.0,
+    )
+
+    row = payload["items"][0]
+    assert row["quote_time"] == "1970-01-01T00:16:40Z"
+    assert row["data_age_seconds"] == 0.25
+    assert row["usable_for_live_trading"] is True
 
 
 def test_open_position_quote_context_discloses_contract_notional() -> None:
@@ -1149,5 +1230,9 @@ def test_open_position_quote_context_discloses_contract_notional() -> None:
     row = payload["items"][0]
     assert row["contract_size"] == 100_000.0
     assert row["contract_units"] == 10_000.0
+    assert row["lot_definition"] == "1 broker lot = 100000 contract units"
+    assert row["size_interpretation"] == (
+        "0.1 broker lots × 100000 units/lot = 10000 contract units"
+    )
     assert row["notional_estimate"] == 11_000.0
     assert row["notional_currency"] == "USD"

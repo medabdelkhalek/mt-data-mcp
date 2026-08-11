@@ -5,9 +5,15 @@ import pandas as pd
 
 from ...utils.denoise import normalize_denoise_spec as _normalize_denoise_spec
 from ...utils.mt5 import _mt5_epoch_to_utc
-from ...utils.patterns import build_index
-from ..interface import ForecastCallContext, ForecastMethod, ForecastResult
 from ..forecast_registry import ForecastRegistry
+from ..interface import ForecastCallContext, ForecastMethod, ForecastResult
+
+
+def build_index(*args: Any, **kwargs: Any) -> Any:
+    """Load pattern-search dependencies only when analog search is executed."""
+    from ...utils.patterns import build_index as _build_index
+
+    return _build_index(*args, **kwargs)
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:
@@ -84,7 +90,7 @@ class AnalogMethod(ForecastMethod):
         {"name": "affine_alpha_min", "type": "float", "description": "Lower bound for affine refinement scale."},
         {"name": "affine_alpha_max", "type": "float", "description": "Upper bound for affine refinement scale."},
         {"name": "affine_penalty", "type": "float", "description": "Penalty for affine scale departure from 1.0."},
-        {"name": "search_engine", "type": "str", "description": "Search engine (ckdtree|hnsw|matrix_profile|mass). `hnsw` requires the optional hnswlib backend and is not part of the default Python 3.14 environment."},
+        {"name": "search_engine", "type": "str", "description": "Search engine (ckdtree|hnsw|matrix_profile|mass). `hnsw` requires the source-built hnswlib backend included in the full [all] stack."},
         {"name": "search_symbols", "type": "str|list", "description": "Optional symbol universe to search; primary symbol is always included."},
         {"name": "secondary_timeframes", "type": "str|list", "description": "Secondary timeframes to ensemble."},
         {"name": "component_weights", "type": "dict|str", "description": "Optional timeframe weights (e.g. H1=2,H4=1)."},

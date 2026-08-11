@@ -1,16 +1,20 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   getDimredMethods,
   getVolatilityMethods,
+  getSktimeEstimators,
   forecastVolatility,
   runBacktest,
   getErrorMessage,
 } from '../api/client'
 import { useForecast, useForecastMethods, useForecastSettings } from '../hooks/useForecast'
-import type { BacktestResult, ForecastPayload } from '../types'
+import type { BacktestResult, ForecastPayload, VolatilityPayload } from '../types'
 import { formatDateTime, coerce } from '../lib/utils'
+import { forecastPanelPlacementClass, type LayoutBreakpoint } from '../lib/layout'
+import { useEscapeKey } from '../lib/useEscapeKey'
 import { DenoiseModal } from './DenoiseModal'
+import { ModelsBrowser } from './ModelsBrowser'
 
 type Props = {
   open: boolean
@@ -18,46 +22,118 @@ type Props = {
   symbol: string
   timeframe: string
   anchor?: number
-  onResult: (res: ForecastPayload) => void
+  onResult: (res: ForecastPayload | null) => void
+  layoutBreakpoint?: LayoutBreakpoint
 }
 
 type Tab = 'forecast' | 'volatility' | 'backtest'
 
-export function ForecastPanel({ open, onClose, symbol, timeframe, anchor, onResult }: Props) {
+export function ForecastPanel({
+  open,
+  onClose,
+  symbol,
+  timeframe,
+  anchor,
+  onResult,
+  layoutBreakpoint = 'desktop',
+}: Props) {
   const [tab, setTab] = useState<Tab>('forecast')
+  useEscapeKey(open, onClose)
 
   if (!open) return null
 
+  const panelClass = forecastPanelPlacementClass(layoutBreakpoint)
+
   return (
-    <div className="absolute top-0 right-0 bottom-0 w-[420px] bg-slate-900/98 backdrop-blur-sm border-l border-slate-800 z-30 flex flex-col shadow-2xl">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800">
-        <div className="flex gap-1">
-          {(['forecast', 'volatility', 'backtest'] as Tab[]).map((item) => (
-            <button
-              key={item}
-              className={`px-3 py-1 text-xs font-medium rounded ${
-                tab === item ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-              }`}
-              onClick={() => setTab(item)}
-            >
-              {item === 'forecast' ? 'Price' : item === 'volatility' ? 'Volatility' : 'Backtest'}
-            </button>
-          ))}
+    <>
+      {layoutBreakpoint === 'mobile' && (
+        <button
+          type="button"
+          className="fixed inset-0 z-20 bg-slate-950/50 backdrop-blur-[1px]"
+          aria-label="Dismiss forecast panel"
+          onClick={onClose}
+        />
+      )}
+      <div className={`${panelClass} animate-slide-in-right`} role="dialog" aria-modal="true" aria-label="Forecast panel">
+        {layoutBreakpoint === 'mobile' && (
+          <div className="flex justify-center pt-2 pb-1" aria-hidden>
+            <div className="h-1 w-10 rounded-full bg-slate-700" />
+          </div>
+        )}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 shrink-0">
+          <div className="flex gap-1 flex-wrap">
+            {(['forecast', 'volatility', 'backtest'] as Tab[]).map((item) => (
+              <button
+                key={item}
+                className={`px-3 py-1.5 min-h-9 text-xs font-medium rounded ${
+                  tab === item ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                }`}
+                onClick={() => setTab(item)}
+              >
+                {item === 'forecast' ? 'Price' : item === 'volatility' ? 'Volatility' : 'Backtest'}
+              </button>
+            ))}
+          </div>
+          <button className="text-slate-400 hover:text-slate-200 p-2 min-h-9 min-w-9" onClick={onClose} aria-label="Close forecast panel">
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
         </div>
-        <button className="text-slate-400 hover:text-slate-200 p-1" onClick={onClose}>
-          <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-          </svg>
+
+        <div className="flex-1 overflow-y-auto overscroll-contain p-4 min-h-0">
+          {tab === 'forecast' && (
+            <ForecastTab symbol={symbol} timeframe={timeframe} anchor={anchor} onResult={onResult} />
+          )}
+          {tab === 'volatility' && <VolatilityTab symbol={symbol} timeframe={timeframe} anchor={anchor} />}
+          {tab === 'backtest' && <BacktestTab symbol={symbol} timeframe={timeframe} />}
+        </div>
+      </div>
+    </>
+  )
+}
+
+function SktimeEstimatorsList() {
+  const { data, error, isFetching, refetch, isFetched } = useQuery({
+    queryKey: ['sktime_estimators'],
+    queryFn: getSktimeEstimators,
+    staleTime: 60_000,
+  })
+  const estimators = data?.estimators ?? []
+
+  return (
+    <div className="space-y-1" data-sktime-estimators>
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-slate-400">sktime estimators</span>
+        <button
+          type="button"
+          className="text-xs text-sky-400 hover:text-sky-300"
+          onClick={() => void refetch()}
+          disabled={isFetching}
+        >
+          {isFetching ? 'Loading…' : 'Refresh'}
         </button>
       </div>
-
-      <div className="flex-1 overflow-y-auto p-4">
-        {tab === 'forecast' && (
-          <ForecastTab symbol={symbol} timeframe={timeframe} anchor={anchor} onResult={onResult} />
-        )}
-        {tab === 'volatility' && <VolatilityTab symbol={symbol} timeframe={timeframe} anchor={anchor} />}
-        {tab === 'backtest' && <BacktestTab symbol={symbol} timeframe={timeframe} />}
-      </div>
+      {error && (
+        <p className="text-xs text-rose-300">{getErrorMessage(error)}</p>
+      )}
+      {isFetched && data && !data.available && (
+        <p className="text-xs text-slate-500">
+          sktime not available{data.error ? `: ${data.error}` : ''}.
+        </p>
+      )}
+      {estimators.length > 0 && (
+        <ul className="max-h-24 overflow-y-auto rounded border border-slate-800 bg-slate-950/50 p-1 text-[11px] text-slate-400">
+          {estimators.slice(0, 40).map((est) => (
+            <li key={est.class_path || est.name} className="px-1.5 py-0.5 truncate" title={est.class_path}>
+              {est.name}
+            </li>
+          ))}
+          {estimators.length > 40 && (
+            <li className="px-1.5 py-0.5 text-slate-600">+{estimators.length - 40} more</li>
+          )}
+        </ul>
+      )}
     </div>
   )
 }
@@ -71,14 +147,14 @@ function ForecastTab({
   symbol: string
   timeframe: string
   anchor?: number
-  onResult: (res: ForecastPayload) => void
+  onResult: (res: ForecastPayload | null) => void
 }) {
-  const { methods } = useForecastMethods()
+  const { methods, error: methodsError } = useForecastMethods()
   const { settings, setSettings, supportsDimred } = useForecastSettings(symbol, timeframe)
   const { data: dimredMethods } = useQuery({ queryKey: ['dimred_methods'], queryFn: getDimredMethods })
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [showDenoise, setShowDenoise] = useState(false)
-  const { run, isLoading, error } = useForecast(symbol, timeframe, settings, onResult)
+  const { run, isLoading, error } = useForecast(symbol, timeframe, settings, onResult, anchor)
 
   const selectedMeta = useMemo(
     () => methods.find((method) => method.method === settings.method),
@@ -226,6 +302,10 @@ function ForecastTab({
             </div>
           )}
 
+          <ModelsBrowser methodFilter={settings.method} compact />
+
+          <SktimeEstimatorsList />
+
           {selectedMeta?.params && selectedMeta.params.length > 0 && (
             <div>
               <div className="text-xs text-slate-400 mb-2">Method Parameters</div>
@@ -258,6 +338,12 @@ function ForecastTab({
       {error && (
         <div className="text-sm text-rose-400 bg-rose-950/50 border border-rose-800 rounded-lg px-3 py-2">
           {error}
+        </div>
+      )}
+
+      {methodsError && (
+        <div className="text-sm text-rose-400 bg-rose-950/50 border border-rose-800 rounded-lg px-3 py-2">
+          Forecast methods: {methodsError}
         </div>
       )}
 
@@ -296,19 +382,36 @@ function ForecastTab({
 }
 
 function VolatilityTab({ symbol, timeframe, anchor }: { symbol: string; timeframe: string; anchor?: number }) {
-  const { data: methods } = useQuery({ queryKey: ['vol_methods'], queryFn: getVolatilityMethods })
+  const { data: methods, error: methodsQueryError } = useQuery({
+    queryKey: ['vol_methods'],
+    queryFn: getVolatilityMethods,
+  })
 
   const [method, setMethod] = useState('ewma')
   const [horizon, setHorizon] = useState(12)
   const [proxy, setProxy] = useState('squared_return')
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [result, setResult] = useState<{ annualized_vol?: number } | null>(null)
+  const [result, setResult] = useState<VolatilityPayload | null>(null)
+  const runId = useRef(0)
+  const requestContract = JSON.stringify({ symbol, timeframe, anchor, method, horizon, proxy })
+  const requestContractRef = useRef(requestContract)
+  requestContractRef.current = requestContract
+
+  useEffect(() => {
+    runId.current += 1
+    setIsLoading(false)
+    setError(null)
+    setResult(null)
+  }, [anchor, horizon, method, proxy, symbol, timeframe])
 
   const run = async () => {
     if (!symbol) return
+    const runContract = requestContract
+    const currentRunId = ++runId.current
     setIsLoading(true)
     setError(null)
+    setResult(null)
     try {
       const response = await forecastVolatility({
         symbol,
@@ -318,11 +421,17 @@ function VolatilityTab({ symbol, timeframe, anchor }: { symbol: string; timefram
         proxy,
         as_of: anchor ? formatDateTime(anchor) : undefined,
       })
-      setResult(response)
+      if (currentRunId === runId.current && runContract === requestContractRef.current) {
+        setResult(response)
+      }
     } catch (err) {
-      setError(getErrorMessage(err))
+      if (currentRunId === runId.current && runContract === requestContractRef.current) {
+        setError(getErrorMessage(err))
+      }
     } finally {
-      setIsLoading(false)
+      if (currentRunId === runId.current && runContract === requestContractRef.current) {
+        setIsLoading(false)
+      }
     }
   }
 
@@ -375,6 +484,12 @@ function VolatilityTab({ symbol, timeframe, anchor }: { symbol: string; timefram
         </div>
       )}
 
+      {methodsQueryError && (
+        <div className="text-sm text-rose-400 bg-rose-950/50 border border-rose-800 rounded-lg px-3 py-2">
+          Volatility methods: {getErrorMessage(methodsQueryError)}
+        </div>
+      )}
+
       <button
         className="w-full bg-sky-600 hover:bg-sky-500 text-white text-sm font-medium py-2 rounded-lg disabled:opacity-50"
         onClick={run}
@@ -387,7 +502,12 @@ function VolatilityTab({ symbol, timeframe, anchor }: { symbol: string; timefram
         <div className="bg-slate-800/50 rounded-lg p-3 text-sm">
           <div className="text-slate-400 text-xs mb-2">Result</div>
           <div className="text-slate-200">
-            Annualized Vol: <span className="font-mono">{((result.annualized_vol ?? 0) * 100).toFixed(2)}%</span>
+            Annualized Vol:{' '}
+            <span className="font-mono">
+              {result.volatility_annualized === undefined
+                ? 'Unavailable'
+                : `${(result.volatility_annualized * 100).toFixed(2)}%`}
+            </span>
           </div>
         </div>
       )}
@@ -396,7 +516,7 @@ function VolatilityTab({ symbol, timeframe, anchor }: { symbol: string; timefram
 }
 
 function BacktestTab({ symbol, timeframe }: { symbol: string; timeframe: string }) {
-  const { methods } = useForecastMethods()
+  const { methods, error: methodsError } = useForecastMethods()
 
   const [selectedMethods, setSelectedMethods] = useState<string[]>(['theta'])
   const [horizon, setHorizon] = useState(12)
@@ -405,8 +525,30 @@ function BacktestTab({ symbol, timeframe }: { symbol: string; timeframe: string 
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<BacktestResult | null>(null)
+  const runId = useRef(0)
+  const requestContract = JSON.stringify({
+    symbol,
+    timeframe,
+    selectedMethods,
+    horizon,
+    steps,
+    spacing,
+  })
+  const requestContractRef = useRef(requestContract)
+  requestContractRef.current = requestContract
 
   const availableMethods = useMemo(() => methods.filter((method) => method.available), [methods])
+  const resultRows = useMemo(() => {
+    if (result?.ranked_methods) return result.ranked_methods
+    return Object.entries(result?.results ?? {}).map(([method, item]) => ({ method, ...item }))
+  }, [result])
+
+  useEffect(() => {
+    runId.current += 1
+    setIsLoading(false)
+    setError(null)
+    setResult(null)
+  }, [horizon, selectedMethods, spacing, steps, symbol, timeframe])
 
   const toggleMethod = (method: string) => {
     setSelectedMethods((previous) =>
@@ -416,15 +558,24 @@ function BacktestTab({ symbol, timeframe }: { symbol: string; timeframe: string 
 
   const run = async () => {
     if (!symbol || !selectedMethods.length) return
+    const runContract = requestContract
+    const currentRunId = ++runId.current
     setIsLoading(true)
     setError(null)
+    setResult(null)
     try {
       const response = await runBacktest({ symbol, timeframe, horizon, steps, spacing, methods: selectedMethods })
-      setResult(response)
+      if (currentRunId === runId.current && runContract === requestContractRef.current) {
+        setResult(response)
+      }
     } catch (err) {
-      setError(getErrorMessage(err))
+      if (currentRunId === runId.current && runContract === requestContractRef.current) {
+        setError(getErrorMessage(err))
+      }
     } finally {
-      setIsLoading(false)
+      if (currentRunId === runId.current && runContract === requestContractRef.current) {
+        setIsLoading(false)
+      }
     }
   }
 
@@ -488,6 +639,12 @@ function BacktestTab({ symbol, timeframe }: { symbol: string; timeframe: string 
         </div>
       )}
 
+      {methodsError && (
+        <div className="text-sm text-rose-400 bg-rose-950/50 border border-rose-800 rounded-lg px-3 py-2">
+          Forecast methods: {methodsError}
+        </div>
+      )}
+
       <button
         className="w-full bg-sky-600 hover:bg-sky-500 text-white text-sm font-medium py-2 rounded-lg disabled:opacity-50"
         onClick={run}
@@ -507,7 +664,8 @@ function BacktestTab({ symbol, timeframe }: { symbol: string; timeframe: string 
               </tr>
             </thead>
             <tbody>
-              {Object.entries(result.results).map(([method, item]) => {
+              {resultRows.map((item) => {
+                const method = item.method
                 const directionPercent = item.avg_directional_accuracy == null
                   ? null
                   : item.avg_directional_accuracy * 100

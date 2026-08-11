@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import stumpy as _stumpy
 from scipy.signal import correlate
 from scipy.spatial import cKDTree
 
@@ -18,7 +17,6 @@ except Exception:
 # Dimensionality reduction abstraction
 # Reuse existing MT5 helpers and denoise utilities
 from ..shared.constants import TIMEFRAME_MAP
-from .dtw import dtw_distance
 from .denoise import (
     denoise_series as apply_denoise_series,
 )
@@ -30,15 +28,21 @@ from .denoise import (
 )
 from .dimred import DimReducer as _DimReducer
 from .dimred import create_reducer as _create_reducer
+from .dtw import _get_ts_dtw, dtw_distance
 from .mt5 import _mt5_copy_rates_from, _rates_to_df
+from .time import bar_close_epoch
 from .utils import align_finite
 
 
 @lru_cache(maxsize=1)
-def _get_ts_dtw():
-    from tslearn.metrics import dtw as _ts_dtw  # type: ignore
-
-    return _ts_dtw
+def _get_stumpy():
+    try:
+        import stumpy  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "matrix-profile search requires 'stumpy'; install the core dependencies"
+        ) from exc
+    return stumpy
 
 
 @lru_cache(maxsize=1)
@@ -78,7 +82,7 @@ def _mass_distance_profile(query: np.ndarray, series: np.ndarray, *, eps: float 
     q_std = float(np.std(q))
     if q_std <= eps:
         return np.full(max(n - m + 1, 0), np.inf, dtype=float)
-    profile = np.asarray(_stumpy.mass(q, s), dtype=float)
+    profile = np.asarray(_get_stumpy().mass(q, s), dtype=float)
     profile[~np.isfinite(profile)] = np.inf
     return profile
 
@@ -206,10 +210,13 @@ class PatternIndex:
                 continue
 
             if self.engine == "matrix_profile":
-                if _stumpy is None:
-                    raise RuntimeError("matrix_profile engine requested but 'stumpy' is not installed")
                 # AB-join: distances from every subsequence in series_slice to the query subsequence
-                mp = _stumpy.stump(series_slice.astype(float), m, T_B=q.astype(float), ignore_trivial=False)
+                mp = _get_stumpy().stump(
+                    series_slice.astype(float),
+                    m,
+                    T_B=q.astype(float),
+                    ignore_trivial=False,
+                )
                 profile = np.asarray(mp[:, 0], dtype=float)
             else:
                 profile = _mass_distance_profile(q, series_slice)
@@ -465,8 +472,16 @@ def _fetch_symbol_df(
     if rates is None or len(rates) == 0:
         raise RuntimeError(f"Failed to fetch rates for {symbol}")
     df = _rates_to_df(rates)
-    if drop_last_live and as_of is None and len(df) >= 2:
-        df = df.iloc[:-1]
+    if drop_last_live and len(df) >= 1:
+        epoch_column = "__epoch" if "__epoch" in df.columns else "time"
+        reference_epoch = pd.Timestamp(to_dt).timestamp()
+        try:
+            tail_open = float(df[epoch_column].iloc[-1])
+            if reference_epoch < bar_close_epoch(tail_open, timeframe):
+                df = df.iloc[:-1]
+        except (KeyError, TypeError, ValueError):
+            # An unclassifiable tail is not safe to treat as a completed bar.
+            df = df.iloc[:-1]
     # Keep last `bars` rows
     if len(df) > bars:
         df = df.iloc[-bars:].copy()
@@ -638,43 +653,50 @@ def build_index(
     if not series:
         raise RuntimeError("No symbols had sufficient data to build pattern index")
 
-    # Build windows
-    X_list: List[np.ndarray] = []
-    start_end: List[Tuple[int, int]] = []
-    labels: List[int] = []
+    # Allocate the persistent index arrays once. The source windows are views;
+    # only their scaled float32 representation needs to be materialized.
+    window_counts = [
+        max(0, ser.close.size - (window_size + future_size) + 1)
+        for ser in series
+    ]
+    total_windows = int(sum(window_counts))
+    if total_windows <= 0:
+        raise RuntimeError("Failed to create any windows for the provided symbols")
+    X = np.empty((total_windows, window_size), dtype=np.float32)
+    start_end_idx = np.empty((total_windows, 2), dtype=int)
+    labels_arr = np.empty(total_windows, dtype=int)
+    offset = 0
     for lbl, ser in enumerate(series):
-        n = ser.close.size
-        limit = n - (window_size + future_size) + 1
+        limit = window_counts[lbl]
         if limit <= 0:
             continue
-        # Create sliding indices
         starts = np.arange(limit, dtype=int)
         ends = starts + (window_size - 1)
-        # Gather windows using stride-based indexing
-        idx = starts[:, None] + np.arange(window_size)[None, :]
-        w = ser.close[idx]
+        windows = np.lib.stride_tricks.sliding_window_view(
+            ser.close, window_size
+        )[:limit]
+        target = X[offset : offset + limit]
         # Apply per-row scaling
         sc = (scale or "minmax").lower()
         if sc == "zscore":
-            mu = np.nanmean(w, axis=1, keepdims=True)
-            sd = np.nanstd(w, axis=1, keepdims=True)
+            mu = np.nanmean(windows, axis=1, keepdims=True)
+            sd = np.nanstd(windows, axis=1, keepdims=True)
             sd[sd <= 1e-12] = 1.0
-            X_scaled = ((w - mu) / sd).astype(np.float32)
+            np.subtract(windows, mu, out=target, casting="unsafe")
+            np.divide(target, sd, out=target)
         elif sc == "none":
-            X_scaled = w.astype(np.float32)
+            target[:] = windows
         else:  # minmax
-            mn = np.nanmin(w, axis=1, keepdims=True)
-            mx = np.nanmax(w, axis=1, keepdims=True)
-            rng = (mx - mn)
+            mn = np.nanmin(windows, axis=1, keepdims=True)
+            mx = np.nanmax(windows, axis=1, keepdims=True)
+            rng = mx - mn
             rng[rng <= 1e-12] = 1.0
-            X_scaled = ((w - mn) / rng).astype(np.float32)
-        X_list.append(X_scaled)
-        start_end.extend(list(np.stack([starts, ends], axis=1)))
-        labels.extend([lbl] * starts.size)
-
-    if not X_list:
-        raise RuntimeError("Failed to create any windows for the provided symbols")
-    X = np.vstack(X_list)
+            np.subtract(windows, mn, out=target, casting="unsafe")
+            np.divide(target, rng, out=target)
+        start_end_idx[offset : offset + limit, 0] = starts
+        start_end_idx[offset : offset + limit, 1] = ends
+        labels_arr[offset : offset + limit] = lbl
+        offset += limit
     # Optional dimensionality reduction
     reducer: Optional[_DimReducer] = None
     effective_dimred_method = dimred_method or "none"
@@ -707,9 +729,6 @@ def build_index(
         norms = np.linalg.norm(X, axis=1, keepdims=True)
         norms[norms <= 1e-12] = 1.0
         X = (X / norms).astype(np.float32)
-    start_end_idx = np.asarray(start_end, dtype=int)
-    labels_arr = np.asarray(labels, dtype=int)
-
     eng = (engine or "ckdtree").lower()
     if eng in ("matrix_profile", "mass"):
         tree_obj = None  # search will bypass tree

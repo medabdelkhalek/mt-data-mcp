@@ -162,6 +162,18 @@ class TestPydanticModels:
         body = ForecastPriceBody(symbol="EURUSD", detail="summary", extras="metadata")
         assert body.to_domain_request().detail == "full"
 
+    @pytest.mark.parametrize("extras", [[], ""])
+    def test_empty_extras_do_not_override_explicit_detail(self, extras):
+        assert ForecastPriceBody(
+            symbol="EURUSD", detail="full", extras=extras
+        ).to_domain_request().detail == "full"
+        assert ForecastVolBody(
+            symbol="EURUSD", detail="full", extras=extras
+        ).to_domain_request().detail == "full"
+        assert BacktestBody(
+            symbol="EURUSD", detail="full", extras=extras
+        ).to_domain_request().detail == "full"
+
     def test_forecast_price_body_rejects_removed_target(self):
         with pytest.raises(ValidationError):
             ForecastPriceBody(symbol="GBPUSD", target="return")
@@ -264,8 +276,50 @@ class TestWebApiRuntimeHelpers:
         runtime = WebApiRuntimeSettings(webui_directory="missing-dist")
         runtime_app = create_web_api_app(settings=runtime)
         with caplog.at_level("WARNING"):
-            mount_webui(runtime_app, settings=runtime)
-        assert any("Skipping Web UI mount" in record.message for record in caplog.records)
+            result = mount_webui(runtime_app, settings=runtime)
+        assert result.mounted is False
+        assert any("Web UI dist not found" in record.message for record in caplog.records)
+
+    def test_request_id_is_shared_by_header_and_error_envelope(self):
+        from mtdata.core.error_envelope import build_error_payload
+
+        runtime_app = create_web_api_app(
+            settings=WebApiRuntimeSettings(cors_origins=("http://localhost",))
+        )
+
+        @runtime_app.get("/failure")
+        def failure():
+            return build_error_payload(
+                "broken",
+                code="test_failure",
+                operation="test_request",
+            )
+
+        response = TestClient(runtime_app).get(
+            "/failure",
+            headers={"X-Request-ID": "client-request_42"},
+        )
+
+        assert response.headers["X-Request-ID"] == "client-request_42"
+        assert response.json()["request_id"] == "client-request_42"
+
+    def test_invalid_request_id_is_replaced(self):
+        runtime_app = create_web_api_app(
+            settings=WebApiRuntimeSettings(cors_origins=("http://localhost",))
+        )
+
+        @runtime_app.get("/ok")
+        def ok():
+            return {"success": True}
+
+        response = TestClient(runtime_app).get(
+            "/ok",
+            headers={"X-Request-ID": "unsafe request value"},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["X-Request-ID"] != "unsafe request value"
+        assert len(response.headers["X-Request-ID"]) == 12
 
 
 class TestWebApiHandlers:
@@ -329,6 +383,14 @@ class TestGetInstruments:
         assert len(res["items"]) == 1
         assert res["items"][0]["symbol"] == "EURUSD"
         assert "name" not in res["items"][0]
+        assert res["count"] == 1
+        assert res["pagination"] == {
+            "total": 1,
+            "returned": 1,
+            "offset": 0,
+            "limit": None,
+            "has_more": False,
+        }
 
     def test_search_filters(self):
         syms = [_make_symbol("EURUSD", "Euro"), _make_symbol("USDJPY", "Yen")]
@@ -350,6 +412,9 @@ class TestGetInstruments:
             resp = _client.get("/api/instruments", params={"limit": 3})
         res = resp.json()
         assert len(res["items"]) == 3
+        assert res["count"] == 3
+        assert res["pagination"]["total"] == 10
+        assert res["pagination"]["has_more"] is True
 
     def test_symbol_exception_skipped(self):
         bad = MagicMock()
@@ -726,7 +791,19 @@ class TestGetHistory:
 
         assert resp.status_code == 200
         assert fetch.call_args.kwargs["allow_stale"] is True
-        assert fetch.call_args.kwargs["indicators"] == "RSI_14"
+        assert fetch.call_args.kwargs["indicators"] == [{"name": "RSI_14"}]
+
+    def test_range_without_limit_uses_range_safety_cap(self):
+        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), \
+             patch("mtdata.core.web_api._fetch_candles_impl", return_value={"data": []}) as fetch, \
+             patch("mtdata.core.web_api.mt5_config"):
+            resp = _client.get(
+                "/api/history",
+                params={"symbol": "EURUSD", "start": "2026-01-01", "end": "2026-01-31"},
+            )
+
+        assert resp.status_code == 200
+        assert fetch.call_args.kwargs["limit"] == 100_000
 
     def test_basic_success(self):
         payload = {"data": [{"time": 1.0, "close": 1.1}], "has_forming_candle": False}
@@ -742,11 +819,12 @@ class TestGetHistory:
         res = resp.json()
         assert res["data"] == [{"time": 1.0, "close": 1.1}]
         assert "last_candle_open" not in res
-        assert "count" not in res
+        assert res["count"] == 1
         assert "candles" not in res
         assert "meta" not in res
         assert res["timestamp_format"] == "iso"
         assert res["server_utc_offset_seconds"] == 0
+        assert res["server_timezone"] == "Europe/Nicosia"
 
     def test_v1_history_uses_modern_runtime_timezone_meta(self):
         payload = {"data": [{"time": 1.0, "close": 1.1}], "has_forming_candle": False}
@@ -789,9 +867,9 @@ class TestGetHistory:
             resp = _client.get("/api/history", params={"symbol": "EURUSD", "include_incomplete": "false"})
         res = resp.json()
         assert len(res["data"]) == 2
-        assert res["has_forming_candle"] is True
         assert res["forming_candle_status"] == "included"
-        assert res["forming_candle_included"] is True
+        assert "has_forming_candle" not in res
+        assert "forming_candle_included" not in res
         assert "last_candle_open" not in res
 
     def test_keeps_incomplete_candle_when_flag(self):
@@ -808,7 +886,8 @@ class TestGetHistory:
             resp = _client.get("/api/history", params={"symbol": "EURUSD", "include_incomplete": "true"})
         res = resp.json()
         assert len(res["data"]) == 2
-        assert res["forming_candle_included"] is True
+        assert res["forming_candle_status"] == "included"
+        assert "forming_candle_included" not in res
         assert "last_candle_open" not in res
 
     def test_fetch_exception(self):
@@ -855,6 +934,7 @@ class TestGetHistory:
             })
         assert resp.status_code == 200
         mock_norm.assert_called_once()
+        assert mock_norm.call_args.kwargs["default_when"] == "pre_ti"
 
     def test_denoise_kv_params_fallback(self):
         payload = {"data": [{"time": 1.0}]}
@@ -873,6 +953,31 @@ class TestGetHistory:
         call_arg = mock_norm.call_args[0][0]
         assert call_arg["params"]["level"] == 3.0
         assert call_arg["params"]["wavelet"] == "db4"
+
+    def test_denoise_kv_params_preserve_control_fields(self):
+        payload = {"data": [{"time": 1.0}]}
+        dn_methods = {"methods": [{"method": "wavelet", "available": True}]}
+        with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), \
+             patch("mtdata.core.web_api._fetch_candles_impl", return_value=payload), \
+             patch("mtdata.core.web_api._get_denoise_methods", return_value=dn_methods), \
+             patch("mtdata.core.web_api._norm_dn", return_value={"method": "wavelet"}) as mock_norm, \
+             patch("mtdata.core.web_api.mt5_config") as mock_cfg:
+            mock_cfg.get_time_offset_seconds.return_value = 0
+            resp = _client.get("/api/history", params={
+                "symbol": "EURUSD",
+                "denoise_method": "wavelet",
+                "denoise_params": (
+                    "window=14,when=pre_ti,causality=causal,"
+                    "keep_original=false,columns=close"
+                ),
+            })
+        assert resp.status_code == 200
+        call_arg = mock_norm.call_args[0][0]
+        assert call_arg["params"] == {"window": 14.0}
+        assert call_arg["when"] == "pre_ti"
+        assert call_arg["causality"] == "causal"
+        assert call_arg["keep_original"] is False
+        assert call_arg["columns"] == ["close"]
 
     def test_denoise_kv_params_rejects_duplicate_keys(self):
         dn_methods = {"methods": [{"method": "wavelet", "available": True}]}
@@ -1290,6 +1395,23 @@ class TestPostForecastPrice:
             resp = _client.post("/api/forecast/price", json={"symbol": "EURUSD"})
         assert resp.status_code == 400
 
+    def test_canonical_error_is_preserved_and_mt5_outage_is_503(self):
+        result = {
+            "success": False,
+            "error": "terminal unavailable",
+            "error_code": "mt5_connection_error",
+            "request_id": "domain-request-id",
+            "operation": "forecast_generate",
+            "details": {"terminal": "disconnected"},
+            "remediation": "Start MT5.",
+        }
+        with patch("mtdata.core.web_api._run_forecast_generate_impl", return_value=result):
+            resp = _client.post("/api/forecast/price", json={"symbol": "EURUSD"})
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        for key, value in result.items():
+            assert detail[key] == value
+
     def test_passes_all_params(self):
         with patch("mtdata.core.web_api._run_forecast_generate_impl", return_value={}) as mock_fc:
             _client.post("/api/forecast/price", json={
@@ -1300,6 +1422,8 @@ class TestPostForecastPrice:
                 "denoise": {"method": "wavelet"}, "features": {"rsi": {}},
                 "dimred_method": "pca", "dimred_params": {"n": 3},
                 "target_spec": {"col": "close"},
+                "async_mode": True,
+                "model_id": "arima/GBPUSD_D1/model-hash",
             })
         request = mock_fc.call_args.args[0]
         assert request.symbol == "GBPUSD"
@@ -1310,6 +1434,27 @@ class TestPostForecastPrice:
         assert request.dimred_method == "pca"
         assert request.target_spec == {"col": "close"}
         assert request.params == {"order": [1, 1, 1]}
+        assert request.async_mode is True
+        assert request.model_id == "arima/GBPUSD_D1/model-hash"
+
+    def test_async_training_submission_returns_accepted(self):
+        result = {"success": True, "status": "pending", "task_id": "task-123"}
+        with patch(
+            "mtdata.core.web_api._run_forecast_generate_impl",
+            return_value=result,
+        ) as forecast_impl:
+            resp = _client.post(
+                "/api/v1/forecast/price",
+                json={
+                    "symbol": "EURUSD",
+                    "method": "nhits",
+                    "async_mode": True,
+                },
+            )
+
+        assert resp.status_code == 202
+        assert resp.json() == result
+        assert forecast_impl.call_args.args[0].async_mode is True
 
     def test_removed_target_is_rejected(self):
         with patch("mtdata.core.web_api._run_forecast_generate_impl", return_value={}) as mock_fc:

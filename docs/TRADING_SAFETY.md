@@ -33,7 +33,8 @@ A dry run routes and validates the request **without sending it to MT5**. The `t
   "preview_ok": true,
   "validation_passed": true,
   "validation_scope": "local_preview_plus_estimates",
-  "preview_checks_performed": [ /* routing, local safety/level checks, margin estimate */ ],
+  "preview_checks_performed": [ /* checks actually completed */ ],
+  "checks_not_performed": [ /* for example, margin_estimate when unavailable */ ],
   "broker_validation_not_performed": [ /* broker acceptance/enforcement, margin reservation, fillability, SL/TP attachment */ ],
   "guardrails_preview": { /* which guardrails would apply */ }
 }
@@ -42,6 +43,8 @@ A dry run routes and validates the request **without sending it to MT5**. The `t
 `success` means the preview operation completed. Gate any subsequent live send
 on `preview_ok` (and the equivalent nested `validation.live_submission_eligible`),
 which is `false` when local requirements such as required SL/TP are missing.
+Closed-market and stale-quote previews also complete successfully, but retain
+`quote_not_live_ready` in `blockers` and keep `preview_ok=false`.
 Compact output always retains these gate fields and the broker-validation
 limitations; `guardrails_preview` remains a standard/full-detail section.
 
@@ -57,7 +60,7 @@ Requires `symbol`, `volume`, and `order_type`.
 
 | Flag | Default | Notes |
 |------|---------|-------|
-| `--symbol` | — | Broker symbol |
+| `symbol` | — | Broker symbol |
 | `--volume` | — | Lots (validated against broker min/max/step) |
 | `--order-type` | — | See [Order types](#order-types) |
 | `--price` | — | Entry for pending orders; **omit for market orders** |
@@ -104,7 +107,7 @@ Modifies an existing order/position by ticket.
 
 | Flag | Default | Notes |
 |------|---------|-------|
-| `--ticket` | — | **Required** |
+| `ticket` | — | **Required** |
 | `--price` | — | New pending-order price |
 | `--stop-loss` / `--sl` | — | New stop-loss |
 | `--take-profit` / `--tp` | — | New take-profit |
@@ -166,13 +169,19 @@ Guardrails span several layers:
 | Account risk | Margin too low, floating loss or exposure too high | `MTDATA_TRADE_MIN_MARGIN_LEVEL_PCT`, `MTDATA_TRADE_MAX_FLOATING_LOSS`, `MTDATA_TRADE_MAX_TOTAL_EXPOSURE_LOTS` |
 | Wallet risk | Post-trade risk exceeds a % of equity/balance/free margin | `MTDATA_TRADE_MAX_RISK_PCT_OF_EQUITY`, `MTDATA_TRADE_MAX_RISK_PCT_OF_BALANCE`, `MTDATA_TRADE_MAX_RISK_PCT_OF_FREE_MARGIN` |
 
-> **Note:** A per-symbol volume map (`MTDATA_TRADE_MAX_VOLUME_BY_SYMBOL`) also acts as an allowlist — a symbol missing from the map is rejected. Wallet-risk caps require a quantifiable stop-loss and valid broker tick metadata.
+> **Note:** A per-symbol volume map (`MTDATA_TRADE_MAX_VOLUME_BY_SYMBOL`) also acts as an allowlist — a symbol missing from the map is rejected. Exposure and wallet-risk caps include both open positions and pending orders. Wallet-risk caps fail closed when any position or pending order lacks a quantifiable stop-loss or valid broker tick metadata.
 
 Reduce-only checks the current open positions before allowing an opposite-side
 order no larger than the net position. On hedging accounts, `trade_place` cannot
 guarantee a reduction, so use `trade_close` with a position ticket instead.
 
 See [ENV_VARS.md § Trade Guardrails](ENV_VARS.md#trade-guardrails) for every variable, defaults, formats, and a ready-to-copy `.env` block. A dry run returns a `guardrails_preview` so you can confirm which rules would fire before going live.
+
+Live market and pending placements are serialized within one mtdata process so
+the portfolio snapshot, guardrail decision, and broker submission are atomic
+against concurrent tool calls. Separate mtdata processes connected to the same
+account do not share that lock; use a single live-trade executor per MT5 account
+when exposure or wallet-risk caps must be enforced across clients.
 
 ---
 
@@ -196,7 +205,7 @@ Because these depend on **live** broker state, they are only fully enforced on a
 1. Confirm the account: `mtdata-cli trade_account_info --json` (verify it's the intended demo/live account).
 2. Snapshot context: `mtdata-cli trade_session_context EURUSD --json`.
 3. Configure guardrails in `.env` (allowlist, volume caps, risk %). Restart mtdata.
-4. Preview: run the order with `--dry-run true`; inspect `guardrails_preview`, `preview_checks_performed`, and `broker_validation_not_performed`.
+4. Preview: run the order with `--dry-run true`; inspect `guardrails_preview`, `preview_checks_performed`, `checks_not_performed`, and `broker_validation_not_performed`. A margin estimate appears under performed checks only when MT5 returned a finite estimate.
 5. Go live with a **small** size and `--dry-run false`.
 6. Verify: `mtdata-cli trade_get_open --json`, then manage with `trade_modify` / `trade_close`.
 

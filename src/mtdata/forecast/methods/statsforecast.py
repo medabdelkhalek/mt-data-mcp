@@ -10,8 +10,14 @@ import pandas as pd
 
 from ..common import build_ci_diagnostics as _build_ci_diagnostics
 from ..common import edge_pad_to_length as _edge_pad_to_length
-from ..interface import CancelToken, ForecastMethod, ForecastResult, ProgressReporter, TrainResult
 from ..forecast_registry import ForecastRegistry
+from ..interface import (
+    CancelToken,
+    ForecastMethod,
+    ForecastResult,
+    ProgressReporter,
+    TrainResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,19 @@ def _coerce_params(params: Dict[str, Any]) -> Dict[str, Any]:
         out[k] = _coerce_param_value(v)
     return out
 
+
+def _statsforecast_train_frame(
+    Y_df: pd.DataFrame,
+    X_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Return current history in StatsForecast's historical-covariate shape."""
+    if X_df is None:
+        return Y_df
+    join_cols = [column for column in ("unique_id", "ds") if column in Y_df and column in X_df]
+    if not join_cols:
+        return Y_df
+    return Y_df.merge(X_df, on=join_cols, how="left")
+
 class StatsForecastMethod(ForecastMethod):
     """Base class for StatsForecast methods."""
     
@@ -75,6 +94,10 @@ class StatsForecastMethod(ForecastMethod):
 
     @property
     def supports_training(self) -> bool:
+        return True
+
+    @property
+    def supports_live_model_update(self) -> bool:
         return True
 
     @property
@@ -168,7 +191,15 @@ class StatsForecastMethod(ForecastMethod):
         if exog_future_arr is None:
             exog_future_arr = exog_future if exog_future is not None else p.get('exog_future')
 
-        _, _, Xf_df = _create_training_dataframes(series.values, horizon, None, exog_future_arr)
+        exog_used = kwargs.get("exog_used")
+        if exog_used is None:
+            exog_used = p.get("exog_used")
+        Y_df, X_df, Xf_df = _create_training_dataframes(
+            series.values,
+            horizon,
+            exog_used,
+            exog_future_arr,
+        )
 
         ci_alpha = kwargs.get('ci_alpha', p.get('ci_alpha'))
         level = None
@@ -180,7 +211,17 @@ class StatsForecastMethod(ForecastMethod):
         sf = model  # deserialized StatsForecast object
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if Xf_df is not None:
+            if callable(getattr(sf, "forecast", None)):
+                forecast_kwargs = {
+                    "h": int(horizon),
+                    "df": _statsforecast_train_frame(Y_df, X_df),
+                    "level": level,
+                }
+                if Xf_df is not None:
+                    Yf = sf.forecast(X_df=Xf_df, **forecast_kwargs)
+                else:
+                    Yf = sf.forecast(**forecast_kwargs)
+            elif Xf_df is not None:
                 Yf = sf.predict(h=int(horizon), X_df=Xf_df, level=level)
             else:
                 Yf = sf.predict(h=int(horizon), level=level)

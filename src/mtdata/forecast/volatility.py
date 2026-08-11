@@ -1,7 +1,9 @@
 import difflib
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, Iterator, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -62,6 +64,23 @@ _VOLATILITY_METHOD_CONCEPT_HINTS = {
     "standard_deviation": "rolling_std",
     "stddev": "rolling_std",
 }
+
+_RATES_CACHE: ContextVar[
+    Optional[Dict[tuple[Any, ...], tuple[int, Any]]]
+] = ContextVar("mtdata_volatility_rates_cache", default=None)
+
+
+@contextmanager
+def volatility_rates_cache() -> Iterator[None]:
+    """Reuse candle supersets within one explicit volatility workload."""
+    if _RATES_CACHE.get() is not None:
+        yield
+        return
+    token = _RATES_CACHE.set({})
+    try:
+        yield
+    finally:
+        _RATES_CACHE.reset(token)
 
 
 # Optional availability flags (match server discovery)
@@ -215,32 +234,7 @@ def get_volatility_methods_data() -> Dict[str, Any]:
         "available": True,
         "requires": [],
         "description": "Theta method applied to the volatility proxy.",
-        "params": [
-            {"name": "alpha", "type": "float", "default": 0.2, "description": "Level smoothing coefficient."},
-        ],
-    })
-
-    methods.append({
-        "method": "mlf_rf",
-        "available": _MLF_AVAILABLE,
-        "requires": [] if _MLF_AVAILABLE else ["mlforecast", "scikit-learn"],
-        "description": "Random forest regression on lagged volatility proxy features (mlforecast).",
-        "params": [
-            {"name": "lags", "type": "list[int]", "default": [1, 2, 3, 4, 5], "description": "Autoregressive lags supplied to the regressor."},
-            {"name": "n_estimators", "type": "int", "default": 200, "description": "Number of trees in the random forest."},
-        ],
-    })
-
-    methods.append({
-        "method": "nhits",
-        "available": _NF_AVAILABLE,
-        "requires": [] if _NF_AVAILABLE else ["neuralforecast[torch]"],
-        "description": "NeuralForecast NHITS model on the volatility proxy.",
-        "params": [
-            {"name": "max_epochs", "type": "int", "default": 30, "description": "Training epochs for NHITS."},
-            {"name": "batch_size", "type": "int", "default": 32, "description": "Mini-batch size."},
-            {"name": "input_size", "type": "int", "default": None, "description": "Lookback window (auto when omitted)."},
-        ],
+        "params": [],
     })
 
     methods.append({
@@ -466,6 +460,34 @@ def _volatility_annualization_context(
     )
 
 
+def _bars_per_session_from_annualization(
+    bars_per_year_value: float,
+    annualization_basis: str,
+) -> float:
+    """Recover the per-session bar count from the reported year convention."""
+    basis = str(annualization_basis or "")
+    sessions_per_year = 365.0 if basis.startswith("365_") else 260.0 if basis.startswith("260_") else 252.0
+    return float(bars_per_year_value) / sessions_per_year
+
+
+def _daily_realized_variance(frame: pd.DataFrame) -> tuple[pd.Series, int]:
+    """Calculate intraday RV without treating an overnight gap as an intraday return."""
+    values = pd.DataFrame(
+        {
+            "time": pd.to_numeric(frame.get("time"), errors="coerce"),
+            "close": pd.to_numeric(frame.get("close"), errors="coerce"),
+        }
+    ).dropna()
+    values = values.sort_values("time", kind="stable")
+    values["day"] = pd.to_datetime(values["time"], unit="s", utc=True).dt.floor("D")
+    values["return"] = values.groupby("day", sort=True)["close"].transform(
+        lambda series: np.log(series.where(series > 0)).diff()
+    )
+    finite = values[np.isfinite(values["return"])].copy()
+    finite["r2"] = np.square(finite["return"].astype(float))
+    return finite.groupby("day", sort=True)["r2"].sum().astype(float), int(len(finite))
+
+
 def _volatility_input_context(
     df: pd.DataFrame,
     *,
@@ -501,6 +523,7 @@ def _volatility_input_context(
             tf_secs,
             max(1, int(horizon)),
             skip_weekends=uses_standard_weekend_projection(symbol, tf_secs),
+            timeframe=timeframe,
         )
         if tf_secs > 0
         else []
@@ -508,20 +531,27 @@ def _volatility_input_context(
     if forecast_epochs:
         start_epoch = float(forecast_epochs[0])
         end_epoch = float(forecast_epochs[-1])
+        calendar_timeframe = str(timeframe).upper() in {"D1", "W1", "MN1"}
         out["forecast_window"] = {
             "anchor": _format_time_minimal(last_epoch),
             "start": _format_time_minimal(start_epoch),
             "end": _format_time_minimal(end_epoch),
             "bars": int(len(forecast_epochs)),
-            "step_seconds": tf_secs,
+            "step_seconds": None if calendar_timeframe else tf_secs,
             "forecast_start_gap_bars": round(
-                (start_epoch - last_epoch) / float(tf_secs),
+                1.0
+                if calendar_timeframe
+                else (start_epoch - last_epoch) / float(tf_secs),
                 4,
             ),
             "calendar_policy": (
-                "forex_weekend_skipped"
-                if uses_standard_weekend_projection(symbol, tf_secs)
-                else "continuous_no_weekend_skip"
+                "broker_calendar_boundaries"
+                if calendar_timeframe
+                else (
+                    "forex_weekend_skipped"
+                    if uses_standard_weekend_projection(symbol, tf_secs)
+                    else "continuous_no_weekend_skip"
+                )
             ),
         }
     if not live_window:
@@ -731,6 +761,29 @@ def _fetch_mt5_rates_guarded(
 ) -> tuple[Optional[Any], Optional[str]]:
     if as_of and (start or end):
         return None, "as_of cannot be combined with start/end."
+    requested_count = int(count)
+    cache = _RATES_CACHE.get()
+    cache_key = (
+        str(symbol),
+        str(mt5_timeframe),
+        str(as_of or ""),
+        str(start or ""),
+        str(end or ""),
+        str(timeframe or ""),
+    )
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None and cached[0] >= requested_count:
+            cached_rates = cached[1]
+            if len(cached_rates) > requested_count:
+                cached_rates = cached_rates[-requested_count:]
+            return cached_rates, None
+
+    def _remember(rates: Any) -> Any:
+        if cache is not None and rates is not None:
+            cache[cache_key] = (requested_count, rates)
+        return rates
+
     info_before = mt5.symbol_info(symbol)
     was_visible = bool(info_before.visible) if info_before is not None else None
     try:
@@ -749,16 +802,20 @@ def _fetch_mt5_rates_guarded(
             return None, "start must be before or equal to end."
         if start_dt is not None:
             rates = _mt5_copy_rates_range(symbol, mt5_timeframe, start_dt, end_dt)
-            if rates is not None and len(rates) > int(count):
-                rates = rates[-int(count):]
-            return rates, None
+            if rates is not None and len(rates) > requested_count:
+                rates = rates[-requested_count:]
+            return _remember(rates), None
         if end_dt is not None:
-            return _mt5_copy_rates_from(symbol, mt5_timeframe, end_dt, count), None
+            return _remember(
+                _mt5_copy_rates_from(symbol, mt5_timeframe, end_dt, requested_count)
+            ), None
         if as_of:
             to_dt = _parse_start_datetime(as_of)
             if not to_dt:
                 return None, "Invalid as_of time."
-            return _mt5_copy_rates_from(symbol, mt5_timeframe, to_dt, count), None
+            return _remember(
+                _mt5_copy_rates_from(symbol, mt5_timeframe, to_dt, requested_count)
+            ), None
 
         tick = mt5.symbol_info_tick(symbol)
         if tick is not None and getattr(tick, "time", None):
@@ -766,8 +823,10 @@ def _fetch_mt5_rates_guarded(
             server_now_dt = datetime.fromtimestamp(t_utc, tz=timezone.utc)
         else:
             server_now_dt = datetime.now(timezone.utc)
-        rates = _mt5_copy_rates_from(symbol, mt5_timeframe, server_now_dt, count)
-        return rates, None
+        rates = _mt5_copy_rates_from(
+            symbol, mt5_timeframe, server_now_dt, requested_count
+        )
+        return _remember(rates), None
     finally:
         if was_visible is False:
             try:
@@ -808,6 +867,13 @@ def forecast_volatility(  # noqa: C901
     Meta: ensemble aggregates multiple successful component volatility forecasts.
     """
     try:
+        try:
+            denoise = _normalize_denoise_spec(
+                denoise,
+                default_when="pre_ti",
+            )
+        except Exception as ex:
+            return {"error": f"Invalid denoise specification: {ex}"}
         if timeframe not in TIMEFRAME_MAP:
             return {"error": invalid_timeframe_error(timeframe, TIMEFRAME_MAP)}
         mt5_tf = TIMEFRAME_MAP[timeframe]
@@ -850,6 +916,26 @@ def forecast_volatility(  # noqa: C901
                         f"{', '.join(sorted(allowed_ewma_params))}."
                     )
                 }
+            try:
+                lookback_value = int(p.get("lookback", 1500))
+            except (TypeError, ValueError):
+                return {"error": "EWMA lookback must be a positive integer."}
+            if lookback_value < 2:
+                return {"error": "EWMA lookback must be at least 2."}
+            if p.get("halflife") is not None:
+                try:
+                    halflife_value = float(p["halflife"])
+                except (TypeError, ValueError):
+                    return {"error": "EWMA halflife must be finite and greater than 0."}
+                if not math.isfinite(halflife_value) or halflife_value <= 0.0:
+                    return {"error": "EWMA halflife must be finite and greater than 0."}
+            if p.get("lambda_") is not None:
+                try:
+                    lambda_value = float(p["lambda_"])
+                except (TypeError, ValueError):
+                    return {"error": "EWMA lambda_ must be finite and between 0 and 1."}
+                if not math.isfinite(lambda_value) or not 0.0 < lambda_value < 1.0:
+                    return {"error": "EWMA lambda_ must be finite and strictly between 0 and 1."}
 
         if method_l == 'ensemble':
             default_methods = ['ewma', 'parkinson', 'rolling_std']
@@ -860,7 +946,16 @@ def forecast_volatility(  # noqa: C901
                 base_methods = [str(item).strip().lower() for item in base_methods_in if str(item).strip()]
             else:
                 base_methods = list(default_methods)
-            base_methods = [m for m in base_methods if m in valid_direct.union(valid_general) and m != 'ensemble']
+            invalid_components = sorted(
+                set(base_methods) - valid_direct.union(valid_general)
+            )
+            if invalid_components or "ensemble" in base_methods:
+                return {
+                    "error": (
+                        "Unknown ensemble component method(s): "
+                        + ", ".join([*invalid_components, *(["ensemble"] if "ensemble" in base_methods else [])])
+                    )
+                }
             seen_methods: set[str] = set()
             base_methods = [m for m in base_methods if not (m in seen_methods or seen_methods.add(m))]
             if not base_methods:
@@ -868,7 +963,12 @@ def forecast_volatility(  # noqa: C901
 
             aggregator = str(p.get('aggregator', 'mean')).lower().strip()
             if aggregator not in {'mean', 'median', 'weighted'}:
-                aggregator = 'mean'
+                return {
+                    "error": (
+                        f"Unknown ensemble aggregator '{aggregator}'. "
+                        "Use mean, median, or weighted."
+                    )
+                }
 
             expose_components = bool(p.get('expose_components', True))
             method_params = p.get('method_params') if isinstance(p.get('method_params'), dict) else {}
@@ -897,6 +997,13 @@ def forecast_volatility(  # noqa: C901
                             method_name: float(weight / total_weight)
                             for method_name, weight in zip(base_methods, parsed_weights)
                         }
+            if aggregator == "weighted" and not weight_map:
+                return {
+                    "error": (
+                        "Weighted ensemble requires one finite positive weight "
+                        "for each component method."
+                    )
+                }
 
             component_results: list[dict[str, Any]] = []
             component_errors: list[dict[str, Any]] = []
@@ -1277,21 +1384,15 @@ def forecast_volatility(  # noqa: C901
                         apply_denoise(dfrv, dn_spec_used, default_when='pre_ti')
                     except Exception:
                         pass
-                bpy, _ = _volatility_annualization_context(
+                bpy, annualization_basis = _volatility_annualization_context(
                     symbol,
                     timeframe,
                     observed_times=dfrv.get("time"),
                     observed_timeframe=rv_tf,
                 )
-                c = dfrv['close'].astype(float).to_numpy()
-                if c.size < 10:
+                if len(dfrv) < 10:
                     return {"error": "Insufficient intraday bars for RV"}
-                rr = _log_returns_from_prices(c)
-                rr = rr[np.isfinite(rr)]
-                dt = pd.to_datetime(dfrv['time'].iloc[1:].astype(float), unit='s', utc=True)
-                days_idx = pd.DatetimeIndex(dt).floor('D')
-                df_r = pd.DataFrame({'day': days_idx, 'r2': rr * rr})
-                daily_rv = df_r.groupby('day')['r2'].sum().astype(float)
+                daily_rv, realized_returns = _daily_realized_variance(dfrv)
                 if len(daily_rv) < max(30, m + 5):
                     return {"error": "Not enough daily RV observations for HAR-RV"}
                 RV = daily_rv.to_numpy(dtype=float)
@@ -1321,9 +1422,13 @@ def forecast_volatility(  # noqa: C901
                 tf_secs = TIMEFRAME_SECONDS.get(timeframe)
                 if not tf_secs:
                     return {"error": unsupported_timeframe_seconds_error(timeframe)}
-                bars_per_day = float(86400.0 / float(tf_secs))
-                sbar = float(math.sqrt(rv_next / bars_per_day))
-                h_days = float(int(horizon)) / bars_per_day
+                bars_per_session = _bars_per_session_from_annualization(
+                    bpy, annualization_basis
+                )
+                if not math.isfinite(bars_per_session) or bars_per_session <= 0:
+                    return {"error": "Unable to resolve HAR-RV bars per trading session"}
+                sbar = float(math.sqrt(rv_next / bars_per_session))
+                h_days = float(int(horizon)) / bars_per_session
                 hsig = float(math.sqrt(rv_next * max(h_days, 0.0)))
                 return _finalize_volatility_with_context(
                     {"success": True, "symbol": symbol, "timeframe": timeframe, "method": method_l, "horizon": int(horizon),
@@ -1331,12 +1436,14 @@ def forecast_volatility(  # noqa: C901
                      "volatility_horizon": hsig, "volatility_horizon_annualized": _annualize_horizon_sigma(hsig, bpy, int(horizon)),
                      "params_used": {"rv_timeframe": rv_tf, "window_w": w, "window_m": m,
                                       "beta": [float(b) for b in beta.tolist()],
-                                      "days": days},
+                                      "days": days,
+                                      "bars_per_session": float(bars_per_session),
+                                      "daily_rv_gap_policy": "within_utc_day_returns_only"},
                      "denoise_used": dn_spec_used},
                     df=dfrv,
                     symbol=symbol,
                     timeframe=timeframe,
-                    returns_used=int(rr.size),
+                    returns_used=int(realized_returns),
                     live_window=as_of is None and end is None,
                     detail=detail,
                     data_timeframe=rv_tf,
@@ -1416,8 +1523,16 @@ def forecast_volatility(  # noqa: C901
                 except Exception:
                     lam = 0.94
             lam = float(lam)
-            w = np.power(lam, np.arange(len(tail)-1, -1, -1, dtype=float)); w /= float(np.sum(w))
+            if not math.isfinite(lam) or not 0.0 < lam < 1.0:
+                return {"error": "EWMA decay must be finite and strictly between 0 and 1."}
+            w = np.power(lam, np.arange(len(tail)-1, -1, -1, dtype=float))
+            weight_sum = float(np.sum(w))
+            if not np.all(np.isfinite(w)) or weight_sum <= 0.0:
+                return {"error": "EWMA produced invalid decay weights."}
+            w /= weight_sum
             sigma2 = float(np.sum(w * (tail * tail)))
+            if not math.isfinite(sigma2) or sigma2 < 0.0:
+                return {"error": "EWMA produced a non-finite variance estimate."}
             sbar = math.sqrt(max(0.0, sigma2))
             hsig = float(sbar * math.sqrt(max(1, int(horizon))))
             params_used = {"lookback": lb, "lambda_": lam, "lambda_source": lambda_source}
@@ -1485,7 +1600,18 @@ def forecast_volatility(  # noqa: C901
                     }
                 sigma2 = float(np.mean(finite_tail))
             else:
-                sigma2 = float(v[-1]) if np.isfinite(v[-1]) else float(np.nanmean(v[-window:]))
+                finite_tail = np.asarray(v[-window:], dtype=float)
+                finite_tail = finite_tail[np.isfinite(finite_tail)]
+                if finite_tail.size == 0:
+                    return {
+                        "error": (
+                            f"{method_l} requires at least {window} applicable "
+                            "observations; no finite rolling estimate is available."
+                        )
+                    }
+                sigma2 = float(finite_tail[-1])
+            if not math.isfinite(sigma2):
+                return {"error": f"{method_l} produced a non-finite variance estimate."}
             sbar = math.sqrt(max(0.0, sigma2))
             hsig = float(sbar * math.sqrt(max(1, int(horizon))))
             return _finalize_volatility_with_context(

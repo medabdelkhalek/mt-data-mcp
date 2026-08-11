@@ -1,8 +1,13 @@
 from typing import Any, Dict, Optional
 
 from ...shared.schema import DenoiseSpec
-from ...utils.barriers import get_tick_size as _get_pip_size
-from ..report.utils import market_snapshot, merge_params, report_section_enabled
+from ...utils.barriers import get_tick_size as _get_tick_size
+from ..report.utils import (
+    is_bounded_report_window,
+    market_snapshot,
+    merge_params,
+    report_section_enabled,
+)
 from .common import build_report_with_market
 
 
@@ -40,7 +45,8 @@ def template_scalping(
         or report_section_enabled(p, 'execution_gates')
         or report_section_enabled(p, 'barriers')
     )
-    snap = market_snapshot(symbol) if needs_snapshot else {}
+    bounded_window = is_bounded_report_window(p.get('start'), p.get('end'))
+    snap = market_snapshot(symbol) if needs_snapshot and not bounded_window else {}
     if str(p.get('mode', '')).lower() == 'ticks':
         last_price = None
         spread_ticks = None
@@ -60,8 +66,8 @@ def template_scalping(
                 spread_ticks = float(snap.get('spread_ticks')) if snap.get('spread_ticks') is not None else None
             except Exception:
                 spread_ticks = None
-        tick_size = _get_pip_size(symbol)
-        if last_price and tick_size and last_price > 1000:
+        tick_size = _get_tick_size(symbol) if last_price is not None else None
+        if last_price and tick_size:
             def _set_default(key: str, value: float) -> None:
                 if key in user_keys:
                     return

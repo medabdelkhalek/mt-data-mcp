@@ -79,24 +79,25 @@ mtdata-cli finviz_ratings GOOGL --json
 
 ### `finviz_news`
 
-Get stock-specific or general market news.
+Get stock-specific market news. Use `finviz_market_news` for general market
+headlines/blogs, or the general `news` tool for the unified news workflow.
 
 ```bash
 # Stock-specific news
 mtdata-cli finviz_news NVDA --limit 10 --json
-
-# General market news (no symbol)
-mtdata-cli finviz_news --limit 20 --json
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `symbol` | (optional) | Stock ticker. Omit for general news. |
+| `symbol` | (required) | Stock ticker. |
 | `--limit` | 20 | Max news items |
 | `--page` | 1 | Pagination page |
 
-Stock-specific responses keep the legacy `news` rows and also include a
-normalized `items` list with `title`, `source`, `published_at`, and `url`.
+Stock-specific responses use a normalized `items` list with `title`, `source`,
+`published_at`, and `url`. Finviz tools may accept one-based `--page` inputs,
+but responses use the shared offset-based `pagination` object documented in
+[OUTPUT.md](OUTPUT.md#pagination); flat provider `page`/`pages` fields are not
+emitted.
 
 ### `finviz_market_news`
 
@@ -217,6 +218,12 @@ mtdata-cli finviz_filters_list --filter-name "Market Cap." --json
 
 ## Macro Market Snapshots
 
+Forex, crypto, and futures snapshots use the same row schema at every detail
+level: `price` is a delayed reference price, and `perf_*_pct` values are
+percentage points (`1.0 = 1%`). Full detail may add source fields, but it does
+not rename or re-unit those canonical values. Check the response `units` and
+`performance_format` fields when consuming rows programmatically.
+
 ### `finviz_forex`
 
 Get forex currency pairs performance.
@@ -234,6 +241,11 @@ Get cryptocurrency performance.
 ```bash
 mtdata-cli finviz_crypto --json
 ```
+
+Finviz may round prices for very low-priced tokens to zero. In that case the
+tool returns `price_status: unavailable_provider_rounded_zero`, omits `price`,
+and includes a warning instead of presenting the rounded value as a tradable
+zero price.
 
 **Returns:** Price, daily change, volume, and market cap for major cryptocurrencies.
 
@@ -266,16 +278,16 @@ mtdata-cli finviz_calendar --calendar earnings --json
 mtdata-cli finviz_calendar --calendar economic --impact high --json
 
 # Date range filter
-mtdata-cli finviz_calendar --date-from 2026-03-01 --date-to 2026-03-15 --json
+mtdata-cli finviz_calendar --start 2026-03-01 --end 2026-03-15 --json
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--calendar` | `economic` | `economic`, `earnings`, or `dividends` |
 | `--impact` | (all) | Economic only: `low`, `medium`, `high` |
-| `--date-from` | (optional) | Start date `YYYY-MM-DD` |
-| `--date-to` | (optional) | End date `YYYY-MM-DD` |
-| `--limit` | 100 | Max events |
+| `--start` | current New York date | Start date `YYYY-MM-DD`; omitted ranges anchor to `America/New_York`, independent of host timezone. |
+| `--end` | (optional) | End date `YYYY-MM-DD` |
+| `--limit` | 20 | Max events |
 | `--page` | 1 | Pagination page |
 
 Economic calendar data is based on Finviz JSON API fields: `date`, `event`,
@@ -283,20 +295,23 @@ Economic calendar data is based on Finviz JSON API fields: `date`, `event`,
 `previous`, `category`, `reference`, and `referenceDate` when present. The
 `finviz_calendar` tool presents these as normalized keys, including `symbol`
 for Finviz `ticker` and `reference_date` for `referenceDate`.
+Root output includes `date_from`, `date_to`, and `calendar_timezone` so defaulted
+calendar ranges remain explicit. Event timestamps use the separate root
+`timezone` field.
 
 ### `finviz_earnings`
 
 Get upcoming earnings announcements.
 
 ```bash
-mtdata-cli finviz_earnings --period "This Week" --json
-mtdata-cli finviz_earnings --period "Next Week" --json
+mtdata-cli finviz_earnings --period this-week --json
+mtdata-cli finviz_earnings --period next-week --json
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--period` | `This Week` | `This Week`, `Next Week`, `Previous Week`, `This Month` |
-| `--limit` | 50 | Max items |
+| `--period` | `this-week` | `this-week`, `next-week`, `previous-week`, `this-month` |
+| `--limit` | 10 | Max items |
 | `--page` | 1 | Pagination page |
 
 ---

@@ -3,18 +3,18 @@ import re
 from datetime import datetime, timedelta, timezone
 from numbers import Number
 from typing import Any, Dict, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import dateparser
 import numpy as np
 import pandas as pd
 
+from .coercion import coerce_scalar as coerce_scalar
 from .formatting import (
     format_float,
-)
-from .formatting import (
     format_number,
+    optimal_decimals,
 )
-from .formatting import optimal_decimals
 
 
 def _positive_float_attr(obj: Any, *names: str) -> Optional[float]:
@@ -37,22 +37,6 @@ def _positive_float_attr(obj: Any, *names: str) -> Optional[float]:
     return None
 
 
-def coerce_scalar(s: str):
-    """Try to coerce a scalar string to int or float; otherwise return original string."""
-    try:
-        if s is None:
-            return s
-        st = str(s).strip()
-        if st == "":
-            return st
-        if st.isdigit() or (st.startswith('-') and st[1:].isdigit()):
-            return int(st)
-        v = float(st)
-        return v
-    except Exception:
-        return s
-
-
 def _normalize_ohlcv_arg(ohlcv: Optional[str]) -> Optional[Set[str]]:
     """Normalize user-provided OHLCV selection into a set of letters.
 
@@ -71,13 +55,6 @@ def _normalize_ohlcv_arg(ohlcv: Optional[str]) -> Optional[Set[str]]:
         return {"O", "H", "L", "C"}
     if t in ("price", "close"):
         return {"C"}
-    # Compact letters like 'cl', 'oh', etc.
-    if all(ch in "ohlcv" for ch in t):
-        return {ch.upper() for ch in t}
-    # Comma separated names
-    parts = [p.strip().lower() for p in t.replace(";", ",").split(",") if p.strip() != ""]
-    if not parts:
-        return None
     mapping = {
         "o": "O", "open": "O",
         "h": "H", "high": "H",
@@ -85,6 +62,15 @@ def _normalize_ohlcv_arg(ohlcv: Optional[str]) -> Optional[Set[str]]:
         "c": "C", "close": "C", "price": "C",
         "v": "V", "vol": "V", "volume": "V", "tick_volume": "V",
     }
+    if t in mapping:
+        return {mapping[t]}
+    # Compact letters like 'cl', 'oh', etc.
+    if all(ch in "ohlcv" for ch in t):
+        return {ch.upper() for ch in t}
+    # Comma separated names
+    parts = [p.strip().lower() for p in t.replace(";", ",").split(",") if p.strip() != ""]
+    if not parts:
+        return None
     out: Set[str] = set()
     for p in parts:
         key = mapping.get(p)
@@ -229,6 +215,12 @@ def _format_numeric_rows_from_df(
     *,
     stringify: bool = True,
 ) -> List[List[Any]]:
+    if not stringify:
+        # Public numeric row modes do not need adaptive display decimals. Keep
+        # the conversion columnar while preserving NaN/Inf sentinels used by
+        # indicator bands and internal callers.
+        return df.loc[:, headers].to_numpy(dtype=object).tolist()
+
     # Precompute per-column decimals to trim numeric noise without losing precision.
     col_decimals: Dict[str, int] = {}
     for col in headers:
@@ -263,21 +255,13 @@ def _format_numeric_rows_from_df(
                 if not math.isfinite(num):
                     out_row.append(format_number(num) if stringify else num)
                     continue
-                if not stringify:
-                    if isinstance(val, int) and not isinstance(val, bool):
-                        out_row.append(int(val))
-                    elif float(num).is_integer() and not isinstance(val, float):
-                        out_row.append(int(num))
-                    else:
-                        out_row.append(num)
+                decimals = col_decimals.get(col)
+                if decimals is None:
+                    out_row.append(format_number(num))
                 else:
-                    decimals = col_decimals.get(col)
-                    if decimals is None:
-                        out_row.append(format_number(num))
-                    else:
-                        out_row.append(format_float(num, decimals))
+                    out_row.append(format_float(num, decimals))
             else:
-                out_row.append(str(val) if stringify else val)
+                out_row.append(str(val))
         out_rows.append(out_row)
     return out_rows
 
@@ -356,11 +340,46 @@ def align_finite(*arrays: Any) -> Tuple["np.ndarray", ...]:
     return tuple(a[mask] for a in conv)
 
 
+def _parse_iana_timezone_datetime(value: str) -> Optional[datetime]:
+    """Parse a local datetime ending in an IANA zone name into naive UTC."""
+    try:
+        local_text, timezone_name = str(value).strip().rsplit(maxsplit=1)
+    except ValueError:
+        return None
+    if "/" not in timezone_name:
+        return None
+    try:
+        local_zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return None
+    local_time = dateparser.parse(
+        local_text,
+        settings={
+            "RETURN_AS_TIMEZONE_AWARE": False,
+            "PREFER_DAY_OF_MONTH": "first",
+        },
+    )
+    if local_time is None or local_time.tzinfo is not None:
+        return None
+
+    # A named local time at a daylight-saving transition can be nonexistent or
+    # ambiguous. Do not silently select a different instant for either case.
+    fold_zero = local_time.replace(tzinfo=local_zone, fold=0)
+    fold_one = local_time.replace(tzinfo=local_zone, fold=1)
+    if fold_zero.utcoffset() != fold_one.utcoffset():
+        return None
+    utc_time = fold_zero.astimezone(timezone.utc)
+    if utc_time.astimezone(local_zone).replace(tzinfo=None) != local_time:
+        return None
+    return utc_time.replace(tzinfo=None)
+
+
 def _parse_start_datetime(value: str) -> Optional[datetime]:
-    """Parse a date/time string via dateparser into UTC-naive datetime."""
+    """Parse a date/time string, including IANA zone names, into naive UTC."""
     if not value:
         return None
-    parts = str(value).strip().lower().split()
+    text = str(value).strip()
+    parts = text.lower().split()
     weekdays = {
         "monday": 0,
         "tuesday": 1,
@@ -378,6 +397,9 @@ def _parse_start_datetime(value: str) -> Optional[datetime]:
         else:
             days = -((today.weekday() - target_weekday) % 7 or 7)
         return datetime.combine(today + timedelta(days=days), datetime.min.time())
+    named_timezone_datetime = _parse_iana_timezone_datetime(text)
+    if named_timezone_datetime is not None:
+        return named_timezone_datetime
     dt = dateparser.parse(
         value,
         settings={

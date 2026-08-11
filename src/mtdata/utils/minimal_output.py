@@ -20,52 +20,10 @@ from .minimal_output_toon import (
     _format_to_toon,
     _headers_from_dicts,
     _is_empty_value,
-    _is_scalar_value,
     _quote_always,
     _quote_key,
     _stringify_for_toon_value,
-    _stringify_scalar,
 )
-
-
-def _indent_text(text: str, indent: str = "  ") -> str:
-    return "\n".join(
-        f"{indent}{line}" if line else indent.rstrip() for line in text.splitlines()
-    )
-
-
-def _format_complex_value(value: Any) -> str:
-    if _is_scalar_value(value):
-        return _stringify_scalar(value)
-    if isinstance(value, list):
-        values = [v for v in value if not _is_empty_value(v)]
-        if not values:
-            return ""
-        if all(isinstance(v, dict) for v in values):
-            headers = _headers_from_dicts(values)
-            return _encode_tabular("data", headers, values, indent=0) if headers else ""
-        if all(_is_scalar_value(v) for v in values):
-            return ", ".join(_stringify_scalar(v) for v in values)
-        parts = []
-        for entry in values:
-            formatted = _format_complex_value(entry)
-            if formatted:
-                parts.append(formatted)
-        return "\n".join(parts)
-    if isinstance(value, dict):
-        lines = []
-        for key, subvalue in value.items():
-            if _is_empty_value(subvalue):
-                continue
-            formatted = _format_complex_value(subvalue)
-            if not formatted:
-                continue
-            if "\n" in formatted:
-                lines.append(f"{key}:\n{_indent_text(formatted)}")
-            else:
-                lines.append(f"{key}: {formatted}")
-        return "\n".join(lines)
-    return _stringify_scalar(value)
 
 
 def _suppress_duplicate_collection_data(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -114,7 +72,7 @@ def _compact_error_envelope(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _render_news_bucket_toon(
+def _render_news_bucket_toon(  # noqa: C901
     key: str,
     items: List[Any],
     *,
@@ -169,13 +127,18 @@ def _render_news_bucket_toon(
     for row in dict_rows:
         values: List[str] = []
 
-        def append_value(value: Any, *, quote: bool = False) -> None:
+        def append_value(
+            value: Any,
+            *,
+            quote: bool = False,
+            row_values: List[str] = values,
+        ) -> None:
             if _is_empty_value(value):
-                values.append("null")
+                row_values.append("null")
             elif quote:
-                values.append(_quote_always(value))
+                row_values.append(_quote_always(value))
             else:
-                values.append(_stringify_for_toon_value(value, None, delimiter))
+                row_values.append(_stringify_for_toon_value(value, None, delimiter))
 
         append_value(row.get("title"), quote=True)
 
@@ -282,9 +245,9 @@ def _resolve_tool_name(result: Any, tool_name: Optional[str]) -> str:
     return ""
 
 
-def _normalize_forecast_payload(
+def _normalize_forecast_payload(  # noqa: C901
     payload: Dict[str, Any], verbose: bool = True, *, format_digits: bool = True
-) -> Optional[Dict[str, Any]]:  # noqa: C901
+) -> Optional[Dict[str, Any]]:
     """Convert forecast payload into meta + tabular rows when possible."""
     try:
         # Detect time column
@@ -757,7 +720,7 @@ def _normalize_trade_table_payload(
     return normalized_rows
 
 
-def _normalize_trade_payload(
+def _normalize_trade_payload(  # noqa: C901
     payload: Dict[str, Any],
     *,
     verbose: bool,
@@ -956,7 +919,7 @@ def _normalize_trade_payload(
     return out
 
 
-def _normalize_market_ticker_payload(
+def _normalize_market_ticker_payload(  # noqa: C901
     payload: Dict[str, Any],
     *,
     verbose: bool,
@@ -1065,11 +1028,21 @@ def _normalize_market_ticker_payload(
             "price_currency",
             "bid",
             "ask",
+            "mid",
             "tick_volume",
             "freshness",
+            "freshness_state",
+            "freshness_reason",
+            "data_stale",
+            "usable_for_live_trading",
             "market_status_reason",
+            "spread_valid",
+            "spread_quality",
+            "quote_source_state",
         ]
-        if primary_spread_key is not None:
+        if not _is_empty_value(payload.get("spread")):
+            compact_keys.append("spread")
+        if primary_spread_key is not None and primary_spread_key != "spread":
             compact_keys.append(primary_spread_key)
         if primary_spread_key == "spread_points":
             compact_keys.append("point")
@@ -1108,7 +1081,7 @@ def _normalize_market_ticker_payload(
         out["meta"] = meta
 
     if not verbose:
-        units = out.get("units")
+        units = payload.get("units")
         if isinstance(units, dict):
             primary_spread_key = next(
                 (
@@ -1120,8 +1093,8 @@ def _normalize_market_ticker_payload(
             )
             filtered_units = {
                 key: units.get(key)
-                for key in ("bid", "ask", primary_spread_key)
-                if key and units.get(key) is not None
+                for key in ("bid", "ask", "spread", primary_spread_key)
+                if key and key in out and units.get(key) is not None
             }
             if filtered_units:
                 out["units"] = filtered_units
@@ -1269,6 +1242,8 @@ def _normalize_barrier_prob_payload(
 ) -> Optional[Dict[str, Any]]:
     if tool_name != "forecast_barrier_prob" or verbose:
         return None
+    if payload.get("error"):
+        return _compact_error_envelope(payload)
 
     out: Dict[str, Any] = {}
     for key in (
@@ -1510,7 +1485,7 @@ def _normalize_analysis_legends_payload(
     return out
 
 
-def _normalize_regime_all_payload(
+def _normalize_regime_all_payload(  # noqa: C901
     payload: Dict[str, Any],
     *,
     verbose: bool,
@@ -1735,12 +1710,12 @@ def _normalize_forecast_methods_payload(
     return out
 
 
-def _normalize_library_models_payload(
+def _normalize_library_models_payload(  # noqa: C901
     payload: Dict[str, Any],
     *,
     verbose: bool,
     tool_name: str,
-) -> Optional[Dict[str, Any]]:  # noqa: C901
+) -> Optional[Dict[str, Any]]:
     if tool_name != "forecast_list_library_models" or verbose:
         return None
 
@@ -1883,7 +1858,7 @@ def _normalize_market_status_payload(
     return normalize_market_status_output(payload, detail="compact")
 
 
-def _normalize_support_resistance_payload(
+def _normalize_support_resistance_payload(  # noqa: C901
     payload: Dict[str, Any],
     *,
     verbose: bool,
@@ -2285,7 +2260,9 @@ def _normalize_timezone_display_meta(value: Any) -> Dict[str, Any]:
             out["client"] = client_out
 
     return out
-def format_result_minimal(
+
+
+def format_result_minimal(  # noqa: C901
     result: Any,
     verbose: bool = True,
     *,

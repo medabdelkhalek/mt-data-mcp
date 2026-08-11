@@ -101,13 +101,15 @@ For method-level detail, see [docs/FORECAST.md](docs/FORECAST.md) and [docs/fore
 |---------|-------------|----------|
 | **CLI** | `mtdata-cli` | Scripts, exploration, copy-paste workflows |
 | **MCP** | `mtdata-stdio` / `mtdata-sse` / `mtdata-streamable-http` | Agent tool use (Claude, Cursor, custom clients) |
-| **Web** | `mtdata-webapi` | Local UI and HTTP integrations |
+| **Web UI + API** | `mtdata-webapi` | Chart workspace at `/app`, REST for apps and notebooks |
+
+All three are first-class delivery surfaces. Pick CLI, MCP, or Web UI for the same research stack.
 
 ---
 
 ## Quick start
 
-**Prerequisites:** Windows + Python 3.14 + MetaTrader 5 installed and running (demo recommended). For the full research stack, install Visual Studio Build Tools 2022 with **Desktop development with C++**.
+**Prerequisites:** Windows + Python 3.14 + MetaTrader 5 installed and running (demo recommended). Install Visual Studio Build Tools 2022 with **Desktop development with C++** because Python 3.14 currently source-builds `hmmlearn`; the full stack also source-builds `hnswlib`.
 
 ```bash
 # Optional: isolate the environment
@@ -133,6 +135,24 @@ mtdata-cli data_fetch_candles EURUSD --timeframe H1 --limit 50
 mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta
 ```
 
+### Web UI (chart workspace)
+
+One path: build the SPA once, start the API, open the UI.
+
+```bash
+# Web extra if you installed lean core only
+pip install -e ".[web]"
+
+# Production frontend (once per checkout / after UI changes)
+cd webui && npm install && npm run build && cd ..
+
+# Start API + UI
+mtdata-webapi
+# → open http://127.0.0.1:8000/app/
+```
+
+If `webui/dist` is missing, the API still starts and `/app` returns a clear enablement page (build steps above). Live UI development: `cd webui && npm run dev` (proxies `/api` to `:8000`). Details: [Web API](docs/WEB_API.md) · [Setup](docs/SETUP.md).
+
 Keep the first session **read-only** unless you are on a demo account and intentionally testing trading.
 
 **Install flavors (summary)**
@@ -143,7 +163,7 @@ Keep the first session **read-only** unless you are on a demo account and intent
 | Full docs-aligned stack | `pip install -r requirements.txt` |
 | Web only | `pip install -e .[web]` |
 | Classical / foundation forecast extras | `pip install -e .[forecast-classical]` / `pip install -e .[forecast-foundation]` |
-| Git-backed add-ons (TimesFM, etc.) | See [docs/SETUP.md](docs/SETUP.md) |
+| TimesFM / Git-manual add-ons | See [docs/SETUP.md](docs/SETUP.md) |
 
 Dependency caveats (NeuralForecast optional installs, Python 3.14 exclusions, optional native accelerators) live in **[Setup](docs/SETUP.md)** so this page stays focused on getting you productive.
 

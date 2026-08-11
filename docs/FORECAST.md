@@ -43,6 +43,7 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta -
 ```bash
 mtdata-cli forecast_list_methods
 mtdata-cli forecast_list_methods --json   # source of truth for *your* install
+mtdata-cli forecast_list_methods --supports-training true
 ```
 
 Availability depends on extras you installed:
@@ -50,6 +51,8 @@ Availability depends on extras you installed:
 - Supported foundation options on the Python 3.14 path include Chronos, Chronos-Bolt, and TimesFM (TimesFM via opt-in extra).
 - NeuralForecast methods (`nhits`, `tft`, `patchtst`, `nbeatsx`) need a manual `neuralforecast` + `torch` setup. On Windows Python 3.14 they do not resolve because `ray` (a NeuralForecast dependency) has no Windows cp314 wheels.
 - Always trust `forecast_list_methods --json` over static docs for what runs locally.
+- `--supports-training true` searches the full catalog automatically, even though
+  the unfiltered default is the smaller quickstart profile.
 
 Full per-method keys, defaults, and dependencies: [forecast/METHODS.md](forecast/METHODS.md).
 
@@ -64,7 +67,7 @@ Full per-method keys, defaults, and dependencies: [forecast/METHODS.md](forecast
 | **Simulation** | `mc_gbm`, `hmm_mc` | Risk sizing, barrier analysis |
 | **Ensemble** | `ensemble` | Combine multiple models |
 
-**Ensemble note:** `ensemble` supports advanced modes (`average`, `bma`, `stacking`). See [forecast/FORECAST_GENERATE.md](forecast/FORECAST_GENERATE.md) for parameters and examples.
+**Ensemble note:** `ensemble` supports advanced modes (`average`, `rmse_weighted`, `stacking`). See [forecast/FORECAST_GENERATE.md](forecast/FORECAST_GENERATE.md) for parameters and examples.
 
 ---
 
@@ -189,7 +192,7 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
 - `window_size`: Pattern length to match (default: 64 bars)
 - `search_depth`: How far back to search (default: 5000 bars)
 - `top_k`: Number of similar patterns to average (default: 20)
-- `metric`: Distance metric (euclidean, dtw, cosine)
+- `metric`: Initial search metric (euclidean, cosine, correlation); use `refine_metric=dtw` for DTW re-ranking
 
 ---
 
@@ -220,7 +223,7 @@ Validate forecast accuracy with rolling-origin backtests.
 
 ```bash
 mtdata-cli forecast_backtest_run EURUSD --timeframe H1 --horizon 12 \
-  --methods "theta sf_autoarima analog" --steps 20 --spacing 10
+  --methods "theta sf_autoarima analog" --steps 20 --spacing 12
 ```
 
 **Parameters:**
@@ -318,7 +321,7 @@ mtdata-cli forecast_optimize_hints EURUSD --timeframes H1 H4 D1 \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--timeframes` | `H1 H4 D1 W1` | Timeframes to search (space- or comma-separated) |
-| `--methods` | (all eligible) | Methods to search; omit to let the search pick |
+| `--methods` | fast classical baselines | Methods to search; neural/foundation methods must be requested explicitly and may initialize or download large models |
 | `--horizon` | 12 | Bars forecast after each backtest anchor |
 | `--steps` | 5 | Rolling-origin backtest anchors per candidate |
 | `--population` / `--generations` | 8 / 5 | Genetic search population and generation counts |
@@ -332,25 +335,47 @@ mtdata-cli forecast_optimize_hints EURUSD --timeframes H1 H4 D1 \
 Heavyweight methods (neural / foundation models, large `mlforecast` runs) can take minutes to fit. mtdata exposes a small task-and-cache layer so those fits happen once and are reused.
 
 ```bash
-# Kick off a background training job
-mtdata-cli forecast_train EURUSD --timeframe H1 --method nhits --horizon 24
+# Start a long-lived CLI session; background tasks run in this process.
+mtdata-cli shell
 
-# Returns: {"task_id": "...", "status": "queued", ...}
+# Then submit and observe the task from that shell.
+forecast_train EURUSD --timeframe H1 --method nhits --horizon 24
+forecast_task_status --task-id <task_id> --json
+forecast_task_wait --task-id <task_id> --timeout-seconds 120 --json
+forecast_task_list --json
 
-# Poll progress
-mtdata-cli forecast_task_status --task-id <task_id> --json
-mtdata-cli forecast_task_wait --task-id <task_id> --timeout-seconds 120 --json
-mtdata-cli forecast_task_list --json
-
-# Cancel if needed
-mtdata-cli forecast_task_cancel --task-id <task_id>
+# Cancel if needed.
+forecast_task_cancel --task-id <task_id>
 ```
 
-Once the task completes the model is persisted on disk and any later `forecast_generate` call with the same `(method, symbol, timeframe, params)` key reuses it without re-fitting.
+One-shot `mtdata-cli forecast_train ...` and
+`mtdata-cli forecast_generate ... --async-mode true` commands are rejected: they
+cannot keep an in-process worker alive after the command exits. Use
+`mtdata-cli shell`, an MCP server, or the Web API for training tasks. A
+`forecast_task_wait` deadline returns
+`success: false`, `status: "timeout"`, and preserves the live task state in
+`task_status` so automation does not treat an unfinished model as usable.
+
+Once training completes, the model is persisted under a key derived from method,
+symbol, timeframe, horizon, seasonality, exogenous-input shape, preprocessing, and
+training parameters. The observed history start/end are freshness metadata, not
+part of that identity. Live `forecast_generate` calls reuse the latest matching
+artifact for at most one resolved seasonal cycle only when the method can refresh
+its fitted history from the newly supplied bars (MLForecast, StatsForecast, and
+sktime adapters). They report `model_staleness_bars`; methods without safe live
+history refresh retrain instead of forecasting from a stale cutoff. Historical
+`as_of` calls always require the artifact's exact training anchor to prevent
+look-ahead reuse.
+
+Default pickle-based model artifacts use a versioned envelope that records the
+Python, mtdata, and observed scientific-library versions. Compatibility is
+checked before unpickling. Legacy or runtime-mismatched artifacts are rejected
+and retrained through the normal cache-miss path; custom method-owned artifact
+formats remain responsible for their own compatibility checks.
 
 ```bash
 mtdata-cli forecast_models_list --json
-mtdata-cli forecast_models_delete --model-id "nhits/EURUSD-H1/abc123"
+mtdata-cli forecast_models_delete --model-id "nhits/EURUSD_H1/abc123"
 ```
 
 Configuration (see [ENV_VARS.md](ENV_VARS.md#async-training--model-store)):
@@ -360,10 +385,25 @@ Configuration (see [ENV_VARS.md](ENV_VARS.md#async-training--model-store)):
 - `MTDATA_FORECAST_JOBS_DB` — durable SQLite task registry (default `~/.mtdata/forecast/jobs.sqlite`).
 - `MTDATA_TRAIN_TIMEOUT_*_SECONDS` — per-category training timeouts for `instant`, `fast`, `moderate`, and `heavy` methods.
 - `MTDATA_FORECAST_HEARTBEAT_SECONDS`, `MTDATA_FORECAST_CANCEL_GRACE_SECONDS`, `MTDATA_FORECAST_SWEEPER_SECONDS` — task liveness, cancellation, and cleanup tuning.
+- `MTDATA_FORECAST_TASK_TTL_SECONDS` — retention for terminal task records and bounded failure diagnostics (default `86400`, or 24 hours).
 - `MTDATA_MODEL_STORE` — root directory for cached models (default `~/.mtdata/models`).
 - `MTDATA_MODEL_TTL_DAYS` — cache idle expiry in days since last use (default `7`); this is not a maximum model age.
 
-`forecast_generate` will also auto-train in the background when called with `async_mode=true` and the requested method is heavy / moderate; the response includes a `task_id` you can poll with `forecast_task_status`. Without `async_mode`, `forecast_generate` blocks until the fit completes (and still caches the result for next time).
+`forecast_generate` auto-trains any trainable method in the background when
+called with `async_mode=true`; the response includes a `task_id` to poll with
+`forecast_task_status`. Without `async_mode`, it performs the same train,
+persist, and predict lifecycle synchronously.
+
+Unexpected exceptions in an isolated forecast child are logged at `ERROR` with
+a bounded child traceback and captured stdout/stderr tails. These diagnostics
+are kept in server logs rather than returned to API callers, because they can
+contain local paths or dependency details.
+
+Heavy background workers retain Python tracebacks and captured stderr/fault
+output in the failed task's bounded `error` field. Signal exits are translated
+to names on POSIX and native status codes on Windows. `SIGKILL` can indicate an
+OOM kill or an explicit forced termination, so system/container logs remain the
+authoritative way to distinguish those causes.
 
 ---
 

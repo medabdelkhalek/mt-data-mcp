@@ -853,43 +853,31 @@ def _analyze_cluster_state(
         1e-9,
     )
     analysis_start = min(int(test["index"]) for test in cluster.get("tests", []) or [{"index": 0}])
-    break_indices: List[int] = []
-    break_times: List[Optional[float]] = []
-    breach_episode_max: List[float] = []
-    in_break = False
-    episode_max = 0.0
+    start = max(0, analysis_start)
+    observed = np.asarray(closes[start:], dtype=float)
+    finite = np.isfinite(observed)
+    if dominant_source == "support":
+        breach = np.where(finite, np.maximum(0.0, float(zone_low) - observed), 0.0)
+        broken = finite & (observed < (float(zone_low) - buffer))
+    else:
+        breach = np.where(finite, np.maximum(0.0, observed - float(zone_high)), 0.0)
+        broken = finite & (observed > (float(zone_high) + buffer))
 
-    for index in range(max(0, analysis_start), len(closes)):
-        close = float(closes[index])
-        if not math.isfinite(close):
-            is_broken = False
-            breach = 0.0
-        elif dominant_source == "support":
-            breach = max(0.0, float(zone_low) - close)
-            is_broken = close < (float(zone_low) - buffer)
-        else:
-            breach = max(0.0, close - float(zone_high))
-            is_broken = close > (float(zone_high) + buffer)
-
-        breach_atr = 0.0
-        if atr_avg is not None and atr_avg > 0.0:
-            breach_atr = breach / atr_avg
-
-        if is_broken:
-            if not in_break:
-                in_break = True
-                break_indices.append(index)
-                break_times.append(epochs[index] if index < len(epochs) else None)
-                episode_max = breach_atr
-            else:
-                episode_max = max(episode_max, breach_atr)
-        elif in_break:
-            breach_episode_max.append(float(episode_max))
-            in_break = False
-            episode_max = 0.0
-
-    if in_break:
-        breach_episode_max.append(float(episode_max))
+    if broken.size:
+        episode_starts = np.flatnonzero(
+            broken & np.concatenate((np.asarray([True]), ~broken[:-1]))
+        )
+    else:
+        episode_starts = np.asarray([], dtype=int)
+    break_indices = (episode_starts + start).tolist()
+    break_times = [epochs[index] if index < len(epochs) else None for index in break_indices]
+    if episode_starts.size:
+        breach_atr = breach / atr_avg if atr_avg is not None and atr_avg > 0.0 else np.zeros_like(breach)
+        breach_episode_max = np.maximum.reduceat(
+            np.where(broken, breach_atr, 0.0), episode_starts
+        ).tolist()
+    else:
+        breach_episode_max = []
 
     breakout_count = len(break_indices)
     avg_breach_atr = float(np.mean(breach_episode_max)) if breach_episode_max else None
@@ -948,7 +936,7 @@ def _format_level(cluster: Dict[str, Any], *, current_price: Optional[float], to
     if current_price is not None and math.isfinite(current_price):
         level_type = "support" if value <= current_price else "resistance"
         distance = value - current_price
-        distance_pct = (abs(distance) / max(abs(current_price), 1e-9)) * 100.0
+        distance_pct = (distance / max(abs(current_price), 1e-9)) * 100.0
 
     metric_weight_sum = float(cluster.get("metric_weight_sum", 0.0))
     avg_bounce_atr = None
@@ -2341,7 +2329,12 @@ def merge_support_resistance_results(  # noqa: C901
                 "a relative 0-to-1 scale"
             ),
         },
-        "units": {"distance_pct": "percentage_points (1.0 = 1%)"},
+        "units": {
+            "distance_pct": (
+                "signed_percentage_points (negative=below_reference, "
+                "positive=above_reference, 1.0=1%)"
+            )
+        },
         "max_levels": int(max_levels_value),
         "max_distance_pct": None if max_distance_value is None else float(max_distance_value),
         "volume_weighting": volume_weighting_mode,
@@ -2502,6 +2495,9 @@ def compact_support_resistance_payload(payload: Dict[str, Any]) -> Dict[str, Any
         "current_price",
         "current_price_source",
         "reference_quote_as_of",
+        "reference_quote_usable_for_live_trading",
+        "reference_quote_freshness_state",
+        "reference_quote_freshness_reason",
         "source",
         "structure_as_of",
         "timezone",
@@ -2834,7 +2830,12 @@ def compute_support_resistance_levels(
                 "a relative 0-to-1 scale"
             ),
         },
-        "units": {"distance_pct": "percentage_points (1.0 = 1%)"},
+        "units": {
+            "distance_pct": (
+                "signed_percentage_points (negative=below_reference, "
+                "positive=above_reference, 1.0=1%)"
+            )
+        },
         "max_levels": int(max_levels_value),
         "max_distance_pct": None if max_distance_value is None else float(max_distance_value),
         "volume_weighting": volume_weighting_mode,

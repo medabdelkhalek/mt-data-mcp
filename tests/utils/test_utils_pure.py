@@ -6,14 +6,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from mtdata.utils.coercion import coerce_scalar
+from mtdata.utils.coercion import safe_float as _safe_float
 from mtdata.utils.time import (
     _format_datetime_second_explicit,
     _format_time_explicit,
     _format_time_minimal,
 )
-from mtdata.utils.coercion import safe_float as _safe_float
 from mtdata.utils.utils import (
-    coerce_scalar,
     _format_numeric_rows_from_df,
     _normalize_limit,
     _normalize_ohlcv_arg,
@@ -108,6 +108,9 @@ class TestNormalizeOhlcvArg:
 
     def test_compact_letters(self):
         assert _normalize_ohlcv_arg("cl") == {"C", "L"}
+
+    def test_short_volume_name_takes_precedence_over_compact_letters(self):
+        assert _normalize_ohlcv_arg("vol") == {"V"}
 
     def test_comma_separated_names(self):
         result = _normalize_ohlcv_arg("open,high,close")
@@ -265,6 +268,14 @@ class TestParseStartDatetime:
         assert dt.tzinfo is None
         assert int(_utc_epoch_seconds(dt)) == 1577836800
 
+    def test_iana_timezone_uses_the_zone_dst_offset(self):
+        dt = _parse_start_datetime("2026-08-03 09:30 America/New_York")
+
+        assert dt == datetime(2026, 8, 3, 13, 30)
+
+    def test_iana_timezone_rejects_ambiguous_dst_local_time(self):
+        assert _parse_start_datetime("2026-11-01 01:30 America/New_York") is None
+
     def test_relative_weekdays(self):
         today = datetime.now(timezone.utc).date()
 
@@ -307,3 +318,25 @@ class TestFormatNumericRowsFromDf:
         df = pd.DataFrame({"time": [0], "flag": [True]})
         rows = _format_numeric_rows_from_df(df, ["time", "flag"])
         assert rows[0][1] == "true"
+
+    def test_numeric_mode_preserves_types_and_non_finite_sentinels(self):
+        df = pd.DataFrame(
+            {
+                "time": [1, 2],
+                "price": [1.25, np.inf],
+                "count": [3, 4],
+                "flag": [True, False],
+                "missing": [np.nan, None],
+            }
+        )
+
+        rows = _format_numeric_rows_from_df(
+            df,
+            ["time", "price", "count", "flag", "missing"],
+            stringify=False,
+        )
+
+        assert rows[0][:4] == [1, 1.25, 3, True]
+        assert rows[1][:4] == [2, np.inf, 4, False]
+        assert np.isnan(rows[0][4])
+        assert np.isnan(rows[1][4])

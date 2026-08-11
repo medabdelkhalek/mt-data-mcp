@@ -49,6 +49,8 @@ MCP_TRANSPORT=sse
 FASTMCP_HOST=127.0.0.1             # loopback only by default
 FASTMCP_PORT=8000
 MCP_AUTH_TOKEN=change-me           # required for non-loopback binds; recommended always
+MCP_ALLOWED_HOSTS=mt5.example.com:* # required with a wildcard bind
+MCP_ALLOWED_ORIGINS=https://client.example.com:*
 
 # Web API (only if you run mtdata-webapi)
 WEBAPI_HOST=127.0.0.1
@@ -77,10 +79,14 @@ Then, from another terminal:
 curl http://127.0.0.1:8001/health
 
 # MCP SSE endpoint is reachable (streams events; Ctrl+C to stop)
-curl -N http://127.0.0.1:8000/sse
+$env:MCP_AUTH_TOKEN = "change-me"
+curl -N -H "Authorization: Bearer $env:MCP_AUTH_TOKEN" http://127.0.0.1:8000/sse
 ```
 
-Stop it with `Ctrl+C` once you've confirmed the endpoints respond.
+Stop it with `Ctrl+C` once you've confirmed the endpoints respond. Clients may
+send the same token as `X-API-Key` instead of a bearer token. A `401` response
+without either header confirms that authentication is being enforced; it is not
+an SSE health failure.
 
 ---
 
@@ -152,9 +158,16 @@ Remove later with `nssm stop mtdata-sse` then `nssm remove mtdata-sse confirm`.
 |---------|-------|------------------|
 | `mtdata-webapi` | `GET http://<host>:<port>/health` | `{"service":"mtdata-webui","status":"ok"}` |
 | `mtdata-webapi` | `GET http://<host>:<port>/ready` | `200` when MT5 is reachable; non-`200` otherwise |
-| `mtdata-sse` | `GET http://<host>:<port>/sse` | An open, streaming SSE connection |
+| `mtdata-sse` | `GET http://<host>:<port>/live` | `200` while the MCP process can serve HTTP requests |
+| `mtdata-sse` | `GET http://<host>:<port>/ready` | `200` when MT5 is reachable; `503` otherwise |
+| `mtdata-streamable-http` | `GET http://<host>:<port>/live` | `200` while the MCP process can serve HTTP requests |
+| `mtdata-streamable-http` | `GET http://<host>:<port>/ready` | `200` when MT5 is reachable; `503` otherwise |
 
-`/health` and `/ready` are also served under `/api` and `/api/v1`. Use `/ready` (not `/health`) if you want the probe to fail when the MT5 terminal is down. Point your task/service monitor or an external uptime check at these URLs.
+The Web API's `/health` and `/ready` routes are also served under `/api` and
+`/api/v1`. Use `/ready` when a probe should fail with the MT5 terminal down;
+use `/health` (Web API) or `/live` (MCP HTTP transports) for process liveness.
+MCP probes remain at the server root when `FASTMCP_MOUNT_PATH` moves the MCP
+protocol endpoint.
 
 ---
 

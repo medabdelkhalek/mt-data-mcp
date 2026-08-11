@@ -57,6 +57,33 @@ def test_market_snapshot_quote_compaction_formats_epoch_without_display():
     assert quote["time_epoch"] == 1700000000
 
 
+def test_market_snapshot_full_quote_preserves_ticker_diagnostics(monkeypatch):
+    monkeypatch.setattr(
+        snapshot_mod,
+        "call_tool_sync_structured",
+        lambda func, **kwargs: {
+            "success": True,
+            "symbol": "EURUSD",
+            "bid": 1.1,
+            "ask": 1.1002,
+            "time": 1700000000,
+            "time_display": "2023-11-14 22:13 UTC",
+            "tick_available": True,
+            "units": {"spread": "price"},
+            "meta": {"tool": "market_ticker"},
+        },
+    )
+
+    quote = snapshot_mod._call_section("quote", "EURUSD", "H1", 8, "full")
+
+    assert quote["tick_available"] is True
+    assert quote["units"] == {"spread": "price"}
+    assert quote["meta"] == {"tool": "market_ticker"}
+    assert quote["time"] == "2023-11-14 22:13 UTC"
+    assert quote["time_epoch"] == 1700000000
+    assert "time_display" not in quote
+
+
 def test_market_snapshot_marks_invalid_symbol_failure(monkeypatch):
     def fake_call_section(name, symbol, timeframe, horizon, detail):
         if name == "quote":
@@ -271,7 +298,15 @@ def test_market_snapshot_compact_keeps_requested_regime_and_forecast(monkeypatch
         if name == "regime":
             return {"success": True, "current_regime": "trend_up", "confidence": 0.8}
         if name == "forecast":
-            return {"success": True, "method": "theta", "forecast": [1.1, 1.2]}
+            return {
+                "success": True,
+                "method": "theta",
+                "forecast": [1.1, 1.2],
+                "ci_status": "unavailable",
+                "trust_level": "degraded",
+                "trust_blockers": ["prediction_interval_unavailable"],
+                "calendar_treatment": "continuous",
+            }
         return {"success": True}
 
     monkeypatch.setattr(snapshot_mod, "_call_section", fake_call_section)
@@ -287,6 +322,10 @@ def test_market_snapshot_compact_keeps_requested_regime_and_forecast(monkeypatch
     assert result["snapshot"]["forecast"] == {
         "method": "theta",
         "forecast": [1.1, 1.2],
+        "ci_status": "unavailable",
+        "trust_level": "degraded",
+        "trust_blockers": ["prediction_interval_unavailable"],
+        "calendar_treatment": "continuous",
     }
 
 
@@ -346,7 +385,7 @@ def test_market_snapshot_exposes_quote_and_assembly_timestamps(monkeypatch):
     with patch.object(snapshot_mod, "datetime", fake_datetime):
         result = _raw_market_snapshot(symbol="EURUSD", detail="compact")
 
-    assert result["as_of"] == "2023-11-14T22:13:20Z"
+    assert result["as_of"] == "2026-06-15T19:34:08Z"
     assert result["quote_as_of"] == "2023-11-14T22:13:20Z"
     assert result["assembled_at"] == "2026-06-15T19:34:08Z"
 

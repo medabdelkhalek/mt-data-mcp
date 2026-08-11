@@ -283,19 +283,107 @@ def test_detect_classic_patterns_historical_scan_finds_older_prefix_pattern(
     match = next(p for p in out_scan if p.name == "Rounding Bottom")
     assert match.status == "forming"
     assert match.end_index == 139
+    assert match.details["available_at_index"] == 139
+    assert match.details["detection_scope"] == "causal_prefix_scan"
 
-def test_detect_classic_patterns_historical_scan_reuses_global_pivots(monkeypatch):
+
+def test_classic_once_excludes_terminal_unconfirmed_pivots(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        classic_mod,
+        "_detect_pivots_close",
+        lambda *_args, **_kwargs: (
+            np.array([5, 14, 17], dtype=int),
+            np.array([7, 13, 19], dtype=int),
+        ),
+    )
+
+    def capture_trend(_c, peaks, troughs, *_args, **_kwargs):
+        captured["peaks"] = peaks.tolist()
+        captured["troughs"] = troughs.tolist()
+        return []
+
+    monkeypatch.setattr(classic_mod, "detect_trend_lines", capture_trend)
+    for detector_name in (
+        "detect_channels",
+        "detect_rectangles",
+        "detect_triangles",
+        "detect_wedges",
+        "detect_broadening",
+        "detect_diamonds",
+        "detect_tops_bottoms",
+        "detect_head_shoulders",
+        "detect_rounding",
+        "detect_flags_pennants",
+        "detect_cup_handle",
+    ):
+        monkeypatch.setattr(classic_mod, detector_name, lambda *_args, **_kwargs: [])
+
+    values = np.linspace(100.0, 101.0, 20)
+    classic_mod._detect_classic_patterns_once(
+        np.arange(20, dtype=float),
+        values,
+        values,
+        values,
+        20,
+        ClassicDetectorConfig(min_distance=5),
+    )
+
+    assert captured["peaks"] == [5, 14]
+    assert captured["troughs"] == [7, 13]
+
+
+def test_classic_right_edge_results_disclose_availability(monkeypatch):
+    n = 40
+    df = pd.DataFrame(
+        {
+            "time": np.arange(n, dtype=float),
+            "close": np.linspace(100.0, 110.0, n),
+        }
+    )
+    result = ClassicPatternResult(
+        name="Triangle",
+        status="completed",
+        confidence=0.8,
+        start_index=10,
+        end_index=30,
+        start_time=10.0,
+        end_time=30.0,
+        details={},
+    )
+    monkeypatch.setattr(
+        classic_mod,
+        "_detect_classic_patterns_once",
+        lambda *_args, **_kwargs: [result],
+    )
+
+    out = detect_classic_patterns(
+        df,
+        ClassicDetectorConfig(
+            min_input_bars=20,
+            min_distance=5,
+            min_confidence=0.0,
+        ),
+    )
+
+    assert out[0].details["available_at_index"] == n - 1
+    assert out[0].details["available_at_time"] == float(n - 1)
+    assert out[0].details["pivot_confirmation_bars"] == 5
+    assert out[0].details["status_basis"] == "causal_as_of_detection_with_confirmed_pivots"
+    assert out[0].details["detection_scope"] == "right_edge_as_of_input_window"
+
+def test_detect_classic_patterns_historical_scan_recomputes_prefix_pivots(monkeypatch):
     n = 220
     df = pd.DataFrame(
         {"time": np.arange(n, dtype=float), "close": np.linspace(100.0, 120.0, n)}
     )
-    calls = {"count": 0}
+    calls = []
 
     def _fake_pivots(c, cfg, *args):
-        _ = c
         _ = cfg
         _ = args
-        calls["count"] += 1
+        calls.append(len(c))
         return np.array([], dtype=int), np.array([], dtype=int)
 
     monkeypatch.setattr(classic_mod, "_detect_pivots_close", _fake_pivots)
@@ -315,7 +403,7 @@ def test_detect_classic_patterns_historical_scan_reuses_global_pivots(monkeypatc
     )
 
     assert out == []
-    assert calls["count"] == 1
+    assert calls == list(range(120, 221, 10))
 
 
 def test_detect_classic_patterns_surfaces_confidence_calibration_errors(monkeypatch):
@@ -1689,6 +1777,38 @@ def test_detect_rounding_returns_multiple_non_overlapping_windows(monkeypatch):
 
     assert len(out) == 2
     assert {pattern.details["window_bars"] for pattern in out} == {100, 220}
+
+
+def test_detect_rounding_uses_a_post_structure_confirmation_bar(monkeypatch):
+    from src.mtdata.patterns.classic_impl import reversal
+
+    x = np.linspace(-1.0, 1.0, 100)
+    structure = 100.0 + 5.0 * np.square(x)
+    rim_level = float(np.mean(structure[-10:]))
+    close = np.concatenate([structure, [rim_level]])
+    monkeypatch.setattr(reversal, "_tol_abs_from_close", lambda *_args: 0.1)
+
+    forming = reversal.detect_rounding(
+        close,
+        np.arange(close.size, dtype=float),
+        ClassicDetectorConfig(rounding_window_sizes=[100]),
+    )
+
+    assert forming
+    assert forming[0].status == "forming"
+    assert forming[0].end_index == 99
+    assert forming[0].details["breakout_index"] is None
+
+    close[-1] = rim_level + 1.0
+    completed = reversal.detect_rounding(
+        close,
+        np.arange(close.size, dtype=float),
+        ClassicDetectorConfig(rounding_window_sizes=[100]),
+    )
+
+    assert completed[0].status == "completed"
+    assert completed[0].end_index == 99
+    assert completed[0].details["breakout_index"] == 100
 
 
 def test_dedupe_overlapping_head_shoulders_results():

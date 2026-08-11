@@ -31,6 +31,40 @@ def _disable_embeddings(monkeypatch) -> None:
     monkeypatch.setattr(svc, "get_news_embedding_service", lambda: FakeEmbeddingService())
 
 
+def test_score_then_dedupe_keeps_the_more_relevant_duplicate(monkeypatch) -> None:
+    context = svc.InstrumentContext(
+        symbol="AAPL",
+        asset_class="equity",
+        base_asset="AAPL",
+        quote_asset=None,
+        aliases=("Apple",),
+        terms=("AAPL", "Apple"),
+    )
+    generic = svc.NewsItem(
+        title="Apple update",
+        provider="first",
+        source="First",
+        url="https://example.test/same",
+    )
+    direct = svc.NewsItem(
+        title="Apple update",
+        provider="second",
+        source="Second",
+        kind="direct_symbol",
+        url="https://example.test/same",
+    )
+    monkeypatch.setattr(svc, "_score_importance", lambda item: 1.0)
+    monkeypatch.setattr(
+        svc,
+        "_score_relevance",
+        lambda item, _context: (5.0 if item.kind == "direct_symbol" else 1.0, []),
+    )
+
+    result = svc._score_then_dedupe_items([generic, direct], context)
+
+    assert result == [direct]
+
+
 def test_fetch_unified_news_without_symbol_returns_only_general_bucket(monkeypatch) -> None:
     def fake_general_news(news_type: str = "news", limit: int = 20, page: int = 1):
         return {
@@ -54,7 +88,7 @@ def test_fetch_unified_news_without_symbol_returns_only_general_bucket(monkeypat
                     "source": "FXStreet",
                     "category": "Economic Calendar",
                     "priority": 1,
-                    "relative_time": "10 minutes ago",
+                    "published_at": "2026-03-29T07:50:00Z",
                 }
             ],
         }
@@ -71,6 +105,32 @@ def test_fetch_unified_news_without_symbol_returns_only_general_bucket(monkeypat
     assert result["related_news"] == []
     assert result["general_count"] == 2
     assert set(result["sources_used"]) == {"finviz", "mt5"}
+
+
+def test_mt5_source_uses_absolute_published_time(monkeypatch) -> None:
+    monkeypatch.setattr(
+        svc,
+        "get_mt5_news",
+        lambda **_kwargs: {
+            "success": True,
+            "news": [
+                {
+                    "subject": "Broker headline",
+                    "source": "Broker",
+                    "category": "Markets",
+                    "priority": 0,
+                    "published_at": "2026-03-29T07:54:32+00:00",
+                    "relative_time": "10 minutes ago",
+                }
+            ],
+        },
+    )
+    source = svc.MT5NewsSource()
+    source._available = True
+
+    items = source.fetch_general_candidates(limit=1)
+
+    assert items[0].published_at == datetime(2026, 3, 29, 7, 54, 32, tzinfo=timezone.utc)
 
 
 def test_fetch_unified_news_rejects_unknown_equity_symbol(monkeypatch) -> None:
@@ -228,7 +288,7 @@ def test_fetch_unified_news_uses_symbol_metadata_for_crypto_classification(monke
                     "source": "FXStreet",
                     "category": "Economic Calendar",
                     "priority": 1,
-                    "relative_time": "5 minutes ago",
+                    "published_at": "2026-03-29T07:55:00Z",
                 }
             ],
         }
@@ -269,6 +329,7 @@ def test_fetch_unified_news_uses_symbol_metadata_for_crypto_classification(monke
     context_titles = [item["title"] for item in result["market_context"]]
 
     assert result["success"] is True
+    assert result["relevance_status"] == "symbol_matched"
     assert result["instrument"]["asset_class"] == "crypto"
     assert result["instrument"]["metadata_hints"]["currency_base"] == "BTC"
     assert any("market snapshot" in title.lower() for title in context_titles)
@@ -1089,6 +1150,27 @@ def test_systemic_impact_news_surfaces_major_war_headline(monkeypatch) -> None:
     assert result["impact_news"][0]["metadata"]["systemic_impact_score"] >= 2.4
 
 
+def test_systemic_impact_terms_do_not_match_inside_words() -> None:
+    context = svc.InstrumentContext(
+        symbol="EURUSD",
+        asset_class="forex",
+        base_asset="EUR",
+        quote_asset="USD",
+        aliases=(),
+        terms=(),
+    )
+    item = svc.NewsItem(
+        title="Warner announces quarterly streaming results",
+        provider="test",
+        source="test",
+    )
+
+    score, matched = svc._score_systemic_impact(item, context)
+
+    assert score == 0.0
+    assert "war" not in matched
+
+
 def test_european_index_matches_regional_macro_events(monkeypatch) -> None:
     future_time = (datetime.now(timezone.utc) + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
     monkeypatch.setattr(svc, "get_general_news", lambda news_type="news", limit=20, page=1: {"success": True, "items": []})
@@ -1380,6 +1462,7 @@ def test_fetch_unified_news_includes_ycnbc_general_candidates_when_enabled(monke
     result = svc.fetch_unified_news()
 
     assert result["success"] is True
+    assert result["relevance_status"] == "market_wide"
     assert "ycnbc" in result["sources_used"]
     assert any(item["provider"] == "ycnbc" for item in result["general_news"])
     assert result["source_details"]["ycnbc"]["selected_general"] >= 1

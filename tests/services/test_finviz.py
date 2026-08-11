@@ -15,6 +15,24 @@ def test_finviz_fundamental_percent_units_are_explicit() -> None:
     }
 
 
+def test_finviz_numeric_percent_values_scale_above_one_hundred_percent() -> None:
+    from mtdata.core.finviz import _finviz_percent_value
+
+    assert _finviz_percent_value(5.1702) == 517.02
+    assert _finviz_percent_value("517.02%") == 517.02
+
+
+def test_finviz_intraday_news_time_is_localized_from_new_york() -> None:
+    from datetime import datetime, timezone
+
+    from mtdata.core.finviz import _normalize_finviz_published_at
+
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    assert _normalize_finviz_published_at("05:30AM", now=now) == (
+        "2026-08-01T09:30:00+00:00"
+    )
+
+
 class TestFinvizService:
     """Tests for the canonical finviz package functions."""
 
@@ -39,6 +57,54 @@ class TestFinvizService:
         assert result["fundamentals"]["P/E"] == "28.5"
 
     @patch('finvizfinance.quote.finvizfinance')
+    def test_get_stock_fundamentals_falls_back_for_current_quote_layout(
+        self, mock_finviz
+    ):
+        from bs4 import BeautifulSoup
+
+        from mtdata.services.finviz import get_stock_fundamentals
+
+        mock_stock = MagicMock()
+        mock_stock.ticker_fundament.side_effect = AttributeError(
+            "'NoneType' object has no attribute 'find_all'"
+        )
+        mock_stock.soup = BeautifulSoup(
+            """
+            <h2 class="quote-header_ticker-wrapper_company">Apple Inc</h2>
+            <div class="quote-header_categories">
+              <a class="quote-header_category" href="screener?v=111&f=sec_technology">Technology</a>
+              <a class="quote-header_category" href="screener?v=111&f=ind_consumerelectronics">Consumer Electronics</a>
+              <a class="quote-header_category" href="screener?v=111&f=geo_usa">USA</a>
+              <a class="quote-header_category" href="screener?v=111&f=cap_mega">Mega</a>
+              <a class="quote-header_category" href="screener?v=111&f=exch_nasd">NASD</a>
+            </div>
+            <table class="snapshot-table2"><tr>
+              <td>P/E</td><td>35.79</td><td>Market Cap</td><td>4557.32B</td>
+            </tr></table>
+            <table class="snapshot-table2"><tr>
+              <td>EPS (ttm)</td><td>8.72</td><td>RSI (14)</td><td>62.10</td>
+            </tr></table>
+            """,
+            "html.parser",
+        )
+        mock_finviz.return_value = mock_stock
+
+        result = get_stock_fundamentals("AAPL")
+
+        assert result["success"] is True
+        assert result["fundamentals"] == {
+            "Company": "Apple Inc",
+            "Sector": "Technology",
+            "Industry": "Consumer Electronics",
+            "Country": "USA",
+            "Exchange": "NASD",
+            "P/E": "35.79",
+            "Market Cap": "4557.32B",
+            "EPS (ttm)": "8.72",
+            "RSI (14)": "62.10",
+        }
+
+    @patch('finvizfinance.quote.finvizfinance')
     def test_get_stock_fundamentals_error(self, mock_finviz):
         """Test fundamentals fetch with error."""
         from mtdata.services.finviz import get_stock_fundamentals
@@ -48,9 +114,15 @@ class TestFinvizService:
         result = get_stock_fundamentals("INVALID")
         
         assert "error" in result
-        assert result["error_code"] == "finviz_unavailable"
+        assert result["error_code"] == "finviz_endpoint_failed"
         assert result["retryable"] is True
-        assert result["remediation"] == "Retry after the provider recovers."
+        assert result["error"] == (
+            "Finviz fundamentals failed for INVALID. Other Finviz endpoints may still be available."
+        )
+        assert result["remediation"] == (
+            "Retry this endpoint or use finviz_screen valuation fields as an "
+            "alternative fundamentals source."
+        )
         assert result["provider"] == "finviz"
         assert result["endpoint"] == "fundamentals"
         assert result["stage"] == "ticker_fundament"
@@ -67,6 +139,9 @@ class TestFinvizService:
         assert result["error_code"] == "finviz_provider_blocked"
         assert result["retryable"] is True
         assert result["endpoint"] == "fundamentals"
+        assert result["remediation"] == (
+            "Retry this endpoint after the upstream condition clears."
+        )
 
     @patch('finvizfinance.quote.finvizfinance')
     def test_get_stock_fundamentals_reports_empty_data_consistently(self, mock_finviz):
@@ -130,12 +205,20 @@ class TestFinvizService:
         assert result["insider_trades"][0]["Date"] == "2025-11-07"
 
     def test_finviz_error_kind_classification(self):
-        from mtdata.services.finviz.api import _finviz_error_kind
+        from mtdata.services.finviz.api import (
+            _finviz_error_kind,
+            _sanitize_error_message,
+        )
 
         assert _finviz_error_kind("Finviz request timed out. Retry later.") == ("finviz_timeout", True)
         assert _finviz_error_kind("Finviz rejected the request as unauthorized.") == ("finviz_unauthorized", False)
         assert _finviz_error_kind("Finviz response could not be parsed.") == ("finviz_parse_error", False)
         assert _finviz_error_kind("Unable to fetch data from Finviz. Please try again later.") == ("finviz_unavailable", True)
+        message = _sanitize_error_message(
+            ValueError("Invalid order 'market-cap'. Possible order: ['Market Cap']")
+        )
+        assert message.startswith("Invalid Finviz parameter: Invalid order")
+        assert _finviz_error_kind(message) == ("finviz_invalid_parameter", False)
 
     def test_get_insider_activity_error_is_structured(self):
         from mtdata.services.finviz import api as finviz_api
@@ -273,6 +356,27 @@ class TestFinvizService:
 
         assert result["success"] is True
         assert result["coins"][0]["Price"] == "1.5e-09"
+
+    @patch('finvizfinance.crypto.Crypto')
+    def test_get_crypto_performance_marks_provider_rounded_zero_unavailable(
+        self, mock_crypto_class
+    ):
+        from mtdata.services.finviz import get_crypto_performance
+
+        mock_crypto = MagicMock()
+        mock_crypto.performance.return_value = pd.DataFrame(
+            [{"Ticker": "SHIBUSD", "Price": 0.0, "Change": "2.5%"}]
+        )
+        mock_crypto_class.return_value = mock_crypto
+
+        result = get_crypto_performance()
+
+        assert result["coins"][0]["Price"] is None
+        assert (
+            result["coins"][0]["Price Status"]
+            == "unavailable_provider_rounded_zero"
+        )
+        assert "SHIBUSD" in result["warnings"][0]
 
     @patch('finvizfinance.crypto.Crypto')
     def test_get_crypto_performance_drops_week_when_day_week_identical(self, mock_crypto_class):
@@ -422,6 +526,7 @@ class TestFinvizService:
 
         assert result["success"] is True
         assert result["source"] == "finviz_api"
+        assert result["calendarTimezone"] == "America/New_York"
         assert result["count"] == 2
         assert result["total"] == 2
         assert len(result["items"]) == 2
@@ -532,6 +637,7 @@ class TestFinvizService:
         assert result["calendar"] == "earnings"
         assert result["dateFrom"] == "2026-01-05"
         assert result["dateTo"] == "2026-01-12"
+        assert result["calendarTimezone"] == "America/New_York"
         assert result["count"] == 1
         assert result["total"] == 1
         assert len(result["items"]) == 1
@@ -575,6 +681,7 @@ class TestFinvizService:
         assert result["calendar"] == "dividends"
         assert result["dateFrom"] == "2026-01-05"
         assert result["dateTo"] == "2026-01-12"
+        assert result["calendarTimezone"] == "America/New_York"
         assert result["count"] == 1
         assert result["total"] == 1
         assert len(result["items"]) == 1
@@ -650,7 +757,7 @@ class TestFinvizTools:
                 "symbol": "EURUSD",
                 "display_symbol": "EUR/USD",
                 "name": "Euro / US Dollar",
-                "delayed_price": 1.1,
+                "price": 1.1,
                 "price_currency": "USD",
                 "price_source": "finviz_delayed",
                 "data_delayed": True,
@@ -682,8 +789,8 @@ class TestFinvizTools:
         result = raw(limit=2)
 
         assert result["count"] == 2
-        assert result["available_count"] == 3
-        assert result["omitted_item_count"] == 1
+        assert result["pagination"]["total"] == 3
+        assert result["pagination"]["more_available"] == 1
         assert result["items"] == [
             {
                 "symbol": "EURUSD",
@@ -717,13 +824,13 @@ class TestFinvizTools:
         assert result["success"] is True
         assert result["symbol"] == "GBPUSD"
         assert result["count"] == 1
-        assert result["available_count"] == 1
+        assert result["pagination"]["total"] == 1
         assert result["items"] == [
             {
                 "symbol": "GBPUSD",
                 "display_symbol": "GBP/USD",
                 "name": "British Pound / US Dollar",
-                "delayed_price": 1.25,
+                "price": 1.25,
                 "price_currency": "USD",
                 "price_source": "finviz_delayed",
                 "data_delayed": True,
@@ -776,7 +883,7 @@ class TestFinvizTools:
         result = raw(limit=10)
 
         assert result["count"] == 2
-        assert result["available_count"] == 2
+        assert result["pagination"]["total"] == 2
         assert result["items"] == [
             {
                 "symbol": "EURUSD",
@@ -868,6 +975,37 @@ class TestFinvizTools:
         result = raw()
 
         assert result["items"][0]["perf_day_pct"] == 0.91
+
+    @patch("mtdata.core.finviz.get_crypto_performance")
+    def test_finviz_crypto_compact_preserves_unavailable_price_status(
+        self, mock_get_crypto
+    ):
+        from mtdata.core.finviz import finviz_crypto
+
+        mock_get_crypto.return_value = {
+            "success": True,
+            "market": "crypto",
+            "coins": [
+                {
+                    "Ticker": "SHIBUSD",
+                    "Price": None,
+                    "Price Status": "unavailable_provider_rounded_zero",
+                }
+            ],
+            "warnings": ["Finviz omitted a provider-rounded zero price."],
+        }
+
+        result = getattr(finviz_crypto, "__wrapped__", finviz_crypto)()
+
+        assert result["items"] == [
+            {
+                "symbol": "SHIBUSD",
+                "price_status": "unavailable_provider_rounded_zero",
+            }
+        ]
+        assert result["warnings"] == [
+            "Finviz omitted a provider-rounded zero price."
+        ]
 
     @patch("mtdata.core.finviz.get_crypto_performance")
     def test_finviz_crypto_compact_maps_wtd_to_week_when_week_missing(self, mock_get_crypto):
@@ -977,7 +1115,13 @@ class TestFinvizTools:
 
         assert result["detail"] == "full"
         assert result["data_fetched_at"].endswith("Z")
-        assert result["items"] == [{"symbol": "NQ", "name": "Nasdaq 100", "perf_pct": "0.8%"}]
+        assert result["items"] == [
+            {"symbol": "NQ", "name": "Nasdaq 100", "perf_day_pct": 0.8}
+        ]
+        assert result["performance_format"] == "percentage_points"
+        assert result["units"] == {
+            "perf_day_pct": "percentage_points (1.0 = 1%)"
+        }
         assert result["meta"]["tool"] == "finviz_futures"
         assert "request" not in result["meta"]
 
@@ -1492,10 +1636,10 @@ class TestFinvizTools:
         result = raw("AAPL")
 
         assert result["detail"] == "compact"
-        assert result["count"] == 3
+        assert result["count"] == 4
         assert result["items"][0]["price_per_share"] == 411.34
         assert "cost" not in result["items"][0]
-        assert result["omitted_item_count"] == 1
+        assert result["pagination"]["more_available"] == 0
         assert result["summary"]["buy_transactions"] == 1
 
     @patch("mtdata.core.finviz.get_stock_insider_trades")
@@ -1516,8 +1660,8 @@ class TestFinvizTools:
         result = raw("AAPL", detail=None)
 
         assert result["detail"] == "compact"
-        assert result["count"] == 3
-        assert result["omitted_item_count"] == 1
+        assert result["count"] == 4
+        assert result["pagination"]["more_available"] == 0
 
     @patch("mtdata.core.finviz.get_stock_ratings")
     def test_finviz_ratings_structures_price_targets(self, mock_get_ratings):
@@ -1597,7 +1741,7 @@ class TestFinvizTools:
 
         assert result["detail"] == "compact"
         assert result["count"] == 2
-        assert result["available_count"] == 2
+        assert result["pagination"]["total"] == 2
         assert "meta" not in result
 
     @patch("mtdata.core.finviz.get_stock_peers")
@@ -1615,7 +1759,7 @@ class TestFinvizTools:
 
         assert result["detail"] == "compact"
         assert result["count"] == 3
-        assert result["available_count"] == 3
+        assert result["pagination"]["total"] == 3
         assert "meta" not in result
 
     @patch("mtdata.core.finviz.get_insider_activity")
@@ -1702,7 +1846,7 @@ class TestFinvizTools:
 
         mock_get_earnings.assert_called_once_with(period="This Week", limit=10, page=1)
         assert result["detail"] == "compact"
-        assert result["omitted_item_count"] == 11
+        assert result["pagination"]["more_available"] == 11
         assert result["items"] == [
             {
                 "symbol": "APLM",
@@ -1710,11 +1854,37 @@ class TestFinvizTools:
                 "earnings": "Apr 27/b",
                 "earnings_timing": "before_market",
                 "market_cap": "14.17M",
-                "price": "12.85",
+                "price": 12.85,
                 "change_pct": -2.58,
                 "volume": "6593",
+                "price_source": "finviz_delayed",
+                "data_delayed": True,
+                "delay_minutes_min": 15,
+                "delay_minutes_max": 20,
             }
         ]
+        assert result["data_delayed"] is True
+        assert result["price_source"] == "finviz_delayed"
+
+    def test_finviz_earnings_yearless_dates_follow_period_across_new_year(self):
+        from datetime import date
+
+        from mtdata.core.finviz import _normalize_finviz_earnings_rows
+
+        next_week = _normalize_finviz_earnings_rows(
+            [{"Earnings": "Jan 02/a"}],
+            period_key="next-week",
+            reference_date=date(2026, 12, 21),
+        )
+        previous_week = _normalize_finviz_earnings_rows(
+            [{"Earnings": "Dec 30/b"}],
+            period_key="previous-week",
+            reference_date=date(2027, 1, 4),
+        )
+
+        assert next_week[0]["earnings_date"] == "2027-01-02"
+        assert previous_week[0]["earnings_date"] == "2026-12-30"
+        assert next_week[0]["earnings_date_year_inferred"] is True
 
     @patch("mtdata.core.finviz.get_earnings_calendar")
     def test_finviz_earnings_rejects_invalid_detail(self, mock_get_earnings):
@@ -2097,7 +2267,7 @@ class TestFinvizTools:
 
         assert result["items"] == [{"symbol": "AAPL", "market_cap": "3.0T"}]
         assert "available_count" not in result
-        assert result["omitted_item_count"] == 1
+        assert result["pagination"]["more_available"] == 1
         assert result["detail"] == "full"
         assert result["meta"]["tool"] == "finviz_screen"
 
@@ -2237,6 +2407,7 @@ class TestFinvizTools:
 
         service_result = {
             "success": True,
+            "calendarTimezone": "America/New_York",
             "items": [
                 {
                     "ticker": "UNITEDSTANONFAR",
@@ -2269,6 +2440,7 @@ class TestFinvizTools:
             }
         ]
         assert result["timezone"] == "UTC"
+        assert result["calendar_timezone"] == "America/New_York"
         assert "symbol" not in result["items"][0]
 
     def test_finviz_dividend_calendar_labels_amounts_and_yield_units(self):

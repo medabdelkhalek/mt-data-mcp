@@ -3,10 +3,60 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Literal, Optional
-
+from typing import Any, List, Literal, Optional
 
 UNPARSED_BOOL = object()
+
+
+def split_top_level_csv(value: Any) -> List[str]:
+    """Split commas outside quotes and nested brackets, omitting empty tokens."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    in_quote: Optional[str] = None
+    for char in text:
+        if in_quote:
+            current.append(char)
+            if char == in_quote:
+                in_quote = None
+            continue
+        if char in ('"', "'"):
+            in_quote = char
+            current.append(char)
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}" and depth:
+            depth -= 1
+        elif char == "," and depth == 0:
+            token = "".join(current).strip()
+            if token:
+                parts.append(token)
+            current = []
+            continue
+        current.append(char)
+    token = "".join(current).strip()
+    if token:
+        parts.append(token)
+    return parts
+
+
+def coerce_scalar(value: Any) -> Any:
+    """Coerce a scalar string to int or float, otherwise preserve its value."""
+    try:
+        if value is None:
+            return value
+        text = str(value).strip()
+        if not text:
+            return text
+        if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+            return int(text)
+        return float(text)
+    except Exception:
+        return value
 
 
 def parse_bool_like(value: Any, *, allow_none: bool = False) -> Any:

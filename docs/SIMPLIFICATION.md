@@ -94,7 +94,11 @@ mtdata-cli data_fetch_candles EURUSD --limit 5000 --simplify rdp \
 **Piecewise Linear Approximation** (segment-based). Control with:
 - `max_error` — maximum deviation per segment
 - or `segments` — fixed number of segments
-- or `points` / `ratio` — mtdata auto-tunes `max_error` toward the target
+- or `points` / `ratio` — select a fixed segment count toward the target
+
+Tolerance requests enforce the pointwise deviation postcondition. Fixed-size
+requests report `observed_max_error`; they do not claim that a tolerance was
+auto-tuned.
 
 Example:
 ```bash
@@ -106,7 +110,7 @@ mtdata-cli data_fetch_candles EURUSD --limit 5000 --simplify pla \
 **Adaptive Piecewise Constant Approximation** (step-wise). Control with:
 - `max_error`
 - or `segments`
-- or `points` / `ratio` (auto-tuned)
+- or `points` / `ratio` (fixed segment count with measured error)
 
 Example:
 ```bash
@@ -120,6 +124,12 @@ mtdata-cli data_fetch_candles EURUSD --limit 5000 --simplify apca \
 
 - Simplification is meant for **visualization and UI performance**. For quantitative analysis (e.g., volatility estimation, backtests), use full-resolution data.
 - In `mode=select`, mtdata returns existing rows; this can miss intra-bar extremes if you simplify OHLC data aggressively.
+- In `mode=approximate`, OHLCV uses candle aggregation, while other numeric columns are segment means. Indicator-like columns are not recomputed and the response is marked `analysis_compatible=false`.
+
+`mode=encode` with `schema=delta` derives its scale from the median non-zero
+change unless `scale` is supplied explicitly, and reports the resolved scale in
+metadata. `mode=symbolic` implements SAX with PAA, optional z-normalization, and
+fixed standard-normal breakpoints, so encodings are comparable across series.
 
 ---
 

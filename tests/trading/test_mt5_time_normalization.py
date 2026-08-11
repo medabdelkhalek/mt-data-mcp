@@ -69,6 +69,38 @@ def test_normalize_times_in_struct_preserves_native_utc_epochs(monkeypatch) -> N
     assert result.tolist() == arr.tolist()
 
 
+def test_server_clock_struct_normalization_fails_closed(monkeypatch) -> None:
+    rows = np.array([(1_768_478_400.0,)], dtype=[("time", float)])
+    monkeypatch.setattr(mt5_mod.mt5_config, "time_offset_minutes", 0, raising=False)
+    monkeypatch.setattr(mt5_mod.mt5_config, "get_server_tz", lambda: None)
+    monkeypatch.setattr(
+        mt5_mod,
+        "_server_epoch_to_utc",
+        lambda value: (_ for _ in ()).throw(ValueError("bad server epoch")),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be returned safely"):
+        mt5_mod._normalize_times_in_struct(
+            rows,
+            mode=mt5_mod._MT5_TIMESTAMP_MODE_SERVER,
+        )
+
+
+def test_server_clock_object_normalization_fails_closed(monkeypatch) -> None:
+    tick = SimpleNamespace(time=1_768_478_400.0, bid=1.1)
+    monkeypatch.setattr(
+        mt5_mod,
+        "_server_epoch_to_utc",
+        lambda value: (_ for _ in ()).throw(ValueError("bad server epoch")),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be returned safely"):
+        mt5_mod._normalize_object_times(
+            tick,
+            mode=mt5_mod._MT5_TIMESTAMP_MODE_SERVER,
+        )
+
+
 def test_adapter_aligns_server_clock_tick_history_to_utc(monkeypatch) -> None:
     now = datetime(2026, 7, 14, 14, 45, tzinfo=timezone.utc)
     now_epoch = now.timestamp()
@@ -241,6 +273,33 @@ def test_adapter_keeps_native_utc_terminal_unchanged(monkeypatch) -> None:
     assert observed_bounds["to"] == now
     assert result is rows
     assert mt5_mod.get_mt5_timestamp_mode("TSLA.NAS-24") == "native_utc"
+
+
+def test_adapter_detects_server_clock_from_closed_market_future_tick(monkeypatch) -> None:
+    now = datetime(2026, 7, 17, 23, 8, 29, tzinfo=timezone.utc)
+    now_epoch = now.timestamp()
+    Tick = namedtuple("Tick", ["time", "time_msc", "bid", "ask"])
+    raw_epoch = now_epoch + 48 * 60 + 30
+    raw_tick = Tick(
+        time=int(raw_epoch),
+        time_msc=int(raw_epoch * 1000),
+        bid=1.15,
+        ask=1.1501,
+    )
+    module = SimpleNamespace(symbol_info_tick=lambda symbol: raw_tick)
+    monkeypatch.setitem(sys.modules, "MetaTrader5", module)
+    monkeypatch.setattr(mt5_mod.time, "time", lambda: now_epoch)
+    monkeypatch.setattr(
+        mt5_mod.mt5_config,
+        "get_time_offset_seconds",
+        lambda at_time=None: 3 * 60 * 60,
+    )
+
+    normalized = mt5_mod.MT5Adapter().symbol_info_tick("EURUSD")
+
+    assert normalized.time == int(raw_epoch - 3 * 60 * 60)
+    assert normalized.time_msc == int((raw_epoch - 3 * 60 * 60) * 1000)
+    assert mt5_mod.get_mt5_timestamp_mode("EURUSD") == "server_clock"
 
 
 def test_adapter_detects_clock_before_normalizing_positions_and_symbol_info(monkeypatch) -> None:

@@ -155,7 +155,7 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 24 \
 **In mtdata:** `forecast_list_methods --json` shows what your install can run. See [FORECAST.md](FORECAST.md) and [forecast/METHODS.md](forecast/METHODS.md).
 
 ### Ensemble (forecast)
-Combines several methods (average, Bayesian model averaging-style, stacking, …) so no single model owns the call. Useful when methods disagree or you want robustness over one hero model.
+Combines several methods (average, RMSE-weighted, stacking, …) so no single model owns the call. Useful when methods disagree or you want robustness over one hero model.
 
 **In mtdata:** `--method ensemble` on forecast tools; see [forecast/FORECAST_GENERATE.md](forecast/FORECAST_GENERATE.md).
 
@@ -546,12 +546,15 @@ Risk a **fixed percent of equity** per trade (e.g. 1% from entry to stop). Simpl
 ---
 
 ### Directional Accuracy
-**What it measures:** How often the forecast predicts the correct direction (up/down).
+**What it measures:** How often the forecast predicts the correct terminal
+horizon direction (up/down) from the forecast anchor. Backtest path-directional
+accuracy is a separate diagnostic for step-to-step shape agreement.
 
 **Example:** Directional accuracy = 0.58 means 58% of forecasts got the direction right.
 
 **Interpretation:**
-- 0.50 = random guessing
+- 0.50 is the balanced binary-chance reference when realized directions are
+  non-flat; flat outcomes and class imbalance change the empirical baseline
 - 0.55+ is generally useful for trading
 - High directional accuracy with high MAE: right direction, wrong magnitude
 
@@ -905,7 +908,7 @@ Return per unit of volatility (often excess return / σ). Higher is “more rewa
 ### Dry-run
 A **preview** of a trading request: validation and routing checks **without** sending the order to MT5. Clean dry-runs are necessary but not sufficient (broker margin/stops still apply live).
 
-**In mtdata:** `--dry-run true` on `trade_place` / `trade_modify` / `trade_close`. Defaults are **live** unless you pass dry-run. See [TRADING_SAFETY.md](TRADING_SAFETY.md).
+**In mtdata:** `trade_place`, `trade_modify`, and `trade_close` default to preview mode (`--dry-run true`). Set `--dry-run false` explicitly for live execution. See [TRADING_SAFETY.md](TRADING_SAFETY.md).
 
 ### Trade guardrails
 Optional environment limits: allowed symbols, max volume, max risk % of equity, blocklists, etc. Defense-in-depth so a bad agent or typo cannot empty an account.

@@ -22,7 +22,7 @@ from ...shared.schema import (
     normalize_required_symbol,
     reject_removed_field,
 )
-from ...utils.coercion import coerce_finite_float
+from ...utils.coercion import coerce_finite_float, split_top_level_csv
 from ..output_contract import normalize_output_detail
 
 _INDICATOR_FORMAT_HELP = (
@@ -41,42 +41,7 @@ DATA_FETCH_TICKS_MAX_LIMIT = 10_000
 
 
 def _split_indicator_tokens(spec: str) -> List[str]:
-    text = str(spec or "").strip()
-    if not text:
-        return []
-    parts: List[str] = []
-    current: List[str] = []
-    depth = 0
-    in_quote: Optional[str] = None
-    for ch in text:
-        if in_quote:
-            current.append(ch)
-            if ch == in_quote:
-                in_quote = None
-            continue
-        if ch in ('"', "'"):
-            in_quote = ch
-            current.append(ch)
-            continue
-        if ch in "([{":
-            depth += 1
-            current.append(ch)
-            continue
-        if ch in ")]}":
-            depth = max(0, depth - 1)
-            current.append(ch)
-            continue
-        if ch == "," and depth == 0:
-            token = "".join(current).strip()
-            if token:
-                parts.append(token)
-            current = []
-            continue
-        current.append(ch)
-    token = "".join(current).strip()
-    if token:
-        parts.append(token)
-    return parts
+    return split_top_level_csv(spec)
 
 
 def _looks_like_indicator_token_start(token: str) -> bool:
@@ -408,8 +373,21 @@ class DataFetchCandlesRequest(_DetailNormalizedRequest):
             "returned window has valid indicator values without raising the limit."
         ),
     )
-    start: Optional[str] = None
-    end: Optional[str] = None
+    start: Optional[str] = Field(
+        None,
+        description=(
+            "Inclusive UTC range start parsed by dateparser. An ISO date-only "
+            "value such as 2026-08-05 resolves to 00:00:00 UTC that day."
+        ),
+    )
+    end: Optional[str] = Field(
+        None,
+        description=(
+            "Inclusive UTC range end parsed by dateparser. An ISO date-only "
+            "value such as 2026-08-06 resolves to 23:59:59.999999 UTC; a value "
+            "with a time is treated as that exact instant."
+        ),
+    )
     timestamp_format: Literal["epoch", "iso"] = Field(
         "iso",
         description=(
@@ -441,9 +419,10 @@ class DataFetchCandlesRequest(_DetailNormalizedRequest):
     include_spread: bool = Field(
         False,
         description=(
-            "Append MT5 historical candle spread values. Defaults false because many "
-            "symbols/timeframes return missing or zero historical spread and the extra "
-            "column increases every row."
+            "Request MT5 historical per-bar spread values. When unavailable, returns "
+            "spread_mode=single_reference with one non-historical live/tick reference, "
+            "or spread_mode=unavailable. Defaults false because the per-bar column "
+            "increases every row."
         ),
     )
     include_incomplete: bool = False
@@ -608,104 +587,50 @@ class SlHitEventSpec(_WaitAccountEventBase):
     type: Literal["sl_hit"] = "sl_hit"
 
 
-class PriceChangeEventSpec(BaseModel):
-    type: Literal["price_change"] = "price_change"
+class _WaitMarketStatEventBase(BaseModel):
     symbol: Optional[str] = None
     window: WaitEventWindow = Field(default_factory=WaitEventWindow)
     baseline_window: WaitEventWindow = Field(
         default_factory=lambda: WaitEventWindow(kind="minutes", value=60.0)
     )
+    threshold_mode: Literal["ratio_to_baseline", "zscore"] = "ratio_to_baseline"
+    threshold_value: float = 2.0
+
+    @field_validator("threshold_value")
+    @classmethod
+    def _validate_threshold_value(cls, value: float) -> float:
+        return _validate_positive_threshold(value)
+
+
+class PriceChangeEventSpec(_WaitMarketStatEventBase):
+    type: Literal["price_change"] = "price_change"
     price_source: Literal["auto", "bid", "ask", "mid", "last"] = "auto"
     direction: Literal["up", "down", "either"] = "either"
-    threshold_mode: Literal["fixed_pct", "ratio_to_baseline", "zscore"] = "ratio_to_baseline"
-    threshold_value: float = 2.0
-
-    @field_validator("threshold_value")
-    @classmethod
-    def _validate_threshold_value(cls, value: float) -> float:
-        return _validate_positive_threshold(value)
+    threshold_mode: Literal[
+        "fixed_pct", "ratio_to_baseline", "zscore"
+    ] = "ratio_to_baseline"
 
 
-class VolumeSpikeEventSpec(BaseModel):
+class VolumeSpikeEventSpec(_WaitMarketStatEventBase):
     type: Literal["volume_spike"] = "volume_spike"
-    symbol: Optional[str] = None
-    window: WaitEventWindow = Field(default_factory=WaitEventWindow)
-    baseline_window: WaitEventWindow = Field(
-        default_factory=lambda: WaitEventWindow(kind="minutes", value=60.0)
-    )
     source: Literal["auto", "tick_count", "volume", "volume_real"] = "auto"
-    threshold_mode: Literal["ratio_to_baseline", "zscore"] = "ratio_to_baseline"
-    threshold_value: float = 2.0
-
-    @field_validator("threshold_value")
-    @classmethod
-    def _validate_threshold_value(cls, value: float) -> float:
-        return _validate_positive_threshold(value)
 
 
-class TickCountSpikeEventSpec(BaseModel):
+class TickCountSpikeEventSpec(_WaitMarketStatEventBase):
     type: Literal["tick_count_spike"] = "tick_count_spike"
-    symbol: Optional[str] = None
-    window: WaitEventWindow = Field(default_factory=WaitEventWindow)
-    baseline_window: WaitEventWindow = Field(
-        default_factory=lambda: WaitEventWindow(kind="minutes", value=60.0)
-    )
-    threshold_mode: Literal["ratio_to_baseline", "zscore"] = "ratio_to_baseline"
-    threshold_value: float = 2.0
-
-    @field_validator("threshold_value")
-    @classmethod
-    def _validate_threshold_value(cls, value: float) -> float:
-        return _validate_positive_threshold(value)
 
 
-class SpreadSpikeEventSpec(BaseModel):
+class SpreadSpikeEventSpec(_WaitMarketStatEventBase):
     type: Literal["spread_spike"] = "spread_spike"
-    symbol: Optional[str] = None
-    window: WaitEventWindow = Field(default_factory=WaitEventWindow)
-    baseline_window: WaitEventWindow = Field(
-        default_factory=lambda: WaitEventWindow(kind="minutes", value=60.0)
-    )
-    threshold_mode: Literal["ratio_to_baseline", "zscore"] = "ratio_to_baseline"
-    threshold_value: float = 2.0
-
-    @field_validator("threshold_value")
-    @classmethod
-    def _validate_threshold_value(cls, value: float) -> float:
-        return _validate_positive_threshold(value)
 
 
-class TickCountDroughtEventSpec(BaseModel):
+class TickCountDroughtEventSpec(_WaitMarketStatEventBase):
     type: Literal["tick_count_drought"] = "tick_count_drought"
-    symbol: Optional[str] = None
-    window: WaitEventWindow = Field(default_factory=WaitEventWindow)
-    baseline_window: WaitEventWindow = Field(
-        default_factory=lambda: WaitEventWindow(kind="minutes", value=60.0)
-    )
-    threshold_mode: Literal["ratio_to_baseline", "zscore"] = "ratio_to_baseline"
     threshold_value: float = 0.5
 
-    @field_validator("threshold_value")
-    @classmethod
-    def _validate_threshold_value(cls, value: float) -> float:
-        return _validate_positive_threshold(value)
-
-
-class RangeExpansionEventSpec(BaseModel):
+class RangeExpansionEventSpec(_WaitMarketStatEventBase):
     type: Literal["range_expansion"] = "range_expansion"
-    symbol: Optional[str] = None
-    window: WaitEventWindow = Field(default_factory=WaitEventWindow)
-    baseline_window: WaitEventWindow = Field(
-        default_factory=lambda: WaitEventWindow(kind="minutes", value=60.0)
-    )
     price_source: Literal["auto", "bid", "ask", "mid", "last"] = "auto"
-    threshold_mode: Literal["ratio_to_baseline", "zscore"] = "ratio_to_baseline"
-    threshold_value: float = 2.0
-
-    @field_validator("threshold_value")
-    @classmethod
-    def _validate_threshold_value(cls, value: float) -> float:
-        return _validate_positive_threshold(value)
 
 
 class PriceTouchLevelEventSpec(BaseModel):

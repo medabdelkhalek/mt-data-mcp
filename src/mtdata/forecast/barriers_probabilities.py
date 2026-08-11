@@ -1,5 +1,4 @@
 import traceback
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
@@ -10,7 +9,7 @@ from ..shared.validators import unsupported_timeframe_seconds_error
 from ..utils.barriers import (
     barrier_prices_are_valid as _barrier_prices_are_valid,
 )
-from ..utils.barriers import get_tick_size as _get_pip_size
+from ..utils.barriers import get_tick_size as _get_tick_size
 from ..utils.barriers import (
     normalize_same_bar_policy,
     normalize_trade_direction,
@@ -20,24 +19,17 @@ from ..utils.barriers import (
 from ..utils.barriers import (
     resolve_barrier_prices as _resolve_barrier_prices,
 )
-from ..utils.freshness import (
-    closed_session_context,
-    format_age_seconds,
-    format_freshness_label,
-)
-from ..utils.market_metadata import build_tick_freshness_context
-from ..utils.time import (
-    _format_time_minimal,
-    _format_time_minimal_local,
-    _use_client_tz,
-)
 from ..utils.utils import parse_kv_or_json as _parse_kv_or_json
 from .barriers_shared import (
+    BROWNIAN_BRIDGE_DUAL_BARRIER_MODEL,
+    BROWNIAN_BRIDGE_DUAL_BARRIER_WARNING,
     _auto_barrier_method,
     _binomial_se,
     _binomial_wilson_95,
     _brownian_bridge_hits,
     _get_live_reference_price,
+    _history_freshness_context,
+    _live_reference_time_context,
     _resolve_reference_prices,
     _scale_price_paths_to_reference,
     _stable_barrier_seed,
@@ -56,144 +48,6 @@ from .monte_carlo import simulate_gbm_mc as _simulate_gbm_mc
 from .monte_carlo import simulate_heston_mc as _simulate_heston_mc
 from .monte_carlo import simulate_hmm_mc as _simulate_hmm_mc
 from .monte_carlo import simulate_jump_diffusion_mc as _simulate_jump_diffusion_mc
-
-
-def _format_barrier_epoch(epoch: float) -> str:
-    formatter = _format_time_minimal_local if _use_client_tz() else _format_time_minimal
-    return formatter(float(epoch))
-
-
-def _coerce_epoch(value: Any) -> Optional[float]:
-    try:
-        epoch = float(value)
-    except Exception:
-        return None
-    if not np.isfinite(epoch) or epoch <= 0.0:
-        return None
-    if epoch > 10_000_000_000:
-        epoch /= 1000.0
-    return epoch
-
-
-def _history_freshness_context(
-    df: Any,
-    timeframe: str,
-    *,
-    symbol: Optional[str] = None,
-    now_epoch: Optional[float] = None,
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"history_bars_used": int(len(df))}
-    try:
-        last_epoch = _coerce_epoch(df["time"].iloc[-1])
-    except Exception:
-        last_epoch = None
-    if last_epoch is None:
-        return out
-
-    if now_epoch is None:
-        now_epoch = datetime.now(timezone.utc).timestamp()
-    timeframe_seconds = max(1, int(TIMEFRAME_SECONDS.get(timeframe, 0) or 0))
-    completed_bar_end = last_epoch + timeframe_seconds
-    age_seconds = max(0, int(round(now_epoch - completed_bar_end)))
-    stale_after = timeframe_seconds
-    data_stale = age_seconds > stale_after if stale_after > 0 else None
-    age_text = format_age_seconds(age_seconds)
-    out.update(
-        {
-            "history_last_bar_open": _format_barrier_epoch(last_epoch),
-            "history_last_bar_open_epoch": float(last_epoch),
-            "data_as_of": _format_barrier_epoch(completed_bar_end),
-            "data_as_of_epoch": float(completed_bar_end),
-            "data_freshness_seconds": age_seconds,
-            "data_stale": data_stale,
-            "stale_after_seconds": stale_after,
-            "freshness_basis": "last_completed_bar_end",
-            "input_bar_policy": "closed_bars_only",
-        }
-    )
-    closed_session = closed_session_context(
-        symbol,
-        now_epoch=now_epoch,
-        item="data",
-        data_age_seconds=age_seconds,
-    )
-    if closed_session:
-        out.update(closed_session)
-    history_policy_ok = not bool(out.get("data_stale")) and not bool(closed_session)
-    out["history_policy_ok"] = history_policy_ok
-    freshness = format_freshness_label(
-        data_stale=out.get("data_stale"),
-        market_status=(
-            out.get("market_status")
-            if out.get("freshness_policy_relaxed") is not False
-            else None
-        ),
-        market_status_reason=(
-            out.get("market_status_reason")
-            if out.get("freshness_policy_relaxed") is not False
-            else None
-        ),
-        age_seconds=age_seconds,
-        age_text=age_text,
-        item="data",
-    )
-    if freshness:
-        out["freshness"] = freshness
-    return out
-
-
-def _live_reference_time_context(
-    symbol: str,
-    timeframe: str,
-    *,
-    now_epoch: Optional[float] = None,
-) -> Dict[str, Any]:
-    try:
-        from ..utils.mt5 import mt5 as _mt5
-    except Exception:
-        return {}
-    try:
-        tick = _mt5.symbol_info_tick(symbol)
-    except Exception:
-        tick = None
-    if tick is None:
-        return {}
-
-    epoch = _coerce_epoch(getattr(tick, "time_msc", None))
-    if epoch is None:
-        epoch = _coerce_epoch(getattr(tick, "time", None))
-    if epoch is None:
-        return {}
-
-    if now_epoch is None:
-        now_epoch = datetime.now(timezone.utc).timestamp()
-    freshness = build_tick_freshness_context(
-        symbol,
-        tick_epoch=epoch,
-        now_epoch=now_epoch,
-        item="reference price",
-        age_rounder=lambda value: max(0, int(round(value))),
-    )
-    age_seconds = freshness.get("data_age_seconds")
-    out = {
-        "reference_price_time": _format_barrier_epoch(epoch),
-        "reference_price_time_epoch": float(epoch),
-        "reference_price_age_seconds": age_seconds,
-        "reference_price_age": format_age_seconds(age_seconds),
-        "reference_price_stale": freshness.get("data_stale"),
-        "reference_freshness_state": freshness.get("freshness_state"),
-        "reference_live_max_age_seconds": freshness.get("live_max_age_seconds"),
-        "reference_usable_for_live": freshness.get("usable_for_live_trading"),
-    }
-    for key in (
-        "market_status",
-        "market_status_reason",
-        "market_status_source",
-        "freshness_policy_relaxed",
-    ):
-        if freshness.get(key) is not None:
-            out[key] = freshness[key]
-    return out
 
 
 def _abs_barrier_side_error(
@@ -325,7 +179,7 @@ def forecast_barrier_hit_probabilities(  # noqa: C901
             return {"error": price_error}
         if price_warning:
             warnings_out.append(price_warning)
-        pip_size = _get_pip_size(symbol)
+        tick_size = _get_tick_size(symbol)
 
         abs_side_error = _abs_barrier_side_error(
             price=last_price, direction=direction_norm, tp_abs=tp_abs, sl_abs=sl_abs
@@ -344,7 +198,7 @@ def forecast_barrier_hit_probabilities(  # noqa: C901
             sl_pct=barrier_values.get("sl_pct"),
             tp_ticks=barrier_values.get("tp_ticks"),
             sl_ticks=barrier_values.get("sl_ticks"),
-            pip_size=pip_size,
+            tick_size=tick_size,
         )
 
         if tp_price is None or sl_price is None:
@@ -390,6 +244,9 @@ def forecast_barrier_hit_probabilities(  # noqa: C901
         bb_enabled = method_key == 'mc_gbm_bb'
         seed_raw = p.get('seed')
         seed_provided = seed_raw is not None
+        # Live reference prices change the barrier geometry, not the stochastic
+        # path generator. Keep common random draws across tick-only changes so
+        # nearby barrier results are directly comparable.
         request_seed_base = (
             normalize_barrier_seed(seed_raw)
             if seed_provided
@@ -400,9 +257,6 @@ def forecast_barrier_hit_probabilities(  # noqa: C901
                 horizon_val,
                 method_key,
                 direction_norm,
-                float(last_price),
-                float(tp_price),
-                float(sl_price),
                 int(sims),
                 int(len(prices)),
                 float(prices[-1]),
@@ -691,6 +545,9 @@ def forecast_barrier_hit_probabilities(  # noqa: C901
                 out["auto_reason"] = auto_reason
         if bb_enabled:
             out["bridge_correction"] = True
+            out["bridge_dual_barrier_model"] = BROWNIAN_BRIDGE_DUAL_BARRIER_MODEL
+            out["bridge_joint_first_passage"] = False
+            warnings_out.append(BROWNIAN_BRIDGE_DUAL_BARRIER_WARNING)
         else:
             warnings_out.append(
                 "Barrier hits are evaluated at simulated bar closes; transient "
@@ -764,14 +621,23 @@ def forecast_barrier_closed_form(
             symbol=symbol,
         )
         base_col = 'close'
+        denoise_applied = False
+        denoise_error: Optional[str] = None
         if denoise:
             try:
                 from ..utils.denoise import apply_denoise as apply_denoise_util
                 added = apply_denoise_util(df, denoise, default_when='pre_ti')
                 if f"{base_col}_dn" in added:
                     base_col = f"{base_col}_dn"
-            except Exception:
-                pass
+                last_application = df.attrs.get("denoise_last_application")
+                overwritten = (
+                    list(last_application.get("overwrote_columns") or [])
+                    if isinstance(last_application, dict)
+                    else []
+                )
+                denoise_applied = bool(added or overwritten)
+            except Exception as exc:
+                denoise_error = str(exc)
         prices = np.asarray(df[base_col].astype(float).to_numpy(), dtype=float)
         prices = prices[np.isfinite(prices)]
         if prices.size < 5:
@@ -828,6 +694,21 @@ def forecast_barrier_closed_form(
             "prob_hit": float(prob),
         }
         result.update(freshness_context)
+        if denoise:
+            result["denoise_applied"] = denoise_applied
+            result["denoise_status"] = (
+                "applied"
+                if denoise_applied
+                else "failed"
+                if denoise_error is not None
+                else "skipped"
+            )
+            if denoise_error is not None:
+                result["denoise_error"] = denoise_error
+                result["warnings"] = [
+                    "Denoise request failed; using raw close prices instead: "
+                    f"{denoise_error}"
+                ]
         if freshness_context.get("data_as_of"):
             result["reference_price_time"] = freshness_context.get("data_as_of")
             result["reference_price_time_epoch"] = freshness_context.get("data_as_of_epoch")

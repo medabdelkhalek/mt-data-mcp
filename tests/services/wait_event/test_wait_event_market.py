@@ -29,6 +29,67 @@ class FakeClock:
         self.current = self.current + timedelta(seconds=float(seconds))
 
 
+@pytest.mark.parametrize(
+    ("event_type", "expected_threshold"),
+    [
+        ("price_change", 2.0),
+        ("volume_spike", 2.0),
+        ("tick_count_spike", 2.0),
+        ("spread_spike", 2.0),
+        ("tick_count_drought", 0.5),
+        ("range_expansion", 2.0),
+    ],
+)
+def test_market_stat_event_specs_share_defaults_and_validation(
+    event_type: str, expected_threshold: float
+) -> None:
+    request = WaitEventRequest(
+        watch_for=[{"type": event_type, "symbol": "EURUSD"}]
+    )
+
+    spec = request.watch_for[0]
+    assert spec.window.kind == "minutes"
+    assert spec.baseline_window.kind == "minutes"
+    assert spec.baseline_window.value == 60.0
+    assert spec.threshold_mode == "ratio_to_baseline"
+    assert spec.threshold_value == expected_threshold
+
+    with pytest.raises(ValidationError, match="threshold_value must be greater than 0"):
+        WaitEventRequest(
+            watch_for=[
+                {
+                    "type": event_type,
+                    "symbol": "EURUSD",
+                    "threshold_value": 0,
+                }
+            ]
+        )
+
+
+def test_only_price_change_accepts_fixed_pct_threshold_mode() -> None:
+    request = WaitEventRequest(
+        watch_for=[
+            {
+                "type": "price_change",
+                "symbol": "EURUSD",
+                "threshold_mode": "fixed_pct",
+            }
+        ]
+    )
+    assert request.watch_for[0].threshold_mode == "fixed_pct"
+
+    with pytest.raises(ValidationError):
+        WaitEventRequest(
+            watch_for=[
+                {
+                    "type": "volume_spike",
+                    "symbol": "EURUSD",
+                    "threshold_mode": "fixed_pct",
+                }
+            ]
+        )
+
+
 def test_price_touch_scans_transient_crossing_inside_poll_batch() -> None:
     spec = {
         "type": "price_touch_level",
@@ -215,6 +276,7 @@ class DisconnectingGateway(SequenceGateway):
 
 def test_support_resistance_watchers_use_compact_levels(monkeypatch) -> None:
     captured: dict[str, object] = {}
+    monkeypatch.setattr(core_data, "_default_level_price_source", lambda symbol: "bid")
 
     monkeypatch.setattr(
         core_data,
@@ -238,14 +300,15 @@ def test_support_resistance_watchers_use_compact_levels(monkeypatch) -> None:
     watchers = core_data._support_resistance_watchers(symbol="BTCUSD")
 
     assert watchers == [
-        {"type": "price_touch_level", "symbol": "BTCUSD", "level": 99.5, "direction": "either"},
-        {"type": "price_break_level", "symbol": "BTCUSD", "level": 99.5, "direction": "down"},
-        {"type": "price_touch_level", "symbol": "BTCUSD", "level": 101.0, "direction": "either"},
-        {"type": "price_break_level", "symbol": "BTCUSD", "level": 101.0, "direction": "up"},
+        {"type": "price_touch_level", "symbol": "BTCUSD", "level": 99.5, "direction": "either", "price_source": "bid"},
+        {"type": "price_break_level", "symbol": "BTCUSD", "level": 99.5, "direction": "down", "price_source": "bid"},
+        {"type": "price_touch_level", "symbol": "BTCUSD", "level": 101.0, "direction": "either", "price_source": "bid"},
+        {"type": "price_break_level", "symbol": "BTCUSD", "level": 101.0, "direction": "up", "price_source": "bid"},
     ]
     assert captured == {"symbol": "BTCUSD", "timeframe": "auto", "detail": "compact"}
 
 def test_support_resistance_watchers_ignore_non_finite_levels(monkeypatch) -> None:
+    monkeypatch.setattr(core_data, "_default_level_price_source", lambda symbol: "bid")
     monkeypatch.setattr(
         core_data,
         "support_resistance_levels",
@@ -261,30 +324,52 @@ def test_support_resistance_watchers_ignore_non_finite_levels(monkeypatch) -> No
     watchers = core_data._support_resistance_watchers(symbol="BTCUSD")
 
     assert watchers == [
-        {"type": "price_touch_level", "symbol": "BTCUSD", "level": 101.0, "direction": "either"},
-        {"type": "price_break_level", "symbol": "BTCUSD", "level": 101.0, "direction": "up"},
+        {"type": "price_touch_level", "symbol": "BTCUSD", "level": 101.0, "direction": "either", "price_source": "bid"},
+        {"type": "price_break_level", "symbol": "BTCUSD", "level": 101.0, "direction": "up", "price_source": "bid"},
     ]
 
 def test_pivot_zone_watchers_use_adjacent_pivot_bands(monkeypatch) -> None:
-    monkeypatch.setattr(
-        core_data,
-        "pivot_compute_points",
-        lambda symbol, timeframe="D1": {
+    captured = {}
+    monkeypatch.setattr(core_data, "_default_level_price_source", lambda symbol: "last")
+
+    def fake_pivots(symbol, timeframe="D1", detail="compact"):
+        captured.update(symbol=symbol, timeframe=timeframe, detail=detail)
+        return {
             "success": True,
             "levels": [
                 {"level": "S1", "traditional": 99.0, "fibonacci": 99.0},
                 {"level": "PP", "traditional": 100.0, "fibonacci": 100.0},
                 {"level": "R1", "traditional": 101.0, "fibonacci": 101.0},
             ],
-        },
+        }
+
+    monkeypatch.setattr(
+        core_data,
+        "pivot_compute_points",
+        fake_pivots,
     )
 
     watchers = core_data._pivot_zone_watchers(symbol="BTCUSD", timeframe="M15")
 
     assert watchers == [
-        {"type": "price_enter_zone", "symbol": "BTCUSD", "lower": 99.0, "upper": 100.0, "direction": "either"},
-        {"type": "price_enter_zone", "symbol": "BTCUSD", "lower": 100.0, "upper": 101.0, "direction": "either"},
+        {"type": "price_enter_zone", "symbol": "BTCUSD", "lower": 99.0, "upper": 100.0, "direction": "either", "price_source": "last"},
+        {"type": "price_enter_zone", "symbol": "BTCUSD", "lower": 100.0, "upper": 101.0, "direction": "either", "price_source": "last"},
     ]
+    assert captured == {"symbol": "BTCUSD", "timeframe": "D1", "detail": "standard"}
+
+
+@pytest.mark.parametrize(
+    ("chart_mode", "expected"),
+    [(0, "bid"), (1, "last"), (None, "auto")],
+)
+def test_default_level_price_source_uses_chart_mode(monkeypatch, chart_mode, expected) -> None:
+    monkeypatch.setattr(
+        core_data,
+        "get_symbol_info_cached",
+        lambda symbol: SimpleNamespace(chart_mode=chart_mode),
+    )
+
+    assert core_data._default_level_price_source("BTCUSD") == expected
 
 def test_run_wait_event_matches_adaptive_price_change() -> None:
     clock = FakeClock(datetime(2026, 3, 15, 12, 0, 0, tzinfo=timezone.utc))
@@ -963,7 +1048,7 @@ def test_snapshot_quote_updates_do_not_repeat_trade_volume() -> None:
     from mtdata.core.data.wait_events import _volume_metric_for_ticks
 
     ticks = [
-        {"volume": 8.0, "volume_real": 8.0, "flags": 1032},
+        {"volume": 8.0, "volume_real": 8.0, "flags": 8},
         {"volume": 8.0, "volume_real": 8.0, "flags": 6},
         {"volume": 8.0, "volume_real": 8.0, "flags": 6},
     ]

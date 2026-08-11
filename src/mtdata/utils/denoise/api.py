@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+
+class DenoiseCausalityError(ValueError):
+    """Raised when a zero-phase-only method lacks explicit user consent."""
+
+    def __init__(self, method: str) -> None:
+        self.method = str(method)
+        super().__init__(
+            f"Denoise method '{self.method}' is non-causal and requires the "
+            "explicit opt-in causality='zero_phase'."
+        )
+
 # Import optional dependencies for availability checking
 try:
     import pywt as _pywt
@@ -88,7 +99,7 @@ _DENOISE_METHOD_DEFAULT_PARAMS: Dict[str, Dict[str, Any]] = {
     "median": {"window": 7},
     "lowpass_fft": {"cutoff_ratio": 0.1},
     "butterworth": {"cutoff": 0.1, "order": 4, "btype": "low", "padlen": None},
-    "hp": {"lamb": 1600.0},
+    "hp": {"lamb": 100.0},
     "savgol": {"window": 11, "polyorder": 2, "mode": "interp"},
     "tv": {"weight": "auto", "n_iter": 50, "tol": 1e-4},
     "kalman": {"process_var": "auto", "measurement_var": "auto", "initial_state": None, "initial_cov": None},
@@ -248,7 +259,7 @@ def _supported_denoise_causality(method: str) -> List[str]:
 
 
 def _normalize_denoise_causality(method: str, causality: str) -> str:
-    normalized = str(causality or "zero_phase").strip().lower() or "zero_phase"
+    normalized = str(causality or "causal").strip().lower() or "causal"
     supported = _supported_denoise_causality(method)
     if normalized not in supported:
         supported_txt = ", ".join(supported)
@@ -308,9 +319,9 @@ def denoise_series(
     s: pd.Series,
     method: str = 'none',
     params: Optional[Dict[str, Any]] = None,
-    causality: str = 'zero_phase',
+    causality: str = 'causal',
 ) -> pd.Series:
-    """Apply denoising to a single series."""
+    """Apply denoising to a single series without look-ahead by default."""
     if params is None:
         params = {}
     method = (method or 'none').lower().strip()
@@ -322,6 +333,52 @@ def denoise_series(
     if n < 3:
         return s
     return _run_denoise_handler(s, handler, params, causality)
+
+
+def _repair_denoised_ohlc_geometry(
+    df: pd.DataFrame,
+    *,
+    added_columns: List[str],
+    overwritten_columns: List[str],
+    suffix: str,
+) -> int:
+    """Restore candle inequalities after independently filtering OHLC columns."""
+    ohlc = ("open", "high", "low", "close")
+    if any(column in overwritten_columns for column in ohlc):
+        columns = {name: name for name in ohlc}
+    else:
+        columns = {name: f"{name}{suffix}" for name in ohlc}
+        if not all(column in added_columns for column in columns.values()):
+            return 0
+    if not all(column in df.columns for column in columns.values()):
+        return 0
+
+    values = pd.DataFrame(
+        {
+            name: pd.to_numeric(df[column], errors="coerce")
+            for name, column in columns.items()
+        },
+        index=df.index,
+    )
+    repaired_high = values.max(axis=1, skipna=True)
+    repaired_low = values.min(axis=1, skipna=True)
+    current_high = values["high"].to_numpy(dtype=float)
+    current_low = values["low"].to_numpy(dtype=float)
+    next_high = repaired_high.to_numpy(dtype=float)
+    next_low = repaired_low.to_numpy(dtype=float)
+    changed = ~(
+        np.isclose(current_high, next_high, equal_nan=True)
+        & np.isclose(current_low, next_low, equal_nan=True)
+    )
+    repaired_count = int(np.count_nonzero(changed))
+    if repaired_count <= 0:
+        return 0
+
+    high_column = columns["high"]
+    low_column = columns["low"]
+    df[high_column] = repaired_high.where(repaired_high.notna(), df[high_column])
+    df[low_column] = repaired_low.where(repaired_low.notna(), df[low_column])
+    return repaired_count
 
 
 def apply_denoise(
@@ -371,17 +428,10 @@ def apply_denoise(
     causality = str(spec.get('causality') or 'causal')
     keep_original = bool(spec.get('keep_original')) if 'keep_original' in spec else (when != 'pre_ti')
     suffix = str(spec.get('suffix') or '_dn')
-    try:
-        handler = _resolve_denoise_handler(method)
-    except Exception as ex:
-        _append_denoise_warning(df, str(ex))
-        return added_cols
-    try:
-        causality = _normalize_denoise_causality(method, causality)
-    except Exception as ex:
-        _append_denoise_warning(df, str(ex))
-        return added_cols
+    handler = _resolve_denoise_handler(method)
+    causality = _normalize_denoise_causality(method, causality)
 
+    attempted_columns = 0
     for col in cols:
         if col not in df.columns:
             _append_denoise_warning(
@@ -389,6 +439,7 @@ def apply_denoise(
                 f"Denoise skipped missing column '{col}'.",
             )
             continue
+        attempted_columns += 1
         try:
             y = _run_denoise_handler(df[col], handler, params, causality)
         except Exception as ex:
@@ -439,6 +490,26 @@ def apply_denoise(
         else:
             df[col] = y
             overwritten_cols.append(str(col))
+    if attempted_columns and not added_cols and not overwritten_cols:
+        warnings_out = df.attrs.get("denoise_warnings")
+        reason = (
+            str(warnings_out[-1])
+            if isinstance(warnings_out, list) and warnings_out
+            else f"Denoise method '{method}' did not produce any output."
+        )
+        raise ValueError(reason)
+    repaired_count = _repair_denoised_ohlc_geometry(
+        df,
+        added_columns=added_cols,
+        overwritten_columns=overwritten_cols,
+        suffix=suffix,
+    )
+    if repaired_count:
+        df.attrs["denoise_last_application"]["ohlc_geometry_repaired"] = repaired_count
+        _append_denoise_warning(
+            df,
+            f"Repaired OHLC geometry on {repaired_count} denoised candle rows.",
+        )
     return added_cols
 
 
@@ -468,7 +539,35 @@ def _denoise_base_defaults(default_when: str = "pre_ti") -> Dict[str, Any]:
     """Get base defaults for denoise spec."""
     base = deepcopy(_DENOISE_BASE_DEFAULTS)
     base["when"] = default_when
+    base["keep_original"] = default_when != "pre_ti"
     return base
+
+
+def _normalize_denoise_param_aliases(
+    method: str,
+    values: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Map the public ``lambda`` spelling to each filter's implementation key."""
+    out = dict(values)
+    if "lambda" not in out:
+        return out
+    target = {
+        "hp": "lamb",
+        "l1_trend": "lamb",
+        "whittaker": "lamb",
+        "tv": "weight",
+        "rls": "lambda_",
+    }.get(method)
+    if target is not None:
+        out[target] = out.pop("lambda")
+    return out
+
+
+def _default_denoise_causality(method: str) -> str:
+    supported = _supported_denoise_causality(method)
+    if "causal" in supported:
+        return "causal"
+    raise DenoiseCausalityError(method)
 
 
 def normalize_denoise_spec(spec: Any, default_when: str = 'pre_ti') -> Optional[Dict[str, Any]]:
@@ -495,13 +594,17 @@ def normalize_denoise_spec(spec: Any, default_when: str = 'pre_ti') -> Optional[
         )
         method = str(out.get('method') or 'none').strip().lower()
         if "causality" not in spec:
-            supported = _supported_denoise_causality(method)
-            out["causality"] = "causal" if "causal" in supported else supported[0]
+            out["causality"] = _default_denoise_causality(method)
+        else:
+            out["causality"] = _normalize_denoise_causality(
+                method,
+                str(out.get("causality") or "causal"),
+            )
         params = deepcopy(_DENOISE_METHOD_DEFAULT_PARAMS.get(method, {}))
-        params.update(top_level_params)
+        params.update(_normalize_denoise_param_aliases(method, top_level_params))
         supplied_params = out.get('params')
         if isinstance(supplied_params, dict):
-            params.update(supplied_params)
+            params.update(_normalize_denoise_param_aliases(method, supplied_params))
         out['method'] = method
         out['params'] = params
         cols = out.get('columns')
@@ -519,8 +622,7 @@ def normalize_denoise_spec(spec: Any, default_when: str = 'pre_ti') -> Optional[
     params = deepcopy(_DENOISE_METHOD_DEFAULT_PARAMS.get(method, {}))
     out = dict(base)
     out.update({"method": method, "params": params})
-    supported = _supported_denoise_causality(method)
-    out["causality"] = "causal" if "causal" in supported else supported[0]
+    out["causality"] = _default_denoise_causality(method)
     return out
 
 
@@ -568,6 +670,7 @@ def get_denoise_methods_data() -> Dict[str, Any]:
             "params": [],
             "supports": {"causality": _supported_denoise_causality("none")},
             "supports_causal": True,
+            "requires_causality_opt_in": False,
             "has_auto_params": False,
             "defaults": base_defaults,
         }
@@ -593,6 +696,7 @@ def get_denoise_methods_data() -> Dict[str, Any]:
             "params": _param_defs(default_params),
             "supports": {"causality": _supported_denoise_causality(method_name)},
             "supports_causal": "causal" in _supported_denoise_causality(method_name),
+            "requires_causality_opt_in": "causal" not in supported_causality,
             "has_auto_params": any(_has_auto_param(value) for value in default_params.values()),
             "defaults": method_defaults,
         })
@@ -609,6 +713,7 @@ def denoise_list_methods() -> Dict[str, Any]:
 
 
 __all__ = [
+    "DenoiseCausalityError",
     "denoise_series",
     "apply_denoise",
     "consume_denoise_warnings",

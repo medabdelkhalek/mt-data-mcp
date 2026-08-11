@@ -43,8 +43,8 @@ pipeline with its preset parameters.
 `minimal` is the quick path. The other templates may perform several MT5
 fetches and invoke pivots, patterns, backtests, barriers, or regime checks.
 Runtime and dependency requirements therefore vary by template. Section
-filters are applied to the completed report, so they reduce output size rather
-than computation.
+controls select the sections to execute and return, while internal
+dependencies may still run when a requested section requires them.
 
 ## Control template, scope, and output
 
@@ -88,10 +88,18 @@ template descriptions.
 
 Full reports contain a `sections` mapping plus summary and status information.
 Section names depend on the template and may include context, forecast,
-backtest, volatility, pivots, patterns, barriers, regimes, or multi-timeframe
+backtest, volatility, pivot, patterns, barriers, regime, or multi-timeframe
 variants. Check the report-level and per-section status before consuming a
 value: a successful report envelope can still describe omitted or partial
 sections.
+
+`section_run_status` reports whether scheduled sections completed (`complete`,
+`partial`, or `failed`). `content_detail` separately reports how much content
+was returned (`summary_only`, `selected_sections`, or `full_sections`). Compact
+responses are therefore explicitly `content_detail: summary_only` even when all
+scheduled sections ran successfully. Context trend windows are calculated from
+consecutive source-timeframe candles; unavailable long windows are `null`
+rather than silently shortened.
 
 For automation, prefer `--json` and follow the stable envelope rules in
 [OUTPUT.md](OUTPUT.md). Do not parse the human-oriented TOON rendering.

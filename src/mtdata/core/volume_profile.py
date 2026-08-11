@@ -19,7 +19,12 @@ from ..utils.utils import (
     _parse_start_datetime,
     _positive_float_attr,
 )
-from ..utils.volume_profile import VolumeProfileConfig, compute_volume_profile
+from ..utils.volume_profile import (
+    VolumeProfileConfig,
+    VolumeProfilePriceSourceLiteral,
+    VolumeProfileVolumeSourceLiteral,
+    compute_volume_profile,
+)
 from ._mcp_instance import mcp
 from .execution_logging import run_logged_operation
 from .mt5_gateway import create_mt5_gateway
@@ -28,15 +33,6 @@ from .output_contract import normalize_output_extras
 logger = logging.getLogger(__name__)
 
 VolumeProfileSourceLiteral = Literal["auto", "ticks", "m1_bars"]
-VolumeProfilePriceSourceLiteral = Literal["mid", "last", "bid", "ask"]
-VolumeProfileVolumeSourceLiteral = Literal[
-    "auto",
-    "real_volume",
-    "tick_volume",
-    "volume_real",
-    "volume",
-    "tick_count",
-]
 
 _DEFAULT_MAX_TICK_WINDOW_DAYS = 1
 _DEFAULT_MAX_TICKS = 50_000
@@ -661,6 +657,12 @@ def compute_volume_profile_payload(
     if profile["diagnostics"].get("tick_limit_reached") is True:
         profile["truncated"] = True
         profile["truncation_reason"] = "max_ticks"
+        profile["volume_profile_accuracy"] = "tick_truncated"
+        profile["volume_source_quality"] = "partial_raw_ticks"
+        profile["source_note"] = (
+            "Prices and volumes come from raw ticks, but max_ticks truncated the "
+            "requested window; POC and value-area levels describe only the retained sample."
+        )
         tick_rows = int(profile["diagnostics"].get("tick_rows") or 0)
         max_ticks_value = int(profile["diagnostics"].get("requested_max_ticks") or tick_rows)
         profile["data_quality"] = {

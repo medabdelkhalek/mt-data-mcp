@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hmac
 import os
-import warnings
 from dataclasses import dataclass
 from ipaddress import ip_address
 from typing import Any, Literal, Optional
@@ -53,14 +52,11 @@ def _require_explicit_remote_bind(host: str, *, allow_remote: bool, host_env: st
     normalized = str(host or "").strip() or "127.0.0.1"
     if is_loopback_host(normalized) or allow_remote:
         return normalized
-    warnings.warn(
-        f"{host_env}={normalized!r} is a non-loopback bind. "
-        f"Set {allow_remote_env}=1 to suppress this warning. "
-        f"For local-only startup, set {host_env}=127.0.0.1.",
-        RuntimeWarning,
-        stacklevel=3,
+    raise ValueError(
+        f"{host_env}={normalized!r} is a non-loopback bind and requires "
+        f"{allow_remote_env}=1. For local-only startup, set "
+        f"{host_env}=127.0.0.1."
     )
-    return normalized
 
 
 def _validate_cors_origins(origins: tuple[str, ...]) -> tuple[str, ...]:
@@ -82,6 +78,8 @@ class McpRuntimeSettings:
     message_path: str = "/message"
     allow_remote: bool = False
     auth_token: Optional[str] = None
+    allowed_hosts: tuple[str, ...] = ()
+    allowed_origins: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -116,6 +114,18 @@ def load_mcp_runtime_settings(
             "MCP_AUTH_TOKEN is required for non-loopback FASTMCP_HOST values "
             "(SSE/streamable-HTTP expose trading tools)."
         )
+    allowed_hosts = _get_csv_env("MCP_ALLOWED_HOSTS", ())
+    allowed_origins = _get_csv_env("MCP_ALLOWED_ORIGINS", ())
+    if transport != "stdio" and not is_loopback_host(host):
+        if host in {"0.0.0.0", "::"} and not allowed_hosts:
+            raise ValueError(
+                "MCP_ALLOWED_HOSTS must list the externally used hostnames or "
+                "IP addresses when FASTMCP_HOST is a wildcard bind."
+            )
+        if not allowed_hosts:
+            allowed_hosts = (f"{host}:*",)
+        if not allowed_origins and host not in {"0.0.0.0", "::"}:
+            allowed_origins = (f"http://{host}:*", f"https://{host}:*")
     return McpRuntimeSettings(
         transport=transport,
         host=host,
@@ -126,6 +136,8 @@ def load_mcp_runtime_settings(
         message_path=(os.getenv("FASTMCP_MESSAGE_PATH", "/message").strip() or "/message"),
         allow_remote=allow_remote,
         auth_token=auth_token,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
     )
 
 
@@ -165,8 +177,18 @@ def apply_mcp_runtime_settings(mcp: Any, settings: McpRuntimeSettings) -> None:
     runtime.port = settings.port
     runtime.log_level = settings.log_level
     runtime.mount_path = settings.mount_path
+    if settings.transport == "streamable-http":
+        runtime.streamable_http_path = settings.mount_path
     runtime.sse_path = settings.sse_path
     runtime.message_path = settings.message_path
+    if settings.allow_remote and settings.transport != "stdio":
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        runtime.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=list(settings.allowed_hosts),
+            allowed_origins=list(settings.allowed_origins),
+        )
     if settings.auth_token and settings.transport != "stdio":
         _install_mcp_bearer_auth(mcp, settings.auth_token)
 
@@ -240,4 +262,4 @@ def _install_mcp_bearer_auth(mcp: Any, token: str) -> None:
             wrapped += 1
     if wrapped == 0:
         raise RuntimeError("FastMCP exposes no HTTP app factory to protect.")
-    setattr(mcp, "_mtdata_auth_installed", True)
+    mcp._mtdata_auth_installed = True

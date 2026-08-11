@@ -1,4 +1,4 @@
-"""Causal signal discovery tools."""
+"""Predictive lead/lag discovery tools."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import math
 import time
 import warnings
 from datetime import datetime, timezone
+from statistics import NormalDist
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -29,11 +30,12 @@ from ..utils.symbol import (
 from ..utils.symbol import (
     _normalize_group_path_query,
 )
+from ..utils.time import bar_close_epoch
 from ..utils.utils import _parse_end_datetime, _parse_start_datetime
 from ._mcp_instance import mcp
 from .execution_logging import run_logged_operation
 from .mt5_gateway import create_mt5_gateway, mt5_connection_error
-from .output_contract import normalize_output_verbosity_detail
+from .output_contract import build_pagination_meta, normalize_output_verbosity_detail
 
 logger = logging.getLogger(__name__)
 
@@ -436,13 +438,12 @@ def _fetch_series(
                 (name for name, value in TIMEFRAME_MAP.items() if value == timeframe),
                 "",
             )
-        bar_seconds = int(TIMEFRAME_SECONDS.get(timeframe_name, 0) or 0)
         forming_trimmed = False
         last_is_forming = False
-        if bar_seconds > 0 and not df.empty:
+        if timeframe_name in TIMEFRAME_SECONDS and not df.empty:
             last_open_epoch = float(df.iloc[-1]["time"])
             now_epoch = datetime.now(timezone.utc).timestamp()
-            last_is_forming = last_open_epoch + bar_seconds > now_epoch
+            last_is_forming = bar_close_epoch(last_open_epoch, timeframe_name) > now_epoch
             if not include_incomplete and last_is_forming:
                 df = df.iloc[:-1]
                 forming_trimmed = True
@@ -522,24 +523,31 @@ def _bar_completion_context(
 
 def _transform_frame(frame: pd.DataFrame, transform: str) -> pd.DataFrame:
     transform = transform.strip().lower()
-    if transform in ("log_return", "logret", "log-returns"):
-        # log return r_t = ln(p_t) - ln(p_{t-1})
-        clean = frame.astype(float).where(frame > 0)
-        clean = clean.mask(clean <= 0)
-        log_prices = np.log(clean)
-        log_prices = log_prices.replace([np.inf, -np.inf], np.nan)
-        frame = log_prices.diff()
-    elif transform in ("log_level", "log", "log-price", "log_price"):
-        clean = frame.astype(float).where(frame > 0)
-        clean = clean.mask(clean <= 0)
-        frame = np.log(clean).replace([np.inf, -np.inf], np.nan)
-    elif transform in ("pct", "return", "pct_change"):
-        frame = frame.pct_change()
-    elif transform in ("diff", "difference", "first_diff"):
-        frame = frame.diff()
-    else:
-        # default no transform
+    if transform not in {
+        "log_return", "logret", "log-returns", "log_level", "log",
+        "log-price", "log_price", "pct", "return", "pct_change",
+        "diff", "difference", "first_diff",
+    }:
         return frame
+
+    # Transform each symbol on its own observed index. Applying diff/pct_change
+    # after an outer join lets another symbol's timestamp interrupt the true
+    # predecessor relationship and creates artificial missing returns.
+    transformed: Dict[str, pd.Series] = {}
+    for column in frame.columns:
+        series = frame[column].dropna().astype(float)
+        if transform in ("log_return", "logret", "log-returns"):
+            clean = series.where(series > 0)
+            values = np.log(clean).replace([np.inf, -np.inf], np.nan).diff()
+        elif transform in ("log_level", "log", "log-price", "log_price"):
+            clean = series.where(series > 0)
+            values = np.log(clean).replace([np.inf, -np.inf], np.nan)
+        elif transform in ("pct", "return", "pct_change"):
+            values = series.pct_change(fill_method=None)
+        else:
+            values = series.diff()
+        transformed[str(column)] = values
+    frame = pd.concat(transformed, axis=1, join="outer").sort_index()
     # Keep pairwise-complete rows for each tested symbol pair later.
     return frame.dropna(how="all")
 
@@ -677,6 +685,19 @@ def _build_pairwise_frame(
     return pd.concat(aligned_map, axis=1, join="outer").sort_index()
 
 
+def _transform_aligned_pair(
+    frame: pd.DataFrame,
+    left: str,
+    right: str,
+    transform: str,
+) -> pd.DataFrame:
+    """Align a raw price pair before deriving pairwise transformed values."""
+    raw_pair = frame[[left, right]].dropna(how="any")
+    if raw_pair.empty:
+        return raw_pair
+    return _transform_frame(raw_pair, transform).dropna(how="any")
+
+
 def _format_sample_time(value: Any) -> str:
     timestamp = pd.Timestamp(value)
     if timestamp.tzinfo is not None:
@@ -794,8 +815,11 @@ def _rank_correlation_pairs(
     symbols: List[str],
     *,
     method: str,
+    transform: str,
     window_bars: int,
     min_overlap: int,
+    inference_supported: bool = True,
+    family_alpha: float = 0.05,
 ) -> tuple[List[Dict[str, Any]], Dict[str, int], Dict[str, int]]:
     rows: List[Dict[str, Any]] = []
     pair_overlaps: Dict[str, int] = {}
@@ -810,7 +834,7 @@ def _rank_correlation_pairs(
         for right in symbols[idx + 1 :]:
             if right not in frame.columns:
                 continue
-            subset_all = frame[[left, right]].dropna(how="any")
+            subset_all = _transform_aligned_pair(frame, left, right, transform)
             overlap_rows = int(len(subset_all))
             pair_overlaps[f"{left}-{right}"] = overlap_rows
             if overlap_rows < min_overlap:
@@ -823,7 +847,6 @@ def _rank_correlation_pairs(
                 continue
             corr_f = float(corr)
             corr_rounded = round(corr_f, 6)
-            ci95_low, ci95_high = _correlation_fisher_ci(corr_f, int(len(subset)))
             period_start = _format_sample_time(subset.index[0])
             period_end = _format_sample_time(subset.index[-1])
             rows.append(
@@ -831,8 +854,6 @@ def _rank_correlation_pairs(
                     "left": left,
                     "right": right,
                     "correlation": corr_rounded,
-                    "ci95_low": ci95_low,
-                    "ci95_high": ci95_high,
                     "abs_correlation": round(abs(corr_f), 6),
                     "samples": int(len(subset)),
                     "period_start": period_start,
@@ -853,6 +874,23 @@ def _rank_correlation_pairs(
                 }
             )
 
+    if inference_supported and rows:
+        family_size = len(rows)
+        family_z = NormalDist().inv_cdf(
+            1.0 - float(family_alpha) / (2.0 * float(family_size))
+        )
+        for row in rows:
+            low, high = _correlation_fisher_ci(
+                float(row["correlation"]),
+                int(row["samples"]),
+                z=family_z,
+            )
+            row["ci_familywise_low"] = low
+            row["ci_familywise_high"] = high
+            row["ci_familywise_alpha"] = float(family_alpha)
+            row["ci_familywise_method"] = "bonferroni_fisher_z"
+            row["pair_tests_run"] = int(family_size)
+
     rows.sort(
         key=lambda item: (
             -float(item["abs_correlation"]),
@@ -865,19 +903,27 @@ def _rank_correlation_pairs(
 
 
 def _compact_correlation_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
+    compact: List[Dict[str, Any]] = []
+    for row in rows:
+        item = {
             "symbol1": row.get("left"),
             "symbol2": row.get("right"),
             "correlation": row.get("correlation"),
-            "ci95_low": row.get("ci95_low"),
-            "ci95_high": row.get("ci95_high"),
             "samples": row.get("samples"),
             "period_start": row.get("period_start"),
             "period_end": row.get("period_end"),
         }
-        for row in rows
-    ]
+        for key in (
+            "ci_familywise_low",
+            "ci_familywise_high",
+            "ci_familywise_alpha",
+            "ci_familywise_method",
+            "pair_tests_run",
+        ):
+            if key in row:
+                item[key] = row[key]
+        compact.append(item)
+    return compact
 
 
 def _normalize_output_limit(limit: Optional[int]) -> tuple[int | None, str | None]:
@@ -915,13 +961,13 @@ def _limit_pair_rows(
         page = rows[start : start + int(limit)]
     has_more = bool(start + len(page) < total)
     truncated = bool(start > 0 or has_more)
-    pagination = {
-        "total_count": total,
-        "offset": int(start),
-        "limit": limit,
-        "has_more": has_more,
-    }
-    return page, truncated, pagination
+    pagination = build_pagination_meta(
+        total=total,
+        returned=len(page),
+        offset=start,
+        limit=limit,
+    )
+    return page, truncated, {"pagination": pagination}
 
 
 def _public_pair_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1328,12 +1374,12 @@ def _format_summary(
     group_hint: str | None = None,
 ) -> str:
     if not rows:
-        return "No valid pairings available for causal discovery."
+        return "No valid pairings available for Granger predictive-link discovery."
     rows_sorted = sorted(
         rows, key=lambda item: (item["p_value"], item["effect"], item["cause"])
     )
     header = [
-        f"Causal signal discovery (transform={transform}, alpha={alpha:.4f})",
+        f"Granger predictive-link discovery (transform={transform}, alpha={alpha:.4f})",
         f"Symbols analysed: {', '.join(symbols)}",
         "",
         "Effect <- Cause | Lag | p-value | Samples | Conclusion",
@@ -1343,7 +1389,11 @@ def _format_summary(
         header.insert(1, f"Group: {group_hint}")
     lines = header
     for row in rows_sorted:
-        conclusion = "causal" if row["p_value"] < alpha else "no-link"
+        conclusion = (
+            "granger-predictive-link"
+            if row["p_value"] < alpha
+            else "no-granger-link"
+        )
         lines.append(
             f"{row['effect']} <- {row['cause']} | {row['lag']} | {row['p_value']:.4f} | {row['samples']} | {conclusion}"
         )
@@ -1355,7 +1405,10 @@ def _format_summary(
         "Displayed p-values use Bonferroni correction across tested lags and "
         "all successfully tested directed pairs."
     )
-    lines.append("Results are pairwise and do not imply full causal graphs.")
+    lines.append(
+        "Results are pairwise predictive lag associations; they do not establish "
+        "structural or economic causality."
+    )
     return "\n".join(lines)
 
 
@@ -1562,7 +1615,7 @@ def causal_discover_signals(  # noqa: C901
     normalize: bool = True,
     detail: DetailLiteral = "compact",
 ) -> Dict[str, Any]:
-    """Run Granger-style causal discovery on MT5 symbols.
+    """Discover pairwise Granger predictive links between MT5 symbols.
 
     Args:
         symbols: Comma-separated MT5 symbols; provide one symbol to auto-expand
@@ -1573,15 +1626,18 @@ def causal_discover_signals(  # noqa: C901
         limit: Optional maximum number of returned causal rows.
         window_bars: Maximum overlapping transformed samples analysed per pair
             after applying any time window.
+            Raw price pairs are aligned before return-style transforms so each
+            paired observation covers the same interval for both symbols.
         start: Optional UTC-compatible start date/time for the analysis window.
         end: Optional UTC-compatible end date/time; end-only anchors recent history.
         max_lag: Maximum lag order for tests (>=1).
-        significance: Family-wise alpha level for reporting causal links after
+        significance: Family-wise alpha level for reporting Granger predictive links after
             Bonferroni correction across tested lags and directed pairs.
         include_incomplete: Include the current forming candle. Defaults to false
             so statistical tests use completed bars only.
         transform: Preprocessing transform: "log_return", "pct", "diff", "level", or "log_level".
-        normalize: Z-score columns before testing to stabilise scale.
+        normalize: Z-score columns for numerical conditioning. With the OLS
+            intercept used here, this does not change the exact Granger statistic.
         detail: "compact" returns significant links plus top pair summaries; "full"
             returns every tested pair in items.
     """
@@ -1609,6 +1665,7 @@ def causal_discover_signals(  # noqa: C901
             "include_incomplete": bool(include_incomplete),
             "transform": str(transform),
             "normalize": bool(normalize),
+            "normalization_role": "numerical_conditioning_only_affine_invariant",
             "detail": detail_mode,
         }
         transform_value = _normalize_transform_name(transform)
@@ -1896,11 +1953,12 @@ def causal_discover_signals(  # noqa: C901
             for cause in transformed.columns:
                 if effect == cause:
                     continue
-                subset = (
-                    transformed[[effect, cause]]
-                    .dropna(how="any")
-                    .tail(int(window_bars))
-                )
+                subset = _transform_aligned_pair(
+                    frame,
+                    str(effect),
+                    str(cause),
+                    transform_value,
+                ).tail(int(window_bars))
                 if normalize and not subset.empty:
                     subset = _standardize_frame(subset).dropna(how="any")
                 if len(subset) <= max_lag + 2:
@@ -2117,7 +2175,7 @@ def causal_discover_signals(  # noqa: C901
                 meta,
                 legends={
                     "transform": _TRANSFORM_LEGEND,
-                    "note_p_value": "Lower p-values indicate stronger evidence of causality. Values < significance threshold indicate significant Granger-causal relationship.",
+                    "note_p_value": "Lower p-values indicate stronger evidence that lagged 'cause' values improve prediction of 'effect'. Values below the significance threshold identify a Granger predictive link, not structural or economic causality.",
                     "note_lag": "Optimal lag order (bars) at which past values of 'cause' best predict current 'effect'",
                     "note_p_value_correction": "Displayed p-values use Bonferroni correction across tested lags and all successfully tested directed pairs.",
                 },
@@ -2132,11 +2190,11 @@ def causal_discover_signals(  # noqa: C901
         if not rows_sorted:
             out["result"] = "no_tests_run"
             out["message"] = (
-                "No causal relationships detected (insufficient data or all tests failed)."
+                "No Granger predictive links tested (insufficient data or all tests failed)."
             )
         elif not significant_rows:
             out["message"] = (
-                "No statistically significant causal links detected at the selected threshold."
+                "No statistically significant Granger predictive links detected at the selected threshold."
             )
             near_threshold = min(1.0, float(significance) * 2.0)
             near_misses = [
@@ -2482,11 +2540,13 @@ def correlation_matrix(  # noqa: C901
             )
 
         rows, pair_overlaps, skipped = _rank_correlation_pairs(
-            transformed,
+            frame,
             symbols_used,
             method=method_value,
+            transform=transform_value,
             window_bars=int(window_bars),
             min_overlap=int(min_overlap),
+            inference_supported=transform_value in {"log_return", "pct", "diff"},
         )
         output_rows_raw, output_truncated, pagination = _limit_pair_rows(
             rows,
@@ -2538,6 +2598,18 @@ def correlation_matrix(  # noqa: C901
                 series_map, include_incomplete=bool(include_incomplete)
             ),
         }
+        if transform_value in {"log_return", "pct", "diff"}:
+            context["correlation_inference"] = {
+                "family_alpha": 0.05,
+                "family_size": int(len(rows)),
+                "method": "bonferroni_fisher_z",
+                "scope": "computed_symbol_pairs",
+            }
+        else:
+            warnings_out.append(
+                "Correlation confidence intervals are suppressed for price-level transforms; "
+                "use log_return, pct, or diff for inferential correlation analysis."
+            )
         alignment_context, alignment_warning = _pairwise_period_alignment(
             rows,
             timeframe=timeframe,
@@ -2714,8 +2786,12 @@ def cross_correlation(  # noqa: C901
                 details=errors,
             )
         frame = _build_pairwise_frame(series_map, symbol_list)
-        transformed = _transform_frame(frame, transform_value)
-        aligned = transformed[symbol_list].dropna(how="any").tail(int(window_bars))
+        aligned = _transform_aligned_pair(
+            frame,
+            symbol_list[0],
+            symbol_list[1],
+            transform_value,
+        ).tail(int(window_bars))
         if len(aligned) < int(min_overlap):
             return _causal_error(
                 f"Only {len(aligned)} overlapping samples are available; min_overlap={min_overlap}.",
@@ -2766,8 +2842,8 @@ def cross_correlation(  # noqa: C901
             {
                 "leader": symbol_list[0] if int(best["lag"]) > 0 else symbol_list[1] if int(best["lag"]) < 0 else None,
                 "follower": symbol_list[1] if int(best["lag"]) > 0 else symbol_list[0] if int(best["lag"]) < 0 else None,
-                "ci_low": round(ci_low, 6) if ci_low is not None else None,
-                "ci_high": round(ci_high, 6) if ci_high is not None else None,
+                "ci95_low": round(ci_low, 6) if ci_low is not None else None,
+                "ci95_high": round(ci_high, 6) if ci_high is not None else None,
                 "significant": bool(ci_low is not None and ci_high is not None and (ci_low > 0.0 or ci_high < 0.0)),
             }
         )

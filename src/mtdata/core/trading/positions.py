@@ -9,7 +9,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ...shared.constants import BROKER_VOLUME_UNIT
 from ...utils.market_metadata import build_tick_freshness_context
-from ...utils.time import format_epoch_utc
+from ...utils.mt5 import account_currency_from_gateway
+from ...utils.quote import tick_epoch
+from ...utils.time import format_datetime_utc, format_epoch_utc
 from ...utils.utils import _normalize_limit
 from .._mcp_instance import mcp
 from ..execution_logging import run_logged_operation
@@ -55,23 +57,19 @@ def _attach_open_position_quote_context(
             continue
         if tick is None:
             continue
-        tick_epoch = getattr(tick, "time_msc", None)
-        try:
-            tick_epoch = float(tick_epoch) / 1000.0 if tick_epoch else None
-        except (TypeError, ValueError):
-            tick_epoch = None
-        if tick_epoch is None:
-            tick_epoch = getattr(tick, "time", None)
+        quote_epoch = tick_epoch(tick)
         freshness = build_tick_freshness_context(
             symbol,
-            tick_epoch=tick_epoch,
+            tick_epoch=quote_epoch,
             now_epoch=current_epoch,
         )
         if not freshness:
             continue
-        side = str(item.get("side") or "").strip().upper()
-        item["price_current_basis"] = "ask" if side == "SELL" else "bid" if side == "BUY" else "broker_mark"
-        item["quote_time"] = format_epoch_utc(tick_epoch)
+        # ``price_current`` is supplied by the broker's position snapshot.  The
+        # tick fetched here is only a freshness check; it does not replace that
+        # broker mark.  Do not label the unchanged value as bid or ask.
+        item["price_current_basis"] = "broker_price_current"
+        item["quote_time"] = format_epoch_utc(quote_epoch)
         symbol_info_fn = getattr(gateway, "symbol_info", None)
         if callable(symbol_info_fn):
             try:
@@ -88,6 +86,13 @@ def _attach_open_position_quote_context(
             if contract_size_value > 0.0 and volume_value > 0.0:
                 item["contract_size"] = contract_size_value
                 item["contract_units"] = round(volume_value * contract_size_value, 6)
+                item["lot_definition"] = (
+                    f"1 broker lot = {contract_size_value:g} contract units"
+                )
+                item["size_interpretation"] = (
+                    f"{volume_value:g} broker lots × {contract_size_value:g} "
+                    f"units/lot = {item['contract_units']:g} contract units"
+                )
                 if mark_value > 0.0:
                     item["notional_estimate"] = round(
                         volume_value * contract_size_value * mark_value,
@@ -128,6 +133,12 @@ _TRADE_VOLUME_UNITS = {
     "Volume": BROKER_VOLUME_UNIT,
     "Initial Volume": BROKER_VOLUME_UNIT,
     "Current Volume": BROKER_VOLUME_UNIT,
+}
+_TRADE_MONEY_FIELDS = {
+    "profit",
+    "commission",
+    "swap",
+    "fee",
 }
 
 
@@ -317,20 +328,49 @@ def _attach_trade_volume_units(out: Dict[str, Any]) -> None:
         for key, unit in _TRADE_VOLUME_UNITS.items()
         if key in seen_fields
     }
+    units.update(
+        {
+            key: "account_currency"
+            for key in _TRADE_MONEY_FIELDS
+            if key in seen_fields
+        }
+    )
     if units:
         out["units"] = units
 
 
-def _gateway_account_currency(gateway: Any) -> Optional[str]:
-    account_info = getattr(gateway, "account_info", None)
-    if not callable(account_info):
-        return None
-    try:
-        account = account_info()
-    except Exception:
-        return None
-    currency = str(getattr(account, "currency", "") or "").strip()
-    return currency or None
+def _attach_open_position_protection_summary(out: Dict[str, Any]) -> None:
+    items = out.get("items")
+    if not isinstance(items, list) or out.get("success") is False:
+        return
+
+    def _missing(value: Any) -> bool:
+        try:
+            return value is None or math.isclose(float(value), 0.0, abs_tol=1e-12)
+        except (TypeError, ValueError):
+            return True
+
+    rows = [item for item in items if isinstance(item, dict)]
+    without_sl = sum(1 for item in rows if _missing(item.get("sl")))
+    without_tp = sum(1 for item in rows if _missing(item.get("tp")))
+    without_either = sum(
+        1 for item in rows if _missing(item.get("sl")) or _missing(item.get("tp"))
+    )
+    fully_unprotected = sum(
+        1 for item in rows if _missing(item.get("sl")) and _missing(item.get("tp"))
+    )
+    out["protection_summary"] = {
+        "positions": len(rows),
+        "positions_without_stop_loss": without_sl,
+        "positions_without_take_profit": without_tp,
+        "positions_missing_any_protection": without_either,
+        "fully_unprotected_positions": fully_unprotected,
+    }
+    if without_either:
+        out["protection_warning"] = (
+            f"{without_either} open position(s) are missing a stop-loss, "
+            "take-profit, or both."
+        )
 
 
 def _normalize_trade_read_output(
@@ -348,9 +388,7 @@ def _normalize_trade_read_output(
         "items": [],
     }
     if kind in ("open_positions", "pending_orders"):
-        out["as_of"] = (
-            datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        )
+        out["as_of"] = format_datetime_utc(datetime.now(timezone.utc))
     if kind == "trade_history":
         filters_applied = _trade_history_filters_applied(request)
         if filters_applied:
@@ -1053,9 +1091,15 @@ def normalize_trade_history_output(
     rows: Any,
     *,
     request: Any,
+    account_currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Normalize trade history into the standard trade read envelope."""
-    out = _normalize_trade_read_output(rows, request=request, kind="trade_history")
+    out = _normalize_trade_read_output(
+        rows,
+        request=request,
+        kind="trade_history",
+        account_currency=account_currency,
+    )
     history_kind = getattr(request, "history_kind", None)
     include_request_metadata = _include_trade_read_request_metadata(request)
     if out.get("success") is True:
@@ -1076,6 +1120,19 @@ def normalize_trade_history_output(
             offset=offset_value,
             limit=limit_value,
         )
+        for field in (
+            "total_count",
+            "offset",
+            "limit",
+            "has_more",
+            "more_available",
+            "truncated",
+            "page",
+            "pages",
+            "next_offset",
+            "next_page",
+        ):
+            out.pop(field, None)
         for item in raw_items:
             if isinstance(item, dict) and item.get("timezone"):
                 timezone_label = str(item["timezone"])
@@ -1100,8 +1157,6 @@ def normalize_trade_history_output(
     if include_request_metadata:
         for key in ("symbol", "ticket"):
             out.pop(key, None)
-        if "total_count" not in out:
-            out.pop("limit", None)
         request_echo = _trade_history_request_echo(request, history_kind=history_kind)
         if request_echo:
             out["request_echo"] = request_echo
@@ -1162,13 +1217,11 @@ def _select_position_candidate(
     if symbol is not None or side in {"BUY", "SELL"}:
         candidates = required_filtered
     if magic is not None:
-        magic_filtered = [
+        candidates = [
             pos
             for pos in candidates
             if validation._safe_int_ticket(getattr(pos, "magic", None)) == magic
         ]
-        if magic_filtered:
-            candidates = magic_filtered
     if volume is not None:
         volume_filtered: List[Any] = []
         for pos in candidates:
@@ -1243,7 +1296,12 @@ def _resolve_open_position(
         if picked is not None:
             direct_ticket = validation._safe_int_ticket(getattr(picked, "ticket", None))
             if require_exact_ticket_match and direct_ticket != candidate:
-                continue
+                alternate_match = bool(
+                    allow_alternate_ticket_match
+                    and candidate in set(_ticket_fields(picked).values())
+                )
+                if not alternate_match:
+                    continue
             resolved = (
                 direct_ticket
                 if require_exact_ticket_match
@@ -1274,6 +1332,7 @@ def _resolve_open_position(
                 "method": "positions_get",
                 "candidate_ids": candidate_ids,
                 "matched": False,
+                "snapshot_unavailable": rows_fallback is None,
             },
         )
 
@@ -1338,14 +1397,17 @@ def _resolve_open_position(
         mt5=mt5,
     )
     if picked is None:
+        diagnostics = {
+            "method": "positions_get(fallback_heuristic)",
+            "candidate_ids": candidate_ids,
+            "matched": False,
+        }
+        if magic is not None:
+            diagnostics["magic_filter"] = magic
         return (
             None,
             None,
-            {
-                "method": "positions_get(fallback_heuristic)",
-                "candidate_ids": candidate_ids,
-                "matched": False,
-            },
+            diagnostics,
         )
     resolved = _resolved_ticket(picked)
     diag = {"method": "positions_get(fallback_heuristic)"}
@@ -1405,7 +1467,12 @@ def _resolve_pending_order(
         return (
             None,
             None,
-            {"method": "orders_get", "candidate_ids": candidate_ids, "matched": False},
+            {
+                "method": "orders_get",
+                "candidate_ids": candidate_ids,
+                "matched": False,
+                "snapshot_unavailable": rows_fallback is None,
+            },
         )
 
     exact_matches: List[Tuple[Any, str, int]] = []
@@ -1483,8 +1550,9 @@ def trade_get_open(
             ),
             request=request,
             kind="open_positions",
-            account_currency=_gateway_account_currency(gateway),
+            account_currency=account_currency_from_gateway(gateway),
         )
+        _attach_open_position_protection_summary(out)
         _attach_open_position_quote_context(out, gateway)
         return out
 
@@ -1517,7 +1585,7 @@ def trade_get_pending(
             ),
             request=request,
             kind="pending_orders",
-            account_currency=_gateway_account_currency(gateway),
+            account_currency=account_currency_from_gateway(gateway),
         )
 
     return run_logged_operation(

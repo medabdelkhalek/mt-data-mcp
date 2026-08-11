@@ -4,9 +4,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, get_args
 
 from pydantic import ValidationError
 
-from ...data.requests import (
-    _normalize_indicator_specs as _shared_normalize_indicator_specs,
-)
+from ....utils.coercion import split_top_level_csv
 from ...error_envelope import build_error_payload
 from ...output_contract import normalize_output_extras
 
@@ -40,41 +38,10 @@ def normalize_cli_list_value(value: Any) -> Any:  # noqa: C901
         s = str(text or "").strip()
         if not s:
             return []
-        parts: List[str] = []
-        current: List[str] = []
-        depth = 0
-        in_quote: Optional[str] = None
-        for ch in s:
-            if in_quote:
-                current.append(ch)
-                if ch == in_quote:
-                    in_quote = None
-                continue
-            if ch in ('"', "'"):
-                in_quote = ch
-                current.append(ch)
-                continue
-            if ch in "([{":
-                depth += 1
-                current.append(ch)
-                continue
-            if ch in ")]}":
-                depth = max(0, depth - 1)
-                current.append(ch)
-                continue
-            if ch == "," and depth == 0:
-                token = "".join(current).strip()
-                if token:
-                    parts.append(token)
-                current = []
-                continue
-            current.append(ch)
-        token = "".join(current).strip()
-        if token:
-            parts.append(token)
+        parts = split_top_level_csv(s)
         if len(parts) > 1:
             return parts
-        return [token for token in s.split() if token]
+        return [part for part in s.split() if part]
 
     def _add_text_tokens(text: str) -> None:
         s = str(text or "").strip()
@@ -221,6 +188,13 @@ def friendly_validation_error(exc: ValidationError, *, cmd_name: str) -> str:
                 "shocks must be a JSON object mapping symbols to percentage shocks. "
                 "Examples: '{\"*\":-2}' or '{\"EURUSD\":-1,\"XAUUSD\":-3}'."
             )
+        if cmd_name == "strategy_validate" and loc.split(".", 1)[0] == "candidates":
+            return (
+                "candidates must be a JSON list of strategy objects. Example: "
+                "'[{\"id\":\"cross\",\"type\":\"builtin_strategy\","
+                "\"strategy\":\"ema_cross\"}]'. Use type=forecast_threshold "
+                "with a method field for forecast candidates."
+            )
         if "indicators" in loc and "params" in loc and any(
             marker in msg.lower()
             for marker in ("list", "dict", "dictionary", "mapping", "valid")
@@ -292,6 +266,12 @@ def create_command_function(  # noqa: C901
     def _normalize_indicator_specs(value: Any) -> Any:
         if value is None:
             return None
+        # Importing a submodule executes core.data.__init__, which registers the
+        # full candle/tick tool family. Keep that work off unrelated CLI starts.
+        from ...data.requests import (
+            _normalize_indicator_specs as _shared_normalize_indicator_specs,
+        )
+
         return _shared_normalize_indicator_specs(value)
 
     def _parse_wait_event_spec_text(text: str) -> Any:
@@ -385,11 +365,25 @@ def create_command_function(  # noqa: C901
             return 1
         for param in func_info["params"]:
             param_name = param["name"]
+            if (
+                cmd_name == "data_fetch_candles"
+                and param_name == "limit"
+                and not hasattr(args, param_name)
+            ):
+                # Preserve omission so the request model can distinguish a ranged
+                # query from a count-based query and select its ranged default.
+                continue
             arg_value = getattr(args, param_name, param["default"])
 
             if (
                 param_name == "symbols"
-                and cmd_name in {"correlation_matrix", "cointegration_test", "cross_correlation"}
+                and cmd_name
+                in {
+                    "correlation_matrix",
+                    "cointegration_test",
+                    "cross_correlation",
+                    "market_relative_strength",
+                }
                 and isinstance(arg_value, (list, tuple))
             ):
                 symbols = [str(value).strip() for value in arg_value if str(value).strip()]

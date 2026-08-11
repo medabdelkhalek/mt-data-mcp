@@ -14,6 +14,7 @@ from mtdata.core.trading import trade_risk_analyze as _trade_risk_analyze_tool
 from mtdata.core.trading.requests import TradeRiskAnalyzeRequest
 from mtdata.core.trading.use_cases import (
     _floor_volume_steps,
+    _resolve_live_trade_risk_entry,
     _resolve_trade_risk_direction,
     run_trade_risk_analyze,
 )
@@ -24,6 +25,30 @@ def _unwrap(fn):
     while hasattr(fn, "__wrapped__"):
         fn = fn.__wrapped__
     return fn
+
+
+def test_live_risk_entry_uses_reconciled_stream_quote(monkeypatch) -> None:
+    gateway = SimpleNamespace(
+        COPY_TICKS_ALL=0,
+        symbol_info_tick=lambda _symbol: SimpleNamespace(
+            bid=1.1000, ask=1.1002, time=1_800_000_000
+        ),
+        copy_ticks_range=lambda *_args: [
+            {"bid": 1.09995, "ask": 1.10015, "time": 1_800_000_000}
+        ],
+    )
+    monkeypatch.setattr(
+        "mtdata.core.trading.use_cases.time.time", lambda: 1_800_000_001.0
+    )
+
+    entry, source, context = _resolve_live_trade_risk_entry(
+        gateway=gateway, symbol="EURUSD", direction="long"
+    )
+
+    assert entry == 1.10015
+    assert source.endswith("_tick_ask")
+    assert context["quote_source"] == "mt5.copy_ticks_range"
+    assert context["quote_source_state"] == "reconciled_equal_timestamp_conflict"
 
 
 def trade_risk_analyze(**kwargs):
@@ -280,7 +305,7 @@ def test_trade_risk_analyze_kelly_no_edge_returns_zero_volume() -> None:
     assert sizing["kelly"]["status"] == "kelly_no_edge"
 
 
-def test_trade_risk_analyze_kelly_missing_inputs_references_trade_journal_analyze() -> None:
+def test_trade_risk_analyze_kelly_missing_inputs_explains_normalization() -> None:
     mt5 = MagicMock()
     mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
     mt5.positions_get.return_value = []
@@ -296,8 +321,34 @@ def test_trade_risk_analyze_kelly_missing_inputs_references_trade_journal_analyz
 
     sizing = out["position_sizing"]
     assert sizing["status"] == "parameters_missing"
-    assert sizing["related_tools"] == ["trade_journal_analyze"]
-    assert "trade_journal_analyze" in sizing["note"]
+    assert "related_tools" not in sizing
+    assert "stake-normalized" in sizing["note"]
+    assert "account-currency PnL" in sizing["note"]
+
+
+def test_trade_risk_analyze_kelly_rejects_raw_journal_pnl_aliases() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
+    mt5.positions_get.return_value = []
+    mt5.symbol_info.return_value = _make_symbol_info()
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(
+            symbol="EURUSD",
+            sizing_method="kelly",
+            entry=100.0,
+            stop_loss=92.0,
+            kelly_metrics={
+                "win_rate": 0.55,
+                "avg_win": 200.0,
+                "avg_loss": 400.0,
+            },
+        )
+
+    sizing = out["position_sizing"]
+    assert sizing["status"] == "parameters_missing"
+    assert sizing["missing"] == ["kelly_avg_win", "kelly_avg_loss"]
+    assert "account-currency PnL" in sizing["note"]
 
 
 def test_trade_risk_analyze_compact_keeps_blocked_sizing_context() -> None:
@@ -392,6 +443,8 @@ def test_trade_risk_analyze_evaluates_trade_levels_without_desired_risk_pct() ->
         )
 
     assert out["success"] is True
+    assert out["candidate_valid"] is True
+    assert out["candidate_status"] == "valid"
     assert out["position_sizing"]["missing"] == ["desired_risk_pct"]
     assert "--desired-risk-pct" in out["position_sizing"]["message"]
     assert out["trade_evaluation"] == {
@@ -434,7 +487,7 @@ def test_trade_risk_analyze_resolves_missing_entry_from_live_tick() -> None:
 
     with _patched_mt5_module(mt5):
         out = trade_risk_analyze(
-            symbol="EURUSD",
+            symbol="BTCUSD",
             direction="long",
             desired_risk_pct=1.0,
             stop_loss=95.0,
@@ -461,7 +514,7 @@ def test_trade_risk_analyze_reanchors_omitted_entry_after_direction_inference() 
 
     with _patched_mt5_module(mt5):
         out = trade_risk_analyze(
-            symbol="EURUSD",
+            symbol="BTCUSD",
             desired_risk_pct=1.0,
             stop_loss=95.0,
             take_profit=112.5,
@@ -473,7 +526,38 @@ def test_trade_risk_analyze_reanchors_omitted_entry_after_direction_inference() 
     assert out["trade_evaluation"]["entry"] == 100.2
 
 
-def test_trade_risk_analyze_does_not_size_from_stale_live_tick() -> None:
+def test_trade_risk_analyze_rejects_direction_inference_inside_spread() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
+    mt5.positions_get.return_value = []
+    mt5.symbol_info.return_value = _make_symbol_info()
+    mt5.symbol_info_tick.return_value = SimpleNamespace(
+        bid=100.0,
+        ask=100.2,
+        time=time.time(),
+    )
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(
+            symbol="BTCUSD",
+            desired_risk_pct=1.0,
+            stop_loss=100.08,
+        )
+
+    assert out["trade_evaluation"]["status"] == "invalid"
+    assert out["trade_evaluation"]["direction"] is None
+    assert out["success"] is False
+    assert out["candidate_valid"] is False
+    assert out["candidate_status"] == "invalid"
+    assert out["error_code"] == "direction_inference_ambiguous"
+    assert out["portfolio_snapshot_status"] == "available"
+    error = out["position_sizing_error"]
+    assert error["code"] == "direction_inference_ambiguous"
+    assert error["entry_in_spread"] is True
+    assert "position_sizing" not in out
+
+
+def test_trade_risk_analyze_sizes_from_stale_tick_as_reference_only() -> None:
     mt5 = MagicMock()
     mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
     mt5.positions_get.return_value = []
@@ -486,7 +570,7 @@ def test_trade_risk_analyze_does_not_size_from_stale_live_tick() -> None:
 
     with _patched_mt5_module(mt5):
         out = trade_risk_analyze(
-            symbol="EURUSD",
+            symbol="BTCUSD",
             direction="long",
             desired_risk_pct=1.0,
             stop_loss=95.0,
@@ -494,9 +578,11 @@ def test_trade_risk_analyze_does_not_size_from_stale_live_tick() -> None:
 
     assert out["quote_context"]["usable_for_live_trading"] is False
     assert out["quote_context"]["freshness_state"] == "stale"
-    assert out["position_sizing"]["status"] == "parameters_missing"
-    assert "entry" in out["position_sizing"]["missing"]
-    assert "trade_evaluation" not in out
+    assert out["quote_context"]["sizing_reference_only"] is True
+    assert "last available non-live quote" in out["quote_context"]["sizing_warning"]
+    assert out["position_sizing"]["entry"] == 100.2
+    assert out["position_sizing"]["entry_source"] == "last_available_tick_ask"
+    assert out["trade_evaluation"]["entry_source"] == "last_available_tick_ask"
 
 
 def test_trade_risk_analyze_keeps_exposure_analysis_with_partial_sizing_params() -> None:
@@ -546,6 +632,7 @@ def test_trade_risk_analyze_preserves_zero_position_risk_metrics() -> None:
             type=0,
             volume=1.0,
             price_open=100.0,
+            price_current=100.0,
             sl=100.0,
             tp=110.0,
         ),
@@ -555,6 +642,7 @@ def test_trade_risk_analyze_preserves_zero_position_risk_metrics() -> None:
             type=0,
             volume=1.0,
             price_open=100.0,
+            price_current=100.0,
             sl=90.0,
             tp=100.0,
         ),
@@ -894,8 +982,39 @@ def test_trade_risk_analyze_rejects_wrong_side_stop_for_short_trade() -> None:
         )
 
     err = out["position_sizing_error"]
+    assert out["success"] is False
+    assert out["candidate_valid"] is False
+    assert out["candidate_status"] == "invalid"
+    assert out["error_code"] == "invalid_sl_for_direction"
+    assert out["portfolio_snapshot_status"] == "available"
     assert err["code"] == "invalid_sl_for_direction"
     assert err["reason"] == "For short trades, stop_loss must be above entry."
+    assert "risk_per_lot" not in out["trade_evaluation"]
+    assert "sl_distance_ticks" not in out["trade_evaluation"]
+    assert "position_sizing" not in out
+
+
+def test_trade_risk_analyze_rejects_invalid_explicit_candidate_direction() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
+    mt5.positions_get.return_value = []
+    mt5.symbol_info.return_value = _make_symbol_info()
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(
+            symbol="EURUSD",
+            direction="sideways",
+            entry=100.0,
+            stop_loss=95.0,
+        )
+
+    assert out["success"] is False
+    assert out["candidate_valid"] is False
+    assert out["candidate_status"] == "invalid"
+    assert out["error_code"] == "invalid_direction"
+    assert out["portfolio_snapshot_status"] == "available"
+    assert out["account"]["equity"] == 1000.0
+    assert out["trade_evaluation"]["status"] == "invalid"
     assert "position_sizing" not in out
 
 
@@ -1015,6 +1134,7 @@ def test_run_trade_risk_analyze_uses_gateway_position_type_constants() -> None:
                 type=7,
                 volume=0.1,
                 price_open=100.0,
+                price_current=100.0,
                 sl=90.0,
                 tp=120.0,
             )
@@ -1030,6 +1150,35 @@ def test_run_trade_risk_analyze_uses_gateway_position_type_constants() -> None:
 
     assert out["success"] is True
     assert out["positions"][0]["type"] == "BUY"
+
+
+def test_run_trade_risk_analyze_rejects_failed_position_snapshot() -> None:
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        account_info=lambda: SimpleNamespace(equity=1000.0, currency="USD"),
+        positions_get=lambda symbol=None: None,
+    )
+
+    out = run_trade_risk_analyze(TradeRiskAnalyzeRequest(), gateway=gateway)
+
+    assert out["success"] is False
+    assert out["error_code"] == "positions_snapshot_unavailable"
+
+
+def test_run_trade_risk_analyze_rejects_failed_pending_snapshot() -> None:
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        account_info=lambda: SimpleNamespace(equity=1000.0, currency="USD"),
+        positions_get=lambda symbol=None: (),
+        orders_get=lambda symbol=None: None,
+        POSITION_TYPE_BUY=0,
+        POSITION_TYPE_SELL=1,
+    )
+
+    out = run_trade_risk_analyze(TradeRiskAnalyzeRequest(), gateway=gateway)
+
+    assert out["success"] is False
+    assert out["error_code"] == "orders_snapshot_unavailable"
 
 
 def test_run_trade_risk_analyze_caches_symbol_info_per_symbol() -> None:
@@ -1116,6 +1265,7 @@ def test_trade_risk_analyze_uses_loss_tick_value_for_open_position_risk() -> Non
             type=0,
             volume=1.0,
             price_open=100.0,
+            price_current=100.0,
             sl=90.0,
             tp=110.0,
         )
@@ -1138,7 +1288,7 @@ def test_trade_risk_analyze_uses_loss_tick_value_for_open_position_risk() -> Non
     assert out["portfolio_risk"]["total_risk_currency"] == 20.0
 
 
-def test_trade_risk_analyze_treats_locked_profit_stop_as_zero_risk() -> None:
+def test_trade_risk_analyze_measures_trailed_stop_from_current_mark() -> None:
     mt5 = MagicMock()
     mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
     mt5.positions_get.return_value = [
@@ -1148,6 +1298,7 @@ def test_trade_risk_analyze_treats_locked_profit_stop_as_zero_risk() -> None:
             type=0,
             volume=1.0,
             price_open=100.0,
+            price_current=120.0,
             sl=110.0,
             tp=120.0,
         )
@@ -1161,10 +1312,46 @@ def test_trade_risk_analyze_treats_locked_profit_stop_as_zero_risk() -> None:
         out = trade_risk_analyze(__cli_raw=True)
 
     position = out["positions"][0]
-    assert position["risk_currency"] == 0.0
-    assert position["risk_pct"] == 0.0
+    assert position["risk_currency"] == 20.0
+    assert position["risk_pct"] == 2.0
     assert position["risk_status"] == "defined"
+    assert position["risk_reference_price"] == 120.0
+    assert position["risk_reference_basis"] == "current_mark"
+    assert out["portfolio_risk"]["total_risk_currency"] == 20.0
+
+
+def test_trade_risk_analyze_marks_breached_stop_as_unbounded() -> None:
+    mt5 = MagicMock()
+    mt5.account_info.return_value = SimpleNamespace(equity=1000.0, currency="USD")
+    mt5.positions_get.return_value = [
+        SimpleNamespace(
+            ticket=16,
+            symbol="EURUSD",
+            type=0,
+            volume=1.0,
+            price_open=120.0,
+            price_current=100.0,
+            sl=110.0,
+            tp=130.0,
+        )
+    ]
+    mt5.symbol_info.return_value = _make_symbol_info(
+        trade_tick_value=1.0,
+        trade_tick_value_loss=2.0,
+    )
+
+    with _patched_mt5_module(mt5):
+        out = trade_risk_analyze(__cli_raw=True)
+
+    position = out["positions"][0]
+    assert position["risk_currency"] is None
+    assert position["stop_overrun_currency"] == 20.0
+    assert position["risk_status"] == "breached"
     assert out["portfolio_risk"]["total_risk_currency"] == 0.0
+    assert out["portfolio_risk"]["stop_overrun_currency"] == 20.0
+    assert out["portfolio_risk"]["positions_with_breached_stops"] == 1
+    assert out["portfolio_risk"]["overall_risk_status"] == "unlimited"
+    assert out["portfolio_risk"]["stop_risk_level"] == "unlimited"
 
 
 def test_trade_risk_analyze_does_not_report_wrong_side_tp_as_reward() -> None:
@@ -1177,6 +1364,7 @@ def test_trade_risk_analyze_does_not_report_wrong_side_tp_as_reward() -> None:
             type=0,
             volume=1.0,
             price_open=100.0,
+            price_current=100.0,
             sl=90.0,
             tp=95.0,
         )
@@ -1211,6 +1399,7 @@ def test_trade_risk_analyze_converts_notional_with_broker_tick_value() -> None:
             type=0,
             volume=1.0,
             price_open=110.0,
+            price_current=110.0,
             sl=109.0,
             tp=111.0,
         )
@@ -1252,6 +1441,7 @@ def test_trade_risk_analyze_flags_invalid_tick_configuration_with_existing_stop_
             type=0,
             volume=0.1,
             price_open=100.0,
+            price_current=100.0,
             sl=90.0,
             tp=110.0,
         )
@@ -1288,6 +1478,7 @@ def test_trade_risk_analyze_flags_invalid_tick_size_even_when_point_is_available
             type=0,
             volume=0.1,
             price_open=100.0,
+            price_current=100.0,
             sl=90.0,
             tp=110.0,
         )
@@ -1323,6 +1514,7 @@ def test_trade_risk_analyze_preserves_quantified_risk_level_with_unlimited_posit
                 type=0,
                 volume=1.0,
                 price_open=100.0,
+                price_current=100.0,
                 sl=80.0,
                 tp=120.0,
             ),
@@ -1332,6 +1524,7 @@ def test_trade_risk_analyze_preserves_quantified_risk_level_with_unlimited_posit
                 type=0,
                 volume=1.0,
                 price_open=100.0,
+                price_current=100.0,
                 sl=0.0,
                 tp=0.0,
             ),
@@ -1347,6 +1540,7 @@ def test_trade_risk_analyze_preserves_quantified_risk_level_with_unlimited_posit
 
     assert out["success"] is True
     assert out["portfolio_risk"]["overall_risk_status"] == "unlimited"
-    assert out["portfolio_risk"]["quantified_risk_level"] == "high"
+    assert out["portfolio_risk"]["quantified_risk_level"] == "unlimited"
+    assert out["portfolio_risk"]["stop_risk_level"] == "unlimited"
     assert out["portfolio_risk"]["total_risk_pct"] == 20.0
     assert out["portfolio_risk"]["positions_without_sl"] == 1

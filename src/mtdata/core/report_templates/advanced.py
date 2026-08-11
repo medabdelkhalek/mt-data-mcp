@@ -1,12 +1,18 @@
 from typing import Any, Dict, Optional
 
 from ...shared.schema import DenoiseSpec
-from ..report.utils import report_section_enabled
+from ..report.utils import (
+    current_only_section_omission as _current_only_section_omission,
+)
+from ..report.utils import (
+    is_bounded_report_window as _is_bounded_report_window,
+)
+from ..report.utils import (
+    report_section_enabled,
+)
 from .basic import (
-    _current_only_section_omission,
     _first_volatility_value,
     _get_raw_result,
-    _is_bounded_report_window,
     template_basic,
 )
 

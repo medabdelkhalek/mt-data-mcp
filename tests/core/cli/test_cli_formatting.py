@@ -219,7 +219,7 @@ class TestFormatResultForCli:
         parsed = json.loads(result)
         assert parsed["avg_return"] == -0.024297043390669737
 
-    def test_json_compact_precision_rounds_floats(self):
+    def test_json_compact_precision_preserves_canonical_floats(self):
         result = _format_result_for_cli(
             {"avg_return": -0.024297043390669737},
             fmt="json",
@@ -228,7 +228,7 @@ class TestFormatResultForCli:
             precision="compact",
         )
         parsed = json.loads(result)
-        assert parsed["avg_return"] == -0.0243
+        assert parsed["avg_return"] == -0.024297043390669737
 
     def test_json_format_replaces_non_finite_with_null(self):
         result = _format_result_for_cli(
@@ -489,6 +489,28 @@ class TestFormatResultForCli:
         assert "prob_sl_first" in result
         assert "tp_hit_prob_by_t" not in result
         assert "sl_hit_prob_by_t" not in result
+
+    def test_toon_format_preserves_barrier_probability_error_envelope(self):
+        result = _format_result_for_cli(
+            {
+                "success": False,
+                "error": "Barrier probabilities require explicit barriers.",
+                "error_code": "barrier_parameters_missing",
+                "request_id": "request-123",
+                "operation": "forecast_barrier_prob",
+                "remediation": "Provide a take-profit and stop-loss pair.",
+                "related_tools": ["forecast_barrier_optimize"],
+            },
+            fmt="toon",
+            verbose=False,
+            cmd_name="forecast_barrier_prob",
+        )
+
+        assert "error_code: barrier_parameters_missing" in result
+        assert "request_id: request-123" in result
+        assert "operation: forecast_barrier_prob" in result
+        assert "remediation:" in result
+        assert "forecast_barrier_optimize" in result
 
     def test_toon_format_hides_barrier_grid_and_param_help_in_shared_output(self):
         result = _format_result_for_cli(
@@ -1710,6 +1732,42 @@ class TestFormatResultForCli:
         assert "coverage_gaps" not in result
         assert "zone_overlap" not in result
         assert "show_all_hint" not in result
+
+    @pytest.mark.parametrize("precision", ["compact", "full"])
+    def test_confluence_toon_preserves_nested_symbol_price_precision(
+        self,
+        precision,
+    ):
+        result = _format_result_for_cli(
+            {
+                "success": True,
+                "symbol": "EURUSD",
+                "price_precision": 5,
+                "levels": [
+                    {
+                        "price": 1.14462,
+                        "range": {
+                            "low": 1.14328,
+                            "high": 1.14594,
+                            "width": 0.00266,
+                        },
+                        "score": 39.02,
+                        "confidence": {"low": 0.123456, "high": 0.654321},
+                    }
+                ],
+            },
+            fmt="toon",
+            verbose=False,
+            cmd_name="confluence_levels",
+            precision=precision,
+        )
+
+        assert "1.14462,low=1.14328; high=1.14594; width=0.00266" in result
+        assert "low=1.143; high=1.146" not in result
+        if precision == "compact":
+            assert "confidence" in result
+            assert "low=0.1235; high=0.654" in result
+            assert "low=0.12346; high=0.65432" not in result
 
     def test_toon_format_keeps_compact_support_resistance_lists(self):
         result = _format_result_for_cli(

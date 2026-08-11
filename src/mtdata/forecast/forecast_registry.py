@@ -7,6 +7,7 @@ Centralizes method definitions, requirements, and availability checking.
 import importlib as _importlib
 import importlib.metadata as _importlib_metadata
 import importlib.util as _importlib_util
+from copy import deepcopy
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple, Type
 
@@ -29,6 +30,8 @@ class ForecastRegistry:
         """
         def decorator(method_cls: Type[ForecastMethod]):
             existing = cls._methods.get(name)
+            if existing is method_cls:
+                return method_cls
             if existing is not None and existing is not method_cls:
                 raise ValueError(
                     f"Forecast method '{name}' is already registered to "
@@ -36,6 +39,7 @@ class ForecastRegistry:
                     f"'{method_cls.__name__}'."
                 )
             cls._methods[name] = method_cls
+            _cached_forecast_methods_snapshot.cache_clear()
             return method_cls
         return decorator
 
@@ -193,7 +197,8 @@ def _build_forecast_methods_snapshot() -> Tuple[List[Dict[str, Any]], Dict[str, 
                 categories.setdefault("ensemble", []).append(method)
             continue
 
-        supports = inst.supports_features or dict(DEFAULT_METHOD_SUPPORTS)
+        supports = dict(inst.supports_features or DEFAULT_METHOD_SUPPORTS)
+        supports["volatility"] = method in {"arima", "sarima", "ets", "theta"}
         requires = list(getattr(inst, "required_packages", []) or [])
         params = getattr(inst, "PARAMS", None)
         if not isinstance(params, list):
@@ -219,13 +224,19 @@ def _build_forecast_methods_snapshot() -> Tuple[List[Dict[str, Any]], Dict[str, 
     return methods, categories
 
 
+@lru_cache(maxsize=1)
+def _cached_forecast_methods_snapshot() -> Tuple[List[Dict[str, Any]], Dict[str, List[str]]]:
+    """Build registry metadata once until a method registration changes it."""
+    return _build_forecast_methods_snapshot()
+
+
 def get_forecast_methods_data() -> Dict[str, Any]:
     """Return metadata about available forecast methods and their requirements.
 
     This is derived from ForecastRegistry to avoid drift.
     """
     _ensure_registry_loaded()
-    methods, categories = _build_forecast_methods_snapshot()
+    methods, categories = deepcopy(_cached_forecast_methods_snapshot())
 
     return {
         "methods": methods,
@@ -237,7 +248,7 @@ def get_forecast_methods_data() -> Dict[str, Any]:
 def get_forecast_method_availability_snapshot() -> Dict[str, bool]:
     """Return method availability derived from the registry-backed method snapshot."""
     _ensure_registry_loaded()
-    methods, _ = _build_forecast_methods_snapshot()
+    methods, _ = _cached_forecast_methods_snapshot()
     return {
         str(method_def.get("method")): bool(method_def.get("available"))
         for method_def in methods
@@ -388,10 +399,10 @@ def _ensemble_metadata() -> Dict[str, Any]:
         "category": "ensemble",
         "available": True,
         "requires": [],
-        "description": "Adaptive ensemble with averaging, Bayesian model averaging, or stacking.",
+        "description": "Adaptive ensemble with averaging, RMSE weighting, or stacking.",
         "params": [
             {"name": "methods", "type": "list", "description": "Methods to ensemble (default: naive,theta,fourier_ols)"},
-            {"name": "mode", "type": "str", "description": "average|bma|stacking (default: average)"},
+            {"name": "mode", "type": "str", "description": "average|rmse_weighted|stacking (default: average)"},
             {"name": "weights", "type": "list", "description": "Manual weights when mode=average"},
             {"name": "cv_points", "type": "int", "description": "Walk-forward anchors for weighting (default: 2*len(methods))"},
             {"name": "min_train_size", "type": "int", "description": "Minimum history per CV anchor (default: max(30, horizon*3))"},

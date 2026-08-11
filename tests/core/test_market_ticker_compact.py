@@ -15,7 +15,7 @@ def test_compact_ticker_keeps_absolute_spread_for_non_forex_quotes() -> None:
             "contract_size": 100.0,
             "lot_definition": "1 broker lot equals contract_size contract units.",
             "pricing_basis": "per_1_lot_estimate",
-            "units": {"spread": "price", "lot": "broker_lot"},
+            "units": {"spread": "absolute_price", "lot": "broker_lot"},
         }
     )
 
@@ -27,7 +27,7 @@ def test_compact_ticker_keeps_absolute_spread_for_non_forex_quotes() -> None:
     assert "contract_size" not in result
     assert "lot_definition" not in result
     assert "pricing_basis" not in result
-    assert "units" not in result
+    assert result["units"] == {"spread": "absolute_price"}
 
 
 def test_compact_ticker_preserves_delayed_freshness_label() -> None:
@@ -38,12 +38,14 @@ def test_compact_ticker_preserves_delayed_freshness_label() -> None:
             "freshness": "delayed, tick 1m 3s ago",
             "freshness_state": "delayed",
             "data_age_seconds": 63.0,
+            "data_stale": True,
             "usable_for_live_trading": False,
         }
     )
 
     assert result["freshness"] == "delayed, tick 1m 3s ago"
     assert result["freshness_state"] == "delayed"
+    assert result["data_stale"] is True
 
 
 def test_compact_ticker_preserves_future_timestamp_cause() -> None:

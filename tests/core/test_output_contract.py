@@ -4,7 +4,9 @@ import pytest
 
 from mtdata.core.output_contract import (
     _coerce_optional_verbose_flag,
+    apply_output_verbosity,
     attach_collection_contract,
+    build_pagination_meta,
     ensure_common_meta,
     normalize_output_detail,
     normalize_output_extras,
@@ -13,6 +15,23 @@ from mtdata.core.output_contract import (
     resolve_output_contract,
 )
 from mtdata.shared.schema import CANONICAL_OUTPUT_DETAIL_ALIASES
+
+
+def test_pagination_meta_can_label_a_provider_lower_bound() -> None:
+    assert build_pagination_meta(
+        total=21,
+        returned=20,
+        limit=20,
+        total_is_lower_bound=True,
+    ) == {
+        "total": 21,
+        "returned": 20,
+        "offset": 0,
+        "limit": 20,
+        "has_more": True,
+        "more_available": 1,
+        "total_is_lower_bound": True,
+    }
 
 
 def test_normalize_output_detail_preserves_summary_and_standard() -> None:
@@ -171,6 +190,53 @@ def test_attach_collection_contract_avoids_duplicate_rows_for_legacy_data() -> N
     assert out["canonical_source"] == "data"
     assert out["row_key"] == "data"
     assert "rows" not in out
+
+
+def test_attach_collection_contract_short_circuits_identical_collection_equality() -> None:
+    class IdentityOnlyRows(list):
+        def __eq__(self, other):
+            raise AssertionError("identity match should not invoke collection equality")
+
+    rows = IdentityOnlyRows([{"symbol": "EURUSD"}])
+
+    out = attach_collection_contract(
+        {"success": True, "data": rows},
+        collection_kind="table",
+        rows=rows,
+    )
+
+    assert out["canonical_source"] == "data"
+    assert "rows" not in out
+
+
+def test_compact_output_reuses_unchanged_collection_branches() -> None:
+    rows = [{"time": 1, "close": 1.25}]
+    payload = {
+        "success": True,
+        "data": rows,
+        "meta": {"diagnostics": {"latency_ms": 1.0}},
+    }
+
+    out = apply_output_verbosity(payload, detail="compact")
+
+    assert out is not payload
+    assert out["data"] is rows
+    assert "meta" not in out
+    assert "meta" in payload
+
+
+def test_compact_output_copies_only_nested_branches_that_change() -> None:
+    unchanged_row = {"time": 1, "close": 1.25}
+    changed_row = {"time": 2, "close": 1.26, "debug": {"source": "test"}}
+    rows = [unchanged_row, changed_row]
+
+    out = apply_output_verbosity({"data": rows}, detail="compact")
+
+    assert out["data"] is not rows
+    assert out["data"][0] is unchanged_row
+    assert out["data"][1] is not changed_row
+    assert "debug" not in out["data"][1]
+    assert "debug" in changed_row
 
 
 def test_attach_collection_contract_can_omit_contract_metadata() -> None:

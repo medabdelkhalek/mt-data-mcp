@@ -51,7 +51,6 @@ from mtdata.core.cli.api import (
     main,
 )
 
-
 # ========================================================================
 # main()
 # ========================================================================
@@ -214,6 +213,40 @@ class TestMain:
         }
 
         with patch("sys.argv", ["cli.py", "correlation_matrix", "EURUSD", "GBPUSD"]):
+            result = main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with(symbols="EURUSD,GBPUSD", __cli_raw=True)
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_market_relative_strength_accepts_positional_symbols(
+        self, mock_discover
+    ):
+        mock_fn = MagicMock(return_value="output text")
+        mock_fn.__module__ = "mtdata.core.server"
+        mock_fn.__name__ = "market_relative_strength"
+        mock_fn.__doc__ = "Relative strength."
+
+        def market_relative_strength(
+            symbols: Optional[str] = None, group: Optional[str] = None
+        ):
+            """Relative strength."""
+            pass
+
+        info = get_function_info(market_relative_strength)
+        info["func"] = mock_fn
+        mock_discover.return_value = {
+            "market_relative_strength": {
+                "func": mock_fn,
+                "meta": {"description": "Relative strength"},
+                "_cli_func_info": info,
+            },
+        }
+
+        with patch(
+            "sys.argv",
+            ["cli.py", "market_relative_strength", "EURUSD", "GBPUSD"],
+        ):
             result = main()
 
         assert result == 0
@@ -553,6 +586,96 @@ class TestMain:
         assert mock_fn.call_args[1]["timeframe"] == "H1"
 
     @patch("mtdata.core.cli.api.discover_tools")
+    def test_global_timeframe_defaults_confluence_pivot_timeframe(
+        self,
+        mock_discover,
+    ):
+        mock_fn = MagicMock(return_value="output text")
+        mock_fn.__module__ = "mtdata.core.server"
+        mock_fn.__name__ = "confluence_levels"
+        mock_fn.__doc__ = "Confluence levels."
+
+        def confluence_levels(
+            symbol: str,
+            pivot_timeframe: str = "D1",
+            sr_timeframe: str = "auto",
+        ):
+            """Confluence levels."""
+
+        info = get_function_info(confluence_levels)
+        info["func"] = mock_fn
+        mock_discover.return_value = {
+            "confluence_levels": {
+                "func": mock_fn,
+                "meta": {"description": "Confluence levels"},
+                "_cli_func_info": info,
+            },
+        }
+
+        with patch(
+            "sys.argv",
+            [
+                "cli.py",
+                "--timeframe",
+                "H4",
+                "confluence_levels",
+                "EURUSD",
+            ],
+        ):
+            result = main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with(
+            symbol="EURUSD",
+            pivot_timeframe="H4",
+            sr_timeframe="auto",
+            __cli_raw=True,
+        )
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_explicit_confluence_pivot_timeframe_overrides_global(
+        self,
+        mock_discover,
+    ):
+        mock_fn = MagicMock(return_value="output text")
+        mock_fn.__module__ = "mtdata.core.server"
+        mock_fn.__name__ = "confluence_levels"
+        mock_fn.__doc__ = "Confluence levels."
+
+        def confluence_levels(
+            symbol: str,
+            pivot_timeframe: str = "D1",
+        ):
+            """Confluence levels."""
+
+        info = get_function_info(confluence_levels)
+        info["func"] = mock_fn
+        mock_discover.return_value = {
+            "confluence_levels": {
+                "func": mock_fn,
+                "meta": {"description": "Confluence levels"},
+                "_cli_func_info": info,
+            },
+        }
+
+        with patch(
+            "sys.argv",
+            [
+                "cli.py",
+                "--timeframe",
+                "H4",
+                "confluence_levels",
+                "EURUSD",
+                "--pivot-timeframe",
+                "W1",
+            ],
+        ):
+            result = main()
+
+        assert result == 0
+        assert mock_fn.call_args.kwargs["pivot_timeframe"] == "W1"
+
+    @patch("mtdata.core.cli.api.discover_tools")
     def test_json_output_suppresses_mtdata_logs_in_non_verbose_mode(
         self, mock_discover, capsys
     ):
@@ -870,7 +993,7 @@ class TestMain:
         assert "command-level --timeframe overrides it" in out
 
     @patch("mtdata.core.cli.api.discover_tools")
-    def test_help_hides_duplicate_symbol_option_for_required_first_arg(
+    def test_help_exposes_equivalent_symbol_option_for_required_first_arg(
         self, mock_discover, capsys
     ):
         mock_fn = MagicMock(return_value={"success": True})
@@ -900,7 +1023,24 @@ class TestMain:
         out = capsys.readouterr().out
         assert "positional arguments:" in out
         assert "symbol" in out
-        assert "--symbol" not in out
+        assert "--symbol" in out
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_required_symbol_accepts_flag_form(self, mock_discover):
+        def market_ticker(symbol: str, **_kwargs):
+            return {"success": True, "symbol": symbol}
+
+        mock_discover.return_value = {
+            "market_ticker": {
+                "func": market_ticker,
+                "meta": {"description": "Get ticker"},
+            }
+        }
+
+        with patch("sys.argv", ["cli.py", "market_ticker", "--symbol", "EURUSD"]):
+            status = main()
+
+        assert status == 0
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_trade_history_days_alias_converts_to_minutes(self, mock_discover):
@@ -1157,6 +1297,32 @@ class TestMain:
         err = capsys.readouterr().err
         assert "Traceback" in err or "Error" in err
 
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_train_rejects_one_shot_process(
+        self, mock_discover, capsys
+    ):
+        invoked = []
+
+        def forecast_train(symbol: str):
+            invoked.append(symbol)
+            return {"status": "pending", "task_id": "task-1"}
+
+        mock_discover.return_value = {
+            "forecast_train": {
+                "func": forecast_train,
+                "meta": {"description": "Train a forecast model"},
+            },
+        }
+
+        with patch("sys.argv", ["cli.py", "forecast_train", "EURUSD", "--json"]):
+            result = main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert result == 1
+        assert payload["error_code"] == "cli_background_process_required"
+        assert payload["operation"] == "forecast_train"
+        assert invoked == []
+
 
 # ========================================================================
 # Forecast generate custom parser integration
@@ -1190,6 +1356,58 @@ class TestForecastGenerateIntegration:
         assert request.detail == "compact"
         assert request.ci_alpha == 0.05
         assert call_kwargs["__cli_raw"] is True
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_generate_rejects_async_mode_in_one_shot_process(
+        self, mock_discover, capsys
+    ):
+        mock_fn = MagicMock(return_value={"status": "pending", "task_id": "task-1"})
+        mock_fn.__name__ = "forecast_generate"
+        mock_fn.__doc__ = "Generate forecasts."
+        mock_discover.return_value = {
+            "forecast_generate": {
+                "func": mock_fn,
+                "meta": {"description": "Generate forecasts"},
+            },
+        }
+
+        with patch(
+            "sys.argv",
+            ["cli.py", "forecast_generate", "EURUSD", "--async-mode", "--json"],
+        ):
+            result = main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert result == 1
+        assert payload["error_code"] == "cli_background_process_required"
+        assert payload["operation"] == "forecast_generate"
+        mock_fn.assert_not_called()
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_generate_allows_async_mode_in_shell_process(
+        self, mock_discover
+    ):
+        mock_fn = MagicMock(return_value={"status": "pending", "task_id": "task-1"})
+        mock_fn.__name__ = "forecast_generate"
+        mock_fn.__doc__ = "Generate forecasts."
+        mock_discover.return_value = {
+            "forecast_generate": {
+                "func": mock_fn,
+                "meta": {"description": "Generate forecasts"},
+            },
+        }
+
+        with (
+            patch("mtdata.core.cli.api._SHELL_SESSION_DEPTH", 1),
+            patch(
+                "sys.argv",
+                ["cli.py", "forecast_generate", "EURUSD", "--async-mode"],
+            ),
+        ):
+            result = main()
+
+        assert result == 0
+        assert mock_fn.call_args.kwargs["request"].async_mode is True
 
     @patch("mtdata.core.cli.api.discover_tools")
     def test_forecast_generate_missing_symbol_is_usage_error(
@@ -1315,7 +1533,7 @@ class TestForecastGenerateIntegration:
         assert call_kwargs["fields"] == "forecast,method"
 
     @patch("mtdata.core.cli.api.discover_tools")
-    def test_forecast_generate_rejects_symbol_flag_alias(self, mock_discover):
+    def test_forecast_generate_accepts_symbol_flag_alias(self, mock_discover):
         mock_fn = MagicMock(return_value={"forecast": [1.0, 2.0]})
         mock_fn.__module__ = "mtdata.core.server"
         mock_fn.__name__ = "forecast_generate"
@@ -1327,12 +1545,53 @@ class TestForecastGenerateIntegration:
                 "meta": {"description": "Generate forecasts"},
             },
         }
+        with patch(
+            "sys.argv", ["cli.py", "forecast_generate", "--symbol", "BTCUSD"]
+        ):
+            result = main()
+        assert result == 0
+        assert mock_fn.call_args.kwargs["request"].symbol == "BTCUSD"
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_generate_rejects_malformed_params(self, mock_discover):
+        mock_fn = MagicMock(return_value={"forecast": [1.0]})
+        mock_fn.__module__ = "mtdata.core.server"
+        mock_fn.__name__ = "forecast_generate"
+        mock_fn.__doc__ = "Generate forecasts."
+        mock_discover.return_value = {
+            "forecast_generate": {"func": mock_fn, "meta": {"description": "Forecast"}}
+        }
+
         with (
-            patch("sys.argv", ["cli.py", "forecast_generate", "--symbol", "BTCUSD"]),
-            pytest.raises(SystemExit) as exc_info,
+            patch(
+                "sys.argv",
+                ["cli.py", "forecast_generate", "EURUSD", "--params", "bad"],
+            ),
+            pytest.raises(SystemExit, match="2"),
         ):
             main()
-        assert exc_info.value.code == 2
+
+        mock_fn.assert_not_called()
+
+    @patch("mtdata.core.cli.api.discover_tools")
+    def test_forecast_generate_rejects_unknown_set_section(self, mock_discover):
+        mock_fn = MagicMock(return_value={"forecast": [1.0]})
+        mock_fn.__module__ = "mtdata.core.server"
+        mock_fn.__name__ = "forecast_generate"
+        mock_fn.__doc__ = "Generate forecasts."
+        mock_discover.return_value = {
+            "forecast_generate": {"func": mock_fn, "meta": {"description": "Forecast"}}
+        }
+
+        with (
+            patch(
+                "sys.argv",
+                ["cli.py", "forecast_generate", "EURUSD", "--set", "bogus.foo=1"],
+            ),
+            pytest.raises(SystemExit, match="2"),
+        ):
+            main()
+
         mock_fn.assert_not_called()
 
     @patch("mtdata.core.cli.api.discover_tools")
@@ -1735,12 +1994,6 @@ class TestEdgeCases:
         result = _json_default(b"\xff\xfe")
         assert isinstance(result, str)
 
-    def test_build_cli_timezone_meta_local_tz(self):
-        from mtdata.core.cli.formatting import _build_cli_timezone_meta
-        result = _build_cli_timezone_meta({})
-        assert "local" not in result
-        assert result["utc"]["tz"] == "UTC"
-
     def test_attach_cli_meta_with_none_cmd(self):
         from mtdata.core.cli.api import _attach_cli_meta
         r = {"data": 1}
@@ -1762,6 +2015,7 @@ class TestEdgeCases:
 
     def test_render_cli_result_selects_requested_fields(self, capsys):
         from argparse import Namespace
+
         from mtdata.core.cli.api import _render_cli_result
 
         _render_cli_result(
@@ -1840,6 +2094,24 @@ class TestEdgeCases:
         cmd_fn(args)
         call_kwargs = mock_fn.call_args[1]
         assert call_kwargs["simplify"]["method"] == "lttb"
+
+    def test_ranged_candle_command_preserves_omitted_limit(self):
+        mock_fn = MagicMock(return_value={"success": True})
+        func_info = {
+            "func": mock_fn,
+            "params": [
+                {
+                    "name": "limit",
+                    "type": int,
+                    "required": False,
+                    "default": 200,
+                }
+            ],
+        }
+        cmd_fn = create_command_function(func_info, cmd_name="data_fetch_candles")
+
+        assert cmd_fn(argparse.Namespace(json=False, verbose=False)) == 0
+        assert "limit" not in mock_fn.call_args.kwargs
 
     def test_extract_help_query_no_args(self):
         assert _extract_help_query([]) is None

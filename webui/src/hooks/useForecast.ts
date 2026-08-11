@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   getHistory,
@@ -20,6 +20,16 @@ import type {
 import { loadJSON, saveJSON } from '../lib/storage'
 import { tfSeconds } from '../lib/timeframes'
 import { formatDateTime } from '../lib/utils'
+import {
+  DEFAULT_PIVOT_METHOD,
+  DEFAULT_SR_CONTROLS,
+  buildPivotQuery,
+  buildSupportResistanceQuery,
+  normalizePivotMethod,
+  normalizeSrControls,
+  type PivotMethod,
+  type SupportResistanceControls,
+} from '../lib/overlayParams'
 
 // ============================================================================
 // Chart Data Hook
@@ -77,44 +87,67 @@ export function useForecastMethods() {
 export function usePivotLevels(symbol: string, timeframe: string) {
   const [levels, setLevels] = useState<PivotLevel[] | null>(null)
   const [meta, setMeta] = useState<{ method: string; period?: { start?: string; end?: string } } | null>(null)
+  const [method, setMethodState] = useState<PivotMethod>(DEFAULT_PIVOT_METHOD)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const levelsRef = useRef(levels)
+  levelsRef.current = levels
+
+  const fetchLevels = useCallback(
+    async (nextMethod: PivotMethod) => {
+      if (!symbol) return
+      try {
+        setIsLoading(true)
+        setError(null)
+        const query = buildPivotQuery(symbol, timeframe, nextMethod)
+        const data = await getPivots(query)
+        const parsed = (data.levels || [])
+          .map((row) => ({ level: String(row.level), value: Number(row.value) }))
+          .filter((row) => Number.isFinite(row.value))
+
+        if (!parsed.length) {
+          setError('No pivot levels returned')
+          setLevels(null)
+          setMeta(null)
+          return
+        }
+
+        setLevels(parsed)
+        setMeta({ method: data.method ?? nextMethod, period: data.period })
+      } catch (err) {
+        setError(getErrorMessage(err))
+        setLevels(null)
+        setMeta(null)
+      } finally {
+        setIsLoading(false)
+      }
+    },
+    [symbol, timeframe]
+  )
 
   const toggle = useCallback(async () => {
     if (!symbol) return
 
-    if (levels) {
+    if (levelsRef.current) {
       setLevels(null)
       setMeta(null)
       setError(null)
       return
     }
 
-    try {
-      setIsLoading(true)
-      setError(null)
-      const data = await getPivots({ symbol, timeframe, method: 'classic' })
-      const parsed = (data.levels || [])
-        .map(row => ({ level: String(row.level), value: Number(row.value) }))
-        .filter(row => Number.isFinite(row.value))
+    await fetchLevels(method)
+  }, [symbol, method, fetchLevels])
 
-      if (!parsed.length) {
-        setError('No pivot levels returned')
-        setLevels(null)
-        setMeta(null)
-        return
+  const setMethod = useCallback(
+    async (next: string) => {
+      const normalized = normalizePivotMethod(next)
+      setMethodState(normalized)
+      if (levelsRef.current) {
+        await fetchLevels(normalized)
       }
-
-      setLevels(parsed)
-      setMeta({ method: data.method ?? 'classic', period: data.period })
-    } catch (err) {
-      setError(getErrorMessage(err))
-      setLevels(null)
-      setMeta(null)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [symbol, timeframe, levels])
+    },
+    [fetchLevels]
+  )
 
   const reset = useCallback(() => {
     setLevels(null)
@@ -122,62 +155,91 @@ export function usePivotLevels(symbol: string, timeframe: string) {
     setError(null)
   }, [])
 
-  return { levels, meta, isLoading, error, toggle, reset }
+  return { levels, meta, method, setMethod, isLoading, error, toggle, reset }
 }
 
 // ============================================================================
 // Support/Resistance Hook
 // ============================================================================
 
-export function useSupportResistance(symbol: string, timeframe: string, limit: number) {
+export function useSupportResistance(symbol: string, timeframe: string, _limit: number) {
   const [levels, setLevels] = useState<SupportResistanceLevel[] | null>(null)
   const [meta, setMeta] = useState<{
     method: string
     tolerance_pct: number
     min_touches: number
+    lookback?: number
     window?: { start?: string | null; end?: string | null }
   } | null>(null)
+  const [controls, setControlsState] = useState<SupportResistanceControls>(DEFAULT_SR_CONTROLS)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const levelsRef = useRef(levels)
+  levelsRef.current = levels
+  const controlsRef = useRef(controls)
+  controlsRef.current = controls
+
+  const fetchLevels = useCallback(
+    async (nextControls: SupportResistanceControls) => {
+      if (!symbol) return
+      try {
+        setIsLoading(true)
+        setError(null)
+        const query = buildSupportResistanceQuery(symbol, timeframe, nextControls)
+        const data = await getSupportResistance(query)
+        const parsed = [...(data.supports || []), ...(data.resistances || [])].filter((row) =>
+          Number.isFinite(row?.value)
+        )
+
+        if (!parsed.length) {
+          setError('No support/resistance levels detected')
+          setLevels(null)
+          setMeta(null)
+          return
+        }
+
+        setLevels(parsed)
+        setMeta({
+          method: data.method ?? 'swing',
+          tolerance_pct: data.tolerance_pct ?? nextControls.tolerance_pct,
+          min_touches: data.min_touches ?? nextControls.min_touches,
+          lookback: data.lookback ?? nextControls.lookback,
+          window: data.scan_window,
+        })
+      } catch (err) {
+        setError(getErrorMessage(err))
+        setLevels(null)
+        setMeta(null)
+      } finally {
+        setIsLoading(false)
+      }
+    },
+    [symbol, timeframe]
+  )
 
   const toggle = useCallback(async () => {
     if (!symbol) return
 
-    if (levels) {
+    if (levelsRef.current) {
       setLevels(null)
       setMeta(null)
       setError(null)
       return
     }
 
-    try {
-      setIsLoading(true)
-      setError(null)
-      const data = await getSupportResistance({ symbol, timeframe: 'auto', limit })
-      const parsed = (data.levels || []).filter(row => Number.isFinite(row?.value))
+    await fetchLevels(controlsRef.current)
+  }, [symbol, fetchLevels])
 
-      if (!parsed.length) {
-        setError('No support/resistance levels detected')
-        setLevels(null)
-        setMeta(null)
-        return
+  const setControls = useCallback(
+    async (partial: Partial<SupportResistanceControls>) => {
+      const next = normalizeSrControls({ ...controlsRef.current, ...partial })
+      setControlsState(next)
+      if (levelsRef.current) {
+        await fetchLevels(next)
       }
-
-      setLevels(parsed)
-      setMeta({
-        method: data.method ?? 'swing',
-        tolerance_pct: data.tolerance_pct ?? 0,
-        min_touches: data.min_touches ?? 2,
-        window: data.window,
-      })
-    } catch (err) {
-      setError(getErrorMessage(err))
-      setLevels(null)
-      setMeta(null)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [symbol, timeframe, limit, levels])
+    },
+    [fetchLevels]
+  )
 
   const reset = useCallback(() => {
     setLevels(null)
@@ -185,7 +247,7 @@ export function useSupportResistance(symbol: string, timeframe: string, limit: n
     setError(null)
   }, [])
 
-  return { levels, meta, isLoading, error, toggle, reset }
+  return { levels, meta, controls, setControls, isLoading, error, toggle, reset }
 }
 
 // ============================================================================
@@ -280,17 +342,37 @@ export function useForecast(
   symbol: string,
   timeframe: string,
   settings: ForecastSettings,
-  onResult: (payload: ForecastPayload) => void
+  onResult: (payload: ForecastPayload | null) => void,
+  anchor?: number
 ) {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const runId = useRef(0)
+  const onResultRef = useRef(onResult)
+  const requestKey = JSON.stringify({ symbol, timeframe, settings, anchor })
+  const requestKeyRef = useRef(requestKey)
+  requestKeyRef.current = requestKey
+
+  useEffect(() => {
+    onResultRef.current = onResult
+  }, [onResult])
+
+  useEffect(() => {
+    runId.current += 1
+    setIsLoading(false)
+    setError(null)
+    onResultRef.current(null)
+  }, [requestKey])
 
   const run = useCallback(
     async (kind: 'full' | 'partial', anchor?: number) => {
       if (!symbol) return
 
+      const runRequestKey = requestKey
+      const currentRunId = ++runId.current
       setIsLoading(true)
       setError(null)
+      onResultRef.current(null)
 
       try {
         const body: ForecastPriceBody = {
@@ -315,14 +397,31 @@ export function useForecast(
           __kind: kind,
         }
 
-        onResult(payload)
+        if (currentRunId !== runId.current || runRequestKey !== requestKeyRef.current) return
+        const compactRows = payload.forecast ?? []
+        const hasChartPrice =
+          payload.forecast_price?.some(Number.isFinite) ||
+          compactRows.some((row) => Number.isFinite(row.price ?? row.value))
+        if (!hasChartPrice) {
+          setError(
+            settings.quantity === 'return'
+              ? 'The return forecast did not include a reconstructed price path for the price chart.'
+              : 'The forecast did not include a finite price path for the chart.'
+          )
+          return
+        }
+        onResultRef.current(payload)
       } catch (err) {
-        setError(getErrorMessage(err))
+        if (currentRunId === runId.current && runRequestKey === requestKeyRef.current) {
+          setError(getErrorMessage(err))
+        }
       } finally {
-        setIsLoading(false)
+        if (currentRunId === runId.current && runRequestKey === requestKeyRef.current) {
+          setIsLoading(false)
+        }
       }
     },
-    [symbol, timeframe, settings, onResult]
+    [requestKey, settings, symbol, timeframe]
   )
 
   return { run, isLoading, error }
@@ -367,7 +466,7 @@ export function useChartOverlays(
     const lineEnd = maxTime !== undefined ? maxTime + fallbackStep : undefined
 
     // Add denoised line if present
-    if (bars.length && 'close_dn' in bars[0]) {
+    if (bars.some((bar) => Number.isFinite(bar.close_dn))) {
       const dnPoints = bars
         .filter((bar): bar is HistoryBar & { close_dn: number } => 
           Number.isFinite(bar.time) && Number.isFinite(bar.close_dn)

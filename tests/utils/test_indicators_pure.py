@@ -197,6 +197,14 @@ class TestParseTiSpecs:
         assert name == "ema"
         assert kwargs.get("length") == 21
 
+    def test_literal_digit_suffixed_indicator_takes_precedence(self, monkeypatch):
+        import mtdata.utils.indicators as indicators_mod
+
+        monkeypatch.setattr(indicators_mod.pta, "hlc3", lambda: None, raising=False)
+        indicators_mod._is_available_ta_indicator.cache_clear()
+
+        assert _parse_ti_specs("hlc3") == [("hlc3", [], {})]
+
     def test_cdl_name_with_trailing_digits_is_not_rewritten(self):
         specs = _parse_ti_specs("CDL_FAKE12")
         name, args, kwargs = specs[0]
@@ -301,6 +309,18 @@ class TestParseTiSpecs:
             assert name in by_name
             assert by_name[name]["category"] == "volatility"
 
+    def test_list_ta_indicators_caches_discovery_without_sharing_mutations(self):
+        import mtdata.utils.indicators as indicators_mod
+
+        indicators_mod._list_ta_indicators_cached.cache_clear()
+        first = indicators_mod.list_ta_indicators(detailed=True)
+        first[0]["name"] = "mutated"
+        second = indicators_mod.list_ta_indicators(detailed=True)
+
+        assert second[0]["name"] != "mutated"
+        assert indicators_mod._list_ta_indicators_cached.cache_info().hits == 1
+        indicators_mod._list_ta_indicators_cached.cache_clear()
+
 
 class TestEstimateWarmupBars:
     def test_empty_spec(self):
@@ -313,15 +333,15 @@ class TestEstimateWarmupBars:
 
     def test_rsi(self):
         result = _estimate_warmup_bars("rsi(14)")
-        assert result >= 42  # 14*3
+        assert result == 350
 
     def test_macd(self):
         result = _estimate_warmup_bars("macd(12,26,9)")
-        assert result == 105
+        assert result == 650
 
     def test_macd_uses_default_signal_when_missing(self):
         result = _estimate_warmup_bars("macd(fast=12,slow=26)")
-        assert result == 105
+        assert result == 650
 
     def test_bbands(self):
         result = _estimate_warmup_bars("bbands(20)")
@@ -337,7 +357,35 @@ class TestEstimateWarmupBars:
 
     def test_multiple_indicators_takes_max(self):
         result = _estimate_warmup_bars("sma(50),rsi(14)")
-        assert result >= 150  # sma(50) -> 50*3=150
+        assert result == 350
+
+    def test_rsi_tip_converges_across_requested_limits(self):
+        count = 1200
+        idx = np.arange(count, dtype=float)
+        close = 100.0 + np.cumsum(
+            0.02 * np.sin(idx / 7.0)
+            + 0.01 * np.cos(idx / 13.0)
+            + 0.003
+        )
+        source = pd.DataFrame(
+            {
+                "time": idx,
+                "open": close,
+                "high": close + 0.1,
+                "low": close - 0.1,
+                "close": close,
+                "tick_volume": 100,
+            }
+        )
+        warmup = _estimate_warmup_bars("rsi(14)")
+        tips = []
+
+        for limit in (3, 5, 10, 50):
+            frame = source.iloc[-(limit + warmup):].copy()
+            columns = _apply_ta_indicators(frame, "rsi(14)")
+            tips.append(float(frame[columns[0]].iloc[-1]))
+
+        assert max(tips) - min(tips) < 1e-9
 
 
 # ===================================================================
@@ -555,9 +603,6 @@ Values above 70 often indicate overbought conditions.
         assert out["count"] == 25
         assert out["data"][0]["params_count"] == 1
         assert set(out["data"][0]) == {"name", "category", "params_count"}
-        assert out["total_count"] == 30
-        assert out["more_available"] == 5
-        assert out["truncated"] is True
         assert out["pagination"] == {
             "total": 30,
             "returned": 25,
@@ -566,6 +611,14 @@ Values above 70 often indicate overbought conditions.
             "has_more": True,
             "more_available": 5,
         }
+        assert not {
+            "total_count",
+            "offset",
+            "limit",
+            "has_more",
+            "more_available",
+            "truncated",
+        } & out.keys()
         assert out["search_hint"] == (
             "Use search_term to match indicator names, "
             "categories, or docs."
@@ -625,11 +678,6 @@ Values above 70 often indicate overbought conditions.
         assert out["success"] is True
         assert out["count"] == 3
         assert [row["name"] for row in out["data"]] == ["ind_04", "ind_05", "ind_06"]
-        assert out["total_count"] == 10
-        assert out["offset"] == 4
-        assert out["limit"] == 3
-        assert out["has_more"] is True
-        assert out["more_available"] == 3
         assert out["pagination"] == {
             "total": 10,
             "returned": 3,
@@ -638,6 +686,7 @@ Values above 70 often indicate overbought conditions.
             "has_more": True,
             "more_available": 3,
         }
+        assert not {"total_count", "offset", "limit", "has_more", "more_available"} & out.keys()
 
     def test_indicators_list_full_detail_includes_descriptions(self, monkeypatch):
         from mtdata.core import indicators as core_indicators

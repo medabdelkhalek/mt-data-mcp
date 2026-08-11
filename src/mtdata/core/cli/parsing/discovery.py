@@ -1,6 +1,6 @@
 import argparse
 import inspect
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 ToolInfo = Dict[str, Any]
 
@@ -11,6 +11,7 @@ _OPTIONAL_FIRST_POSITIONAL_PARAMS: set[tuple[str, str]] = {
     ("news", "symbol"),
     ("correlation_matrix", "symbols"),
     ("cointegration_test", "symbols"),
+    ("market_relative_strength", "symbols"),
     ("market_scan", "symbols"),
     ("causal_discover_signals", "symbols"),
     ("market_status", "symbol"),
@@ -30,6 +31,20 @@ _HIDDEN_OPTIONAL_FIRST_POSITIONAL_FLAGS: set[tuple[str, str]] = {
 }
 
 _COMMAND_PARAM_CHOICE_OVERRIDES: Dict[tuple[str, str], list[str]] = {
+    ("correlation_matrix", "method"): ["pearson", "spearman"],
+    (
+        "correlation_matrix",
+        "transform",
+    ): ["log_return", "pct", "diff", "level", "log_level"],
+    ("cross_correlation", "method"): ["pearson", "spearman"],
+    (
+        "cross_correlation",
+        "transform",
+    ): ["log_return", "pct", "diff", "level", "log_level"],
+    (
+        "trade_var_cvar_calculate",
+        "method",
+    ): ["historical", "hist", "parametric", "gaussian", "normal"],
     (
         "forecast_barrier_optimize",
         "method",
@@ -57,8 +72,17 @@ _COMMAND_PARAM_CHOICE_OVERRIDES: Dict[tuple[str, str], list[str]] = {
     ("forecast_barrier_optimize", "search_profile"): ["fast", "medium", "long"],
 }
 
+_POSITIONAL_ONLY_OPTIONAL_FIRST_PARAMS: set[tuple[str, str]] = {
+    ("market_scan", "symbols"),
+}
+
 _MULTI_VALUE_SYMBOL_POSITIONAL_COMMANDS = frozenset(
-    {"correlation_matrix", "cointegration_test", "cross_correlation"}
+    {
+        "correlation_matrix",
+        "cointegration_test",
+        "cross_correlation",
+        "market_relative_strength",
+    }
 )
 
 _COMMAND_REQUIRED_OPTIONS: set[tuple[str, str]] = {
@@ -66,8 +90,38 @@ _COMMAND_REQUIRED_OPTIONS: set[tuple[str, str]] = {
     ("trade_place", "order_type"),
 }
 
+_PRESERVE_OMITTED_DEFAULT_PARAMS: set[tuple[str, str]] = {
+    ("data_fetch_candles", "limit"),
+}
 
 _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
+    ("correlation_matrix", "method"): "Correlation coefficient: pearson or spearman.",
+    ("correlation_matrix", "transform"): (
+        "Price transform: log_return, pct, diff, level, or log_level."
+    ),
+    ("cross_correlation", "method"): "Correlation coefficient: pearson or spearman.",
+    ("cross_correlation", "transform"): (
+        "Price transform: log_return, pct, diff, level, or log_level."
+    ),
+    ("stationarity_test", "tests"): (
+        "Comma-separated stationarity tests: adf, kpss, pp. "
+        "Example: --tests adf,kpss."
+    ),
+    ("denoise_describe", "method"): (
+        "Denoise method to describe. Run denoise_list_methods to list methods "
+        "available in this installation."
+    ),
+    ("trade_var_cvar_calculate", "method"): (
+        "Tail-risk method: historical (or hist) or parametric (or gaussian/normal)."
+    ),
+    ("trade_var_cvar_calculate", "symbol"): (
+        "Optional scope: calculate VaR/CVaR for currently open positions in this "
+        "symbol. Omit it for the full open portfolio."
+    ),
+    ("trade_var_cvar_calculate", "transform"): (
+        "Return transform: log_return (aliases log_returns/log) or pct "
+        "(aliases pct_return/percent/simple_return)."
+    ),
     ("data_fetch_candles", "indicators"): "Technical indicators. On PowerShell, quote parenthesized specs such as --indicators \"rsi(14)\", or use shell-safe rsi_14 / sma=20 syntax. JSON arrays like '[{\"name\":\"rsi\",\"params\":[14]}]' and named params like rsi(length=14) also work. Use params syntax, not sma,20.",
     ("indicators_list", "trading_style"): "Filter indicators by common trading workflow: intraday, swing, or position.",
     ("trade_place", "magic"): "MT5 magic number: integer strategy/order identifier used to group EA or strategy trades. Defaults to configured order_magic when omitted.",
@@ -88,11 +142,44 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "arima, theta, or ensemble. Run forecast_list_methods with "
         "--detail standard --search-term NAME to browse the full namespace."
     ),
+    ("volatility_term_structure", "horizons"): (
+        "Comma-separated realized-volatility horizons in bars, for example 1,5,20."
+    ),
+    ("market_relative_strength", "horizons"): (
+        "Comma-separated ranking horizons in bars; values align one-to-one with --weights."
+    ),
+    ("market_relative_strength", "weights"): (
+        "Comma-separated non-negative ranking weights matching --horizons; normalized "
+        "to sum to 1."
+    ),
+    ("market_relative_strength", "limit"): "Max ranked symbols to return.",
+    ("options_chain", "limit"): "Max option contracts to return.",
+    ("options_heston_calibrate", "valuation_date"): (
+        "Valuation date in YYYY-MM-DD format; omit for today's date."
+    ),
+    ("volume_profile_levels", "limit"): (
+        "Historical bar count for a timeframe-based profile; requires --timeframe."
+    ),
+    ("outliers_detect", "limit"): "Max anomalous bars to return.",
+    ("temporal_analyze", "limit"): (
+        "Max grouped time buckets to return; pagination only, not the analysis window."
+    ),
+    ("temporal_analyze", "session_calendar"): "Session calendar: auto, fx, or equity.",
+    ("seasonality_detect", "max_period"): (
+        "Maximum candidate seasonal period in bars; defaults from available samples and "
+        "--min-cycles."
+    ),
     ("causal_discover_signals", "symbols"): (
         "Comma-separated MT5 symbols (e.g. EURUSD,GBPUSD); one symbol auto-expands "
         "to its MT5 group. Optional with --group."
     ),
     ("options_barrier_price", "option_type"): "Option side: call or put.",
+    ("options_barrier_price", "calendar"): (
+        "QuantLib calendar name, such as UnitedStates.NYSE, TARGET, or NullCalendar."
+    ),
+    ("options_barrier_price", "maturity_basis"): (
+        "Interpret maturity_days as calendar_days or business_days in the selected QuantLib calendar."
+    ),
     ("options_barrier_price", "barrier"): (
         "Option knock-in/knock-out barrier price level, in the same units as spot "
         "and strike. This is a numeric parametric pricer; it does not fetch a symbol quote."
@@ -127,6 +214,20 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
     ),
     ("options_heston_calibrate", "symbol"): (
         "Underlying symbol for listed options, e.g. AAPL or SPX."
+    ),
+    ("options_heston_calibrate", "calendar"): (
+        "QuantLib calendar name used by calibration helpers, such as UnitedStates.NYSE or NullCalendar."
+    ),
+    ("options_heston_calibrate", "maturity_basis"): (
+        "Basis for the reported days_to_expiry diagnostic; calibration remains anchored to the contract expiry date."
+    ),
+    ("options_chain", "expiration"): (
+        "Listed option expiration date in YYYY-MM-DD format, e.g. 2026-07-17. "
+        "Omit to use the provider's nearest available expiration."
+    ),
+    ("options_heston_calibrate", "expiration"): (
+        "Listed option expiration date in YYYY-MM-DD format, e.g. 2026-07-17. "
+        "Omit to use the provider's nearest available expiration."
     ),
     ("forecast_tune_optuna", "search_space"): "Optuna search space (JSON or k=v).",
     ("indicators_list", "detail"): "Output detail: compact table or full rows with aliases and descriptions.",
@@ -164,6 +265,11 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
     ("market_scan", "symbols"): (
         "Comma-separated MT5 symbols to scan. Optional with --group."
     ),
+    ("market_relative_strength", "symbols"): (
+        "Comma- or space-separated MT5 symbols to rank (e.g. EURUSD,GBPUSD "
+        "or EURUSD GBPUSD). Provide at least two symbols, or omit symbols and "
+        "use --group."
+    ),
     ("market_scan", "preset"): (
         "Built-in scan preset: oversold, overbought, high-volume, tight-spread, "
         "gap-up, or gap-down. Explicit filter flags override preset defaults."
@@ -183,12 +289,12 @@ _COMMAND_PARAM_HELP_OVERRIDES: Dict[tuple[str, str], str] = {
         "summary, or full."
     ),
     ("labels_triple_barrier", "limit"): (
-        "Historical bars fetched for labeling; not an output row limit. "
-        "Too-small values are raised to cover lookback plus horizon."
+        "Maximum sampled rows for compact/standard output; compact is capped at "
+        "10 and full returns the complete labeled series."
     ),
     ("labels_triple_barrier", "lookback"): (
-        "Recent labeled entries used for compact/summary stats and samples; "
-        "limit controls fetched history."
+        "Number of labeled entries to calculate; the tool fetches lookback plus "
+        "horizon bars."
     ),
     ("market_scan", "limit"): "Max matching symbols to return.",
     ("market_depth_fetch", "require_dom"): "Fail if DOM is unavailable instead of falling back to a quote snapshot.",
@@ -317,6 +423,22 @@ _FORECAST_METHOD_LITERAL_MARKERS = {
 
 def _normalize_cli_choice_value(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _case_insensitive_choice_parser(choices: Sequence[str]) -> Callable[[Any], str]:
+    canonical = [str(choice) for choice in choices]
+    folded: Dict[str, Optional[str]] = {}
+    for choice in canonical:
+        key = choice.casefold()
+        folded[key] = choice if key not in folded else None
+
+    def _parse(value: Any) -> str:
+        text = str(value or "").strip()
+        if text in canonical:
+            return text
+        return folded.get(text.casefold()) or text
+
+    return _parse
 
 
 def _is_forecast_method_literal(
@@ -627,7 +749,9 @@ def resolve_param_kwargs(
                     choices = [str(v) for v in get_args(inner)]
                     if choices:
                         kwargs["choices"] = choices
-                    kwargs["type"] = str
+                        kwargs["type"] = _case_insensitive_choice_parser(choices)
+                    else:
+                        kwargs["type"] = str
                     kwargs["nargs"] = "+"
                 else:
                     kwargs["type"] = str
@@ -636,19 +760,25 @@ def resolve_param_kwargs(
                 choices = [str(v) for v in get_args(base_type)]
                 if choices:
                     kwargs["choices"] = choices
-                kwargs["type"] = str
+                    kwargs["type"] = _case_insensitive_choice_parser(choices)
+                else:
+                    kwargs["type"] = str
         except Exception as exc:
             debug(f"Type resolution failed for param '{param['name']}': {exc}")
             kwargs["type"] = str
 
     if not param["required"] and not (param["type"] is bool and param["default"] is None):
-        kwargs["default"] = param["default"]
+        if (str(cmd_name or ""), str(param["name"])) in _PRESERVE_OMITTED_DEFAULT_PARAMS:
+            kwargs["default"] = argparse.SUPPRESS
+        else:
+            kwargs["default"] = param["default"]
 
     choice_override_key = (str(cmd_name or ""), str(param["name"]))
     choice_override = _COMMAND_PARAM_CHOICE_OVERRIDES.get(choice_override_key)
     if choice_override:
-        kwargs["choices"] = list(choice_override)
-        kwargs["type"] = _normalize_cli_choice_value
+        choices = list(choice_override)
+        kwargs["choices"] = choices
+        kwargs["type"] = _case_insensitive_choice_parser(choices)
 
     if (str(cmd_name or ""), str(param["name"])) == ("indicators_list", "category"):
         kwargs["type"] = lambda value: str(value or "").strip().lower()
@@ -656,7 +786,7 @@ def resolve_param_kwargs(
     return kwargs, is_mapping_type
 
 
-def add_dynamic_arguments(
+def add_dynamic_arguments(  # noqa: C901
     parser: Any,
     param_info: Dict[str, Any],
     *,
@@ -693,7 +823,10 @@ def add_dynamic_arguments(
             cmd_name=cmd_name,
             param_names=param_names,
         )
-        if (str(cmd_name or ""), str(param["name"])) in _COMMAND_REQUIRED_OPTIONS:
+        is_required_option = (
+            param["required"] and param != param_info["params"][0]
+        ) or (str(cmd_name or ""), str(param["name"])) in _COMMAND_REQUIRED_OPTIONS
+        if is_required_option:
             kwargs["required"] = True
             kwargs["default"] = argparse.SUPPRESS
             kwargs["help"] = f"{kwargs.get('help') or param['name']} (required)"
@@ -704,7 +837,40 @@ def add_dynamic_arguments(
             and (str(cmd_name or ""), str(param["name"])) in _OPTIONAL_FIRST_POSITIONAL_PARAMS
         )
 
-        if param["required"] and param == param_info["params"][0]:
+        required_symbol_alias = (
+            param["required"]
+            and param == param_info["params"][0]
+            and str(param["name"]) in {"symbol", "symbols"}
+        )
+        if required_symbol_alias:
+            positional_kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if k in ("help", "type", "choices", "metavar")
+            }
+            positional_kwargs["nargs"] = (
+                "*"
+                if (
+                    str(cmd_name or "") in _MULTI_VALUE_SYMBOL_POSITIONAL_COMMANDS
+                    and str(param["name"]) == "symbols"
+                )
+                else "?"
+            )
+            positional_kwargs["default"] = argparse.SUPPRESS
+            positional_kwargs["help"] = (
+                f"{positional_kwargs.get('help') or param['name']} (required)"
+            )
+            parser.add_argument(param["name"], **positional_kwargs)
+            option_kwargs = dict(kwargs)
+            option_kwargs["default"] = argparse.SUPPRESS
+            option_kwargs["required"] = False
+            if option_flags:
+                parser.add_argument(*option_flags, **option_kwargs)
+            if hidden_option_flags:
+                hidden_option_kwargs = dict(option_kwargs)
+                hidden_option_kwargs["help"] = argparse.SUPPRESS
+                parser.add_argument(*hidden_option_flags, **hidden_option_kwargs)
+        elif param["required"] and param == param_info["params"][0]:
             positional_kwargs = {k: v for k, v in kwargs.items() if k in ("help", "type", "choices", "metavar")}
             if (
                 str(cmd_name or "") in _MULTI_VALUE_SYMBOL_POSITIONAL_COMMANDS
@@ -731,9 +897,10 @@ def add_dynamic_arguments(
                 or (str(cmd_name or ""), str(param["name"])) in _HIDDEN_OPTIONAL_FIRST_POSITIONAL_FLAGS
             ):
                 option_kwargs["help"] = argparse.SUPPRESS
-            if option_flags:
+            positional_key = (str(cmd_name or ""), str(param["name"]))
+            if option_flags and positional_key not in _POSITIONAL_ONLY_OPTIONAL_FIRST_PARAMS:
                 parser.add_argument(*option_flags, **option_kwargs)
-            if hidden_option_flags:
+            if hidden_option_flags and positional_key not in _POSITIONAL_ONLY_OPTIONAL_FIRST_PARAMS:
                 hidden_option_kwargs = dict(kwargs)
                 hidden_option_kwargs["help"] = argparse.SUPPRESS
                 parser.add_argument(*hidden_option_flags, **hidden_option_kwargs)

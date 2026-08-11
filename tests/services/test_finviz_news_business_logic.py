@@ -60,9 +60,9 @@ def test_finviz_news_normalizes_stock_results_to_single_items_array() -> None:
         "success": True,
         "symbol": "AAPL",
         "count": 1,
-        "total": 1,
-        "page": 1,
-        "pages": 1,
+        "total": 3,
+        "page": 2,
+        "pages": 3,
         "news": [
             {
                 "Title": "  Apple launches new chips  ",
@@ -74,11 +74,11 @@ def test_finviz_news_normalizes_stock_results_to_single_items_array() -> None:
     }
 
     with patch("mtdata.core.finviz.get_stock_news", return_value=service_result):
-        out = raw(symbol="AAPL", limit=5, page=1)
+        out = raw(symbol="AAPL", limit=1, page=2)
 
     assert out["items"][0]["title"] == "Apple launches new chips"
     assert out["items"][0]["source"] == "Reuters"
-    assert out["items"][0]["published_at"] == "2026-04-18T00:00:00+00:00"
+    assert out["items"][0]["published_at"] == "2026-04-18T04:00:00+00:00"
     assert out["items"][0]["kind"] == "direct_symbol"
     assert out["items"][0]["content_type"] == "news"
     assert out["detail"] == "compact"
@@ -87,6 +87,15 @@ def test_finviz_news_normalizes_stock_results_to_single_items_array() -> None:
     assert "output_shape" not in out
     assert "timezone" not in out
     assert "news" not in out
+    assert out["pagination"] == {
+        "total": 3,
+        "returned": 1,
+        "offset": 1,
+        "limit": 1,
+        "has_more": True,
+        "more_available": 1,
+    }
+    assert not {"total", "page", "pages", "has_more"} & out.keys()
 
 
 def test_finviz_news_repairs_mojibake_titles() -> None:
@@ -181,7 +190,7 @@ def test_finviz_market_news_normalizes_items() -> None:
     assert out["items"][0]["title"] == "Stocks rise"
     assert out["items"][0]["source"] == "AP"
     assert out["items"][0]["content_type"] == "news"
-    assert "T14:00:00+00:00" in out["items"][0]["published_at"]
+    assert "T18:00:00+00:00" in out["items"][0]["published_at"]
     assert out["row_key"] == "items"
     assert "preferred_tool" not in out
     assert "tool_scope" not in out

@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .common import interval_overlap_ratio, prepare_ohlc_pattern_inputs
 from .classic_impl.config import (
     ClassicDetectorConfig,
     ClassicPatternResult,
@@ -30,6 +29,7 @@ from .classic_impl.utils import (
     _calibrate_confidence,
     _detect_pivots_close,
 )
+from .common import interval_overlap_ratio, prepare_ohlc_pattern_inputs
 
 __all__ = [
     "ClassicDetectorConfig",
@@ -69,6 +69,14 @@ def _detect_classic_patterns_once(
         peaks = np.asarray(peaks, dtype=int)
         troughs = np.asarray(troughs, dtype=int)
 
+    # scipy peak detection can identify a recent local extremum before enough
+    # right-hand bars exist to treat it as a stable trading pivot. Apply the
+    # same conservative confirmation gap used by the historical prefix scan.
+    pivot_confirm_gap = max(2, int(getattr(cfg, "min_distance", 5)))
+    pivot_cutoff = max(0, int(n) - pivot_confirm_gap)
+    peaks = peaks[peaks < pivot_cutoff]
+    troughs = troughs[troughs < pivot_cutoff]
+
     results: List[ClassicPatternResult] = []
     results.extend(detect_trend_lines(c, peaks, troughs, t, cfg, high=h, low=l))
     results.extend(detect_channels(c, peaks, troughs, t, cfg, high=h, low=l))
@@ -89,6 +97,26 @@ def _detect_classic_patterns_once(
     )
     results.extend(detect_cup_handle(c, t, cfg))
     return results
+
+
+def _attach_classic_availability(
+    results: List[ClassicPatternResult],
+    t: np.ndarray,
+    *,
+    available_at_index: int,
+    pivot_confirmation_bars: int,
+    detection_scope: str,
+) -> None:
+    for result in results:
+        if not isinstance(result.details, dict):
+            result.details = {}
+        result.details.setdefault("available_at_index", int(available_at_index))
+        available_at_time = result.resolve_time(t, int(available_at_index))
+        if available_at_time is not None:
+            result.details.setdefault("available_at_time", available_at_time)
+        result.details.setdefault("pivot_confirmation_bars", int(pivot_confirmation_bars))
+        result.details.setdefault("status_basis", "causal_as_of_detection_with_confirmed_pivots")
+        result.details.setdefault("detection_scope", detection_scope)
 
 
 def _pattern_overlap_ratio(a: ClassicPatternResult, b: ClassicPatternResult) -> float:
@@ -158,13 +186,18 @@ def _scan_classic_patterns(
         prefix_ends.append(n_total)
 
     scan_cfg = replace(cfg, scan_historical=False)
-    full_peaks, full_troughs = _detect_pivots_close(c, scan_cfg, h, l)
-    full_peaks = np.asarray(full_peaks, dtype=int)
-    full_troughs = np.asarray(full_troughs, dtype=int)
     pivot_confirm_gap = max(2, int(getattr(scan_cfg, "min_distance", 5)))
 
     merged: List[ClassicPatternResult] = []
     for end in prefix_ends:
+        prefix_peaks, prefix_troughs = _detect_pivots_close(
+            c[:end],
+            scan_cfg,
+            h[:end],
+            l[:end],
+        )
+        prefix_peaks = np.asarray(prefix_peaks, dtype=int)
+        prefix_troughs = np.asarray(prefix_troughs, dtype=int)
         pivot_cutoff = max(0, int(end) - pivot_confirm_gap)
         batch = _detect_classic_patterns_once(
             t[:end],
@@ -173,8 +206,15 @@ def _scan_classic_patterns(
             l[:end],
             int(end),
             scan_cfg,
-            peaks=full_peaks[full_peaks < pivot_cutoff],
-            troughs=full_troughs[full_troughs < pivot_cutoff],
+            peaks=prefix_peaks[prefix_peaks < pivot_cutoff],
+            troughs=prefix_troughs[prefix_troughs < pivot_cutoff],
+        )
+        _attach_classic_availability(
+            batch,
+            t[:end],
+            available_at_index=int(end) - 1,
+            pivot_confirmation_bars=pivot_confirm_gap,
+            detection_scope="causal_prefix_scan",
         )
         merged = _merge_scanned_patterns(merged, batch, cfg)
     return merged
@@ -251,5 +291,12 @@ def detect_classic_patterns(
         results = _scan_classic_patterns(t, c, h, l, cfg)
     else:
         results = _detect_classic_patterns_once(t, c, h, l, n, cfg)
+        _attach_classic_availability(
+            results,
+            t,
+            available_at_index=int(n) - 1,
+            pivot_confirmation_bars=max(2, int(getattr(cfg, "min_distance", 5))),
+            detection_scope="right_edge_as_of_input_window",
+        )
 
     return _postprocess_classic_results(results, cfg, n)

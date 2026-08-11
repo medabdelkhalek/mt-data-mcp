@@ -60,12 +60,14 @@ def test_seasonal_naive_validation_and_repeating_pattern():
 def test_theta_forecast_tracks_trend_and_reports_alpha_and_slope():
     method = cl.ThetaMethod()
     series = pd.Series([2.0, 4.0, 6.0, 8.0])
-    out = method.forecast(series, horizon=2, seasonality=0, params={"alpha": 0.5})
+    out = method.forecast(series, horizon=2, seasonality=0, params={})
 
     # On linear data y=2t, OLS slope should be near 2.
     assert out.params_used is not None
-    assert out.params_used["alpha"] == 0.5
+    assert 0.0 < out.params_used["alpha"] <= 1.0
     assert out.params_used["trend_slope"] == pytest.approx(2.0, abs=1e-10)
+    assert out.params_used["m"] == 1
+    assert out.params_used["seasonality_applied"] is False
     assert out.forecast.shape == (2,)
     assert np.all(out.forecast > 0.0)
 
@@ -75,6 +77,31 @@ def test_theta_forecast_rejects_non_finite_series_values():
 
     with pytest.raises(ValueError, match="finite"):
         method.forecast(pd.Series([2.0, np.nan, 6.0]), horizon=2, seasonality=0, params={})
+
+
+def test_theta_forecast_deseasonalizes_and_restores_requested_cycle():
+    method = cl.ThetaMethod()
+    trend = 10.0 + 0.5 * np.arange(24, dtype=float)
+    seasonal = np.tile(np.array([-2.0, 1.0, 3.0, -2.0]), 6)
+    series = pd.Series(trend + seasonal)
+
+    out = method.forecast(series, horizon=8, seasonality=4, params={})
+    nonseasonal = method.forecast(series, horizon=8, seasonality=1, params={})
+
+    assert out.params_used["m"] == 4
+    assert out.params_used["seasonality_applied"] is True
+    assert not np.allclose(out.forecast, nonseasonal.forecast)
+    assert np.allclose(np.diff(out.forecast[:4]), np.diff(out.forecast[4:]))
+
+
+def test_theta_forecast_rejects_noncanonical_parameters():
+    with pytest.raises(ValueError, match="does not accept"):
+        cl.ThetaMethod().forecast(
+            pd.Series([1.0, 2.0, 3.0]),
+            horizon=2,
+            seasonality=1,
+            params={"alpha": 0.2},
+        )
 
 
 def test_fourier_ols_default_and_custom_params():

@@ -649,22 +649,24 @@ def _run_candle_boundary_only(
     )
     max_wait_seconds = request.max_wait_seconds
     if max_wait_seconds is not None and float(preview["sleep_seconds"]) > float(max_wait_seconds):
-        preview["success"] = True
-        preview["status"] = "deferred_timeout_risk"
+        preview["success"] = False
+        preview["completed"] = False
+        preview["status"] = "wait_budget_exceeded"
+        preview["error_code"] = "wait_budget_exceeded"
+        preview["error"] = (
+            "The next candle boundary is beyond max_wait_seconds; no wait was "
+            "performed and no candle-close event was observed."
+        )
+        preview["not_waited"] = True
         preview["slept"] = False
         preview["slept_seconds"] = 0.0
         preview["remaining_seconds"] = float(preview["sleep_seconds"])
         preview["max_wait_seconds"] = float(max_wait_seconds)
-        preview["warning"] = (
-            "Skipping blocking wait because the remaining candle wait exceeds max_wait_seconds. "
-            "Increase max_wait_seconds in clients that allow longer MCP tool timeouts."
+        preview["remediation"] = (
+            "Increase max_wait_seconds beyond remaining_seconds and retry."
         )
-        preview["event"] = "candle_close"
-        preview["boundary_event"] = {
-            "type": "candle_close",
-            "timeframe": boundary["timeframe"],
-            "buffer_seconds": boundary["buffer_seconds"],
-        }
+        preview["event"] = None
+        preview["boundary_event"] = None
         if identity_payload:
             preview.update(identity_payload)
         if quote_payload:
@@ -695,6 +697,7 @@ def _run_candle_boundary_only(
         None if request.max_wait_seconds is None else float(request.max_wait_seconds)
     )
     payload["success"] = True
+    payload["completed"] = True
     if identity_payload:
         payload.update(identity_payload)
     started_at_value = _normalize_optional_utc_datetime(payload.get("started_at_utc"))
@@ -2556,10 +2559,13 @@ def _build_wait_result(
     elapsed_seconds = max(0.0, (observed_at_utc - started_at_utc).total_seconds())
     matched_event = _with_wait_event_identity(matched_event)
     timed_out = status == "timeout"
+    matched = status in {"matched", "already_satisfied"}
+    boundary_only = status == "boundary_reached" and not watch_for_payload
     result = {
-        "success": not timed_out,
+        "success": matched or boundary_only,
+        "completed": not timed_out,
         "status": status,
-        "matched": status in {"matched", "already_satisfied"},
+        "matched": matched,
         "event": matched_event["type"] if matched_event is not None else None,
         "matched_event": matched_event,
         "boundary_event": boundary_event,
@@ -2586,6 +2592,15 @@ def _build_wait_result(
                 "error_code": "wait_event_timeout",
                 "error": (
                     "Wait timed out before a watched event or boundary was observed."
+                ),
+            }
+        )
+    elif status == "boundary_reached" and not boundary_only:
+        result.update(
+            {
+                "error_code": "wait_event_boundary_reached",
+                "error": (
+                    "A wait boundary was reached before any watched event matched."
                 ),
             }
         )

@@ -203,11 +203,18 @@ class TestModelStoreTTL(unittest.TestCase):
         self.assertIsNone(self.store.find("m", "d", "p"))
         self.assertTrue(model_dir.exists())
 
-    def test_load_refreshes_last_used(self):
+    def test_load_does_not_refresh_last_used_until_marked(self):
         self.store.save("m", "d", "p", b"data")
-        # Load to refresh last_used
-        self.store.load_bytes("m/d/p")
         meta_path = self.store._model_dir("m", "d", "p") / "metadata.json"
+        with open(meta_path) as f:
+            original_meta = json.load(f)
+
+        self.store.load_bytes("m/d/p")
+        with open(meta_path) as f:
+            loaded_meta = json.load(f)
+        self.assertEqual(loaded_meta["last_used"], original_meta["last_used"])
+
+        self.assertTrue(self.store.mark_used("m/d/p"))
         with open(meta_path) as f:
             meta = json.load(f)
         self.assertAlmostEqual(meta["last_used"], time.time(), delta=2)
@@ -215,7 +222,7 @@ class TestModelStoreTTL(unittest.TestCase):
         self.assertEqual(meta["store_metadata"]["compatibility_version"], 1)
         self.assertAlmostEqual(meta["store_metadata"]["last_used"], meta["last_used"], delta=0.01)
 
-    def test_load_updates_last_used_under_store_lock(self):
+    def test_mark_used_updates_last_used_under_store_lock(self):
         self.store.save("m", "d", "p", b"data")
         lock_states = []
         original_touch = self.store._touch_last_used
@@ -226,7 +233,7 @@ class TestModelStoreTTL(unittest.TestCase):
 
         self.store._touch_last_used = wrapped_touch
 
-        self.assertEqual(self.store.load_bytes("m/d/p"), b"data")
+        self.assertTrue(self.store.mark_used("m/d/p"))
         self.assertEqual(lock_states, [True])
 
     def test_find_backfills_store_metadata_for_legacy_metadata(self):
@@ -275,6 +282,19 @@ class TestModelStoreTTL(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertIsNone(self.store.find("m1", "d", "p1"))
         self.assertIsNotNone(self.store.find("m2", "d", "p2"))
+
+    def test_cleanup_expired_removes_metadata_less_artifact(self):
+        model_dir = self.store._model_dir("m", "d", "orphan")
+        model_dir.mkdir(parents=True)
+        artifact_path = model_dir / "model.bin"
+        artifact_path.write_bytes(b"orphan")
+        old = time.time() - 10
+        os.utime(artifact_path, (old, old))
+
+        removed = self.store.cleanup_expired()
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(model_dir.exists())
 
     def test_cleanup_expired_deletes_under_store_lock(self):
         self.store.save("m1", "d", "p1", b"d")
@@ -411,6 +431,16 @@ class TestModelStoreAtomicWrite(unittest.TestCase):
         loaded = self.store.load_bytes("m/d/p")
         self.assertTrue(loaded.startswith(b"model_data_"))
 
+    def test_artifact_metadata_generation_mismatch_is_rejected(self):
+        self.store.save("m", "d", "p", b"generation-one")
+        model_dir = self.store._model_dir("m", "d", "p")
+        self.store._atomic_write_bytes(
+            model_dir / "model.bin", b"generation-two"
+        )
+
+        with self.assertRaisesRegex(FileNotFoundError, "generation mismatch"):
+            self.store.load_bytes("m/d/p")
+
 
 class TestModelStoreDataScopeEscaping(unittest.TestCase):
     """Data scopes with slashes/backslashes are safely stored."""
@@ -434,6 +464,32 @@ class TestModelStoreDataScopeEscaping(unittest.TestCase):
         handle = self.store.save("tft", scope, "abc", b"multi")
         loaded = self.store.load_bytes(handle.model_id)
         self.assertEqual(loaded, b"multi")
+
+    def test_distinct_path_characters_do_not_collide(self):
+        slash = self.store.save("m", "EUR/USD_H1", "p", b"slash")
+        backslash = self.store.save("m", "EUR\\USD_H1", "p", b"backslash")
+        underscore = self.store.save("m", "EUR_USD_H1", "p", b"underscore")
+
+        self.assertEqual(len({slash.model_id, backslash.model_id, underscore.model_id}), 3)
+        self.assertEqual(self.store.load_bytes(slash.model_id), b"slash")
+        self.assertEqual(self.store.load_bytes(backslash.model_id), b"backslash")
+        self.assertEqual(self.store.load_bytes(underscore.model_id), b"underscore")
+
+    def test_cleanup_retries_staged_tombstone_removal(self):
+        handle = self.store.save("m", "scope", "p", b"data")
+
+        with unittest.mock.patch(
+            "mtdata.forecast.model_store.shutil.rmtree",
+            side_effect=PermissionError("locked"),
+        ):
+            self.assertTrue(self.store.delete(handle.model_id))
+
+        deleted_root = self.store._deleted_root()
+        self.assertTrue(any(deleted_root.iterdir()))
+
+        self.store.cleanup_expired()
+
+        self.assertEqual(list(deleted_root.iterdir()), [])
 
 
 if __name__ == "__main__":

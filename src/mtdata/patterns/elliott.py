@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import StandardScaler
+
+if TYPE_CHECKING:
+    from sklearn.mixture import GaussianMixture
+    from sklearn.preprocessing import StandardScaler
 
 from ..utils.utils import to_float_np
 from .common import PatternResultBase
@@ -26,8 +28,10 @@ class ElliottWaveConfig:
 
     Structural scoring is based on hard-rule validity and Fibonacci-template
     fit. The optional GMM classifier is diagnostic-only. When scale_mode is
-    "auto", request-scoped causal calibration selects market-relative ZigZag
-    scales and may conservatively smooth the close-based pivot signal.
+    "auto", request-scoped trailing-window calibration selects market-relative
+    ZigZag scales and may conservatively smooth the close-based pivot signal.
+    Its filters are causal, but its terminal selection is not a walk-forward
+    historical backtest.
     """
 
     # Pivot detection controls (used by analysis and threshold scans)
@@ -750,6 +754,9 @@ def _classify_waves(
         return np.array([]), None, None, None, None
 
     try:
+        from sklearn.mixture import GaussianMixture
+        from sklearn.preprocessing import StandardScaler
+
         feature_std = np.nanstd(features, axis=0)
         if (
             not np.all(np.isfinite(feature_std))
@@ -830,12 +837,13 @@ def _evaluate_impulse_rules(
     if (not bullish) and w[2] >= w[0]:
         violations.append("wave2_over_retrace")
 
-    # Rule 3 is defined in percentage terms. Arithmetic lengths are retained as
-    # diagnostics, but do not decide validity on instruments with large moves.
+    # Rule 3 compares the three motive-wave lengths on one price scale. Dividing
+    # each leg by its own start price can reverse their ordering after a large
+    # advance and admit a genuinely shortest wave 3.
     pct1 = absL[0] / abs(w[0]) if w[0] != 0 else 0.0
     pct3 = absL[2] / abs(w[2]) if w[2] != 0 else 0.0
     pct5 = absL[4] / abs(w[4]) if w[4] != 0 else 0.0
-    if pct3 < min(pct1, pct5):
+    if absL[2] < min(absL[0], absL[4]):
         violations.append("wave3_shortest")
 
     if bullish and w[3] <= w[1]:

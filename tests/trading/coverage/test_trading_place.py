@@ -41,15 +41,14 @@ _mt5_stub.POSITION_TYPE_BUY = 0
 _mt5_stub.POSITION_TYPE_SELL = 1
 sys.modules["MetaTrader5"] = _mt5_stub
 
-from mtdata.core.trading import (
-    trade_place as _trade_place_tool,
+from mtdata.core.trading import trade_place as _trade_place_tool
+from mtdata.core.trading.orders import (
+    _prepare_order_symbol_context,
+    _send_order_with_fill_mode_retry,
+    _submit_order_request,
 )
-from mtdata.core.trading.orders import _send_order_with_fill_mode_retry
-from mtdata.core.trading.requests import (
-    TradePlaceRequest,
-)
+from mtdata.core.trading.requests import TradePlaceRequest
 from mtdata.core.trading.use_cases import _should_persist_idempotency_outcome
-
 
 # ===================================================================
 # Helpers
@@ -181,6 +180,174 @@ def test_ambiguous_order_send_outcome_is_idempotency_safe():
     assert _should_persist_idempotency_outcome(
         {"error_code": "order_send_ambiguous", "ambiguous": True}
     )
+
+
+def test_dry_run_preview_is_not_persisted_as_idempotent_outcome():
+    assert not _should_persist_idempotency_outcome(
+        {"success": True, "dry_run": True, "no_action": True}
+    )
+
+
+def test_order_preflight_blocks_critical_account_margin_before_symbol_lookup():
+    gateway = MagicMock()
+    gateway.build_trade_preflight.return_value = {"execution_ready_strict": True}
+    gateway.account_info.return_value = SimpleNamespace(
+        equity=1000.0, margin=950.0, margin_free=50.0, margin_level=105.26
+    )
+
+    context, error = _prepare_order_symbol_context(
+        gateway, symbol="EURUSD", volume=0.01
+    )
+
+    assert context is None
+    assert error["error_code"] == "trade_blocked_account_state"
+    assert "critical_margin_stress" in error["blockers"]
+    gateway.symbol_info.assert_not_called()
+
+
+def test_order_preflight_blocks_when_account_snapshot_is_unavailable():
+    gateway = MagicMock()
+    gateway.build_trade_preflight.return_value = {"execution_ready_strict": True}
+    gateway.account_info.return_value = None
+
+    context, error = _prepare_order_symbol_context(
+        gateway, symbol="EURUSD", volume=0.01
+    )
+
+    assert context is None
+    assert error["error_code"] == "account_snapshot_unavailable"
+    assert error["blockers"] == ["account_snapshot_unavailable"]
+    gateway.symbol_info.assert_not_called()
+
+
+def _critical_margin_gateway(*, margin_mode: int, positions):
+    from mtdata.core.trading.gateway import MT5TradingGateway
+
+    adapter = MagicMock()
+    adapter.account_info.return_value = SimpleNamespace(
+        equity=1000.0,
+        margin=1000.0,
+        margin_free=0.0,
+        margin_level=100.0,
+        margin_mode=margin_mode,
+        trade_allowed=True,
+    )
+    adapter.positions_get.return_value = list(positions)
+    adapter.symbol_info.return_value = _sym()
+    adapter.symbol_info_tick.return_value = _tick()
+    adapter.symbol_select.return_value = True
+    adapter.order_send.return_value = _order_result(volume=0.5)
+    adapter.ORDER_TYPE_BUY = 0
+    adapter.ORDER_TYPE_SELL = 1
+    adapter.POSITION_TYPE_BUY = 0
+    adapter.POSITION_TYPE_SELL = 1
+    adapter.TRADE_ACTION_DEAL = 1
+    adapter.TRADE_ACTION_SLTP = 6
+    adapter.TRADE_RETCODE_DONE = 10009
+    adapter.TRADE_RETCODE_DONE_PARTIAL = 10010
+    adapter.TRADE_RETCODE_PLACED = 10008
+    adapter.ORDER_TIME_GTC = 0
+    adapter.ORDER_FILLING_IOC = 1
+    return MT5TradingGateway(
+        adapter=adapter,
+        ensure_connection_impl=lambda: None,
+        build_trade_preflight_impl=lambda *_args, **_kwargs: {
+            "execution_ready_strict": True
+        },
+        retcode_name_impl=lambda _adapter, retcode: str(retcode),
+    )
+
+
+def test_critical_margin_allows_proven_netting_reduction():
+    from mtdata.core.trading.orders import _place_market_order
+
+    gateway = _critical_margin_gateway(
+        margin_mode=0,
+        positions=[_position(type_=0, volume=1.0)],
+    )
+
+    result = _place_market_order(
+        "EURUSD",
+        0.5,
+        "SELL",
+        gateway=gateway,
+    )
+
+    assert result["success"] is True
+    assert gateway.adapter.order_send.call_count == 1
+
+
+def test_critical_margin_still_blocks_hedging_order():
+    from mtdata.core.trading.orders import _place_market_order
+
+    gateway = _critical_margin_gateway(
+        margin_mode=2,
+        positions=[_position(type_=0, volume=1.0)],
+    )
+
+    result = _place_market_order(
+        "EURUSD",
+        0.5,
+        "SELL",
+        gateway=gateway,
+    )
+
+    assert result["error_code"] == "trade_blocked_account_state"
+    gateway.adapter.order_send.assert_not_called()
+
+
+def test_netting_order_protection_cannot_mutate_existing_position():
+    from mtdata.core.trading.orders import _place_market_order
+
+    gateway = _critical_margin_gateway(
+        margin_mode=0,
+        positions=[_position(type_=0, volume=1.0)],
+    )
+    gateway.adapter.account_info.return_value = SimpleNamespace(
+        equity=1000.0,
+        margin=100.0,
+        margin_free=900.0,
+        margin_level=1000.0,
+        margin_mode=0,
+        trade_allowed=True,
+    )
+
+    result = _place_market_order(
+        "EURUSD",
+        0.1,
+        "BUY",
+        stop_loss=1.0,
+        take_profit=1.2,
+        gateway=gateway,
+    )
+
+    assert result["error_code"] == "netting_position_protection_conflict"
+    gateway.adapter.order_send.assert_not_called()
+
+
+def test_failed_order_omits_success_last_error_sentinel():
+    gateway = MagicMock()
+    gateway.TRADE_RETCODE_DONE = 10009
+    gateway.TRADE_RETCODE_DONE_PARTIAL = 10010
+    gateway.TRADE_RETCODE_PLACED = 10008
+    gateway.TRADE_RETCODE_INVALID_FILL = 10030
+    gateway.ORDER_FILLING_FOK = 0
+    gateway.ORDER_FILLING_IOC = 1
+    gateway.ORDER_FILLING_RETURN = 2
+    gateway.order_send.return_value = _order_result(retcode=10004)
+    gateway.last_error.return_value = (1, "Success")
+    gateway.retcode_name.side_effect = lambda value: str(value)
+
+    outcome, error = _submit_order_request(
+        gateway,
+        {"type_filling": 1},
+        base_error="Order failed",
+        invalid_comment_error="Invalid comment",
+    )
+
+    assert outcome is None
+    assert error["retcode"] == 10004
+    assert "last_error" not in error
 
 
 # Patch MT5 connection helpers to avoid real terminal access in tests
@@ -446,6 +613,99 @@ class TestPlaceMarketOrder:
         assert mt5.order_send.call_count == 2
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_sl_follow_up_preserves_existing_take_profit(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.order_send.side_effect = [_order_result(), _order_result()]
+        mt5.positions_get.side_effect = [
+            [_position(sl=0.0, tp=1.12)],
+            [_position(sl=1.09, tp=1.12)],
+        ]
+        from mtdata.core.trading import _place_market_order
+
+        result = _place_market_order(
+            "EURUSD",
+            0.01,
+            "BUY",
+            stop_loss=1.09,
+        )
+
+        modify_request = mt5.order_send.call_args_list[1].args[0]
+        assert modify_request["sl"] == pytest.approx(1.09)
+        assert modify_request["tp"] == pytest.approx(1.12)
+        assert (result.get("sl_tp_result") or {}).get("status") == "applied"
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_tp_follow_up_preserves_existing_stop_loss(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.order_send.side_effect = [_order_result(), _order_result()]
+        mt5.positions_get.side_effect = [
+            [_position(sl=1.09, tp=0.0)],
+            [_position(sl=1.09, tp=1.12)],
+        ]
+        from mtdata.core.trading import _place_market_order
+
+        result = _place_market_order(
+            "EURUSD",
+            0.01,
+            "BUY",
+            take_profit=1.12,
+        )
+
+        modify_request = mt5.order_send.call_args_list[1].args[0]
+        assert modify_request["sl"] == pytest.approx(1.09)
+        assert modify_request["tp"] == pytest.approx(1.12)
+        assert (result.get("sl_tp_result") or {}).get("status") == "applied"
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_sl_tp_follow_up_does_not_retry_ambiguous_none(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.order_send.side_effect = [_order_result(), None]
+        mt5.positions_get.return_value = [_position(sl=0.0, tp=0.0)]
+        from mtdata.core.trading import _place_market_order
+
+        result = _place_market_order(
+            "EURUSD",
+            0.01,
+            "BUY",
+            stop_loss=1.09,
+            take_profit=1.12,
+        )
+
+        assert mt5.order_send.call_count == 2
+        assert (result.get("sl_tp_result") or {}).get("status") == "unverified"
+        assert "not retried" in (result.get("sl_tp_result") or {}).get("error", "")
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_sl_tp_resolution_rejects_same_symbol_heuristic_match(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.order_send.return_value = _order_result(order=10, deal=20)
+        mt5.history_deals_get.return_value = []
+        mt5.positions_get.return_value = [
+            _position(ticket=99, sl=0.0, tp=0.0, time=int(time.time()))
+        ]
+        from mtdata.core.trading import _place_market_order
+
+        with patch(
+            "mtdata.core.trading.orders._POSITION_RESOLUTION_WAIT_SCHEDULE_SECONDS",
+            (),
+        ):
+            result = _place_market_order(
+                "EURUSD",
+                0.01,
+                "BUY",
+                stop_loss=1.09,
+                take_profit=1.12,
+            )
+
+        assert mt5.order_send.call_count == 1
+        assert (result.get("sl_tp_result") or {}).get("status") == "unverified"
+        assert result.get("position_ticket") is None
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_sl_tp_readback_rejects_different_position_ticket(self):
         mt5 = sys.modules["MetaTrader5"]
         self._setup_mt5(mt5)
@@ -531,13 +791,12 @@ class TestPlaceMarketOrder:
         assert sl_tp_result.get("last_retcode") == 10004
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
-    def test_sl_tp_attach_retries_through_transient_none_return(self):
-        """A transient None return from order_send must not abort the attach loop;
-        the loop should keep retrying until a terminal retcode is seen."""
+    def test_sl_tp_attach_stops_after_ambiguous_none_return(self):
+        """A missing write response must not trigger another modify request."""
         mt5 = sys.modules["MetaTrader5"]
         self._setup_mt5(mt5)
 
-        # place -> REQUOTE -> None (transient) -> DONE (then verified).
+        # place -> REQUOTE -> None (ambiguous); the later DONE must not be sent.
         results = [
             _order_result(),                                # market order fill
             _order_result(retcode=10004, comment="Requote"),
@@ -559,9 +818,9 @@ class TestPlaceMarketOrder:
         with patch("mtdata.core.trading.orders._stdlib_time.sleep", lambda *_a, **_k: None):
             from mtdata.core.trading import _place_market_order
             result = _place_market_order("EURUSD", 0.01, "BUY", stop_loss=1.09, take_profit=1.12)
-        # Placement + 3 attach attempts (REQUOTE, None, DONE) => 4 order_send calls.
-        assert calls["n"] == 4
-        assert (result.get("sl_tp_result") or {}).get("status") == "applied"
+        # Placement + REQUOTE + ambiguous None => no further write.
+        assert calls["n"] == 3
+        assert (result.get("sl_tp_result") or {}).get("status") == "unverified"
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_initial_protected_order_failure_returns_error(self):
@@ -603,6 +862,35 @@ class TestPlaceMarketOrder:
         from mtdata.core.trading import _place_market_order
         result = _place_market_order("EURUSD", 0.01, "BUY")
         assert result.get("sl_tp_result") == {"status": "not_requested"}
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_queued_market_order_is_not_reported_as_filled(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.order_send.return_value = _order_result(retcode=10008, volume=0.0)
+        from mtdata.core.trading import _place_market_order
+
+        result = _place_market_order("EURUSD", 0.01, "BUY")
+
+        assert result["success"] is False
+        assert result["execution_status"] == "queued"
+        assert result["requested_volume"] == 0.01
+        assert result["filled_volume"] == 0.0
+        assert result["remaining_volume"] == 0.01
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_partial_market_order_exposes_remaining_volume(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.order_send.return_value = _order_result(retcode=10010, volume=0.004)
+        from mtdata.core.trading import _place_market_order
+
+        result = _place_market_order("EURUSD", 0.01, "BUY")
+
+        assert result["success"] is False
+        assert result["execution_status"] == "partial"
+        assert result["filled_volume"] == 0.004
+        assert result["remaining_volume"] == pytest.approx(0.006)
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_comment_truncation_is_reported(self):
@@ -710,8 +998,8 @@ class TestPlaceMarketOrder:
 
     def test_accepts_injected_gateway(self):
         """Market order placement accepts an injected MT5TradingGateway."""
-        from mtdata.core.trading.gateway import MT5TradingGateway
         from mtdata.core.trading import _place_market_order
+        from mtdata.core.trading.gateway import MT5TradingGateway
 
         adapter = MagicMock()
         adapter.symbol_info.return_value = _sym()
@@ -817,6 +1105,20 @@ class TestPlacePendingOrder:
         assert result.get("requested_tp") is None
         request = mt5.order_send.call_args.args[0]
         assert request["type_filling"] == mt5.ORDER_FILLING_RETURN
+
+    @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
+    def test_rejects_stale_tick_before_pending_submission(self):
+        mt5 = sys.modules["MetaTrader5"]
+        self._setup_mt5(mt5)
+        mt5.symbol_info_tick.return_value = SimpleNamespace(
+            bid=1.1000, ask=1.1002, time=1
+        )
+        from mtdata.core.trading import _place_pending_order
+
+        result = _place_pending_order("EURUSD", 0.01, "BUY_LIMIT", price=1.09)
+
+        assert "stale" in result["error"]
+        mt5.order_send.assert_not_called()
 
     @patch.dict("sys.modules", {"MetaTrader5": MagicMock()})
     def test_sell_stop_success(self):

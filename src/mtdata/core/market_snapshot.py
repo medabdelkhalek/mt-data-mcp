@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
-import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from ..shared.schema import DetailLiteral, TimeframeLiteral
+from ..utils.coercion import coerce_finite_float as _coerce_float
 from ..utils.market_metadata import build_tick_freshness_context
+from ..utils.time import format_datetime_utc
 from ._mcp_instance import mcp
 from .error_envelope import build_error_payload
 from .execution_logging import run_logged_operation
@@ -88,7 +89,7 @@ def _preflight_snapshot_symbol(
     )
 
 
-def _compact_quote(quote: Any) -> Any:
+def _compact_quote(quote: Any, *, detail: str = "compact") -> Any:
     if not isinstance(quote, dict) or quote.get("error"):
         return quote
     normalized_quote = dict(quote)
@@ -99,14 +100,13 @@ def _compact_quote(quote: Any) -> Any:
         if display_time not in (None, ""):
             normalized_quote["time"] = display_time
         else:
-            normalized_quote["time"] = (
+            normalized_quote["time"] = format_datetime_utc(
                 datetime.fromtimestamp(float(raw_time), tz=timezone.utc)
-                .replace(microsecond=0)
-                .isoformat()
-                .replace("+00:00", "Z")
             )
     elif display_time not in (None, "") and raw_time in (None, ""):
         normalized_quote["time"] = display_time
+    if str(detail or "compact").strip().lower() in {"standard", "full"}:
+        return normalized_quote
     keys = (
         "symbol",
         "bid",
@@ -169,11 +169,8 @@ def _revalidate_snapshot_quote(
 
 
 def _utc_iso_text(epoch_seconds: float) -> str:
-    return (
+    return format_datetime_utc(
         datetime.fromtimestamp(float(epoch_seconds), tz=timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
     )
 
 
@@ -312,16 +309,6 @@ def _snapshot_summary(
     if failed_sections:
         parts.append("failed=" + ",".join(failed_sections))
     return "; ".join(parts) + "."
-
-
-def _coerce_float(value: Any) -> Optional[float]:
-    try:
-        out = float(value)
-    except Exception:
-        return None
-    if not math.isfinite(out):
-        return None
-    return out
 
 
 def _first_level_value(levels: Any) -> Any:
@@ -512,7 +499,7 @@ def _pattern_bias(payload: Any) -> Optional[str]:
     return None
 
 
-def _snapshot_summary_payload(sections: Dict[str, Any]) -> Dict[str, Any]:
+def _snapshot_summary_payload(sections: Dict[str, Any]) -> Dict[str, Any]:  # noqa: C901
     quote = sections.get("quote")
     status = sections.get("status")
     levels = sections.get("levels")
@@ -619,7 +606,22 @@ def _snapshot_summary_payload(sections: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(forecast, dict):
         compact_forecast = {
             key: forecast[key]
-            for key in ("method", "forecast", "values", "predictions", "horizon", "quantity")
+            for key in (
+                "method",
+                "forecast",
+                "values",
+                "predictions",
+                "horizon",
+                "quantity",
+                "uncertainty",
+                "ci_status",
+                "forecast_mode",
+                "trust_level",
+                "trust_blockers",
+                "calendar_treatment",
+                "last_observation_time",
+                "last_observation_epoch",
+            )
             if key in forecast
         }
         if compact_forecast:
@@ -652,7 +654,8 @@ def _call_section(name: str, symbol: str, timeframe: str, horizon: int, detail: 
                     symbol=symbol,
                     detail=detail,
                     raw_tool_output=True,
-                )
+                ),
+                detail=detail,
             )
         if name == "levels":
             from .pivot import support_resistance_levels
@@ -746,9 +749,9 @@ def market_snapshot(
     snapshot stays fast and comparable. Call dedicated regime/forecast/pattern
     tools for custom methods and parameters.
 
-    Timestamp semantics: `as_of` tracks the latest quote time when available,
-    `quote_as_of` duplicates that normalized quote timestamp explicitly, and
-    `assembled_at` records when this snapshot payload was built. The quote runs
+    Timestamp semantics: `as_of` and `assembled_at` record when this snapshot
+    payload was built, while `quote_as_of` records the normalized source quote
+    time when available. The quote runs
     after analytical sections and its freshness is revalidated at `assembled_at`,
     so live-readiness describes the delivered snapshot rather than an early step.
     """
@@ -775,12 +778,7 @@ def market_snapshot(
         }
         health = _snapshot_health(symbol, selected, section_payloads)
         assembled_at_dt = datetime.now(timezone.utc)
-        assembled_at = (
-            assembled_at_dt
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
+        assembled_at = format_datetime_utc(assembled_at_dt)
         quote_warning = _revalidate_snapshot_quote(
             section_payloads,
             symbol=symbol,
@@ -791,7 +789,7 @@ def market_snapshot(
             "success": bool(health.get("success")),
             "symbol": symbol,
             "timeframe": timeframe,
-            "as_of": quote_as_of or assembled_at,
+            "as_of": assembled_at,
             "assembled_at": assembled_at,
             "sections_requested": list(selected),
             **{key: value for key, value in health.items() if key != "success"},

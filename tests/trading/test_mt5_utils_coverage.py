@@ -448,7 +448,7 @@ class TestMT5Connection:
         assert conn.is_connected() is False
 
     @patch("mtdata.utils.mt5.mt5_config")
-    def test_ensure_connection_with_credentials_success(self, cfg):
+    def test_ensure_connection_with_credentials_success(self, cfg, caplog):
         conn = MT5Connection()
         _mt5_mock.terminal_info.return_value = None
         cfg.has_credentials.return_value = True
@@ -458,11 +458,14 @@ class TestMT5Connection:
         _mt5_mock.initialize.reset_mock(side_effect=True)
         _mt5_mock.initialize.return_value = True
         _mt5_mock.account_info.return_value = MagicMock(login=12345, server="Demo")
+        caplog.set_level("DEBUG", logger="mtdata.utils.mt5")
         assert conn._ensure_connection() is True
         assert conn.connected is True
+        assert "12345" not in caplog.text
+        assert "Connected to the configured MT5 account" in caplog.text
 
     @patch("mtdata.utils.mt5.mt5_config")
-    def test_ensure_connection_cred_fail_does_not_fallback_to_current_terminal(self, cfg):
+    def test_ensure_connection_cred_fail_does_not_fallback_to_current_terminal(self, cfg, caplog):
         conn = MT5Connection()
         _mt5_mock.terminal_info.return_value = None
         cfg.has_credentials.return_value = True
@@ -471,16 +474,19 @@ class TestMT5Connection:
         cfg.get_server.return_value = "Demo"
         _mt5_mock.initialize.reset_mock(side_effect=True)
         _mt5_mock.initialize.return_value = False
-        _mt5_mock.last_error.return_value = (-1, "err")
+        _mt5_mock.last_error.return_value = (-1, "account 12345 rejected")
         assert conn._ensure_connection() is False
         _mt5_mock.initialize.assert_called_once_with(
             login=12345,
             password="pass",
             server="Demo",
         )
+        assert "error_code=-1" in caplog.text
+        assert "12345" not in caplog.text
+        assert "rejected" not in caplog.text
 
     @patch("mtdata.utils.mt5.mt5_config")
-    def test_ensure_connection_credential_account_mismatch_fails(self, cfg):
+    def test_ensure_connection_credential_account_mismatch_fails(self, cfg, caplog):
         conn = MT5Connection()
         _mt5_mock.terminal_info.return_value = None
         cfg.has_credentials.return_value = True
@@ -493,6 +499,9 @@ class TestMT5Connection:
         _mt5_mock.account_info.return_value = MagicMock(login=67890, server="Demo")
         assert conn._ensure_connection() is False
         _mt5_mock.shutdown.assert_called()
+        assert "does not match the configured account" in caplog.text
+        assert "12345" not in caplog.text
+        assert "67890" not in caplog.text
 
     @patch("mtdata.utils.mt5.mt5_config")
     def test_ensure_connection_no_cred_success(self, cfg):
@@ -519,17 +528,45 @@ class TestMT5Connection:
 
     @patch("mtdata.utils.mt5.clear_mt5_time_alignment_cache")
     @patch("mtdata.utils.mt5.clear_symbol_info_cache")
-    def test_connected_session_refresh_clears_caches_when_identity_changes(self, clear_symbol_cache, clear_alignment_cache):
+    @patch("mtdata.utils.mt5.mt5_config")
+    def test_connected_session_refresh_clears_caches_when_identity_changes(
+        self, cfg, clear_symbol_cache, clear_alignment_cache
+    ):
         conn = MT5Connection()
         conn.connected = True
         conn._connection_identity = (12345, "Demo-A")
-        _mt5_mock.terminal_info.return_value = MagicMock(connected=True, server="Demo-B")
+        cfg.get_login.return_value = None
+        _mt5_mock.terminal_info.return_value = MagicMock(
+            connected=True,
+            server="Demo-B",
+        )
         _mt5_mock.account_info.return_value = MagicMock(login=67890, server="Demo-B")
 
         assert conn._ensure_connection() is True
         clear_symbol_cache.assert_called_once()
         clear_alignment_cache.assert_called_once()
         assert conn._connection_identity == (67890, "Demo-B")
+
+    @patch("mtdata.utils.mt5.mt5_config")
+    def test_ensure_connection_rejects_mid_session_account_switch(self, cfg, caplog):
+        conn = MT5Connection()
+        conn.connected = True
+        conn._connection_identity = (12345, "Demo-A")
+        cfg.get_login.return_value = 12345
+        _mt5_mock.terminal_info.return_value = MagicMock(
+            connected=True,
+            server="Demo-B",
+        )
+        _mt5_mock.account_info.return_value = MagicMock(login=67890, server="Demo-B")
+        _mt5_mock.shutdown.reset_mock()
+
+        assert conn._ensure_connection() is False
+        assert conn.connected is False
+        assert conn._connection_identity is None
+        _mt5_mock.shutdown.assert_called_once_with()
+        assert "no longer matches the configured account" in caplog.text
+        assert "12345" not in caplog.text
+        assert "67890" not in caplog.text
 
     @patch("mtdata.utils.mt5.mt5_config")
     def test_ensure_connection_no_cred_fail(self, cfg):
@@ -541,11 +578,14 @@ class TestMT5Connection:
         assert conn._ensure_connection() is False
 
     @patch("mtdata.utils.mt5.mt5_config")
-    def test_ensure_connection_exception(self, cfg):
+    def test_ensure_connection_exception(self, cfg, caplog):
         conn = MT5Connection()
         _mt5_mock.terminal_info.return_value = None
-        cfg.has_credentials.side_effect = Exception("boom")
+        cfg.has_credentials.side_effect = RuntimeError("account 12345 rejected")
         assert conn._ensure_connection() is False
+        assert "exception_type=RuntimeError" in caplog.text
+        assert "12345" not in caplog.text
+        assert "rejected" not in caplog.text
 
     def test_disconnect_when_connected(self):
         conn = MT5Connection()
@@ -733,7 +773,11 @@ class TestInspectMt5TimeAlignment:
         now = 1_700_000_045.0
         current_bar = float((int(now) // 60) * 60)
         last_closed_bar = current_bar - 60.0
-        monkeypatch.setattr(_mt5_mod, "ensure_mt5_connection_or_raise", lambda **kwargs: None)
+        monkeypatch.setattr(
+            _mt5_mod,
+            "ensure_mt5_connection_or_raise",
+            lambda **kwargs: None,
+        )
         monkeypatch.setattr(_mt5_mod, "_ensure_symbol_ready", lambda symbol: None)
         monkeypatch.setattr(_mt5_mod.time, "time", lambda: now)
         monkeypatch.setattr(_mt5_mod.mt5, "symbol_info_tick", lambda symbol: MagicMock(time=now - 1.0))
@@ -780,6 +824,42 @@ class TestInspectMt5TimeAlignment:
         assert result["status"] == "misaligned"
         assert result["reason"] == "timestamp_in_future"
         assert "latest tick is 3600s in the future" in result["warning"]
+
+    def test_h4_boundary_uses_configured_server_offset(self, monkeypatch):
+        now = datetime(2026, 1, 5, 6, 30, tzinfo=timezone.utc).timestamp()
+        current_bar = datetime(2026, 1, 5, 6, 0, tzinfo=timezone.utc).timestamp()
+        monkeypatch.setattr(
+            _mt5_mod,
+            "ensure_mt5_connection_or_raise",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr(_mt5_mod, "_ensure_symbol_ready", lambda symbol: None)
+        monkeypatch.setattr(_mt5_mod.time, "time", lambda: now)
+        monkeypatch.setattr(
+            _mt5_mod,
+            "_configured_server_offset_seconds",
+            lambda _epoch: 2 * 60 * 60,
+        )
+        monkeypatch.setattr(
+            _mt5_mod.mt5,
+            "symbol_info_tick",
+            lambda symbol: MagicMock(time=now - 1.0),
+        )
+        monkeypatch.setattr(
+            _mt5_mod,
+            "_mt5_copy_rates_from_pos",
+            lambda symbol, timeframe, start_pos, count: [
+                {"time": current_bar - 8 * 60 * 60},
+                {"time": current_bar - 4 * 60 * 60},
+                {"time": current_bar},
+            ],
+        )
+
+        result = inspect_mt5_time_alignment("EURUSD", probe_timeframe="H4")
+
+        assert result["status"] == "ok"
+        assert result["current_bar_delta_seconds"] == 0.0
+        assert result["bar_boundary_server_utc_offset_seconds"] == 7200
 
     def test_reports_stale_data(self, monkeypatch):
         now = 1_700_000_045.0

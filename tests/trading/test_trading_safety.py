@@ -8,6 +8,7 @@ from src.mtdata.core.trading.safety import (
     TradeSafetyPolicy,
     _estimate_order_risk_currency,
     _evaluate_safety_policy,
+    assess_margin_stress,
 )
 
 
@@ -26,6 +27,57 @@ def test_order_risk_uses_integer_tick_distance() -> None:
 
     assert error is None
     assert risk == 150.0
+
+
+def test_breached_stop_overrun_is_counted_by_explicit_policy() -> None:
+    risk, error = _estimate_order_risk_currency(
+        symbol_info=SimpleNamespace(
+            trade_tick_size=1.0,
+            trade_tick_value=1.0,
+            trade_tick_value_loss=2.0,
+        ),
+        volume=1.0,
+        entry_price=100.0,
+        stop_loss=110.0,
+        side="BUY",
+        wrong_side_policy="overrun",
+    )
+
+    assert error is None
+    assert risk == 20.0
+
+
+def test_stressed_margin_reports_triggering_thresholds() -> None:
+    result = assess_margin_stress(
+        SimpleNamespace(
+            equity=100.0,
+            margin=76.0,
+            margin_free=24.0,
+            margin_level=140.0,
+        )
+    )
+
+    assert result["status"] == "stressed"
+    assert result["reasons"] == [
+        "margin_level_at_or_below_150_pct",
+        "margin_utilization_at_or_above_75_pct",
+        "free_margin_at_or_below_25_pct_of_equity",
+    ]
+
+
+@pytest.mark.parametrize("equity", [0.0, -100.0])
+def test_nonpositive_equity_is_critical(equity: float) -> None:
+    result = assess_margin_stress(
+        SimpleNamespace(
+            equity=equity,
+            margin=0.0,
+            margin_free=-25.0,
+            margin_level=0.0,
+        )
+    )
+
+    assert result["status"] == "critical"
+    assert result["reasons"] == ["equity_at_or_below_zero"]
 
 
 # ---------------------------------------------------------------------------

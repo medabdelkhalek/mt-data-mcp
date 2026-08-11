@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -100,8 +101,8 @@ def test_temporal_analyze_session_groups_use_analysis_timezone_clock() -> None:
     assert result["timezone"] == "Europe/London"
     assert result["bars"] == 2
     assert result["session_definition"]["clock"] == "Europe/London"
-    assert [group["group"] for group in result["groups"]] == ["ny"]
-    assert [group["group_label"] for group in result["groups"]] == ["ny"]
+    assert [group["group"] for group in result["groups"]] == ["london_ny_overlap"]
+    assert [group["group_label"] for group in result["groups"]] == ["london ny overlap"]
 
 
 def test_temporal_analyze_compact_keeps_session_clock_definition() -> None:
@@ -127,3 +128,30 @@ def test_temporal_analyze_compact_keeps_session_clock_definition() -> None:
 
     assert result["session_definition"]["basis"] == "dst_aware_market_sessions"
     assert result["session_definition"]["clock"] == result["timezone"]
+
+
+def test_temporal_auto_calendar_uses_broker_path_for_index_cfd() -> None:
+    rates = _make_rates_from_epochs(
+        [
+            int(datetime(2026, 7, 15, 14, 30, tzinfo=timezone.utc).timestamp()),
+            int(datetime(2026, 7, 15, 15, 0, tzinfo=timezone.utc).timestamp()),
+            int(datetime(2026, 7, 15, 15, 30, tzinfo=timezone.utc).timestamp()),
+        ]
+    )
+    with patch(_P + "_fetch_rates", return_value=(rates, None)), patch(
+        _P + "_symbol_ready_guard", new=_guard_stub
+    ), patch(_P + "ensure_mt5_connection_or_raise", new=lambda: None), patch(
+        _P + "get_symbol_info_cached",
+        return_value=SimpleNamespace(path="CFD\\Indices"),
+    ):
+        result = _raw_temporal_analyze(
+            symbol="US30",
+            timeframe="M30",
+            lookback=100,
+            group_by="session",
+            detail="compact",
+        )
+
+    assert result["success"] is True, result
+    assert result["session_calendar"] == "fx"
+    assert result["session_calendar_source"] == "symbol_and_broker_metadata"

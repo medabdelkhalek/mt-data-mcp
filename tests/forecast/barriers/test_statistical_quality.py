@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 import numpy as np
 
-from ._helpers import _BarrierModulePatchMixin, _BarrierTestBase, _BARRIER_PROB_ROOT, _BARRIER_OPT_ROOT
 from mtdata.forecast.barriers_optimization import forecast_barrier_optimize
 from mtdata.forecast.barriers_probabilities import (
     forecast_barrier_closed_form,
@@ -18,6 +17,12 @@ from mtdata.forecast.barriers_shared import (
     _sort_candidate_results,
 )
 
+from ._helpers import (
+    _BARRIER_OPT_ROOT,
+    _BARRIER_PROB_ROOT,
+    _BarrierModulePatchMixin,
+    _BarrierTestBase,
+)
 
 # ---------------------------------------------------------------------------
 # Statistical significance (T1.2)
@@ -377,6 +382,36 @@ def test_sort_candidate_results_handles_missing_values():
     ]
     _sort_candidate_results(rows, "ev")
     assert rows[0]["tp"] == 2.0
+
+
+def test_sort_candidate_results_breaks_objective_ties_by_barrier_geometry():
+    objective_fields = {
+        "edge": "edge",
+        "ev": "ev",
+        "ev_cond": "ev_cond",
+        "ev_per_bar": "ev_per_bar",
+        "kelly": "kelly",
+        "kelly_cond": "kelly_cond",
+        "prob_tp_first": "prob_tp_first",
+        "prob_resolve": "prob_resolve",
+        "profit_factor": "profit_factor",
+        "min_loss_prob": "prob_loss",
+        "utility": "utility",
+        "unknown_objective": "ev",
+    }
+
+    for objective, metric_field in objective_fields.items():
+        first = {"tp": 2.0, "sl": 1.0, metric_field: 0.25}
+        second = {"tp": 1.0, "sl": 2.0, metric_field: 0.25}
+        forward = [dict(first), dict(second)]
+        reversed_input = [dict(second), dict(first)]
+
+        _sort_candidate_results(forward, objective)
+        _sort_candidate_results(reversed_input, objective)
+
+        expected = [(1.0, 2.0), (2.0, 1.0)]
+        assert [(row["tp"], row["sl"]) for row in forward] == expected
+        assert [(row["tp"], row["sl"]) for row in reversed_input] == expected
 
 
 if __name__ == '__main__':

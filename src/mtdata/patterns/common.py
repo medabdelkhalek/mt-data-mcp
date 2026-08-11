@@ -1,7 +1,7 @@
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import logging
 from typing import Any, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -10,6 +10,7 @@ from scipy.signal import find_peaks
 
 from ..shared.constants import TIMEFRAME_SECONDS
 from ..shared.symbols import is_probably_crypto_symbol, is_probably_forex_symbol
+from ..utils.time import bar_close_epoch
 from ..utils.utils import to_float_np
 
 
@@ -309,7 +310,7 @@ def _crosses_weekend(start_epoch: float, end_epoch: float) -> bool:
     return end_dt.weekday() >= 5
 
 
-def data_quality_warnings(
+def data_quality_warnings(  # noqa: C901
     df: Any,
     *,
     symbol: Optional[str] = None,
@@ -425,8 +426,7 @@ def should_drop_last_live_bar(
     """Return True when the last bar is still forming or cannot be validated."""
     if len(df) < 2:
         return False
-    seconds_per_bar = float(TIMEFRAME_SECONDS.get(timeframe, 0) or 0)
-    if seconds_per_bar <= 0 or "time" not in df.columns:
+    if timeframe not in TIMEFRAME_SECONDS or "time" not in df.columns:
         return True
     try:
         last_open = float(pd.to_numeric(df["time"], errors="coerce").iloc[-1])
@@ -443,7 +443,6 @@ def should_drop_last_live_bar(
             current_ts = float((now_utc or datetime.now(timezone.utc)).timestamp())
     else:
         current_ts = float((now_utc or datetime.now(timezone.utc)).timestamp())
-    elapsed = current_ts - last_open
-    if elapsed < 0:
+    if current_ts < last_open:
         return True
-    return elapsed < seconds_per_bar
+    return current_ts < bar_close_epoch(last_open, timeframe)

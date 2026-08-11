@@ -44,6 +44,146 @@ def _get_select_market_scan_symbols():
     return _select_market_scan_symbols
 
 
+def test_market_scan_spread_cost_uses_account_currency() -> None:
+    from mtdata.core.symbols import _build_market_scan_spread_row
+
+    symbol = SimpleNamespace(
+        name="EURJPY",
+        path="Forex",
+        digits=3,
+        point=0.001,
+        trade_tick_size=0.001,
+        trade_tick_value=0.75,
+        currency_profit="JPY",
+    )
+    gateway = SimpleNamespace(
+        symbol_info_tick=lambda _symbol: SimpleNamespace(
+            bid=170.000,
+            ask=170.010,
+            time=0,
+        ),
+        last_error=lambda: None,
+    )
+
+    row, error = _build_market_scan_spread_row(
+        symbol,
+        gateway,
+        spread_cost_currency="USD",
+    )
+
+    assert error is None
+    assert row["bid"] == 170.0
+    assert row["ask"] == 170.01
+    assert row["mid"] == 170.005
+    assert row["quote_as_of"] is None
+    assert row["spread_cost_per_lot"] == pytest.approx(7.5)
+    assert row["spread_cost_currency"] == "USD"
+
+
+def test_market_scan_locked_quote_is_explicitly_unsafe() -> None:
+    from mtdata.core.symbols import _build_market_scan_spread_row
+
+    symbol = _make_symbol("XRPUSD", path="Crypto", point=0.0001, digits=4)
+    gateway = SimpleNamespace(
+        symbol_info_tick=lambda _symbol: SimpleNamespace(
+            bid=1.0333,
+            ask=1.0333,
+            time=1_700_000_000.0,
+        ),
+        last_error=lambda: None,
+    )
+
+    with patch("mtdata.core.symbols.time.time", return_value=1_700_000_001.0):
+        row, error = _build_market_scan_spread_row(symbol, gateway)
+
+    assert error is None
+    assert row["spread"] == 0.0
+    assert row["spread_valid"] is False
+    assert row["spread_quality"] == "locked"
+    assert row["usable_for_live_trading"] is False
+    assert "Locked quote" in row["warning"]
+
+
+@patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
+@patch("mtdata.core.symbols.mt5.symbol_info_tick")
+@patch("mtdata.core.symbols.mt5.symbols_get")
+def test_top_markets_ranks_locked_quotes_after_valid_spreads(
+    mock_symbols_get,
+    mock_tick,
+    mock_group,
+) -> None:
+    mock_symbols_get.return_value = [
+        _make_symbol("LOCKED", path="Crypto"),
+        _make_symbol("VALID", path="Crypto"),
+    ]
+    mock_tick.side_effect = lambda symbol: {
+        "LOCKED": _make_tick(bid=1.0, ask=1.0),
+        "VALID": _make_tick(bid=1.0, ask=1.0005),
+    }[symbol]
+
+    result = _get_symbols_top_markets()(rank_by="spread", limit=2)
+
+    assert [row["symbol"] for row in result["data"]] == ["VALID", "LOCKED"]
+    locked = result["data"][1]
+    assert locked["spread_valid"] is False
+    assert locked["spread_quality"] == "locked"
+    assert locked["usable_for_live_trading"] is False
+    assert result["unsafe_quote_rows"] == 1
+
+
+@patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
+@patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
+@patch("mtdata.core.symbols.mt5.symbol_info_tick")
+@patch("mtdata.core.symbols.mt5.symbols_get")
+def test_market_scan_ranks_locked_quotes_after_valid_spreads(
+    mock_symbols_get,
+    mock_tick,
+    mock_rates,
+    mock_group,
+) -> None:
+    now = 1_700_010_800.0
+    mock_symbols_get.return_value = [
+        _make_symbol("LOCKED", path="Crypto"),
+        _make_symbol("VALID", path="Crypto"),
+    ]
+    mock_tick.side_effect = lambda symbol: {
+        "LOCKED": SimpleNamespace(bid=1.0, ask=1.0, time=now - 1.0),
+        "VALID": SimpleNamespace(bid=1.0, ask=1.0005, time=now - 1.0),
+    }[symbol]
+    rates = [
+        {"time": now - (3 * 3600), "open": 1.0, "close": 1.0, "tick_volume": 10, "real_volume": 0},
+        {"time": now - (2 * 3600), "open": 1.0, "close": 1.01, "tick_volume": 11, "real_volume": 0},
+        {"time": now - 3600, "open": 1.01, "close": 1.02, "tick_volume": 12, "real_volume": 0},
+    ]
+    mock_rates.return_value = rates
+
+    with patch("mtdata.core.symbols.time.time", return_value=now):
+        result = _get_market_scan()(
+            rank_by="spread",
+            timeframe="H1",
+            lookback=3,
+            limit=2,
+        )
+
+    assert [row["symbol"] for row in result["data"]] == ["VALID", "LOCKED"]
+    locked = result["data"][1]
+    assert locked["spread_valid"] is False
+    assert locked["spread_quality"] == "locked"
+    assert locked["quote_usable_for_live_trading"] is False
+    assert result["unsafe_quote_rows"] == 1
+
+    with patch("mtdata.core.symbols.time.time", return_value=now):
+        tight_only = _get_market_scan()(
+            rank_by="spread",
+            timeframe="H1",
+            lookback=3,
+            max_spread_pct=0.1,
+            limit=2,
+        )
+
+    assert [row["symbol"] for row in tight_only["data"]] == ["VALID"]
+
+
 def test_market_scan_freshness_uses_broker_crypto_category_on_weekends() -> None:
     from mtdata.core.symbols import _market_scan_freshness_fields
 
@@ -159,7 +299,7 @@ def test_market_scan_bar_freshness_uses_timeframe_window():
 
     assert result["stale_after_seconds"] == 2 * 60 * 60
     assert result["data_stale"] is True
-    assert result["freshness"] == "stale, bar 1d 2h ago"
+    assert result["freshness"] == "stale, bar 1d 1h ago"
 
 
 def test_market_scan_labels_recent_bars_as_completed_not_current():
@@ -172,7 +312,7 @@ def test_market_scan_labels_recent_bars_as_completed_not_current():
         )
 
     assert result["data_stale"] is False
-    assert result["freshness"] == "latest completed bar, 1h 0m ago"
+    assert result["freshness"] == "latest completed bar, 0s ago"
 
 
 def test_market_scan_keeps_future_quote_unsafe_when_bar_is_fresh() -> None:
@@ -201,13 +341,13 @@ def test_market_scan_keeps_future_quote_unsafe_when_bar_is_fresh() -> None:
         )
 
     row = result["data"][0]
-    assert row["timestamp_in_future"] is True
-    assert row["data_stale"] is True
-    assert row["usable_for_live_trading"] is False
-    assert row["freshness_reason"] == "future_timestamp"
-    assert row["warning"] == row["timestamp_warning"]
+    assert row["quote_timestamp_in_future"] is True
+    assert row["quote_stale"] is True
+    assert "usable_for_live_trading" not in row
+    assert row["quote_freshness_reason"] == "future_timestamp"
+    assert row["quote_warning"] == row["quote_timestamp_warning"]
     assert row["bar_stale"] is False
-    assert row["bar_freshness"] == "latest completed bar, 1h 0m ago"
+    assert row["bar_freshness"] == "latest completed bar, 0s ago"
     assert result["freshness"] == "stale"
     assert result["stale_rows"] == 1
     assert result["stale_bar_rows"] == 0
@@ -220,6 +360,53 @@ def test_market_scan_default_limit_is_concise():
     from mtdata.core.symbols import market_scan
 
     assert signature(_unwrap(market_scan)).parameters["limit"].default == 10
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"limit": 0}, "limit must be a positive integer"),
+        ({"max_spread_pct": -0.1}, "max_spread_pct must be"),
+        ({"min_tick_volume": -1}, "min_tick_volume must be"),
+        ({"rsi_below": 101}, "rsi_below must be"),
+        ({"rsi_above": -1}, "rsi_above must be"),
+    ],
+)
+def test_market_scan_rejects_invalid_constraints_before_mt5(kwargs, message):
+    from mtdata.core import symbols as symbols_mod
+
+    with patch.object(symbols_mod, "create_mt5_gateway") as create_gateway:
+        result = _unwrap(symbols_mod.market_scan)(**kwargs)
+
+    assert result["success"] is False
+    assert result["error_code"] == "invalid_input"
+    assert message in result["error"]
+    create_gateway.assert_not_called()
+
+
+def test_market_scan_spread_row_reconciles_newer_stream_quote() -> None:
+    from mtdata.core.symbols import _build_market_scan_spread_row
+
+    symbol = _make_symbol("EURUSD", digits=4)
+    gateway = SimpleNamespace(
+        COPY_TICKS_ALL=0,
+        symbol_info_tick=lambda _symbol: SimpleNamespace(
+            bid=1.1000, ask=1.1002, time=1_700_000_000.0
+        ),
+        copy_ticks_range=lambda *_args: [
+            {"bid": 1.1010, "ask": 1.1012, "time": 1_700_000_010.0}
+        ],
+        last_error=lambda: None,
+    )
+
+    with patch("mtdata.core.symbols.time.time", return_value=1_700_000_011.0):
+        row, error = _build_market_scan_spread_row(symbol, gateway)
+
+    assert error is None
+    assert row["bid"] == 1.101
+    assert row["ask"] == 1.1012
+    assert row["quote_source"] == "mt5.copy_ticks_range"
+    assert row["quote_source_state"] == "refreshed_from_tick_stream"
 
 
 @patch("mtdata.core.symbols.time.time", return_value=10_000.0)
@@ -354,6 +541,51 @@ def _make_bars(closes, *, tick_volume: int = 100):
     return bars
 
 
+@patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
+@patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
+@patch("mtdata.core.symbols.mt5.symbol_info_tick")
+@patch("mtdata.core.symbols.mt5.symbols_get")
+def test_gap_up_preset_uses_open_vs_previous_close(
+    mock_symbols_get,
+    mock_tick,
+    mock_rates,
+    mock_group,
+):
+    mock_symbols_get.return_value = [
+        _make_symbol("EURUSD"),
+        _make_symbol("GBPUSD"),
+    ]
+    mock_tick.side_effect = lambda symbol: _make_tick(
+        bid=100.0,
+        ask=100.1,
+    )
+    genuine_gap = _make_bars([100.0, 100.0])
+    genuine_gap[-1]["open"] = 103.0
+    close_only_rally = _make_bars([100.0, 103.0])
+    close_only_rally[-1]["open"] = 100.0
+    mock_rates.side_effect = lambda symbol, timeframe, start_pos, count: (
+        genuine_gap if symbol == "EURUSD" else close_only_rally
+    )
+
+    result = _get_market_scan()(
+        symbols="EURUSD,GBPUSD",
+        preset="gap_up",
+        timeframe="H1",
+        lookback=2,
+        detail="full",
+    )
+
+    assert result["success"] is True
+    assert result["rank_by"] == "gap_pct"
+    assert result["preset_filters"] == {"min_gap_pct": 2.0}
+    assert [row["symbol"] for row in result["data"]] == ["EURUSD"]
+    assert result["data"][0]["gap_pct"] == 3.0
+    assert result["data"][0]["price_change_pct"] == 0.0
+    assert result["gap_basis"] == (
+        "previous_completed_close_to_latest_completed_open"
+    )
+
+
 def test_symbol_category_prefers_stock_group_over_crypto_substrings():
     from mtdata.core.symbols import _symbol_category
 
@@ -446,10 +678,12 @@ class TestSymbolsTopMarkets:
 
     @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
     @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
+    @patch("mtdata.core.symbols.mt5.symbol_info_tick")
     @patch("mtdata.core.symbols.mt5.symbols_get")
     def test_default_returns_single_abs_price_change_leaderboard(
         self,
         mock_symbols_get,
+        mock_tick,
         mock_rates,
         mock_group,
     ):
@@ -457,8 +691,19 @@ class TestSymbolsTopMarkets:
             _make_symbol("EURUSD", description="Euro", digits=4),
             _make_symbol("GBPUSD", description="Pound", digits=4),
         ]
+        mock_tick.side_effect = lambda symbol: {
+            "EURUSD": _make_tick(bid=1.0448, ask=1.0450),
+            "GBPUSD": _make_tick(bid=1.3298, ask=1.3300),
+        }[symbol]
         mock_rates.side_effect = lambda symbol, timeframe, start_pos, count: {
             "EURUSD": [
+                {
+                    "time": 1699996400.0,
+                    "open": 1.1000,
+                    "close": 1.1000,
+                    "tick_volume": 90,
+                    "real_volume": 0,
+                },
                 {
                     "time": 1700000000.0,
                     "open": 1.1000,
@@ -468,6 +713,13 @@ class TestSymbolsTopMarkets:
                 }
             ],
             "GBPUSD": [
+                {
+                    "time": 1699996400.0,
+                    "open": 1.3000,
+                    "close": 1.3000,
+                    "tick_volume": 40,
+                    "real_volume": 0,
+                },
                 {
                     "time": 1700000000.0,
                     "open": 1.3000,
@@ -488,7 +740,13 @@ class TestSymbolsTopMarkets:
         assert len(result["data"]) == 1
         assert result["data"][0]["symbol"] == "EURUSD"
         assert result["data"][0]["close"] == 1.045
-        assert "bid" not in result["data"][0]
+        assert result["data"][0]["price_change_pct"] == -5.0
+        assert result["price_change_basis"] == (
+            "previous_completed_close_to_latest_completed_close"
+        )
+        assert result["data"][0]["bid"] == 1.0448
+        assert result["data"][0]["ask"] == 1.045
+        assert result["data"][0]["mid"] == 1.0449
         assert "spread_points" not in result["data"][0]
         assert result["units"]["tick_volume"] == "broker_tick_count"
         assert result["units"]["close"] == "price"
@@ -516,6 +774,13 @@ class TestSymbolsTopMarkets:
         mock_rates.side_effect = lambda symbol, timeframe, start_pos, count: {
             "EURUSD": [
                 {
+                    "time": 1699996400.0,
+                    "open": 1.1000,
+                    "close": 1.1000,
+                    "tick_volume": 90,
+                    "real_volume": 0,
+                },
+                {
                     "time": 1700000000.0,
                     "open": 1.1000,
                     "close": 1.1100,
@@ -524,6 +789,13 @@ class TestSymbolsTopMarkets:
                 }
             ],
             "GBPUSD": [
+                {
+                    "time": 1699996400.0,
+                    "open": 1.3000,
+                    "close": 1.3000,
+                    "tick_volume": 40,
+                    "real_volume": 0,
+                },
                 {
                     "time": 1700000000.0,
                     "open": 1.3000,
@@ -582,7 +854,7 @@ class TestSymbolsTopMarkets:
         assert "returned_count" not in result
         assert result["universe_size"] == 2
         assert result["available_count"] == 2
-        assert "only 2 symbols had usable spread data" in result["note"]
+        assert "only 2 symbols provided spread data" in result["note"]
         assert [row["symbol"] for row in result["data"]] == ["EURUSD", "XAUUSD"]
         assert list(result["data"][0].keys()) == [
             "symbol",
@@ -593,8 +865,13 @@ class TestSymbolsTopMarkets:
             "time",
             "data_stale",
             "freshness",
+            "spread_valid",
+            "spread_quality",
+            "usable_for_live_trading",
+            "quote_as_of",
             "bid",
             "ask",
+            "mid",
             "spread_pct",
             "spread_points",
             "spread_pips",
@@ -635,6 +912,7 @@ class TestSymbolsTopMarkets:
         assert result["ranking"] == "highest_tick_volume"
         assert result["rank_by"] == "tick_volume"
         assert result["rank_by_input"] is None
+        mock_tick.assert_not_called()
 
     @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
     @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
@@ -650,8 +928,8 @@ class TestSymbolsTopMarkets:
             "GBPUSD": _make_tick(bid=1.3000, ask=1.3004),
         }[symbol]
         mock_rates.side_effect = lambda symbol, timeframe, start_pos, count: {
-            "EURUSD": [{"time": 1700000000.0, "open": 1.1000, "close": 1.1010, "tick_volume": 100, "real_volume": 0}],
-            "GBPUSD": [{"time": 1700000000.0, "open": 1.3000, "close": 1.3300, "tick_volume": 50, "real_volume": 0}],
+            "EURUSD": _make_bars([1.1000, 1.1010], tick_volume=99),
+            "GBPUSD": _make_bars([1.3000, 1.3300], tick_volume=49),
         }[symbol]
 
         fn = _get_symbols_top_markets()
@@ -721,8 +999,13 @@ class TestSymbolsTopMarkets:
             "time",
             "data_stale",
             "freshness",
+            "spread_valid",
+            "spread_quality",
+            "usable_for_live_trading",
+            "quote_as_of",
             "bid",
             "ask",
+            "mid",
             "spread_pct",
             "spread_points",
             "spread_pips",
@@ -755,24 +1038,8 @@ class TestSymbolsTopMarkets:
             "GBPUSD": _make_tick(bid=1.3000, ask=1.3004),
         }[symbol]
         mock_rates.side_effect = lambda symbol, timeframe, start_pos, count: {
-            "EURUSD": [
-                {
-                    "time": 1700000000.0,
-                    "open": 1.1000,
-                    "close": 1.1010,
-                    "tick_volume": 100,
-                    "real_volume": 0,
-                }
-            ],
-            "GBPUSD": [
-                {
-                    "time": 1700000000.0,
-                    "open": 1.3000,
-                    "close": 1.3300,
-                    "tick_volume": 50,
-                    "real_volume": 0,
-                }
-            ],
+            "EURUSD": _make_bars([1.1000, 1.1010], tick_volume=99),
+            "GBPUSD": _make_bars([1.3000, 1.3300], tick_volume=49),
         }[symbol]
 
         fn = _get_symbols_top_markets()
@@ -872,6 +1139,29 @@ class TestSymbolsTopMarkets:
         assert [row["symbol"] for row in result["data"]] == ["EURUSD", "USDJPY"]
         mock_ready_guard.assert_called_once_with("USDJPY", info_before=mock_symbols_get.return_value[1])
 
+    @patch("mtdata.core.symbols._symbol_ready_guard")
+    @patch("mtdata.core.symbols.mt5.symbols_get")
+    def test_all_universe_rejects_oversized_candidate_set_before_activation(
+        self,
+        mock_symbols_get,
+        mock_ready_guard,
+    ):
+        mock_symbols_get.return_value = [
+            _make_symbol(f"SYM{index:04d}", visible=False)
+            for index in range(251)
+        ]
+
+        result = _get_symbols_top_markets()(
+            rank_by="spread",
+            universe="all",
+            limit=5,
+        )
+
+        assert result["error_code"] == "candidate_universe_too_large"
+        assert result["candidate_count"] == 251
+        assert result["candidate_cap"] == 250
+        mock_ready_guard.assert_not_called()
+
     @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
     @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
     @patch("mtdata.core.symbols.mt5.symbols_get")
@@ -881,7 +1171,7 @@ class TestSymbolsTopMarkets:
             _make_symbol("GBPUSD"),
         ]
         mock_rates.side_effect = lambda symbol, timeframe, start_pos, count: {
-            "EURUSD": [{"time": 1700000000.0, "open": 1.1000, "close": 1.1010, "tick_volume": 100, "real_volume": 0}],
+            "EURUSD": _make_bars([1.1000, 1.1010], tick_volume=99),
             "GBPUSD": None,
         }[symbol]
 
@@ -1012,14 +1302,15 @@ class TestMarketScan:
         mock_rates.return_value = _make_bars([1.0, 2.0, 3.0, 4.0], tick_volume=120)
 
         fn = _get_market_scan()
-        result = fn(timeframe="H1", lookback=4, limit=5)
+        with patch("mtdata.core.symbols.time.time", return_value=1_700_014_400.0):
+            result = fn(timeframe="H1", lookback=4, limit=5)
 
         assert result["success"] is True
         assert "columns" not in result
         assert result["count"] == 1
         assert result["rank_by"] == "abs_price_change_pct"
         assert result["ranking"] == "largest_abs_price_change_pct"
-        assert result["requested_limit"] == 5
+        assert result["pagination"]["limit"] == 5
         assert "returned_count" not in result
         assert result["universe_size"] == 1
         assert result["freshness"] in {
@@ -1099,8 +1390,92 @@ class TestMarketScan:
         row = result["data"][0]
         assert row["spread_points"] == 50
         assert isinstance(row["spread_points"], int)
-        assert row["spread_pips"] is None
+        assert "spread_pips" not in row
         assert "spread_pips" not in result["units"]
+
+    def test_market_scan_compact_hoists_repeated_row_metadata(self):
+        from mtdata.core.symbols import _compact_market_scan_projection
+
+        warning = "Latest tick timestamp is ahead of the wall clock."
+        headers, shared = _compact_market_scan_projection(
+            [
+                "symbol",
+                "timestamp_in_future",
+                "timestamp_warning",
+                "price_basis",
+                "spread_pips",
+            ],
+            [
+                {
+                    "symbol": "EURUSD",
+                    "timestamp_in_future": True,
+                    "timestamp_warning": warning,
+                    "price_basis": "mt5_latest_completed_bar_close",
+                    "spread_pips": None,
+                },
+                {
+                    "symbol": "GBPUSD",
+                    "timestamp_in_future": True,
+                    "timestamp_warning": warning,
+                    "price_basis": "mt5_latest_completed_bar_close",
+                    "spread_pips": None,
+                },
+            ],
+        )
+
+        assert headers == ["symbol", "timestamp_in_future"]
+        assert shared == {
+            "price_basis": "mt5_latest_completed_bar_close",
+            "warnings": [warning],
+        }
+
+    @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
+    @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
+    @patch("mtdata.core.symbols.mt5.symbol_info_tick")
+    @patch("mtdata.core.symbols.mt5.symbols_get")
+    def test_market_scan_and_top_markets_share_price_and_freshness_semantics(
+        self,
+        mock_symbols_get,
+        mock_tick,
+        mock_rates,
+        mock_group,
+    ):
+        now = 1_700_043_200.0
+        mock_symbols_get.return_value = [
+            _make_symbol("EURUSD", description="Euro", digits=5)
+        ]
+        mock_tick.return_value = SimpleNamespace(
+            bid=1.0199,
+            ask=1.0200,
+            time=now - 5.0,
+        )
+        mock_rates.return_value = _make_bars([1.0, 1.01, 1.02], tick_volume=100)
+
+        with patch("mtdata.core.symbols.time.time", return_value=now):
+            scan = _get_market_scan()(timeframe="H1", lookback=3, limit=1)
+            top = _get_symbols_top_markets()(
+                rank_by="abs_price_change",
+                timeframe="H1",
+                limit=1,
+            )
+
+        scan_row = scan["data"][0]
+        top_row = top["data"][0]
+        assert scan_row["price_change_pct"] == top_row["price_change_pct"]
+        assert scan_row["bid"] == top_row["bid"] == 1.0199
+        assert scan_row["ask"] == top_row["ask"] == 1.02
+        assert scan_row["mid"] == top_row["mid"] == 1.01995
+        assert scan_row["quote_as_of"] == top_row["quote_as_of"]
+        assert scan_row["quote_time"] == scan_row["quote_as_of"]
+        assert scan_row["quote_stale"] is False
+        assert scan_row["price_as_of"] == scan_row["time"]
+        assert "freshness_reason" not in scan_row
+        assert top_row["data_stale"] is False
+        assert scan_row["bar_stale"] is True
+        assert top_row["bar_stale"] is True
+        assert scan["stale_rows"] == top["stale_rows"] == 1
+        assert scan["stale_bar_rows"] == top["stale_bar_rows"] == 1
+        assert scan["unsafe_quote_rows"] == top["unsafe_quote_rows"] == 0
 
     @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
     @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
@@ -1135,11 +1510,7 @@ class TestMarketScan:
         assert result["success"] is True
         assert result["count"] == 1
         assert result["data"][0]["symbol"] == "GBPUSD"
-        assert result["offset"] == 1
-        assert result["requested_limit"] == 1
         assert "returned_count" not in result
-        assert result["total_count"] == 3
-        assert result["has_more"] is True
         assert result["pagination"] == {
             "total": 3,
             "returned": 1,
@@ -1148,10 +1519,40 @@ class TestMarketScan:
             "has_more": True,
             "more_available": 1,
         }
+        assert not {
+            "total_count",
+            "offset",
+            "requested_limit",
+            "has_more",
+        } & result.keys()
         assert result["message"].startswith(
             "Showing 1 of 3 symbols matching the requested market scan filters."
         )
         assert result["meta"]["request"]["offset"] == 1
+
+    @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
+    @patch("mtdata.core.symbols.mt5.symbol_info_tick")
+    @patch("mtdata.core.symbols.mt5.symbols_get")
+    def test_market_scan_rejects_oversized_candidate_set_before_evaluation(
+        self,
+        mock_symbols_get,
+        mock_tick,
+        mock_rates,
+    ):
+        mock_symbols_get.return_value = [
+            _make_symbol(f"SYM{index:04d}")
+            for index in range(251)
+        ]
+
+        result = _get_market_scan()(limit=5)
+
+        assert result["error_code"] == "candidate_universe_too_large"
+        assert result["meta"]["stats"] == {
+            "candidate_count": 251,
+            "candidate_cap": 250,
+        }
+        mock_tick.assert_not_called()
+        mock_rates.assert_not_called()
 
     @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
     @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
@@ -1277,7 +1678,7 @@ class TestMarketScan:
         assert result["meta"]["request"]["scope"] == "group"
         assert result["summary"]["counts"]["scanned_symbols"] == 2
         assert "matched_symbols" not in result["summary"]["counts"]
-        assert result["total_count"] == 2
+        assert result["pagination"]["total"] == 2
         assert result["meta"]["stats"]["scanned_symbols"] == 2
         mock_ready_guard.assert_called_once_with("USDJPY", info_before=hidden_symbol)
 
@@ -1361,7 +1762,7 @@ class TestMarketScan:
         mock_group,
     ):
         mock_symbols_get.return_value = [
-            _make_symbol("EURUSD", description="Euro"),
+            _make_symbol("EURUSD", description="Euro", currency_profit="USD"),
             _make_symbol("GBPUSD", description="Pound"),
         ]
         mock_tick.return_value = _make_tick(bid=1.1000, ask=1.1001)
@@ -1373,6 +1774,35 @@ class TestMarketScan:
         assert result["success"] is True
         assert result["meta"]["request"]["symbols_input"] == ["EURUSD"]
         assert [row["symbol"] for row in result["data"]] == ["EURUSD"]
+        assert result["data"][0]["price_currency"] == "USD"
+        assert result["data"][0]["price_basis"] == "mt5_latest_completed_bar_close"
+        assert result["data"][0]["price_point"] == 0.0001
+        assert "usable_for_live_trading" not in result["data"][0]
+
+    @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
+    @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
+    @patch("mtdata.core.symbols.mt5.symbol_info_tick")
+    @patch("mtdata.core.symbols.mt5.symbols_get")
+    def test_market_scan_reports_missing_requested_symbols(
+        self,
+        mock_symbols_get,
+        mock_tick,
+        mock_rates,
+        mock_group,
+    ):
+        mock_symbols_get.return_value = [_make_symbol("EURUSD")]
+        mock_tick.return_value = _make_tick(bid=1.1000, ask=1.1001)
+        mock_rates.return_value = _make_bars([1.0, 1.01, 1.02, 1.03])
+
+        result = _get_market_scan()(symbols="EURUSD,NOTAREALPAIR", lookback=4)
+
+        assert result["success"] is True
+        assert result["missing_symbols"] == ["NOTAREALPAIR"]
+        assert result["summary"]["counts"]["skipped_symbols"] == 1
+        assert result["warnings"] == [
+            "Requested symbol(s) not found and excluded from the scan: "
+            "NOTAREALPAIR."
+        ]
 
     @patch("mtdata.core.symbols._extract_group_path_util", side_effect=lambda s: s.path)
     @patch("mtdata.core.symbols._mt5_copy_rates_from_pos")
@@ -1395,7 +1825,7 @@ class TestMarketScan:
         assert result["success"] is True
         assert result["summary"]["empty"] is True
         assert "matched_symbols" not in result["summary"]["counts"]
-        assert result["total_count"] == 0
+        assert result["pagination"]["total"] == 0
         assert result["message"] == "No symbols matched the requested market scan filters."
         assert "no_action" not in result
 

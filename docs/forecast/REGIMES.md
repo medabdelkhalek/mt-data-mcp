@@ -40,10 +40,24 @@ The implementation is a Gaussian HMM with an estimated transition matrix.
 `params.inference=filtered` is the default and uses observations through each
 bar under parameters fitted on the requested window. Use
 `params.inference=smoothed` only for retrospective segmentation because it uses
-later observations. State changes are confirmed causally by `min_regime_bars`.
+later observations. A state change is emitted only after the new raw state has
+persisted for `min_regime_bars` consecutive observations. This is a causal
+confirmation delay, not a promise that every emitted run will contain that many
+rows; a still-unconfirmed terminal candidate is reported in `warnings`.
+Posterior probabilities remain the model's pre-confirmation values, so their
+argmax can temporarily differ from the confirmed state during that delay;
+`params_used.state_probability_alignment` makes this explicit.
 Model parameters are still fitted on the requested analysis window, and canonical
 state IDs are ordered by full-window state means. Historical canonical IDs are
 therefore retrospective labels; use rolling `as_of` calls for point-in-time tests.
+Compact and full responses preserve this distinction in
+`historical_labels_are_retrospective`, `historical_label_scope`, and
+`point_in_time_guidance`.
+
+Return direction labels use one shared statistical rule across state models,
+BOCPD, and PELT: bullish or bearish requires the estimated mean to be at least
+1.96 standard errors from zero. State-model labels use the state's dispersion
+and observed bar count; without enough evidence the label remains neutral.
 
 **Example:**
 ```bash
@@ -159,6 +173,11 @@ mtdata-cli regime_detect EURUSD --timeframe H1 --method ms_ar --params "n_states
 Use `n_states` to choose the number of regimes.
 Like HMM, MS-AR defaults to filtered probabilities. Set
 `params.inference=smoothed` only for retrospective analysis.
+The reported probability rows are the model's pre-confirmation posterior values.
+When `min_regime_bars` delays a candidate transition, their argmax can therefore
+temporarily differ from the emitted confirmed `state`; `params_used.state_probability_alignment`
+records this contract. Fitted `intercept`, `ar_coefficients`, and
+`innovation_volatility` values are reported in canonical regime order.
 
 **When to use:**
 - When regime changes affect both mean and autocorrelation structure
@@ -172,7 +191,8 @@ Like HMM, MS-AR defaults to filtered probabilities. Set
 
 The scaler, optional PCA, cluster model, and canonical state ordering are fitted
 on the full requested window. Clustering output is descriptive; reproduce live
-behavior with rolling `as_of` calls. `min_regime_bars` confirmation itself is causal.
+behavior with rolling `as_of` calls. `min_regime_bars` confirmation itself is
+causal and reports a terminal candidate that is still awaiting confirmation.
 
 **Example:**
 ```bash
@@ -263,6 +283,7 @@ Canonical fields for successful compact/full JSON responses:
 | `regimes` | all compact/full methods | Uses `start`, `end`, `bars`, and `regime_confidence` consistently where regime confidence applies. |
 | `regime_info` | state/rule methods | Describes regime labels and statistics. Clustering labels are derived from return/volatility when available instead of opaque `regime_N` names. |
 | `reliability` | all methods | Always includes `confidence`, `reliability_label`, and `source`; method-specific diagnostics may add more fields. |
+| `historical_label_scope` | full-window fitted methods | Marks historical labels as retrospective; use `point_in_time_guidance` for rolling `as_of` evaluation. |
 | `warnings` | as needed | Explains accepted parameters that do not apply to the selected method. |
 
 `current_regime.regime_confidence` and `regimes[].regime_confidence` are the canonical regime-confidence keys. Reliability diagnostics keep their own `reliability.confidence` field.
@@ -297,6 +318,15 @@ Some methods use a heuristic to choose `n_states` when it is not explicitly supp
 |--------|----------------------|
 | `garch` | Realized-volatility percentile spread plus return kurtosis |
 | `ensemble` | Return-distribution kurtosis |
+
+GARCH selects four states when the 90th/10th realized-volatility percentile
+ratio is above 10 or raw return kurtosis is above 6; it selects three when the
+ratio is above 5 or kurtosis is above 4, and two otherwise. With 10 or fewer
+usable realized-volatility observations, it defaults to three states.
+
+The ensemble uses a separate rule based only on raw return kurtosis: above 6
+selects six states, above 4.5 selects five, above 3.5 selects four, and all
+other values select three.
 
 These rules control output granularity; they are not AIC/BIC model selection and
 do not estimate the true number of market regimes. Set `n_states` explicitly and
@@ -348,8 +378,9 @@ volatility, then bins that path into ordered volatility tiers. By default the
 cut points are percentiles of the full analysis window, so labels such as
 `low_vol` and `high_vol` are relative within that run and can change when the
 window changes. With two states, `params.vol_threshold` selects an explicit
-absolute cut point instead. The output reports `threshold_scope` and
-`volatility_thresholds` in `params_used`.
+absolute cut point instead. Full output reports `threshold_scope` and
+`volatility_thresholds` in `params_used`; compact and full output preserve the
+retrospective classification contract in `historical_label_scope`.
 
 This method is not a Markov-switching GARCH model and does not estimate latent
 regime dynamics. AIC, BIC, and log likelihood are exposed as `model_fit`

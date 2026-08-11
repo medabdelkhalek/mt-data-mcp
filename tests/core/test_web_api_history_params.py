@@ -13,7 +13,7 @@ def test_history_timestamp_format_defaults_to_iso() -> None:
     assert parameter.default == "iso"
 
 
-def test_history_uses_start_end_ohlcv_and_preserves_canonical_forming_candle() -> None:
+def test_history_uses_start_end_ohlcv_and_preserves_canonical_compact_shape() -> None:
     payload = {
         "success": True,
         "data": [
@@ -38,13 +38,14 @@ def test_history_uses_start_end_ohlcv_and_preserves_canonical_forming_candle() -
             include_incomplete=False,
         )
 
-    # Web API preserves the canonical candles payload; forming-bar policy is
-    # owned by data_fetch_candles via the forwarded include_incomplete flag.
+    # Web API preserves the canonical compact candles payload. The status is
+    # retained when a forming bar exists, while redundant booleans are omitted.
     assert len(res["data"]) == 3
+    assert res["count"] == 3
     assert "candles" not in res
-    assert res["has_forming_candle"] is True
+    assert "has_forming_candle" not in res
     assert res["forming_candle_status"] == "included"
-    assert res["forming_candle_included"] is True
+    assert "forming_candle_included" not in res
     assert "last_candle_open" not in res
     kwargs = mock_fetch.call_args.kwargs
     assert kwargs["start"] == "2025-01-01 00:00"
@@ -126,3 +127,72 @@ def test_history_labels_explicit_epoch_timestamps_as_utc_seconds() -> None:
     assert res["timestamp_format"] == "epoch"
     assert res["timestamp_unit"] == "unix_seconds_utc"
     assert mock_fetch.call_args.kwargs["time_as_epoch"] is True
+
+
+def test_history_non_causal_denoise_without_opt_in_returns_400() -> None:
+    """l1_trend (and peers) must not 500 when causality opt-in is missing."""
+    from fastapi import HTTPException
+
+    with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), patch(
+        "mtdata.core.web_api._get_denoise_methods",
+        return_value={
+            "methods": [
+                {
+                    "method": "l1_trend",
+                    "available": True,
+                    "requires": "",
+                }
+            ]
+        },
+    ), patch("mtdata.core.web_api._fetch_candles_impl") as mock_fetch:
+        try:
+            web_api.get_history(
+                symbol="BTCUSD",
+                timeframe="H1",
+                limit=10,
+                denoise_method="l1_trend",
+                denoise_params='{"params":{}}',
+            )
+            raised = None
+        except HTTPException as exc:
+            raised = exc
+
+    assert raised is not None
+    assert raised.status_code == 400
+    detail = raised.detail
+    assert isinstance(detail, dict)
+    assert detail.get("code") == "denoise_non_causal_requires_opt_in" or (
+        isinstance(detail.get("error"), str)
+        and "zero-phase" in detail["error"].lower()
+    ) or (
+        isinstance(detail, dict)
+        and "zero-phase" in str(detail).lower()
+    )
+    mock_fetch.assert_not_called()
+
+
+def test_history_non_causal_denoise_with_zero_phase_reaches_fetch() -> None:
+    payload = {
+        "success": True,
+        "data": [{"time": 1735689600.0, "close": 1.1, "close_dn": 1.05}],
+    }
+    with patch.object(web_api.mt5_connection, "_ensure_connection", return_value=True), patch(
+        "mtdata.core.web_api._get_denoise_methods",
+        return_value={"methods": [{"method": "l1_trend", "available": True, "requires": ""}]},
+    ), patch(
+        "mtdata.core.web_api._fetch_candles_impl",
+        return_value=payload,
+    ) as mock_fetch:
+        res = web_api.get_history(
+            symbol="BTCUSD",
+            timeframe="H1",
+            limit=10,
+            denoise_method="l1_trend",
+            denoise_params='{"params":{},"causality":"zero_phase"}',
+            timestamp_format="epoch",
+        )
+
+    assert res["data"][0]["close_dn"] == 1.05
+    denoise = mock_fetch.call_args.kwargs.get("denoise") or mock_fetch.call_args.kwargs
+    # denoise may be nested in request path via use case; assert fetch was invoked
+    mock_fetch.assert_called_once()

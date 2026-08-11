@@ -1,6 +1,39 @@
+import json
+import subprocess
+import sys
+
 import pytest
 
 from mtdata.forecast import forecast_registry as fr
+
+
+def test_method_discovery_does_not_import_analog_search_stack():
+    code = """
+import json
+import sys
+from mtdata.forecast.forecast_registry import get_forecast_methods_data
+
+data = get_forecast_methods_data()
+print(json.dumps({
+    "total": data["total"],
+    "patterns": "mtdata.utils.patterns" in sys.modules,
+    "dimred": "mtdata.utils.dimred" in sys.modules,
+    "umap": "umap" in sys.modules,
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert result["total"] >= 70
+    assert result["patterns"] is False
+    assert result["dimred"] is False
+    assert result["umap"] is False
 
 
 def test_package_availability_failures_are_isolated(monkeypatch) -> None:
@@ -159,6 +192,8 @@ def test_ensure_registry_loaded_reraises_non_optional_import_errors(monkeypatch)
 
 
 def test_get_forecast_methods_data_assembles_categories_and_skips_broken(monkeypatch):
+    fr._cached_forecast_methods_snapshot.cache_clear()
+
     class GoodMethod:
         """Good method summary."""
 
@@ -201,6 +236,7 @@ def test_get_forecast_methods_data_assembles_categories_and_skips_broken(monkeyp
     monkeypatch.setattr(fr, "_check_requirements", fake_check_requirements)
 
     data = fr.get_forecast_methods_data()
+    fr._cached_forecast_methods_snapshot.cache_clear()
     methods = {m["method"]: m for m in data["methods"]}
 
     assert data["total"] == 3
@@ -253,11 +289,14 @@ def test_get_forecast_method_availability_snapshot_reuses_shared_snapshot_builde
             {"classic": ["theta"]},
         ),
     )
-
-    assert fr.get_forecast_method_availability_snapshot() == {
-        "theta": True,
-        "timesfm": False,
-    }
+    fr._cached_forecast_methods_snapshot.cache_clear()
+    try:
+        assert fr.get_forecast_method_availability_snapshot() == {
+            "theta": True,
+            "timesfm": False,
+        }
+    finally:
+        fr._cached_forecast_methods_snapshot.cache_clear()
 
 
 def test_register_rejects_duplicate_name_with_different_class():
@@ -278,6 +317,45 @@ def test_register_rejects_duplicate_name_with_different_class():
                 pass
     finally:
         fr.ForecastRegistry._methods.pop(unique, None)
+        fr._cached_forecast_methods_snapshot.cache_clear()
+
+
+def test_method_metadata_snapshot_is_cached_and_registration_invalidates(monkeypatch):
+    constructions = 0
+
+    class FirstMethod:
+        supports_features = {"price": True}
+        required_packages = []
+        PARAMS = []
+        category = "test"
+        supports_training = False
+        training_category = "instant"
+
+        def __init__(self):
+            nonlocal constructions
+            constructions += 1
+
+    class SecondMethod(FirstMethod):
+        pass
+
+    monkeypatch.setattr(fr, "_ensure_registry_loaded", lambda: None)
+    monkeypatch.setattr(fr.ForecastRegistry, "_methods", {"first": FirstMethod})
+    fr._cached_forecast_methods_snapshot.cache_clear()
+    try:
+        first = fr.get_forecast_methods_data()
+        first["methods"][0]["method"] = "mutated-by-caller"
+        second = fr.get_forecast_methods_data()
+
+        assert constructions == 1
+        assert second["methods"][0]["method"] == "first"
+
+        fr.ForecastRegistry.register("second")(SecondMethod)
+        refreshed = fr.get_forecast_methods_data()
+
+        assert constructions == 3
+        assert [row["method"] for row in refreshed["methods"]] == ["first", "second"]
+    finally:
+        fr._cached_forecast_methods_snapshot.cache_clear()
 
 
 def test_chronos_aliases_report_distinct_names():

@@ -11,17 +11,28 @@ from fastapi import HTTPException
 from ..forecast.exceptions import ForecastError
 from ..forecast.forecast_methods import get_forecast_methods_payload
 from ..utils.coercion import UNPARSED_BOOL, parse_bool_like
+from ..utils.denoise import DenoiseCausalityError
 from ..utils.mt5 import MT5ConnectionError
 from ..utils.support_resistance import compact_support_resistance_payload
-from .error_envelope import build_error_payload
+from .data.requests import DataFetchCandlesRequest
+from .data.use_cases import run_data_fetch_candles
+from .error_envelope import build_error_payload, normalize_error_payload
 from .mt5_gateway import create_mt5_gateway
-from .output_contract import apply_output_verbosity, ensure_common_meta, output_extras_shape_detail
+from .output_contract import (
+    apply_output_verbosity,
+    ensure_common_meta,
+    normalize_output_extras,
+    output_extras_shape_detail,
+)
 from .pivot import compute_support_resistance_payload
 from .tool_calling import resolve_sync_tool_result
 from .web_api_models import BacktestBody, ForecastPriceBody, ForecastVolBody
 
 logger = logging.getLogger(__name__)
 _MAX_DENOISE_PARAMS_CHARS = 4096
+_HISTORY_DENOISE_CONTROL_KEYS = frozenset(
+    {"columns", "when", "causality", "keep_original"}
+)
 
 
 def _shape_detail_from_extras(extras: Any) -> str:
@@ -32,7 +43,21 @@ def _shape_detail_from_extras(extras: Any) -> str:
 
 
 def _shape_detail(detail: str, extras: Any) -> str:
-    return _shape_detail_from_extras(extras) if extras is not None else detail
+    normalized_extras = normalize_output_extras(extras)
+    return _shape_detail_from_extras(normalized_extras) if normalized_extras else detail
+
+
+def _http_status_for_error(payload: Dict[str, Any], *, default: int = 400) -> int:
+    """Map a canonical domain error to HTTP without changing its identity."""
+    code = str(payload.get("error_code") or "").strip().lower()
+    if code == "symbol_not_found":
+        return 404
+    if code == "mt5_connection_error" or (
+        "mt5" in code
+        and any(token in code for token in ("connection", "unavailable", "quote"))
+    ):
+        return 503
+    return default
 
 
 def _http_error(
@@ -43,12 +68,21 @@ def _http_error(
     operation: str,
     details: Optional[Dict[str, Any]] = None,
 ) -> HTTPException:
-    payload = build_error_payload(
-        message,
-        code=code,
-        operation=operation,
-        details=details,
-    )
+    if isinstance(message, dict) and isinstance(message.get("error"), str):
+        payload = normalize_error_payload(
+            message,
+            default_code=code,
+            operation=operation,
+        )
+        if details and "details" not in payload:
+            payload["details"] = dict(details)
+    else:
+        payload = build_error_payload(
+            message,
+            code=code,
+            operation=operation,
+            details=details,
+        )
     log_fn = logger.error if status_code >= 500 else logger.warning
     log_fn(
         "transport=web_api operation=%s request_id=%s status=%s error=%s",
@@ -180,6 +214,31 @@ def _history_denoise_columns(value: Any) -> List[str]:
     return columns
 
 
+def _apply_history_denoise_controls(
+    spec_input: Dict[str, Any],
+    controls: Dict[str, Any],
+) -> None:
+    if "columns" in controls:
+        spec_input["columns"] = _history_denoise_columns(controls["columns"])
+    if "when" in controls:
+        spec_input["when"] = _history_denoise_choice(
+            controls["when"],
+            field_name="when",
+            allowed={"post_ti", "pre_ti"},
+        )
+    if "causality" in controls:
+        spec_input["causality"] = _history_denoise_choice(
+            controls["causality"],
+            field_name="causality",
+            allowed={"causal", "zero_phase"},
+        )
+    if "keep_original" in controls:
+        spec_input["keep_original"] = _history_denoise_bool(
+            controls["keep_original"],
+            field_name="keep_original",
+        )
+
+
 def get_instruments_response(
     *,
     search: Optional[str],
@@ -213,9 +272,23 @@ def get_instruments_response(
             items.append({"symbol": name, "group": group, "description": desc})
         except Exception:
             continue
+    total = len(items)
     if limit and limit > 0:
-        items = items[: int(limit)]
-    return {"items": items}
+        returned_items = items[: int(limit)]
+    else:
+        returned_items = items
+    returned = len(returned_items)
+    return {
+        "items": returned_items,
+        "count": returned,
+        "pagination": {
+            "total": total,
+            "returned": returned,
+            "offset": 0,
+            "limit": int(limit) if limit and limit > 0 else None,
+            "has_more": returned < total,
+        },
+    }
 
 
 def _compact_forecast_method_definition(method_def: Dict[str, Any]) -> Dict[str, Any]:
@@ -403,7 +476,7 @@ def get_history_response(  # noqa: C901
     *,
     symbol: str,
     timeframe: str,
-    limit: int,
+    limit: Optional[int],
     start: Optional[str],
     end: Optional[str],
     ohlcv: Optional[str],
@@ -419,6 +492,7 @@ def get_history_response(  # noqa: C901
     fetch_candles_impl: Callable[..., Any],
     get_denoise_methods: Callable[[], Any],
     normalize_denoise_spec: Callable[..., Any],
+    gateway: Any,
     mt5_config: Any,
 ) -> Dict[str, Any]:
     _require_mt5_connection()
@@ -478,29 +552,14 @@ def get_history_response(  # noqa: C901
                     if "params" in payload:
                         spec_input["params"] = _history_denoise_params_dict(payload.pop("params"))
                     else:
-                        reserved = {"columns", "when", "causality", "keep_original"}
-                        extra_params = {key: value for key, value in payload.items() if key not in reserved}
+                        extra_params = {
+                            key: value
+                            for key, value in payload.items()
+                            if key not in _HISTORY_DENOISE_CONTROL_KEYS
+                        }
                         if extra_params:
                             spec_input["params"] = extra_params
-                    if "columns" in payload:
-                        spec_input["columns"] = _history_denoise_columns(payload["columns"])
-                    if "when" in payload:
-                        spec_input["when"] = _history_denoise_choice(
-                            payload["when"],
-                            field_name="when",
-                            allowed={"post_ti", "pre_ti"},
-                        )
-                    if "causality" in payload:
-                        spec_input["causality"] = _history_denoise_choice(
-                            payload["causality"],
-                            field_name="causality",
-                            allowed={"causal", "zero_phase"},
-                        )
-                    if "keep_original" in payload:
-                        spec_input["keep_original"] = _history_denoise_bool(
-                            payload["keep_original"],
-                            field_name="keep_original",
-                        )
+                    _apply_history_denoise_controls(spec_input, payload)
                 else:
                     raise ValueError("payload not dict")
             except HTTPException:
@@ -544,24 +603,59 @@ def get_history_response(  # noqa: C901
                             params_dict[key] = float(value) if value.replace(".", "", 1).lstrip("-").isdigit() else value
                         except Exception:
                             params_dict[key] = value
+                controls = {
+                    key: params_dict.pop(key)
+                    for key in tuple(params_dict)
+                    if key in _HISTORY_DENOISE_CONTROL_KEYS
+                }
                 spec_input["params"] = params_dict
-        denoise_spec = normalize_denoise_spec(spec_input, default_when="post_ti")
+                _apply_history_denoise_controls(spec_input, controls)
+        try:
+            denoise_spec = normalize_denoise_spec(spec_input, default_when="pre_ti")
+        except DenoiseCausalityError as exc:
+            # Non-causal filters (e.g. l1_trend) require explicit zero_phase opt-in.
+            # Surface as a client error, not an unhandled 500.
+            raise _http_error(
+                400,
+                (
+                    f"Denoise method '{exc.method}' requires explicit zero-phase "
+                    "opt-in because it uses future bars."
+                ),
+                code="denoise_non_causal_requires_opt_in",
+                operation="get_history",
+                details={
+                    "method": exc.method,
+                    "required_causality": "zero_phase",
+                    "uses_future_bars": True,
+                    "remediation": (
+                        "Pass denoise_params causality=zero_phase for retrospective "
+                        "chart analysis, or choose a causal denoise method."
+                    ),
+                },
+            ) from exc
 
+    request_values: Dict[str, Any] = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "start": start,
+        "end": end,
+        "ohlcv": ohlcv,
+        "include_spread": include_spread,
+        "indicators": indicators,
+        "denoise": denoise_spec,
+        "include_incomplete": include_incomplete,
+        "allow_stale": allow_stale,
+        "timestamp_format": timestamp_format,
+        "detail": detail,
+    }
+    if limit is not None:
+        request_values["limit"] = int(limit)
     try:
-        result = fetch_candles_impl(
-            symbol=symbol,
-            timeframe=timeframe,  # type: ignore[arg-type]
-            limit=int(limit),
-            start=start,
-            end=end,
-            ohlcv=ohlcv,
-            include_spread=include_spread,
-            indicators=indicators,
-            denoise=denoise_spec,
-            simplify=None,
-            include_incomplete=include_incomplete,
-            allow_stale=allow_stale,
-            time_as_epoch=str(timestamp_format).strip().lower() != "iso",
+        request = DataFetchCandlesRequest(**request_values)
+        result = run_data_fetch_candles(
+            request,
+            gateway=gateway,
+            fetch_candles_impl=fetch_candles_impl,
         )
     except Exception as exc:
         _raise_history_fetch_error(exc)
@@ -569,7 +663,12 @@ def get_history_response(  # noqa: C901
     if not isinstance(result, dict):
         raise _http_error(500, "Unexpected history payload", code="history_payload_invalid", operation="get_history")
     if result.get("error"):
-        raise _http_error(400, str(result["error"]), code="history_tool_error", operation="get_history")
+        raise _http_error(
+            _http_status_for_error(result),
+            result,
+            code="history_tool_error",
+            operation="get_history",
+        )
 
     payload = ensure_common_meta(
         result,
@@ -589,6 +688,8 @@ def get_history_response(  # noqa: C901
             server_meta = timezone_meta.get("server") if isinstance(timezone_meta, dict) else None
             if isinstance(server_meta, dict) and server_meta.get("offset_seconds") is not None:
                 payload["server_utc_offset_seconds"] = server_meta["offset_seconds"]
+            if isinstance(server_meta, dict) and server_meta.get("tz"):
+                payload["server_timezone"] = server_meta["tz"]
     return apply_output_verbosity(
         payload,
         detail=shape_detail,
@@ -647,8 +748,8 @@ def get_pivots_response(
 
     if isinstance(result, dict) and result.get("error"):
         raise _http_error(
-            400,
-            str(result["error"]),
+            _http_status_for_error(result),
+            result,
             code="pivot_tool_error",
             operation="get_pivots",
         )
@@ -796,78 +897,92 @@ def get_tick_response(
             status_code = 400
         raise _http_error(
             status_code,
-            result["error"],
+            result,
             code=error_code,
             operation="get_tick",
         )
     return apply_output_verbosity(result, detail=detail, tool_name="market_ticker")
 
 
-def post_forecast_price_response(*, body: ForecastPriceBody, forecast_generate_use_case: Callable[..., Any]) -> Dict[str, Any]:
+def _post_use_case_response(
+    *,
+    body: Any,
+    use_case: Callable[..., Any],
+    operation: str,
+    domain_error_code: str,
+    mt5_error_code: str,
+    internal_error_code: str,
+    internal_message: str,
+    result_error_code: str,
+) -> Dict[str, Any]:
     try:
-        result = forecast_generate_use_case(body.to_domain_request())
+        result = use_case(body.to_domain_request())
     except HTTPException:
         raise
     except ForecastError as exc:
-        raise _http_error(400, str(exc), code="forecast_error", operation="post_forecast_price")
+        raise _http_error(
+            400,
+            str(exc),
+            code=domain_error_code,
+            operation=operation,
+        )
     except MT5ConnectionError as exc:
         raise _http_error(
             503,
             str(exc),
-            code="forecast_mt5_unavailable",
-            operation="post_forecast_price",
+            code=mt5_error_code,
+            operation=operation,
         )
     except Exception:
         _raise_internal_handler_error(
-            operation="post_forecast_price",
-            code="forecast_internal_error",
-            message="Forecast computation failed.",
+            operation=operation,
+            code=internal_error_code,
+            message=internal_message,
         )
     if isinstance(result, dict) and result.get("error"):
-        raise _http_error(400, str(result["error"]), code="forecast_tool_error", operation="post_forecast_price")
+        raise _http_error(
+            _http_status_for_error(result),
+            result,
+            code=result_error_code,
+            operation=operation,
+        )
     return result
+
+
+def post_forecast_price_response(*, body: ForecastPriceBody, forecast_generate_use_case: Callable[..., Any]) -> Dict[str, Any]:
+    return _post_use_case_response(
+        body=body,
+        use_case=forecast_generate_use_case,
+        operation="post_forecast_price",
+        domain_error_code="forecast_error",
+        mt5_error_code="forecast_mt5_unavailable",
+        internal_error_code="forecast_internal_error",
+        internal_message="Forecast computation failed.",
+        result_error_code="forecast_tool_error",
+    )
 
 
 def post_forecast_volatility_response(*, body: ForecastVolBody, forecast_vol_impl: Callable[..., Any]) -> Dict[str, Any]:
-    try:
-        result = forecast_vol_impl(body.to_domain_request())
-    except HTTPException:
-        raise
-    except ForecastError as exc:
-        raise _http_error(400, str(exc), code="forecast_volatility_error", operation="post_forecast_volatility")
-    except MT5ConnectionError as exc:
-        raise _http_error(
-            503,
-            str(exc),
-            code="forecast_volatility_mt5_unavailable",
-            operation="post_forecast_volatility",
-        )
-    except Exception:
-        _raise_internal_handler_error(
-            operation="post_forecast_volatility",
-            code="forecast_volatility_internal_error",
-            message="Forecast volatility computation failed.",
-        )
-    if isinstance(result, dict) and result.get("error"):
-        raise _http_error(400, str(result["error"]), code="forecast_volatility_error", operation="post_forecast_volatility")
-    return result
+    return _post_use_case_response(
+        body=body,
+        use_case=forecast_vol_impl,
+        operation="post_forecast_volatility",
+        domain_error_code="forecast_volatility_error",
+        mt5_error_code="forecast_volatility_mt5_unavailable",
+        internal_error_code="forecast_volatility_internal_error",
+        internal_message="Forecast volatility computation failed.",
+        result_error_code="forecast_volatility_error",
+    )
 
 
 def post_backtest_response(*, body: BacktestBody, backtest_use_case: Callable[..., Any]) -> Dict[str, Any]:
-    try:
-        result = backtest_use_case(body.to_domain_request())
-    except HTTPException:
-        raise
-    except ForecastError as exc:
-        raise _http_error(400, str(exc), code="backtest_error", operation="post_backtest")
-    except MT5ConnectionError as exc:
-        raise _http_error(503, str(exc), code="backtest_mt5_unavailable", operation="post_backtest")
-    except Exception:
-        _raise_internal_handler_error(
-            operation="post_backtest",
-            code="backtest_internal_error",
-            message="Backtest computation failed.",
-        )
-    if isinstance(result, dict) and result.get("error"):
-        raise _http_error(400, str(result["error"]), code="backtest_error", operation="post_backtest")
-    return result
+    return _post_use_case_response(
+        body=body,
+        use_case=backtest_use_case,
+        operation="post_backtest",
+        domain_error_code="backtest_error",
+        mt5_error_code="backtest_mt5_unavailable",
+        internal_error_code="backtest_internal_error",
+        internal_message="Backtest computation failed.",
+        result_error_code="backtest_error",
+    )

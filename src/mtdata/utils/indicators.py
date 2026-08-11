@@ -1,5 +1,6 @@
-import inspect
+import copy
 import importlib
+import inspect
 import logging
 import pydoc
 import re
@@ -17,8 +18,8 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
-_INDICATOR_SERIES_NAMES = ("open", "high", "low", "close", "volume")
-_VOLUME_SOURCE_COLUMNS = ("volume", "real_volume", "tick_volume")
+_INDICATOR_SERIES_NAMES = ("open", "open_", "high", "low", "close", "volume")
+_VOLUME_SOURCE_COLUMNS = ("real_volume", "volume", "tick_volume")
 _TA_INDICATOR_CATEGORIES = (
     "candles",
     "momentum",
@@ -155,8 +156,8 @@ def infer_defaults_from_doc(func_name: str, doc_text: str, params: List[Dict[str
                 p['default'] = default_value
 
 
-def list_ta_indicators(*, detailed: bool = False) -> List[Dict[str, Any]]:
-    """Return [{'name','params','description','category'}, ...] discovered from pandas_ta."""
+@lru_cache(maxsize=2)
+def _list_ta_indicators_cached(detailed: bool) -> Tuple[Dict[str, Any], ...]:
     items: List[Dict[str, Any]] = []
     seen = set()
 
@@ -219,7 +220,12 @@ def list_ta_indicators(*, detailed: bool = False) -> List[Dict[str, Any]]:
         except Exception:
             continue
     items.sort(key=lambda x: x["name"])
-    return items
+    return tuple(items)
+
+
+def list_ta_indicators(*, detailed: bool = False) -> List[Dict[str, Any]]:
+    """Return a mutation-safe copy of the process-cached pandas-ta catalog."""
+    return copy.deepcopy(list(_list_ta_indicators_cached(bool(detailed))))
 
 def _parse_ti_specs(spec: str) -> List[Tuple[str, List[int | float], Dict[str, int | float]]]:
     """Parse a compact indicator spec string into [(name, args, kwargs)].
@@ -287,6 +293,7 @@ def _parse_ti_specs(spec: str) -> List[Tuple[str, List[int | float], Dict[str, i
             m
             and str(m.group(1) or "").strip()
             and not normalized_name.startswith("cdl_")
+            and not _is_available_ta_indicator(normalized_name)
             and not args
             and 'length' not in kwargs
         ):
@@ -363,6 +370,7 @@ def _resolve_indicator_volume_series(df: pd.DataFrame) -> Optional[pd.Series]:
             numeric = series
         try:
             if bool((numeric.fillna(0) != 0).any()):
+                df.attrs["indicator_volume_source"] = col_name
                 return series
         except Exception:
             pass
@@ -390,10 +398,11 @@ def _resolve_indicator_series_inputs(
                 resolved[name] = volume_series
             continue
 
-        if name not in df.columns:
+        source_name = "open" if name == "open_" else name
+        if source_name not in df.columns:
             missing.append(name)
             continue
-        resolved[name] = df[name]
+        resolved[name] = df[source_name]
 
     if missing:
         raise ValueError(
@@ -421,7 +430,8 @@ def _apply_ta_indicators(df: pd.DataFrame, ti_spec: str) -> List[str]:  # noqa: 
     try:
         if not isinstance(df.index, pd.DatetimeIndex):
             try:
-                df.index = pd.to_datetime(df['time'], unit='s', utc=True)
+                epoch_source = df['__epoch'] if '__epoch' in df.columns else df['time']
+                df.index = pd.to_datetime(epoch_source, unit='s', utc=True)
             except Exception:
                 try:
                     df.index = pd.to_datetime(df['time'])
@@ -454,7 +464,7 @@ def _apply_ta_indicators(df: pd.DataFrame, ti_spec: str) -> List[str]:  # noqa: 
 
                 # Generic mapping: map provided numeric args to function parameters in declared order
                 # Skip series parameters and any already supplied in call_kwargs
-                series_names = {'open', 'high', 'low', 'close', 'volume'}
+                series_names = {'open', 'open_', 'high', 'low', 'close', 'volume'}
                 ordered_param_names = []
                 for pname, p in params.items():
                     if p.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
@@ -487,6 +497,10 @@ def _apply_ta_indicators(df: pd.DataFrame, ti_spec: str) -> List[str]:  # noqa: 
                         df[c] = out[c]
                 elif isinstance(out, pd.Series):
                     df[out.name or lname] = out
+                elif out is None:
+                    raise ValueError(
+                        f"Indicator '{lname}' returned no output for the supplied data and parameters."
+                    )
             except ValueError:
                 raise
             except Exception as apply_exc:
@@ -508,6 +522,29 @@ def _apply_ta_indicators(df: pd.DataFrame, ti_spec: str) -> List[str]:  # noqa: 
             df.index = original_index
     return added_cols
 
+_RECURSIVE_WARMUP_MULTIPLIER = 25
+_FINITE_WINDOW_WARMUP_MULTIPLIER = 3
+_RECURSIVE_INDICATORS = frozenset(
+    {
+        "adx",
+        "adxr",
+        "atr",
+        "dema",
+        "dm",
+        "ema",
+        "kama",
+        "kc",
+        "natr",
+        "qqe",
+        "rma",
+        "rsi",
+        "supertrend",
+        "t3",
+        "tema",
+    }
+)
+
+
 def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
     if not ti_spec:
         return 0
@@ -528,8 +565,12 @@ def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
                     return default
             return default
         warm = 0
-        if lname in ("sma", "ema", "rsi"):
+        multiplier = _FINITE_WINDOW_WARMUP_MULTIPLIER
+        if lname == "sma":
             warm = geti("length", 14)
+        elif lname in _RECURSIVE_INDICATORS:
+            warm = geti("length", 14)
+            multiplier = _RECURSIVE_WARMUP_MULTIPLIER
         elif lname == "macd":
             # Accept both short names and pandas_ta-style *_period kwargs.
             fast = kwargs.get(
@@ -545,9 +586,10 @@ def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
                 kwargs.get("signal_period", args[2] if len(args) > 2 else 9),
             )
             try:
-                warm = max(int(fast), int(slow)) + int(signal)
+                warm = max(int(fast), int(slow), int(signal))
             except Exception:
-                warm = 35
+                warm = 26
+            multiplier = _RECURSIVE_WARMUP_MULTIPLIER
         elif lname == "stoch":
             k = kwargs.get("k", args[0] if len(args) > 0 else 14)
             d = kwargs.get("d", args[1] if len(args) > 1 else 3)
@@ -564,7 +606,7 @@ def _estimate_warmup_bars(ti_spec: Optional[str]) -> int:
                 warm = 20
         else:
             warm = 50
-        if warm > max_warmup:
-            max_warmup = warm
-    scaled = max(int(max_warmup * 3), 50) if max_warmup > 0 else 0
-    return scaled
+        candidate = max(int(warm * multiplier), 50)
+        if candidate > max_warmup:
+            max_warmup = candidate
+    return max_warmup

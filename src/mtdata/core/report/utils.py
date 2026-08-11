@@ -4,7 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ...shared.constants import TIME_DISPLAY_FORMAT
 from ...shared.market_units import forex_pip_size
-from ...utils.barriers import get_tick_size as _get_pip_size
+from ...utils.barriers import get_tick_size as _get_tick_size
 from ...utils.mt5 import get_symbol_info_cached
 from ..tool_calling import call_tool_sync_structured
 from .shared import (
@@ -23,6 +23,31 @@ from .shared import (
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime(TIME_DISPLAY_FORMAT)
+
+
+_CURRENT_ONLY_OMISSION_REASON = "current_only_section_omitted"
+
+
+def is_bounded_report_window(start: Any, end: Any) -> bool:
+    return start not in (None, "") or end not in (None, "")
+
+
+def current_only_section_omission(
+    section: str,
+    *,
+    start: Any,
+    end: Any,
+) -> Dict[str, Any]:
+    return {
+        "status": "omitted",
+        "reason": _CURRENT_ONLY_OMISSION_REASON,
+        "section": section,
+        "requested_window": {"start": start, "end": end},
+        "message": (
+            f"{section} was omitted because it cannot currently honor the "
+            "report's bounded market window."
+        ),
+    }
 
 
 _REPORT_FORECAST_FIELDS = (
@@ -297,6 +322,25 @@ def pick_best_forecast_method(
         return None
 
 
+def normalize_report_methods(value: Any) -> List[str]:
+    """Normalize documented comma/whitespace method inputs in stable order."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = []
+    normalized: List[str] = []
+    for raw in raw_items:
+        for token in str(raw or "").replace(",", " ").split():
+            method = token.strip()
+            if method and method not in normalized:
+                normalized.append(method)
+    return normalized
+
+
 def summarize_barrier_grid(grid: Dict[str, Any], top_k: int = 3) -> Dict[str, Any]:
     try:
         best = grid.get('best') if isinstance(grid, dict) else None
@@ -419,7 +463,9 @@ def merge_params(base: Optional[Dict[str, Any]], extra: Dict[str, Any], override
     return p
 
 
-def market_snapshot(symbol: str, timezone: str = 'UTC') -> Dict[str, Any]:
+def market_snapshot(  # noqa: C901
+    symbol: str, timezone: str = 'UTC'
+) -> Dict[str, Any]:
     try:
         from ..market_depth import market_depth_fetch as _fetch_market_depth
         dom = call_tool_sync_structured(
@@ -461,7 +507,7 @@ def market_snapshot(symbol: str, timezone: str = 'UTC') -> Dict[str, Any]:
                 except Exception:
                     total_sell_vol = None
         info = get_symbol_info_cached(symbol)
-        tick_size = _get_pip_size(symbol, symbol_info=info)
+        tick_size = _get_tick_size(symbol, symbol_info=info)
         point_size = None
         digits = None
         if info is not None:
@@ -623,7 +669,8 @@ def context_for_tf(
                 _fetch_cache[cache_key] = cached_error
             return cached_error
         freshness = extract_candle_freshness_diagnostics(res)
-        rows = parse_table_tail(res, tail=int(tail))
+        all_rows = parse_table_tail(res, tail=int(limit))
+        rows = all_rows[-int(tail):]
 
         if not rows:
             empty_out = {'freshness': freshness} if freshness else None
@@ -642,7 +689,7 @@ def context_for_tf(
         # Compute trend compact data for MTF matrix
         try:
             from ..report_templates.basic import _compute_compact_trend
-            compact = _compute_compact_trend(rows)
+            compact = _compute_compact_trend(all_rows)
             if compact:
                 out['trend_compact'] = compact
         except Exception:
@@ -864,13 +911,28 @@ def attach_market_and_timeframes(
 ) -> Dict[str, Any]:
     market_enabled = report_section_enabled(params, 'market')
     gates_enabled = report_section_enabled(params, 'execution_gates')
+    start = (params or {}).get('start')
+    end = (params or {}).get('end')
     snap: Dict[str, Any] = {}
     if market_enabled or gates_enabled:
-        snap = snapshot if snapshot is not None else market_snapshot(symbol)
-        report.setdefault('sections', {})['market'] = snap
-        gates = apply_market_gates(snap if isinstance(snap, dict) else {}, params or {})
-        if gates:
-            report['sections']['execution_gates'] = gates
+        sections = report.setdefault('sections', {})
+        if is_bounded_report_window(start, end):
+            if market_enabled:
+                sections['market'] = current_only_section_omission(
+                    'market', start=start, end=end
+                )
+            if gates_enabled:
+                sections['execution_gates'] = current_only_section_omission(
+                    'execution_gates', start=start, end=end
+                )
+        else:
+            snap = snapshot if snapshot is not None else market_snapshot(symbol)
+            sections['market'] = snap
+            gates = apply_market_gates(
+                snap if isinstance(snap, dict) else {}, params or {}
+            )
+            if gates:
+                sections['execution_gates'] = gates
     attach_report_timeframes(
         report,
         symbol,

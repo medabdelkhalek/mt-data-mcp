@@ -31,10 +31,14 @@ from ..services.finviz import (
     get_stock_ratings,
     screen_stocks,
 )
+from ..services.finviz.symbols import (
+    looks_like_non_equity_symbol,
+    normalize_finviz_equity_symbol,
+)
 from ..services.news_text import normalize_news_text
-from ..services.finviz.symbols import looks_like_non_equity_symbol
 from ..shared.schema import DetailLiteral
 from ..shared.symbols import finviz_forex_symbol_to_mt5
+from ..utils.time import format_datetime_utc
 from ._mcp_instance import mcp
 from .error_envelope import build_error_payload
 from .execution_logging import run_logged_operation
@@ -47,21 +51,6 @@ from .output_contract import (
 
 logger = logging.getLogger(__name__)
 
-_FINVIZ_EQUITY_BROKER_SUFFIXES = {
-    "AMEX",
-    "ARCA",
-    "BATS",
-    "L",
-    "NAS",
-    "NASDAQ",
-    "NQ",
-    "NY",
-    "NYSE",
-    "O",
-    "OTC",
-    "TQ",
-    "US",
-}
 _FINVIZ_SCREEN_FILTERS_EXAMPLE = '{"Exchange":"NASDAQ","Sector":"Technology"}'
 _FINVIZ_FUNDAMENTAL_CATEGORIES: Dict[str, tuple[str, ...]] = {
     "summary": (
@@ -187,21 +176,8 @@ def _validate_positive_finviz_limit(
     )
 
 
-def _normalize_finviz_equity_symbol_text(symbol: str) -> str:
-    symbol_norm = str(symbol or "").strip().upper()
-    if "." not in symbol_norm:
-        return symbol_norm
-    base, suffix = symbol_norm.rsplit(".", 1)
-    if (
-        suffix in _FINVIZ_EQUITY_BROKER_SUFFIXES
-        and re.fullmatch(r"[A-Z]{1,6}", base or "") is not None
-    ):
-        return base
-    return symbol_norm
-
-
 def _normalize_equity_symbol(symbol: str, *, tool_name: str) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
-    symbol_norm = _normalize_finviz_equity_symbol_text(symbol)
+    symbol_norm = normalize_finviz_equity_symbol(symbol)
     if not symbol_norm:
         return None, _finviz_error_payload(
             f"{tool_name} requires a symbol.",
@@ -241,12 +217,7 @@ def _require_equity_symbol(
 
 
 def _finviz_data_fetched_at() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return format_datetime_utc(datetime.now(timezone.utc))
 
 
 def _attach_finviz_fetch_timestamp(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,17 +264,18 @@ _FINVIZ_MARKET_COMPACT_FIELDS = (
     "display_symbol",
     "name",
     "price",
+    "price_status",
     "price_currency",
     "price_source",
     "data_delayed",
     "delay_minutes_min",
     "delay_minutes_max",
     "group",
-    "perf_day",
-    "perf_week",
-    "perf_month",
-    "perf_quart",
-    "perf_year",
+    "perf_day_pct",
+    "perf_week_pct",
+    "perf_month_pct",
+    "perf_quart_pct",
+    "perf_year_pct",
 )
 _FINVIZ_MARKET_PERFORMANCE_PERIOD_FIELDS = (
     ("day", "perf_day_pct"),
@@ -494,49 +466,61 @@ def _finviz_percent_value(
         return None
     if not fraction_input:
         return round(float(parsed), 6)
-    if isinstance(value, (int, float)) and abs(float(parsed)) <= 1.0:
+    if isinstance(value, (int, float)):
         parsed = float(parsed) * 100.0
         return round(float(parsed), 6)
     text = str(value).strip()
-    if text and not text.endswith("%") and abs(float(parsed)) <= 1.0:
+    if text and not text.endswith("%"):
         parsed = float(parsed) * 100.0
     return round(float(parsed), 6)
 
 
+def _normalize_finviz_market_performance_fields(
+    row: Dict[str, Any],
+    *,
+    rows_key: str,
+) -> Dict[str, Any]:
+    """Use percentage-point performance fields for every market detail level."""
+    out = dict(row)
+    if "perf_day" not in out and "perf_pct" in out:
+        out["perf_day"] = out["perf_pct"]
+    out.pop("perf_pct", None)
+    if "perf_week" not in out and out.get("perf_wtd") not in (None, ""):
+        out["perf_week"] = out["perf_wtd"]
+        out["perf_week_basis"] = "week_to_date"
+    out.pop("perf_wtd", None)
+
+    for field, value in tuple(out.items()):
+        if (
+            not field.startswith("perf_")
+            or field.endswith("_pct")
+            or field == "perf_week_basis"
+        ):
+            continue
+        pct_value = _finviz_percent_value(
+            value,
+            fraction_input=rows_key != "futures",
+        )
+        if pct_value is not None:
+            out[f"{field}_pct"] = pct_value
+        out.pop(field, None)
+    return out
+
+
 def _compact_finviz_market_row(row: Dict[str, Any], *, rows_key: str) -> Dict[str, Any]:
-    compact = dict(row)
-    if "perf_day" not in compact and "perf_pct" in compact:
-        compact["perf_day"] = compact["perf_pct"]
+    compact = _normalize_finviz_market_performance_fields(row, rows_key=rows_key)
     if rows_key == "pairs" and not compact.get("name"):
         derived_name = _derive_forex_pair_name(compact.get("symbol"))
         if derived_name is not None:
             compact["name"] = derived_name
-    if "perf_week" not in compact and compact.get("perf_wtd") not in (None, ""):
-        compact["perf_week"] = compact["perf_wtd"]
-        compact["_perf_week_basis"] = "week_to_date"
     fields = _FINVIZ_MARKET_COMPACT_FIELDS
-    if rows_key == "pairs" and compact.get("price") not in (None, ""):
-        compact["delayed_price"] = compact.pop("price")
-        fields = tuple(
-            "delayed_price" if field == "price" else field
-            for field in fields
-        )
     out = {
         field: compact[field]
         for field in fields
         if field in compact and compact[field] not in (None, "")
     }
-    for field in tuple(out):
-        if field.startswith("perf_"):
-            pct_value = _finviz_percent_value(
-                out.get(field),
-                fraction_input=rows_key != "futures",
-            )
-            if pct_value is not None:
-                out[f"{field}_pct"] = pct_value
-            out.pop(field, None)
-    if compact.get("_perf_week_basis") and "perf_week_pct" in out:
-        out["perf_week_basis"] = compact["_perf_week_basis"]
+    if compact.get("perf_week_basis") and "perf_week_pct" in out:
+        out["perf_week_basis"] = compact["perf_week_basis"]
     return out
 
 
@@ -630,7 +614,7 @@ def _finviz_screen_units_for_rows(rows: Any) -> Dict[str, str]:
     return units
 
 
-def _normalize_finviz_market_payload(
+def _normalize_finviz_market_payload(  # noqa: C901
     result: Dict[str, Any],
     *,
     rows_key: str,
@@ -649,14 +633,20 @@ def _normalize_finviz_market_payload(
         if rows_key == "stocks"
         else _snake_finviz_market_key
     )
-    normalized_rows = [
-        _canonicalize_finviz_market_row(
+    normalized_rows = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            normalized_rows.append(row)
+            continue
+        normalized_row = _canonicalize_finviz_market_row(
             {key_normalizer(key): value for key, value in row.items()}
         )
-        if isinstance(row, dict)
-        else row
-        for row in (rows if isinstance(rows, list) else [])
-    ]
+        if rows_key in {"pairs", "coins", "futures"}:
+            normalized_row = _normalize_finviz_market_performance_fields(
+                normalized_row,
+                rows_key=rows_key,
+            )
+        normalized_rows.append(normalized_row)
     upstream_count = len(normalized_rows)
     symbol_filter_norm: Optional[str] = None
     if rows_key == "pairs":
@@ -696,20 +686,25 @@ def _normalize_finviz_market_payload(
     if symbol_filter_norm is not None:
         out["symbol"] = symbol_filter_norm
     available = len(normalized_rows)
-    if rows_key != "stocks":
-        out["available_count"] = available
-    out["pagination"] = build_pagination_meta(
-        total=(int(out.get("total") or 0) if rows_key == "stocks" else available),
-        returned=len(output_rows),
-        offset=0,
-        limit=limit_value,
+    pagination_total = out.get("total") if rows_key == "stocks" else available
+    pagination_lower_bound = (
+        (out.get("total_lower_bound") or available)
+        if rows_key == "stocks"
+        else None
     )
-    if rows_key == "stocks" and out.get("total") not in (None, ""):
-        omitted = max(0, int(out.get("total") or 0) - int(out["count"]))
-    else:
-        omitted = max(0, available - len(limited_rows))
-    if omitted:
-        out["omitted_item_count"] = omitted
+    pagination_has_more = bool(
+        out.get("has_more") or available > len(limited_rows)
+    )
+    out.pop("omitted_item_count", None)
+    _apply_finviz_pagination_contract(
+        out,
+        returned=len(output_rows),
+        limit=limit_value,
+        page=int(out.get("page") or request.get("page") or 1),
+        total=pagination_total,
+        total_lower_bound=pagination_lower_bound,
+        has_more=pagination_has_more,
+    )
     out["detail"] = detail_mode
     has_price = any(
         isinstance(row, dict) and row.get("price") not in (None, "")
@@ -734,7 +729,7 @@ def _normalize_finviz_market_payload(
     if rows_key == "futures":
         _attach_finviz_delayed_root_metadata(out)
         _append_finviz_warning(out, _FINVIZ_FUTURES_DELAYED_WARNING)
-    if detail_mode != "full" and rows_key in {"pairs", "coins", "futures"}:
+    if rows_key in {"pairs", "coins", "futures"}:
         out["performance_format"] = "percentage_points"
     units = _finviz_screen_units_for_rows(output_rows)
     if units:
@@ -813,6 +808,72 @@ def _coerce_finviz_offset(offset: Optional[int]) -> int:
         return max(0, int(offset or 0))
     except Exception:
         return 0
+
+
+_FINVIZ_FLAT_PAGINATION_FIELDS = (
+    "total",
+    "total_count",
+    "total_lower_bound",
+    "total_is_lower_bound",
+    "offset",
+    "limit",
+    "page",
+    "pages",
+    "has_more",
+    "more_available",
+    "next_offset",
+    "next_page",
+    "truncated",
+)
+
+
+def _apply_finviz_pagination_contract(
+    out: Dict[str, Any],
+    *,
+    returned: int,
+    limit: int,
+    page: int = 1,
+    total: Any = None,
+    total_lower_bound: Any = None,
+    has_more: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Replace Finviz page aliases with the canonical offset pagination block."""
+    limit_value = max(1, int(limit))
+    page_value = max(1, int(page))
+    offset_value = (page_value - 1) * limit_value
+    returned_value = max(0, int(returned))
+
+    exact_total: Optional[int]
+    try:
+        exact_total = None if total in (None, "") else max(0, int(total))
+    except (TypeError, ValueError):
+        exact_total = None
+    try:
+        lower_bound = (
+            None
+            if total_lower_bound in (None, "")
+            else max(0, int(total_lower_bound))
+        )
+    except (TypeError, ValueError):
+        lower_bound = None
+
+    total_is_lower_bound = exact_total is None
+    if exact_total is not None:
+        pagination_total = exact_total
+    else:
+        minimum_total = offset_value + returned_value + (1 if has_more else 0)
+        pagination_total = max(lower_bound or 0, minimum_total)
+
+    for field in _FINVIZ_FLAT_PAGINATION_FIELDS:
+        out.pop(field, None)
+    out["pagination"] = build_pagination_meta(
+        total=pagination_total,
+        returned=returned_value,
+        offset=offset_value,
+        limit=limit_value,
+        total_is_lower_bound=total_is_lower_bound,
+    )
+    return out
 
 
 def _build_tool_contract_meta(
@@ -1205,10 +1266,12 @@ def finviz_filters_list(
         "success": True,
         "items": limited_rows,
         "count": len(limited_rows),
-        "total": len(rows),
-        "limit": limit_value,
-        "offset": offset_value,
-        "has_more": offset_value + len(limited_rows) < len(rows),
+        "pagination": build_pagination_meta(
+            total=len(rows),
+            returned=len(limited_rows),
+            offset=offset_value,
+            limit=limit_value,
+        ),
         "detail": detail_mode,
         "hint": (
             "Use finviz_screen filters as Filter=Value pairs or shorthand "
@@ -1220,8 +1283,6 @@ def finviz_filters_list(
         out["search"] = search
     if filter_name not in (None, ""):
         out["filter_name"] = filter_name
-    if len(rows) > len(limited_rows):
-        out["omitted_item_count"] = max(0, len(rows) - offset_value - len(limited_rows))
     return out
 
 
@@ -1233,7 +1294,11 @@ def _clean_finviz_text_value(value: Any) -> Any:
 
 def _normalize_finviz_published_at(value: Any, *, now: Optional[datetime] = None) -> Any:
     if isinstance(value, datetime):
-        dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        dt = (
+            value
+            if value.tzinfo is not None
+            else value.replace(tzinfo=_FINVIZ_CALENDAR_LOCAL_TZ)
+        )
         return dt.astimezone(timezone.utc).isoformat()
     if not isinstance(value, str):
         return value
@@ -1245,7 +1310,7 @@ def _normalize_finviz_published_at(value: Any, *, now: Optional[datetime] = None
     try:
         dt = datetime.fromisoformat(iso_text)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=_FINVIZ_CALENDAR_LOCAL_TZ)
         return dt.astimezone(timezone.utc).isoformat()
     except ValueError:
         pass
@@ -1253,7 +1318,11 @@ def _normalize_finviz_published_at(value: Any, *, now: Optional[datetime] = None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(text, fmt)
-            return dt.replace(tzinfo=timezone.utc).isoformat()
+            return (
+                dt.replace(tzinfo=_FINVIZ_CALENDAR_LOCAL_TZ)
+                .astimezone(timezone.utc)
+                .isoformat()
+            )
         except ValueError:
             continue
 
@@ -1266,18 +1335,19 @@ def _normalize_finviz_published_at(value: Any, *, now: Optional[datetime] = None
         if reference.tzinfo is None:
             reference = reference.replace(tzinfo=timezone.utc)
         reference = reference.astimezone(timezone.utc)
+        reference_local = reference.astimezone(_FINVIZ_CALENDAR_LOCAL_TZ)
         dt = datetime.combine(
-            reference.date(),
+            reference_local.date(),
             datetime_time(
                 parsed_time.hour,
                 parsed_time.minute,
                 parsed_time.second,
-                tzinfo=timezone.utc,
+                tzinfo=_FINVIZ_CALENDAR_LOCAL_TZ,
             ),
         )
-        if dt > reference + timedelta(hours=1):
+        if dt.astimezone(timezone.utc) > reference + timedelta(hours=1):
             dt -= timedelta(days=1)
-        return dt.isoformat()
+        return dt.astimezone(timezone.utc).isoformat()
 
     return text
 
@@ -1357,6 +1427,8 @@ def _normalize_finviz_news_payload(
     *,
     detail: DetailLiteral = "compact",  # type: ignore
     kind: str = "headline",
+    limit: int = 20,
+    page: int = 1,
 ) -> Dict[str, Any]:
     out = dict(result)
     out.pop("tool_scope", None)
@@ -1383,6 +1455,22 @@ def _normalize_finviz_news_payload(
         for item in source_rows
     ]
     out.pop("news", None)
+    pages = result.get("pages")
+    page_value = int(result.get("page") or page or 1)
+    has_more = bool(
+        result.get("has_more")
+        or (pages not in (None, "") and page_value < int(pages))
+    )
+    _apply_finviz_pagination_contract(
+        out,
+        returned=len(normalized_items),
+        limit=limit,
+        page=page_value,
+        total=result.get("total"),
+        total_lower_bound=result.get("total_lower_bound"),
+        has_more=has_more,
+    )
+    out.pop("omitted_item_count", None)
     if detail_mode == "summary":
         out.pop("items", None)
         out["count"] = int(out.get("count") or len(normalized_items))
@@ -1672,6 +1760,10 @@ _FINVIZ_EARNINGS_COMPACT_FIELDS = (
     "price",
     "change",
     "volume",
+    "price_source",
+    "data_delayed",
+    "delay_minutes_min",
+    "delay_minutes_max",
 )
 _FINVIZ_EARNINGS_TIMING_SUFFIXES = {
     "/b": "before_market",
@@ -1913,21 +2005,60 @@ def _normalize_finviz_output_rows(rows: Any) -> Any:
     return [_normalize_finviz_output_row(row) for row in rows]
 
 
-def _normalize_finviz_earnings_rows(rows: Any) -> List[Any]:
+def _finviz_earnings_period_window(
+    period_key: str, reference_date: Any
+) -> tuple[Any, Any]:
+    week_start = reference_date - timedelta(days=reference_date.weekday())
+    if period_key == "next-week":
+        start = week_start + timedelta(days=7)
+        return start, start + timedelta(days=6)
+    if period_key == "previous-week":
+        start = week_start - timedelta(days=7)
+        return start, start + timedelta(days=6)
+    if period_key == "this-month":
+        start = reference_date.replace(day=1)
+        next_month = (
+            start.replace(year=start.year + 1, month=1)
+            if start.month == 12
+            else start.replace(month=start.month + 1)
+        )
+        return start, next_month - timedelta(days=1)
+    return week_start, week_start + timedelta(days=6)
+
+
+def _normalize_finviz_earnings_rows(
+    rows: Any,
+    *,
+    period_key: str = "this-week",
+    reference_date: Any = None,
+) -> List[Any]:
     normalized = _normalize_finviz_output_rows(rows)
     if not isinstance(normalized, list):
         return []
+    reference = reference_date or datetime.now(timezone.utc).astimezone(
+        ZoneInfo("America/New_York")
+    ).date()
+    period_window = _finviz_earnings_period_window(period_key, reference)
     for row in normalized:
         if not isinstance(row, dict):
             continue
+        if row.get("price") not in (None, ""):
+            row.update(_mark_finviz_delayed_price(row))
         earnings_text = str(row.get("earnings") or "").strip().lower()
         for suffix, timing in _FINVIZ_EARNINGS_TIMING_SUFFIXES.items():
             if earnings_text.endswith(suffix):
                 row["earnings_timing"] = timing
                 break
-        earnings_date = _finviz_earnings_date_from_token(row.get("earnings"))
+        earnings_date = _finviz_earnings_date_from_token(
+            row.get("earnings"),
+            reference_date=reference,
+            period_window=period_window,
+        )
         if earnings_date:
             row["earnings_date"] = earnings_date
+            date_part = str(row.get("earnings") or "").split("/", 1)[0].strip()
+            if len(date_part) < 10 or date_part[4:5] != "-":
+                row["earnings_date_year_inferred"] = True
         if "market_cap" not in row:
             continue
         market_cap_source = row.get("market_cap")
@@ -1943,7 +2074,12 @@ def _normalize_finviz_earnings_rows(rows: Any) -> List[Any]:
     return normalized
 
 
-def _finviz_earnings_date_from_token(value: Any) -> Optional[str]:
+def _finviz_earnings_date_from_token(
+    value: Any,
+    *,
+    reference_date: Any = None,
+    period_window: Optional[tuple[Any, Any]] = None,
+) -> Optional[str]:
     if value in (None, ""):
         return None
     token = str(value).strip()
@@ -1958,13 +2094,23 @@ def _finviz_earnings_date_from_token(value: Any) -> Optional[str]:
         except ValueError:
             continue
         return parsed.date().isoformat()
-    reference_year = datetime.now(timezone.utc).year
-    for fmt in ("%b %d %Y", "%B %d %Y"):
-        try:
-            parsed = datetime.strptime(f"{date_part} {reference_year}", fmt)
-        except ValueError:
-            continue
-        return parsed.date().isoformat()
+    reference = reference_date or datetime.now(timezone.utc).date()
+    candidates = []
+    for year in (reference.year - 1, reference.year, reference.year + 1):
+        for fmt in ("%b %d %Y", "%B %d %Y"):
+            try:
+                parsed = datetime.strptime(f"{date_part} {year}", fmt).date()
+            except ValueError:
+                continue
+            candidates.append(parsed)
+            break
+    if period_window is not None:
+        start, end = period_window
+        within = [candidate for candidate in candidates if start <= candidate <= end]
+        if within:
+            return min(within, key=lambda candidate: abs(candidate - reference)).isoformat()
+    if candidates:
+        return min(candidates, key=lambda candidate: abs(candidate - reference)).isoformat()
     return None
 
 
@@ -2009,9 +2155,25 @@ def _normalize_finviz_economic_calendar_time(item: Dict[str, Any]) -> Dict[str, 
     normalized["local_time"] = local_dt.replace(microsecond=0).isoformat()
     normalized["local_timezone"] = _FINVIZ_CALENDAR_LOCAL_TIMEZONE
     utc_time = parsed.astimezone(timezone.utc)
-    normalized["date"] = (
-        utc_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    )
+    normalized["date"] = format_datetime_utc(utc_time)
+    return normalized
+
+
+def _normalize_finviz_earnings_calendar_time(item: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(item)
+    raw_value = normalized.get("earnings_date")
+    raw_text = str(raw_value or "").strip()
+    if len(raw_text) <= 10:
+        return normalized
+    parsed = _parse_finviz_calendar_time(raw_value)
+    if parsed is None:
+        return normalized
+    local_dt = parsed.astimezone(_FINVIZ_CALENDAR_LOCAL_TZ)
+    utc_text = format_datetime_utc(parsed)
+    normalized["earnings_date"] = utc_text
+    normalized["date"] = utc_text
+    normalized["local_time"] = local_dt.replace(microsecond=0).isoformat()
+    normalized["local_timezone"] = _FINVIZ_CALENDAR_LOCAL_TIMEZONE
     return normalized
 
 
@@ -2281,6 +2443,8 @@ def _normalize_finviz_calendar_payload(
     detail: str = "compact",
     calendar_type: str = "economic",
     country_code_filter: Optional[str] = None,
+    limit: int = 20,
+    page: int = 1,
 ) -> Dict[str, Any]:
     if not isinstance(result, dict) or result.get("error"):
         return result
@@ -2309,6 +2473,13 @@ def _normalize_finviz_calendar_payload(
             ]
             normalized_items = [
                 _add_finviz_calendar_impact_label(item)
+                if isinstance(item, dict)
+                else item
+                for item in normalized_items
+            ]
+        elif calendar_mode == "earnings":
+            normalized_items = [
+                _normalize_finviz_earnings_calendar_time(item)
                 if isinstance(item, dict)
                 else item
                 for item in normalized_items
@@ -2346,7 +2517,7 @@ def _normalize_finviz_calendar_payload(
                 out["hint"] = "Relax impact, country, currency, start, or end filters."
     if country_code_filter:
         out["country_filter"] = str(country_code_filter).upper()
-    if str(calendar_type or "economic").strip().lower() == "economic":
+    if str(calendar_type or "economic").strip().lower() in {"economic", "earnings"}:
         out["timezone"] = "UTC"
     else:
         out.setdefault("timezone", _FINVIZ_CALENDAR_LOCAL_TIMEZONE)
@@ -2358,6 +2529,22 @@ def _normalize_finviz_calendar_payload(
             "special_amount": "listing_currency_per_share",
             "yield_pct": "percentage_points (1.0 = 1%)",
         }
+    page_value = int(result.get("page") or page or 1)
+    pages = result.get("pages")
+    has_more = bool(
+        result.get("has_more")
+        or (pages not in (None, "") and page_value < int(pages))
+    )
+    _apply_finviz_pagination_contract(
+        out,
+        returned=len(out.get("items") or []),
+        limit=limit,
+        page=page_value,
+        total=result.get("total"),
+        total_lower_bound=result.get("total_lower_bound"),
+        has_more=has_more,
+    )
+    out.pop("omitted_item_count", None)
     out["detail"] = detail_mode
     return out
 
@@ -2452,7 +2639,13 @@ def _normalize_finviz_insider_rows(rows: Any) -> List[Any]:
     return normalized
 
 
-def _compact_finviz_insider_payload(result: Dict[str, Any], *, detail: str) -> Dict[str, Any]:
+def _compact_finviz_insider_payload(
+    result: Dict[str, Any],
+    *,
+    detail: str,
+    limit: int = 20,
+    page: int = 1,
+) -> Dict[str, Any]:
     error = _validate_finviz_detail(detail, operation="finviz_insider")
     if error is not None or not result.get("success"):
         return error or result
@@ -2463,13 +2656,28 @@ def _compact_finviz_insider_payload(result: Dict[str, Any], *, detail: str) -> D
     normalized_rows = _normalize_finviz_insider_rows(rows)
     out = {key: value for key, value in result.items() if key != "insider_trades"}
     out["detail"] = detail_mode
+    page_value = int(result.get("page") or page or 1)
+    pages = result.get("pages")
+    has_more = bool(
+        result.get("has_more")
+        or (pages not in (None, "") and page_value < int(pages))
+    )
     if detail_mode == "full":
         out["items"] = normalized_rows
         out["count"] = len(normalized_rows)
+        _apply_finviz_pagination_contract(
+            out,
+            returned=len(normalized_rows),
+            limit=limit,
+            page=page_value,
+            total=result.get("total"),
+            total_lower_bound=result.get("total_lower_bound"),
+            has_more=has_more,
+        )
         return out
     compact_rows = [
         _compact_finviz_insider_row(row, include_symbol=False)
-        for row in normalized_rows[:3]
+        for row in normalized_rows
     ]
     transaction_texts = [_transaction_text(row) for row in normalized_rows if isinstance(row, dict)]
     buys = sum(1 for text in transaction_texts if "buy" in text or "purchase" in text)
@@ -2484,12 +2692,24 @@ def _compact_finviz_insider_payload(result: Dict[str, Any], *, detail: str) -> D
         "Single-symbol insider trades; use finviz_insider_activity for "
         "market-wide scans."
     )
-    out["omitted_item_count"] = max(0, len(normalized_rows) - len(compact_rows))
+    _apply_finviz_pagination_contract(
+        out,
+        returned=len(compact_rows),
+        limit=limit,
+        page=page_value,
+        total=result.get("total"),
+        total_lower_bound=result.get("total_lower_bound"),
+        has_more=has_more,
+    )
     return out
 
 
 def _compact_finviz_insider_activity_payload(
-    result: Dict[str, Any], *, detail: str
+    result: Dict[str, Any],
+    *,
+    detail: str,
+    limit: int = 50,
+    page: int = 1,
 ) -> Dict[str, Any]:
     error = _validate_finviz_detail(detail, operation="finviz_insider_activity")
     if error is not None or not result.get("success"):
@@ -2502,13 +2722,28 @@ def _compact_finviz_insider_activity_payload(
     normalized_rows = _normalize_finviz_insider_rows(rows)
     out = {key: value for key, value in result.items() if key != "insider_trades"}
     out["detail"] = detail_mode
+    page_value = int(result.get("page") or page or 1)
+    pages = result.get("pages")
+    has_more = bool(
+        result.get("has_more")
+        or (pages not in (None, "") and page_value < int(pages))
+    )
     if detail_mode == "full":
         out["items"] = normalized_rows
         out["count"] = len(normalized_rows)
+        _apply_finviz_pagination_contract(
+            out,
+            returned=len(normalized_rows),
+            limit=limit,
+            page=page_value,
+            total=result.get("total"),
+            total_lower_bound=result.get("total_lower_bound"),
+            has_more=has_more,
+        )
         return out
 
     compact_rows: List[Any] = []
-    for row in normalized_rows[:5]:
+    for row in normalized_rows:
         if not isinstance(row, dict):
             compact_rows.append(row)
             continue
@@ -2527,7 +2762,15 @@ def _compact_finviz_insider_activity_payload(
         "top_symbols": _summarize_insider_activity_tickers(normalized_rows),
     }
     out["hint"] = "Market-wide insider activity; use finviz_insider SYMBOL for one ticker."
-    out["omitted_item_count"] = max(0, len(normalized_rows) - len(compact_rows))
+    _apply_finviz_pagination_contract(
+        out,
+        returned=len(compact_rows),
+        limit=limit,
+        page=page_value,
+        total=result.get("total"),
+        total_lower_bound=result.get("total_lower_bound"),
+        has_more=has_more,
+    )
     return out
 
 
@@ -2548,11 +2791,14 @@ def _compact_finviz_ratings_payload(
     omitted = max(0, len(normalized_rows) - len(limited_rows))
     out["ratings"] = limited_rows
     out["count"] = len(limited_rows)
-    out["available_count"] = len(normalized_rows)
-    out["truncated"] = omitted > 0
+    out["pagination"] = build_pagination_meta(
+        total=len(normalized_rows),
+        returned=len(limited_rows),
+        offset=0,
+        limit=max(1, limit_value),
+    )
     out["detail"] = detail_mode
     if detail_mode == "full":
-        out["omitted_item_count"] = omitted
         if omitted:
             out["show_all_hint"] = f"Increase limit to {len(normalized_rows)} to view all ratings."
         return out
@@ -2561,7 +2807,6 @@ def _compact_finviz_ratings_payload(
     out["summary"] = {
         "latest": compact_rows[0] if compact_rows else None,
     }
-    out["omitted_item_count"] = omitted
     if omitted:
         out["show_all_hint"] = f"Set extras='metadata' or limit={len(normalized_rows)} to view all ratings."
     return out
@@ -2586,18 +2831,22 @@ def _compact_finviz_peers_payload(
     if detail_mode == "full":
         out["peers"] = limited_peers
         out["count"] = len(limited_peers)
-        out["available_count"] = len(peers)
-        out["offset"] = offset_value
-        out["has_more"] = offset_value + len(limited_peers) < len(peers)
-        out["omitted_item_count"] = omitted
+        out["pagination"] = build_pagination_meta(
+            total=len(peers),
+            returned=len(limited_peers),
+            offset=offset_value,
+            limit=max(1, limit_value),
+        )
         return out
     compact_peers = limited_peers
     out["peers"] = compact_peers
     out["count"] = len(compact_peers)
-    out["available_count"] = len(peers)
-    out["offset"] = offset_value
-    out["has_more"] = offset_value + len(compact_peers) < len(peers)
-    out["omitted_item_count"] = omitted
+    out["pagination"] = build_pagination_meta(
+        total=len(peers),
+        returned=len(compact_peers),
+        offset=offset_value,
+        limit=max(1, limit_value),
+    )
     if omitted:
         out["show_all_hint"] = (
             f"{omitted} more peers available; pass offset={offset_value + len(compact_peers)}."
@@ -2956,6 +3205,8 @@ def finviz_news(
             get_stock_news(symbol_norm, limit=limit, page=page),
             detail=detail,
             kind="direct_symbol",
+            limit=limit,
+            page=page,
         )
 
     return _run_logged_tool("finviz_news", fields, _run)
@@ -2983,8 +3234,8 @@ def finviz_insider(
     page : int
         Page number for pagination (default 1)
     detail : {"compact", "full"}
-        "compact" returns the first three rows plus aggregate buy/sell counts.
-        "full" preserves all returned trades.
+        "compact" normalizes each row in the requested page and adds aggregate
+        buy/sell counts. "full" preserves all fields for the returned page.
     
     Returns
     -------
@@ -3001,6 +3252,8 @@ def finviz_insider(
         return _compact_finviz_insider_payload(
             get_stock_insider_trades(symbol_norm, limit=limit, page=page),
             detail=detail,
+            limit=limit,
+            page=page,
         )
 
     return _run_logged_tool(
@@ -3254,6 +3507,8 @@ def finviz_market_news(
             get_general_news(news_type=news_type, limit=limit, page=page),
             detail=detail,
             kind="blog" if str(news_type).lower().strip() == "blogs" else "headline",
+            limit=limit,
+            page=page,
         ),
     )
 
@@ -3282,8 +3537,8 @@ def finviz_insider_activity(
     page : int
         Page number for pagination (default 1)
     detail : {"compact", "full"}
-        Response detail level. Compact returns a short normalized item list and
-        summary; full keeps all normalized rows including SEC link fields.
+        Response detail level. Compact normalizes every row in the requested
+        page and adds a summary; full keeps all fields including SEC links.
     
     Returns
     -------
@@ -3297,6 +3552,8 @@ def finviz_insider_activity(
         return _compact_finviz_insider_activity_payload(
             get_insider_activity(option=option, limit=limit, page=page),
             detail=detail,
+            limit=limit,
+            page=page,
         )
 
     return _run_logged_tool(
@@ -3517,6 +3774,8 @@ def finviz_calendar(
                 detail=detail,
                 calendar_type=cal,
                 country_code_filter=country_filter,
+                limit=limit,
+                page=page,
             )
         if cal == "earnings":
             return _normalize_finviz_calendar_payload(
@@ -3528,6 +3787,8 @@ def finviz_calendar(
                 ),
                 detail=detail,
                 calendar_type=cal,
+                limit=limit,
+                page=page,
             )
         if cal == "dividends":
             return _normalize_finviz_calendar_payload(
@@ -3539,6 +3800,8 @@ def finviz_calendar(
                 ),
                 detail=detail,
                 calendar_type=cal,
+                limit=limit,
+                page=page,
             )
         return {"error": f"Unsupported calendar '{calendar}'. Expected economic, earnings, or dividends."}
 
@@ -3627,21 +3890,20 @@ def finviz_earnings(
         items = result.get("earnings")
         if not isinstance(items, list):
             items = []
-        normalized_items = _normalize_finviz_earnings_rows(items)
+        reference_date = datetime.now(timezone.utc).astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        normalized_items = _normalize_finviz_earnings_rows(
+            items,
+            period_key=period_key,
+            reference_date=reference_date,
+        )
         detail_mode = normalize_output_verbosity_detail(detail, default="compact")
         output_items = (
             normalized_items
             if detail_mode == "full"
             else _compact_finviz_earnings_items(normalized_items)
         )
-        pagination = {
-            "page": result.get("page"),
-            "total": result.get("total"),
-            "pages": result.get("pages"),
-            "has_more": bool(result.get("has_more")),
-            "total_lower_bound": result.get("total_lower_bound"),
-            "truncated": bool(result.get("truncated")),
-        }
         stats = {
             "truncated": result.get("truncated"),
         }
@@ -3651,23 +3913,21 @@ def finviz_earnings(
             "detail": detail_mode,
             "items": output_items,
             "row_key": "items",
-            "count": int(result.get("count") or len(output_items)),
+            "count": len(output_items),
             "total": result.get("total"),
             "page": result.get("page"),
             "pages": result.get("pages"),
             "has_more": bool(result.get("has_more")),
             "truncated": bool(result.get("truncated")),
+            "calendar_reference_date": reference_date.isoformat(),
+            "calendar_timezone": "America/New_York",
         }
-        if result.get("total_lower_bound") is not None:
-            out["total_lower_bound"] = result.get("total_lower_bound")
-        if out["has_more"] and out.get("page") is not None:
-            out["next_page"] = int(out["page"]) + 1
+        if any(
+            isinstance(item, dict) and item.get("data_delayed") is True
+            for item in output_items
+        ):
+            _attach_finviz_delayed_root_metadata(out)
         if out["detail"] != "full":
-            out["omitted_item_count"] = (
-                None
-                if out.get("total") is None
-                else max(0, int(out["total"]) - int(out["count"]))
-            )
             out["hint"] = (
                 "Period-based earnings view; use finviz_calendar(calendar='earnings') "
                 "for date-range EPS/sales actuals and surprises."
@@ -3677,8 +3937,22 @@ def finviz_earnings(
                 tool="finviz_earnings",
                 request=request,
                 stats=stats,
-                pagination=pagination,
             )
+        page_value = int(result.get("page") or page or 1)
+        pages = result.get("pages")
+        has_more = bool(
+            result.get("has_more")
+            or (pages not in (None, "") and page_value < int(pages))
+        )
+        _apply_finviz_pagination_contract(
+            out,
+            returned=len(output_items),
+            limit=limit,
+            page=page_value,
+            total=result.get("total"),
+            total_lower_bound=result.get("total_lower_bound"),
+            has_more=has_more,
+        )
         return out
 
     return _run_logged_tool(

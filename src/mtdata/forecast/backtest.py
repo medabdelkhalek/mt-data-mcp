@@ -6,11 +6,11 @@ import numpy as np
 
 from ..core.output_contract import normalize_output_verbosity_detail
 from ..shared.constants import TIMEFRAME_MAP
-from ..shared.schema import DetailLiteral, DenoiseSpec, TimeframeLiteral
+from ..shared.schema import DenoiseSpec, DetailLiteral, TimeframeLiteral
 from ..shared.validators import invalid_timeframe_error
 from ..utils.denoise import normalize_denoise_spec as _normalize_denoise_spec
-from ..utils.time import _format_time_minimal
 from ..utils.mt5 import mt5
+from ..utils.time import _format_time_minimal
 from .common import (
     annualization_context as _annualization_context,
 )
@@ -41,6 +41,7 @@ from .exceptions import ForecastError, raise_if_error_result
 from .forecast import forecast
 from .forecast_validation import attach_denoise_causality_disclosure
 from .gpu_runtime import cleanup_forecast_gpu_runtime, forecast_methods_may_use_gpu
+from .target_builder import _log_return_array
 from .volatility import forecast_volatility
 
 _BREAKEVEN_RETURN_EPS = 1e-12
@@ -155,7 +156,8 @@ def _compact_strategy_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
                 summary_out.pop("gross_return_pct", None)
         except Exception:
             pass
-        summary_out.pop("metrics_reliability", None)
+        if not summary_out.get("metrics_reliability_reasons"):
+            summary_out.pop("metrics_reliability", None)
         summary_out.pop("trades_observed", None)
         out["summary"] = summary_out
     metrics = out.get("metrics")
@@ -189,6 +191,8 @@ def _unavailable_performance_metrics(reason: str, slippage_bps: float) -> Dict[s
     return {
         "avg_return": None,
         "avg_return_pct": None,
+        "cumulative_return": None,
+        "cumulative_return_pct": None,
         "avg_return_per_trade": None,
         "avg_return_per_trade_pct": None,
         "win_rate": None,
@@ -261,10 +265,14 @@ _MIN_ANNUALIZATION_TRADES = 30
 _MIN_ANNUALIZATION_YEARS = 0.25
 _TRADE_BACKTEST_UNITS = {
     "returns": "return_fraction",
+    "cumulative_return": "return_fraction",
+    "cumulative_return_pct": "percentage_points",
     "gross_return": "return_fraction",
     "gross_return_pct": "percentage_points",
     "net_return": "return_fraction",
     "net_return_pct": "percentage_points",
+    "return_after_known_costs": "return_fraction",
+    "return_after_known_costs_pct": "percentage_points",
     "avg_return": "return_fraction",
     "avg_return_pct": "percentage_points",
     "avg_return_per_trade": "return_fraction",
@@ -288,6 +296,9 @@ _TRADE_BACKTEST_UNITS = {
     "avg_directional_accuracy": "fraction",
     "directional_calls_made": "count",
     "directional_opportunities": "count",
+    "avg_path_directional_accuracy": "fraction",
+    "path_directional_calls_made": "count",
+    "path_directional_opportunities": "count",
     "slippage_bps": "basis_points",
     "successful_tests": "count",
     "num_tests": "count",
@@ -351,6 +362,49 @@ def _directional_accuracy_from_signs(
     return accuracy, calls_made, opportunities
 
 
+def _forecast_direction_metrics(
+    forecast_values: Any,
+    actual_values: Any,
+    *,
+    entry_price: float,
+    target_mode: str,
+) -> tuple[
+    Tuple[Optional[float], int, int],
+    Tuple[Optional[float], int, int],
+]:
+    """Score terminal trade direction and retain path-shape agreement."""
+    forecast_arr = np.asarray(forecast_values, dtype=float)
+    actual_arr = np.asarray(actual_values, dtype=float)
+    width = min(forecast_arr.size, actual_arr.size)
+    if width <= 0:
+        empty = (None, 0, 0)
+        return empty, empty
+
+    forecast_arr = forecast_arr[:width]
+    actual_arr = actual_arr[:width]
+    if target_mode == "return":
+        terminal_forecast = float(np.sum(forecast_arr))
+        terminal_actual = float(np.sum(actual_arr))
+        path_forecast = np.sign(forecast_arr)
+        path_actual = np.sign(actual_arr)
+    else:
+        terminal_forecast = float(forecast_arr[-1] - entry_price)
+        terminal_actual = float(actual_arr[-1] - entry_price)
+        path_forecast = np.sign(
+            np.diff(np.concatenate(([entry_price], forecast_arr)))
+        )
+        path_actual = np.sign(
+            np.diff(np.concatenate(([entry_price], actual_arr)))
+        )
+
+    terminal = _directional_accuracy_from_signs(
+        [np.sign(terminal_forecast)],
+        [np.sign(terminal_actual)],
+    )
+    path = _directional_accuracy_from_signs(path_forecast, path_actual)
+    return terminal, path
+
+
 def _compute_performance_metrics(
     returns: List[float],
     timeframe: str,
@@ -380,6 +434,8 @@ def _compute_performance_metrics(
             else float("nan")
         )
         return {
+            "cumulative_return": 0.0,
+            "cumulative_return_pct": 0.0,
             "avg_return_per_trade": 0.0,
             "avg_return_per_trade_pct": 0.0,
             "win_rate": 0.0,
@@ -510,6 +566,7 @@ def _compute_performance_metrics(
         else None
     )
     metrics.update({
+        "cumulative_return": float(equity[-1] - 1.0),
         "avg_return_per_trade": avg_return,
         "win_rate": float(round(win_rate_value, 4)) if win_rate_value is not None else None,
         "win_rate_pct": win_rate_pct,
@@ -535,6 +592,7 @@ def _compute_performance_metrics(
         "slippage_bps": float(slippage_bps),
     })
     for source_key in (
+        "cumulative_return",
         "avg_return_per_trade",
         "avg_win_return",
         "avg_loss_return",
@@ -882,24 +940,91 @@ def _build_strategy_trade(
     exit_price: float,
     slippage_bps: float,
     spread_bps: float,
+    spread_cost_available: bool,
 ) -> Dict[str, Any]:
     gross_return = float(direction) * ((float(exit_price) - float(entry_price)) / float(entry_price))
     if gross_return <= -0.999:
         gross_return = -0.999
     slip = float(abs(slippage_bps) or 0.0) / 10000.0
-    net_return = gross_return - (float(abs(spread_bps) or 0.0) / 10000.0) - (2.0 * slip)
-    if net_return <= -0.999:
-        net_return = -0.999
+    return_after_known_costs = (
+        gross_return
+        - (float(abs(spread_bps) or 0.0) / 10000.0)
+        - (2.0 * slip)
+    )
+    if return_after_known_costs <= -0.999:
+        return_after_known_costs = -0.999
     return {
+        "_entry_idx": int(entry_idx),
+        "_exit_idx": int(exit_idx),
         "direction": _strategy_signal_label(float(direction)),
         "entry_time": _format_time_minimal(float(entry_time)),
         "exit_time": _format_time_minimal(float(exit_time)),
         "entry_price": float(entry_price),
         "exit_price": float(exit_price),
         "bars_held": int(max(1, exit_idx - entry_idx)),
+        "spread_cost_bps": float(abs(spread_bps) or 0.0),
+        "spread_cost_status": "included" if spread_cost_available else "missing",
+        "slippage_cost_bps": 2.0 * float(abs(slippage_bps) or 0.0),
         "return_gross": gross_return,
-        "return_net": net_return,
+        "return_after_known_costs": return_after_known_costs,
     }
+
+
+def _public_strategy_trade(
+    trade: Dict[str, Any],
+    *,
+    cost_model_complete: bool,
+) -> Dict[str, Any]:
+    out = dict(trade)
+    out.pop("_entry_idx", None)
+    out.pop("_exit_idx", None)
+    if cost_model_complete:
+        out["return_net"] = out.pop("return_after_known_costs", None)
+    return out
+
+
+def _historical_bar_spread_prices(symbol: str, frame: Any) -> Tuple[Optional[np.ndarray], float]:
+    """Return per-bar quoted spread in price units and its valid-row coverage."""
+    if "spread" not in frame.columns or len(frame) == 0:
+        return None, 0.0
+    try:
+        spread_points = np.asarray(frame["spread"], dtype=float)
+        info = mt5.symbol_info(symbol)
+        point = float(getattr(info, "point", 0.0) or 0.0)
+    except Exception:
+        return None, 0.0
+    if not math.isfinite(point) or point <= 0.0:
+        return None, 0.0
+    # MT5 commonly fills unavailable historical spread samples with zero. A
+    # zero-spread series is not evidence of frictionless execution.
+    valid = np.isfinite(spread_points) & (spread_points > 0.0)
+    coverage = float(np.mean(valid)) if len(valid) else 0.0
+    if not bool(np.any(valid)):
+        return None, coverage
+    spread_prices = np.where(valid, spread_points * point, np.nan)
+    return spread_prices, coverage
+
+
+def _historical_trade_spread_bps(
+    *,
+    direction: int,
+    entry_idx: int,
+    exit_idx: int,
+    entry_price: float,
+    exit_price: float,
+    spread_prices: Optional[np.ndarray],
+) -> Optional[float]:
+    """Price a bid-OHLC trade at the bar where it crosses the quoted spread."""
+    if spread_prices is None:
+        return None
+    spread_idx = int(entry_idx if direction > 0 else exit_idx)
+    execution_price = float(entry_price if direction > 0 else exit_price)
+    if spread_idx < 0 or spread_idx >= len(spread_prices) or execution_price <= 0.0:
+        return None
+    spread_price = float(spread_prices[spread_idx])
+    if not math.isfinite(spread_price) or spread_price < 0.0:
+        return None
+    return (spread_price / execution_price) * 10000.0
 
 
 def strategy_backtest(  # noqa: C901
@@ -917,7 +1042,7 @@ def strategy_backtest(  # noqa: C901
     oversold: float = 30.0,
     overbought: float = 70.0,
     max_hold_bars: Optional[int] = None,
-    cost_model: Literal["current_spread_proxy", "fixed"] = "current_spread_proxy",
+    cost_model: Literal["historical_bar_spread", "fixed"] = "historical_bar_spread",
     spread_bps: Optional[float] = None,
     slippage_bps: float = 1.0,
 ) -> Dict[str, Any]:
@@ -956,24 +1081,16 @@ def strategy_backtest(  # noqa: C901
             return {"error": "fast_period must be less than slow_period"}
         if float(oversold) >= float(overbought):
             return {"error": "oversold must be less than overbought"}
-        cost_model_value = str(cost_model or "current_spread_proxy").strip().lower()
-        if cost_model_value not in {"current_spread_proxy", "fixed"}:
+        cost_model_value = str(cost_model or "historical_bar_spread").strip().lower()
+        if cost_model_value not in {"historical_bar_spread", "fixed"}:
             return {
-                "error": "cost_model must be 'current_spread_proxy' or 'fixed'"
+                "error": "cost_model must be 'historical_bar_spread' or 'fixed'"
             }
-        resolved_spread_bps = float(spread_bps or 0.0)
-        spread_source = "explicit" if spread_bps is not None else "unavailable"
-        if spread_bps is None and cost_model_value == "current_spread_proxy":
-            try:
-                tick = mt5.symbol_info_tick(symbol)
-                bid = float(getattr(tick, "bid", 0.0) or 0.0)
-                ask = float(getattr(tick, "ask", 0.0) or 0.0)
-                mid = (bid + ask) / 2.0
-                if ask > bid > 0.0 and mid > 0.0:
-                    resolved_spread_bps = (ask - bid) / mid * 10000.0
-                    spread_source = "mt5_current_quote"
-            except Exception:
-                pass
+        if cost_model_value == "historical_bar_spread" and spread_bps is not None:
+            return {
+                "error": "spread_bps is only valid with cost_model='fixed'"
+            }
+        fixed_spread_bps = float(spread_bps or 0.0)
 
         if strategy_value in {"sma_cross", "ema_cross"}:
             warmup_bars = max(int(slow_period), 5)
@@ -991,6 +1108,13 @@ def strategy_backtest(  # noqa: C901
         min_required = warmup_bars + 5 if range_requested else max(int(lookback), warmup_bars + 5)
         if len(df) < min_required:
             return {"error": "Not enough closed bars for strategy backtest"}
+
+        historical_spread_prices: Optional[np.ndarray] = None
+        historical_spread_coverage = 0.0
+        if cost_model_value == "historical_bar_spread":
+            historical_spread_prices, historical_spread_coverage = (
+                _historical_bar_spread_prices(symbol, df)
+            )
 
         signal_series, diagnostics, signal_warmup = _build_strategy_signal_series(
             df,
@@ -1013,6 +1137,8 @@ def strategy_backtest(  # noqa: C901
         signals = signal_series.to_numpy(dtype=float)
 
         trades: List[Dict[str, Any]] = []
+        observed_spread_costs: List[float] = []
+        missing_spread_costs = 0
         current_direction = 0
         entry_idx = None
         entry_time = None
@@ -1052,6 +1178,24 @@ def strategy_backtest(  # noqa: C901
             if desired_direction == current_direction and not hit_max_hold:
                 continue
 
+            trade_spread_bps = (
+                fixed_spread_bps
+                if cost_model_value == "fixed" and spread_bps is not None
+                else _historical_trade_spread_bps(
+                    direction=current_direction,
+                    entry_idx=int(entry_idx),
+                    exit_idx=action_idx,
+                    entry_price=float(entry_price),
+                    exit_price=float(action_price),
+                    spread_prices=historical_spread_prices,
+                )
+            )
+            spread_cost_available = trade_spread_bps is not None
+            if not spread_cost_available:
+                missing_spread_costs += 1
+                trade_spread_bps = 0.0
+            else:
+                observed_spread_costs.append(float(trade_spread_bps))
             trades.append(
                 _build_strategy_trade(
                     direction=current_direction,
@@ -1062,7 +1206,8 @@ def strategy_backtest(  # noqa: C901
                     entry_price=float(entry_price),
                     exit_price=float(action_price),
                     slippage_bps=float(slippage_bps),
-                    spread_bps=resolved_spread_bps,
+                    spread_bps=float(trade_spread_bps),
+                    spread_cost_available=spread_cost_available,
                 )
             )
             current_direction = 0
@@ -1081,6 +1226,24 @@ def strategy_backtest(  # noqa: C901
             final_exit_price = float(closes[final_exit_idx])
             if not math.isfinite(final_exit_price) or final_exit_price <= 0.0:
                 final_exit_price = _execution_price(final_exit_idx) or float(entry_price)
+            trade_spread_bps = (
+                fixed_spread_bps
+                if cost_model_value == "fixed" and spread_bps is not None
+                else _historical_trade_spread_bps(
+                    direction=current_direction,
+                    entry_idx=int(entry_idx),
+                    exit_idx=int(final_exit_idx),
+                    entry_price=float(entry_price),
+                    exit_price=float(final_exit_price),
+                    spread_prices=historical_spread_prices,
+                )
+            )
+            spread_cost_available = trade_spread_bps is not None
+            if not spread_cost_available:
+                missing_spread_costs += 1
+                trade_spread_bps = 0.0
+            else:
+                observed_spread_costs.append(float(trade_spread_bps))
             trades.append(
                 _build_strategy_trade(
                     direction=current_direction,
@@ -1091,20 +1254,21 @@ def strategy_backtest(  # noqa: C901
                     entry_price=float(entry_price),
                     exit_price=float(final_exit_price),
                     slippage_bps=float(slippage_bps),
-                    spread_bps=resolved_spread_bps,
+                    spread_bps=float(trade_spread_bps),
+                    spread_cost_available=spread_cost_available,
                 )
             )
 
-        trade_returns = [float(trade["return_net"]) for trade in trades if trade.get("return_net") is not None]
-        entry_indices = []
-        for trade in trades:
-            entry_time_text = str(trade.get("entry_time") or "")
-            try:
-                entry_idx = next(i for i, ts in enumerate(times) if _format_time_minimal(float(ts)) == entry_time_text)
-            except Exception:
-                entry_idx = None
-            if entry_idx is not None:
-                entry_indices.append(entry_idx)
+        trade_returns = [
+            float(trade["return_after_known_costs"])
+            for trade in trades
+            if trade.get("return_after_known_costs") is not None
+        ]
+        entry_indices = [
+            int(trade["_entry_idx"])
+            for trade in trades
+            if trade.get("_entry_idx") is not None
+        ]
         trade_spacing = None
         if len(entry_indices) > 1:
             trade_spacing = int(np.median(np.diff(entry_indices)))
@@ -1122,7 +1286,9 @@ def strategy_backtest(  # noqa: C901
             metrics = _compact_metrics_payload(metrics)
 
         gross_equity = np.cumprod([1.0 + float(trade["return_gross"]) for trade in trades]) if trades else np.array([1.0])
-        net_equity = np.cumprod([1.0 + float(trade["return_net"]) for trade in trades]) if trades else np.array([1.0])
+        known_cost_equity = np.cumprod(
+            [1.0 + float(trade["return_after_known_costs"]) for trade in trades]
+        ) if trades else np.array([1.0])
         long_trades = int(sum(1 for trade in trades if trade.get("direction") == "long"))
         short_trades = int(sum(1 for trade in trades if trade.get("direction") == "short"))
         last_idx = len(df) - 1
@@ -1155,16 +1321,80 @@ def strategy_backtest(  # noqa: C901
             "lookback": int(lookback),
             "slippage_bps": float(slippage_bps),
             "cost_model": cost_model_value,
-            "spread_bps": resolved_spread_bps,
             **_strategy_params,
         }
+        if cost_model_value == "fixed":
+            _params["spread_bps"] = fixed_spread_bps
         if start is not None:
             _params["start"] = start
         if end is not None:
             _params["end"] = end
         bars_used = len(df) if range_requested else int(lookback)
         gross_return = float(gross_equity[-1] - 1.0)
-        net_return = float(net_equity[-1] - 1.0)
+        return_after_known_costs = float(known_cost_equity[-1] - 1.0)
+        mean_spread_cost_bps = (
+            float(np.mean(observed_spread_costs))
+            if observed_spread_costs
+            else None
+        )
+        cost_model_complete = (
+            cost_model_value == "fixed" and spread_bps is not None
+        ) or (
+            cost_model_value == "historical_bar_spread"
+            and historical_spread_prices is not None
+            and missing_spread_costs == 0
+        )
+        spread_source = (
+            "explicit"
+            if cost_model_value == "fixed" and spread_bps is not None
+            else (
+                "mt5_historical_bar_spread"
+                if historical_spread_prices is not None
+                else "unavailable"
+            )
+        )
+        reported_spread_cost_bps = (
+            fixed_spread_bps
+            if cost_model_value == "fixed" and spread_bps is not None
+            else mean_spread_cost_bps
+        )
+        priced_trade_count = len(observed_spread_costs)
+        costed_trade_count = priced_trade_count + int(missing_spread_costs)
+        priced_trade_coverage_pct = (
+            round(priced_trade_count / costed_trade_count * 100.0, 2)
+            if costed_trade_count
+            else None
+        )
+        summary_returns = (
+            {
+                "net_return": return_after_known_costs,
+                "net_return_pct": _return_fraction_to_pct(
+                    return_after_known_costs
+                ),
+            }
+            if cost_model_complete
+            else {
+                "return_after_known_costs": return_after_known_costs,
+                "return_after_known_costs_pct": _return_fraction_to_pct(
+                    return_after_known_costs
+                ),
+                "return_status": "partial_transaction_costs",
+            }
+        )
+        result_units = _backtest_units()
+        if cost_model_complete:
+            result_units.pop("return_after_known_costs", None)
+            result_units.pop("return_after_known_costs_pct", None)
+            reported_metrics = metrics
+        else:
+            result_units.pop("net_return", None)
+            result_units.pop("net_return_pct", None)
+            reported_metrics = {
+                "metrics_available": False,
+                "metrics_reason": "incomplete_transaction_costs",
+                "metrics_reliability": "unavailable",
+                "trades_observed": int(len(trades)),
+            }
 
         result: Dict[str, Any] = {
             "success": True,
@@ -1178,15 +1408,20 @@ def strategy_backtest(  # noqa: C901
             "price_basis": "mt5_bid_ohlc",
             "cost_model": {
                 "type": cost_model_value,
-                "spread_bps_round_trip": resolved_spread_bps,
+                "spread_bps_round_trip": reported_spread_cost_bps,
                 "spread_source": spread_source,
+                "spread_observations": priced_trade_count,
+                "unpriced_trades": int(missing_spread_costs),
+                "priced_trade_coverage_pct": priced_trade_coverage_pct,
                 "slippage_bps_per_side": float(slippage_bps),
-                "round_trip_cost_bps": resolved_spread_bps + float(slippage_bps) * 2.0,
-                "complete": (
-                    cost_model_value == "fixed" and spread_source == "explicit"
+                "round_trip_cost_bps": (
+                    reported_spread_cost_bps + float(slippage_bps) * 2.0
+                    if reported_spread_cost_bps is not None
+                    else None
                 ),
+                "complete": cost_model_complete,
             },
-            "units": _backtest_units(),
+            "units": result_units,
             "parameters": _params,
             "summary": {
                 "bars_used": int(bars_used),
@@ -1201,10 +1436,9 @@ def strategy_backtest(  # noqa: C901
                 "short_trades": short_trades,
                 "gross_return": gross_return,
                 "gross_return_pct": _return_fraction_to_pct(gross_return),
-                "net_return": net_return,
-                "net_return_pct": _return_fraction_to_pct(net_return),
+                **summary_returns,
             },
-            "metrics": metrics,
+            "metrics": reported_metrics,
             "last_signal": {
                 "signal_status": "historical_observation_only",
                 "signal": _strategy_signal_label(last_signal_value),
@@ -1215,10 +1449,32 @@ def strategy_backtest(  # noqa: C901
                 "time": _format_time_minimal(float(times[last_idx])),
             },
         }
-        if cost_model_value == "current_spread_proxy":
+        if cost_model_value == "historical_bar_spread":
+            result["cost_model"]["historical_spread_coverage_pct"] = round(
+                historical_spread_coverage * 100.0,
+                2,
+            )
+            if historical_spread_prices is None and "spread" in df.columns:
+                result["cost_model"]["historical_spread_status"] = (
+                    "unavailable_zero_or_missing_samples"
+                )
+        if not cost_model_complete:
+            spread_warning = (
+                " Historical zero spread samples are treated as unavailable, not as "
+                "frictionless execution."
+                if cost_model_value == "historical_bar_spread"
+                and historical_spread_prices is None
+                else ""
+            )
             result["warnings"] = [
-                "Transaction costs use one current MT5 quote as a fixed proxy "
-                "for every historical trade; they are not historical observed spreads."
+                "Transaction costs are incomplete because the selected spread model "
+                "could not price every trade. Returns after known costs exclude missing "
+                "spread costs and are not comparable to complete net results."
+                + spread_warning
+            ]
+            result["summary"]["metrics_reliability"] = "unavailable"
+            result["summary"]["metrics_reliability_reasons"] = [
+                "incomplete_transaction_costs"
             ]
         sample_notice = metrics.get("sample_notice") if isinstance(metrics, dict) else None
         if isinstance(sample_notice, dict):
@@ -1231,10 +1487,11 @@ def strategy_backtest(  # noqa: C901
                 "minimum_trades": minimum_trades,
                 **result["summary"],
             }
-            result["warning"] = (
-                f"Only {trades_observed} trade(s) observed; treat strategy metrics as low-confidence "
-                f"until at least {minimum_trades} trades are available."
-            )
+            if cost_model_complete:
+                result["warning"] = (
+                    f"Only {trades_observed} trade(s) observed; treat strategy metrics "
+                    f"as low-confidence until at least {minimum_trades} trades are available."
+                )
         if detail_mode == "full":
             result["contracts"] = {
                 "data_preparation": _contract_payload(data_contract),
@@ -1248,7 +1505,13 @@ def strategy_backtest(  # noqa: C901
             }
         if trades:
             if detail_mode == "full":
-                result["trades"] = trades
+                result["trades"] = [
+                    _public_strategy_trade(
+                        trade,
+                        cost_model_complete=cost_model_complete,
+                    )
+                    for trade in trades
+                ]
                 # Add enriched detail for full mode: equity curve, drawdowns, monthly breakdown, trade distribution
                 
                 # Build equity curve with timestamps
@@ -1256,18 +1519,16 @@ def strategy_backtest(  # noqa: C901
                 cumulative_net = 1.0
                 trade_exit_times = {}
                 for i, trade in enumerate(trades):
-                    exit_time_str = str(trade.get("exit_time") or "")
-                    if exit_time_str:
-                        try:
-                            exit_idx = next(j for j, ts in enumerate(times) if _format_time_minimal(float(ts)) == exit_time_str)
-                            trade_exit_times[exit_idx] = i
-                        except Exception:
-                            pass
+                    exit_idx = trade.get("_exit_idx")
+                    if exit_idx is not None:
+                        trade_exit_times[int(exit_idx)] = i
                 
                 for idx in sorted(trade_exit_times.keys()):
                     trade_idx = trade_exit_times[idx]
-                    trade_net_return = float(trades[trade_idx].get("return_net") or 0.0)
-                    cumulative_net *= (1.0 + trade_net_return)
+                    trade_known_cost_return = float(
+                        trades[trade_idx].get("return_after_known_costs") or 0.0
+                    )
+                    cumulative_net *= (1.0 + trade_known_cost_return)
                     equity_curve.append({
                         "time": _format_time_minimal(float(times[idx])),
                         "equity": cumulative_net,
@@ -1316,7 +1577,9 @@ def strategy_backtest(  # noqa: C901
                                 "returns": [],
                             }
                         monthly_stats[month_key]["trades"] += 1
-                        ret = float(trade.get("return_net") or 0.0)
+                        ret = float(
+                            trade.get("return_after_known_costs") or 0.0
+                        )
                         monthly_stats[month_key]["returns"].append(ret)
                         bucket = _trade_return_bucket(ret)
                         if bucket == "winning":
@@ -1343,21 +1606,30 @@ def strategy_backtest(  # noqa: C901
                 if trades:
                     winning_trades = [
                         t for t in trades
-                        if _trade_return_bucket(t.get("return_net")) == "winning"
+                        if _trade_return_bucket(
+                            t.get("return_after_known_costs")
+                        ) == "winning"
                     ]
                     losing_trades = [
                         t for t in trades
-                        if _trade_return_bucket(t.get("return_net")) == "losing"
+                        if _trade_return_bucket(
+                            t.get("return_after_known_costs")
+                        ) == "losing"
                     ]
                     breakeven_trades = [
                         t for t in trades
-                        if _trade_return_bucket(t.get("return_net")) == "breakeven"
+                        if _trade_return_bucket(
+                            t.get("return_after_known_costs")
+                        ) == "breakeven"
                     ]
                     
                     trade_distribution = {}
                     
                     if winning_trades:
-                        winning_returns = [float(t.get("return_net") or 0.0) for t in winning_trades]
+                        winning_returns = [
+                            float(t.get("return_after_known_costs") or 0.0)
+                            for t in winning_trades
+                        ]
                         trade_distribution["winning"] = {
                             "count": len(winning_trades),
                             "avg_return": float(np.mean(winning_returns)),
@@ -1366,7 +1638,10 @@ def strategy_backtest(  # noqa: C901
                         }
                     
                     if losing_trades:
-                        losing_returns = [float(t.get("return_net") or 0.0) for t in losing_trades]
+                        losing_returns = [
+                            float(t.get("return_after_known_costs") or 0.0)
+                            for t in losing_trades
+                        ]
                         trade_distribution["losing"] = {
                             "count": len(losing_trades),
                             "avg_return": float(np.mean(losing_returns)),
@@ -1381,6 +1656,14 @@ def strategy_backtest(  # noqa: C901
                     
                     if trade_distribution:
                         result["trade_distribution"] = trade_distribution
+                if not cost_model_complete:
+                    for incomplete_metric in (
+                        "equity_curve",
+                        "drawdown_periods",
+                        "monthly_breakdown",
+                        "trade_distribution",
+                    ):
+                        result.pop(incomplete_metric, None)
         else:
             result["no_action"] = True
             result["message"] = "The strategy generated no trades on the requested history."
@@ -1404,6 +1687,8 @@ def strategy_backtest(  # noqa: C901
                 "oversold": float(oversold),
                 "overbought": float(overbought),
                 "max_hold_bars": int(max_hold_bars) if max_hold_bars is not None else None,
+                "cost_model": cost_model_value,
+                "spread_bps": spread_bps,
                 "slippage_bps": float(slippage_bps),
             },
             detail=detail_mode,
@@ -1556,10 +1841,8 @@ def forecast_backtest(  # noqa: C901
             if idx + int(horizon) >= len(closes):
                 continue
             if target_mode == 'return' and quantity != 'volatility':
-                prev = np.maximum(closes[idx: idx + int(horizon)], 1e-12)
-                nxt = np.maximum(closes[idx + 1: idx + 1 + int(horizon)], 1e-12)
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    actual = np.log(nxt / prev).tolist()
+                price_window = closes[idx: idx + int(horizon) + 1]
+                actual = _log_return_array(price_window, k=1)[1:].tolist()
             else:
                 actual = closes[idx + 1: idx + 1 + int(horizon)].tolist()
             ts = times[idx + 1: idx + 1 + int(horizon)].tolist()
@@ -1571,9 +1854,16 @@ def forecast_backtest(  # noqa: C901
 
         # Normalize denoise spec once for the whole run (uniform across methods)
         try:
-            _dn_used = _normalize_denoise_spec(denoise, default_when='pre_ti') if denoise is not None else None
-        except Exception:
-            _dn_used = None
+            _dn_used = (
+                _normalize_denoise_spec(denoise, default_when='pre_ti')
+                if denoise is not None
+                else None
+            )
+        except Exception as exc:
+            return {
+                "error": f"Invalid denoise configuration: {exc}",
+                "error_code": "denoise_invalid_configuration",
+            }
 
         data_contract = DataPreparationContract(
             symbol=symbol,
@@ -1639,7 +1929,9 @@ def forecast_backtest(  # noqa: C901
                         pm = params_map.get(method)
                         if pm is None:
                             pm = params
-                        anchor_history = df.iloc[: idx + 1].copy()
+                        # The forecast boundary takes its own defensive copy.
+                        # Keep this anchor as a view so each evaluation copies once.
+                        anchor_history = df.iloc[: idx + 1]
                         if execution_contract is None:
                             execution_contract = ForecastExecutionContract(
                                 data_preparation=data_contract,
@@ -1715,22 +2007,20 @@ def forecast_backtest(  # noqa: C901
                         continue
                     mae = float(np.mean(np.abs(fcv[:m] - act[:m])))
                     rmse = float(np.sqrt(np.mean((fcv[:m] - act[:m])**2)))
-                    if target_mode == 'return':
-                        # Return mode: DA = did forecasted non-zero return signs match realized signs?
-                        da, directional_calls_made, directional_opportunities = _directional_accuracy_from_signs(
-                            np.sign(fcv[:m]),
-                            np.sign(act[:m]),
-                        )
-                    elif m > 1:
-                        da, directional_calls_made, directional_opportunities = _directional_accuracy_from_signs(
-                            np.sign(np.diff(fcv[:m])),
-                            np.sign(np.diff(act[:m])),
-                        )
-                    else:
-                        da = None
-                        directional_calls_made = 0
-                        directional_opportunities = 0
                     entry_price = float(closes[idx]) if idx < len(closes) else float('nan')
+                    (
+                        (da, directional_calls_made, directional_opportunities),
+                        (
+                            path_da,
+                            path_directional_calls_made,
+                            path_directional_opportunities,
+                        ),
+                    ) = _forecast_direction_metrics(
+                        fcv[:m],
+                        act[:m],
+                        entry_price=entry_price,
+                        target_mode=target_mode,
+                    )
                     if target_mode == 'return':
                         expected_move = float(np.nansum(fcv[:m]))
                     else:
@@ -1837,6 +2127,9 @@ def forecast_backtest(  # noqa: C901
                         "directional_accuracy": da,
                         "directional_calls_made": directional_calls_made,
                         "directional_opportunities": directional_opportunities,
+                        "path_directional_accuracy": path_da,
+                        "path_directional_calls_made": path_directional_calls_made,
+                        "path_directional_opportunities": path_directional_opportunities,
                         "entry_price": entry_price,
                         "exit_price": exit_price,
                         "exit_step": int(exit_step) + 1 if m > 0 else 0,
@@ -1894,6 +2187,26 @@ def forecast_backtest(  # noqa: C901
                     da_vals = [v for v in da_vals if v is not None and np.isfinite(v)]
                     if da_vals:
                         agg["avg_directional_accuracy"] = float(np.mean(da_vals))
+                    path_directional_calls_made = sum(
+                        int(x.get("path_directional_calls_made") or 0) for x in ok
+                    )
+                    path_directional_opportunities = sum(
+                        int(x.get("path_directional_opportunities") or 0) for x in ok
+                    )
+                    agg["path_directional_calls_made"] = path_directional_calls_made
+                    agg["path_directional_opportunities"] = (
+                        path_directional_opportunities
+                    )
+                    path_da_vals = [x.get("path_directional_accuracy") for x in ok]
+                    path_da_vals = [
+                        value
+                        for value in path_da_vals
+                        if value is not None and np.isfinite(value)
+                    ]
+                    if path_da_vals:
+                        agg["avg_path_directional_accuracy"] = float(
+                            np.mean(path_da_vals)
+                        )
                     # Exclude flat positions from trade metrics
                     trade_returns = [
                         float(x['trade_return']) for x in ok
@@ -1966,8 +2279,14 @@ def forecast_backtest(  # noqa: C901
                 int(len(anchor_indices)) - 1,
             ) * int(spacing)
 
+        successful_methods = [
+            method
+            for method, method_result in results.items()
+            if isinstance(method_result, dict) and method_result.get("success") is True
+        ]
+        failed_methods = [method for method in results if method not in successful_methods]
         result_payload = {
-            "success": True,
+            "success": bool(successful_methods),
             "symbol": symbol,
             "timeframe": timeframe,
             "units": _backtest_units(quantity),
@@ -1977,6 +2296,24 @@ def forecast_backtest(  # noqa: C901
             "detail": detail_mode,
             "results": results,
         }
+        if quantity != "volatility":
+            result_payload["directional_accuracy_reference"] = {
+                "value": 0.5,
+                "basis": "balanced_binary_chance",
+                "applicability": "non_flat_balanced_realized_directions",
+                "note": (
+                    "Flat outcomes and directional class imbalance change the empirical "
+                    "baseline; a result below 0.5 is not by itself proof of an "
+                    "invertible signal."
+                ),
+            }
+        if failed_methods:
+            result_payload["failed_methods"] = failed_methods
+        if not successful_methods:
+            result_payload["error_code"] = "forecast_backtest_no_successful_methods"
+            result_payload["error"] = (
+                "No requested forecast method produced a successful backtest observation."
+            )
         attach_denoise_causality_disclosure(result_payload, _dn_used)
         return result_payload
     except Exception as e:

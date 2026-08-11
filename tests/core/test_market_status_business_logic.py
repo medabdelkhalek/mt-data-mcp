@@ -122,6 +122,9 @@ def test_market_status_symbol_mode_reports_heuristic_status(monkeypatch) -> None
                 trade_mode=4,
             )
 
+        def symbols_get(self):
+            return [SimpleNamespace(name="EURUSD")]
+
         def symbol_info_tick(self, symbol: str):
             assert symbol == "EURUSD"
             return SimpleNamespace(time=now_epoch, bid=1.1, ask=1.2)
@@ -139,10 +142,11 @@ def test_market_status_symbol_mode_reports_heuristic_status(monkeypatch) -> None
         lambda **kwargs: GatewayWithEmptySchedule(),
     )
 
-    result = raw(symbol="eurusd", timezone_display="utc")
+    result = raw(symbol="EUR/USD", timezone_display="utc")
 
     assert result["mode"] == "symbol"
     assert result["symbol"] == "EURUSD"
+    assert result["symbol_input"] == "EUR/USD"
     assert result["timezone"] == "UTC"
     assert result["status"] == "probably_open"
     assert result["status_source"] == "trade_mode_and_tick_freshness"
@@ -150,7 +154,7 @@ def test_market_status_symbol_mode_reports_heuristic_status(monkeypatch) -> None
     assert result["heuristic_note"].startswith(
         "Symbol status is inferred from MT5 trade_mode, tick freshness"
     )
-    assert "FX weekly sessions typically run Sun 22:00-Fri 22:00 UTC" in result[
+    assert "FX weekly sessions typically run Sun 17:00-Fri 17:00" in result[
         "heuristic_note"
     ]
     assert result["can_open_new_positions"] is True
@@ -160,7 +164,7 @@ def test_market_status_symbol_mode_reports_heuristic_status(monkeypatch) -> None
     assert result["data_fetched_at"] == "2024-01-02T12:00:00Z"
     assert result["last_tick_time"] == "2024-01-02T12:00:00Z"
     assert result["is_tradable"] is True
-    assert result["is_tradable_confidence"] == "heuristic"
+    assert result["is_tradable_confidence"] == "broker_trade_mode"
     assert result["market_clock"] == "2024-01-02T12:00:00Z"
     assert result["market_clock_timezone"] == "UTC"
     assert result["authoritative_clock"] in {"server", "utc"}
@@ -188,7 +192,26 @@ def test_market_status_symbol_timezone_context_labels_server_clock(monkeypatch) 
     assert context["market_now"] == "2024-01-02T14:00:00+02:00"
 
 
-def test_market_status_blocks_tradability_when_tick_timestamp_is_unsafe(monkeypatch) -> None:
+def test_symbol_tick_snapshot_prefers_millisecond_timestamp() -> None:
+    now_utc = datetime.fromtimestamp(1_001.0, tz=timezone.utc)
+
+    result = market_status_mod._symbol_tick_snapshot(
+        "EURUSD",
+        {
+            "time": 1_000.0,
+            "time_msc": 1_000_750,
+            "bid": 1.1,
+            "ask": 1.1002,
+        },
+        now_utc=now_utc,
+    )
+
+    assert result["last_tick_time"] == "1970-01-01T00:16:40Z"
+    assert result["last_tick_age_seconds"] == 0.25
+    assert result["tick_freshness"] == "live"
+
+
+def test_market_status_blocks_new_entries_when_tick_timestamp_is_unsafe(monkeypatch) -> None:
     raw = _unwrap(market_status_mod.market_status)
     fixed_now = datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc)
 
@@ -225,8 +248,8 @@ def test_market_status_blocks_tradability_when_tick_timestamp_is_unsafe(monkeypa
     assert result["status"] == "quote_not_live_ready"
     assert result["trade_mode_allows_opening"] is True
     assert result["can_open_new_positions"] is False
-    assert result["is_tradable"] is False
-    assert result["tick_freshness"] == "stale"
+    assert result["is_tradable"] is True
+    assert result["tick_freshness"] == "clock_skew"
     assert result["freshness_reason"] == "future_timestamp"
     assert result["timestamp_in_future"] is True
 
@@ -346,9 +369,10 @@ def test_market_status_symbol_mode_handles_bool_like_trade_and_schedule(monkeypa
     monkeypatch.setattr(
         market_status_mod,
         "_symbol_trade_mode_status",
-        lambda gateway, trade_mode: {
-            "can_open_new_positions": BoolLike(),
-            "status": "open",
+            lambda gateway, trade_mode: {
+                "can_open_new_positions": BoolLike(),
+                "is_tradable": BoolLike(),
+                "status": "open",
             "trade_mode_label": "Full",
         },
     )
@@ -439,7 +463,63 @@ def test_market_status_symbol_mode_blocks_weekend_opening(monkeypatch) -> None:
     assert result["reason"] == "weekend"
     assert result["can_open_new_positions"] is False
     assert result["trade_mode_allows_opening"] is True
+    assert result["is_tradable"] is True
     assert "message" not in result
+
+
+def test_market_status_uses_standard_weekend_boundary_for_index_cfd(monkeypatch) -> None:
+    raw = _unwrap(market_status_mod.market_status)
+    fixed_now = datetime(2026, 7, 17, 22, 30, tzinfo=timezone.utc)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.replace(tzinfo=None) if tz is None else fixed_now.astimezone(tz)
+
+    class Gateway:
+        SYMBOL_TRADE_MODE_FULL = 4
+        SYMBOL_TRADE_MODE_DISABLED = 0
+        SYMBOL_TRADE_MODE_CLOSEONLY = 3
+        SYMBOL_TRADE_MODE_LONGONLY = 1
+        SYMBOL_TRADE_MODE_SHORTONLY = 2
+        TIMEFRAME_M1 = 1
+
+        def ensure_connection(self):
+            return None
+
+        def symbol_info(self, symbol):
+            return SimpleNamespace(name=symbol, visible=True, trade_mode=4)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(time=fixed_now.timestamp() - 60, bid=45000.0, ask=45001.0)
+
+        def copy_rates_range(self, symbol, timeframe, start, end):
+            return []
+
+    monkeypatch.setattr(market_status_mod, "datetime", FixedDateTime)
+    monkeypatch.setattr(market_status_mod, "create_mt5_gateway", lambda **kwargs: Gateway())
+
+    result = raw(symbol="US30")
+
+    assert result["status"] == "weekend_closed"
+    assert result["can_open_new_positions"] is False
+    assert result["is_tradable"] is True
+
+
+def test_close_only_symbol_remains_tradable_but_cannot_open() -> None:
+    gateway = SimpleNamespace(
+        SYMBOL_TRADE_MODE_FULL=4,
+        SYMBOL_TRADE_MODE_DISABLED=0,
+        SYMBOL_TRADE_MODE_CLOSEONLY=3,
+        SYMBOL_TRADE_MODE_LONGONLY=1,
+        SYMBOL_TRADE_MODE_SHORTONLY=2,
+    )
+
+    result = market_status_mod._symbol_trade_mode_status(gateway, 3)
+
+    assert result["status"] == "close_only"
+    assert result["can_open_new_positions"] is False
+    assert result["is_tradable"] is True
 
 
 def test_market_status_symbol_mode_allows_crypto_on_weekend(monkeypatch) -> None:
@@ -477,10 +557,10 @@ def test_market_status_symbol_mode_allows_crypto_on_weekend(monkeypatch) -> None
 
     result = raw(symbol="BTCUSD")
 
-    assert result["status"] == "probably_open"
-    assert result["can_open_new_positions"] is True
+    assert result["status"] == "quote_not_live_ready"
+    assert result["can_open_new_positions"] is False
     assert result["trade_mode_allows_opening"] is True
-    assert "reason" not in result
+    assert result["usable_for_live_trading"] is False
     assert result["tick_freshness"] == "recent"
     assert "FX weekly sessions" not in result["heuristic_note"]
 
@@ -515,8 +595,9 @@ def test_market_status_symbol_mode_allows_fx_after_sunday_open(monkeypatch) -> N
 
     result = raw(symbol="EURUSD")
 
-    assert result["status"] == "probably_open"
-    assert result["can_open_new_positions"] is True
+    assert result["status"] == "quote_not_live_ready"
+    assert result["can_open_new_positions"] is False
+    assert result["trade_mode_allows_opening"] is True
 
 
 def test_market_status_symbol_mode_uses_recent_candles_for_weekend_session(
@@ -564,15 +645,16 @@ def test_market_status_symbol_mode_uses_recent_candles_for_weekend_session(
 
     result = raw(symbol="XAUUSD", detail="full")
 
-    assert result["status"] == "probably_open"
-    assert result["can_open_new_positions"] is True
+    assert result["status"] == "quote_not_live_ready"
+    assert result["can_open_new_positions"] is False
+    assert result["trade_mode_allows_opening"] is True
     assert result["current_time_in_recent_session"] is True
     assert result["trades_on_weekends"] is True
     assert result["schedule_source"] == "recent_m1_candles"
     assert result["inferred_schedule"]["active_hours_utc"] == {
         "saturday": ["03:00-04:00"]
     }
-    assert "reason" not in result
+    assert result["reason"] == "market_closed"
 
 
 def test_recent_sunday_reopen_is_not_classified_as_weekend_trading() -> None:
@@ -592,6 +674,57 @@ def test_recent_sunday_reopen_is_not_classified_as_weekend_trading() -> None:
     assert result["saturday_candles"] == 0
     assert result["sunday_candles"] == 1
 
+
+def test_market_status_reconciles_future_cached_tick_with_live_stream(monkeypatch) -> None:
+    fixed_now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+    now_epoch = fixed_now.timestamp()
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.replace(tzinfo=None) if tz is None else fixed_now.astimezone(tz)
+
+    class Gateway:
+        COPY_TICKS_ALL = 0
+        TIMEFRAME_M1 = 1
+        SYMBOL_TRADE_MODE_FULL = 4
+        SYMBOL_TRADE_MODE_DISABLED = 0
+        SYMBOL_TRADE_MODE_CLOSEONLY = 3
+        SYMBOL_TRADE_MODE_LONGONLY = 1
+        SYMBOL_TRADE_MODE_SHORTONLY = 2
+
+        def ensure_connection(self) -> None:
+            return None
+
+        def symbol_info(self, symbol: str):
+            return SimpleNamespace(name=symbol, visible=True, trade_mode=4)
+
+        def symbol_info_tick(self, _symbol: str):
+            return SimpleNamespace(time=now_epoch + 45, bid=100.0, ask=101.0)
+
+        def copy_ticks_range(self, _symbol, _start, _end, _flags):
+            return [
+                {
+                    "time": now_epoch - 1,
+                    "time_msc": (now_epoch - 1) * 1000,
+                    "bid": 100.1,
+                    "ask": 100.2,
+                }
+            ]
+
+        def copy_rates_range(self, _symbol, _timeframe, _start, _end):
+            return []
+
+    monkeypatch.setattr(market_status_mod, "datetime", FixedDateTime)
+    monkeypatch.setattr(market_status_mod, "create_mt5_gateway", lambda **kwargs: Gateway())
+
+    result = _unwrap(market_status_mod.market_status)(symbol="BTCUSD", detail="full")
+
+    assert result["status"] == "probably_open"
+    assert result["can_open_new_positions"] is True
+    assert result["tick"]["quote_source"] == "mt5.copy_ticks_range"
+    assert result["tick"]["quote_source_state"] == "refreshed_from_tick_stream"
+    assert result["tick"]["last_tick_age_seconds"] == 1.0
 
 def test_market_status_symbol_mode_marks_weekend_snapshot_freshness(monkeypatch) -> None:
     raw = _unwrap(market_status_mod.market_status)
@@ -699,17 +832,21 @@ def test_upcoming_holidays_crosses_into_the_next_year(monkeypatch) -> None:
         def now(cls, tz=None):
             return cls(2030, 12, 30, 12, 0, tzinfo=tz or timezone.utc)
 
-    def fake_country_holidays(country: str, years):
+    def fake_financial_holidays(exchange: str, years):
         year_tuple = tuple(int(value) for value in years)
-        calls.append((country, year_tuple))
+        calls.append((exchange, year_tuple))
         year = year_tuple[0]
         if year == 2031:
             return {date(2031, 1, 1): "New Year's Day"}
         return {}
 
-    market_status_mod._get_holidays.cache_clear()
+    market_status_mod._get_exchange_holidays.cache_clear()
     monkeypatch.setattr(market_status_mod, "datetime", FixedDateTime)
-    monkeypatch.setattr(market_status_mod.holidays, "country_holidays", fake_country_holidays)
+    monkeypatch.setattr(
+        market_status_mod.holidays,
+        "financial_holidays",
+        fake_financial_holidays,
+    )
 
     upcoming = market_status_mod._get_upcoming_holidays(["NYSE"], days_ahead=3)
 
@@ -722,9 +859,60 @@ def test_upcoming_holidays_crosses_into_the_next_year(monkeypatch) -> None:
             "impact": "closed",
             "early_close_time": None,
             "days_away": 2,
+            "calendar_source": "exchange_calendar",
         }
     ]
-    assert calls == [("US", (2030,)), ("US", (2031,))]
+    assert calls == [("XNYS", (2030,)), ("XNYS", (2031,))]
+
+
+def test_upcoming_holidays_use_each_venue_local_date(monkeypatch) -> None:
+    checked_dates: list[date] = []
+
+    def fake_is_holiday(_country: str, dt: datetime, _exchange=None):
+        checked_dates.append(dt.date())
+        if dt.date() == date(2026, 1, 2):
+            return True, "Local closure"
+        return False, None
+
+    monkeypatch.setattr(market_status_mod, "_is_holiday", fake_is_holiday)
+
+    upcoming = market_status_mod._get_upcoming_holidays(
+        ["TSE"],
+        days_ahead=1,
+        now_utc=datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc),
+    )
+
+    assert checked_dates[0] == date(2026, 1, 2)
+    assert upcoming[0]["date"] == "2026-01-02"
+    assert upcoming[0]["days_away"] == 0
+
+
+def test_exchange_calendar_differs_from_country_calendar() -> None:
+    market_status_mod._get_exchange_holidays.cache_clear()
+
+    good_friday = datetime(2026, 4, 3, 12, tzinfo=timezone.utc)
+    columbus_day = datetime(2026, 10, 12, 12, tzinfo=timezone.utc)
+    veterans_day = datetime(2026, 11, 11, 12, tzinfo=timezone.utc)
+
+    assert market_status_mod._is_holiday("US", good_friday, "XNYS")[0] is True
+    assert market_status_mod._is_holiday("US", columbus_day, "XNYS")[0] is False
+    assert market_status_mod._is_holiday("US", veterans_day, "XNYS")[0] is False
+
+
+def test_tokyo_session_uses_current_1530_close(monkeypatch) -> None:
+    monkeypatch.setattr(
+        market_status_mod,
+        "_is_holiday",
+        lambda _country, _dt, _exchange=None: (False, None),
+    )
+
+    result = market_status_mod._check_market_status(
+        "TSE",
+        datetime(2026, 8, 6, 15, 15, tzinfo=ZoneInfo("Asia/Tokyo")),
+    )
+
+    assert result["status"] == "open"
+    assert result["next_close"].endswith("T15:30:00+09:00")
 
 
 def test_normalize_market_status_output_compact_hides_messages_and_holidays() -> None:

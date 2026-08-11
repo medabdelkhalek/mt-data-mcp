@@ -45,6 +45,9 @@ class _Gateway:
             point=0.0001,
         )
 
+    def symbol_info_tick(self, symbol):
+        return SimpleNamespace(bid=1.0999, ask=1.1001, time=1)
+
 
 def test_trade_stress_test_offsets_long_and_short_positions():
     result = run_trade_stress_test(
@@ -56,3 +59,57 @@ def test_trade_stress_test_offsets_long_and_short_positions():
     assert result["positions_evaluated"] == 2
     assert result["total_pnl_impact"] == -550.0
     assert result["equity_after"] == 9450.0
+    assert result["mark_freshness_status"] == "stale_or_unverified"
+    assert result["usable_for_live_trading"] is False
+    assert result["data_stale"] is True
+    assert result["valuation_time"] == "1970-01-01T00:00:01Z"
+    assert {item["symbol"] for item in result["mark_freshness"]} == {"EURUSD"}
+
+
+def test_trade_stress_test_labels_entry_price_fallback_as_non_live():
+    gateway = _Gateway()
+    gateway.positions_get = lambda: [
+        SimpleNamespace(
+            ticket=3,
+            symbol="EURUSD",
+            type=0,
+            volume=1.0,
+            price_current=0.0,
+            price_open=1.1,
+        )
+    ]
+    gateway.symbol_info_tick = lambda _symbol: SimpleNamespace(
+        bid=1.0999, ask=1.1001, time=4_102_444_800
+    )
+
+    result = run_trade_stress_test(
+        TradeStressTestRequest(shocks={"EURUSD": -1.0}), gateway=gateway
+    )
+
+    assert result["items"][0]["valuation_basis"] == "entry_price_fallback"
+    assert result["mark_freshness_status"] == "entry_price_fallback"
+    assert result["valuation_basis"] == "entry_price_fallback"
+    assert result["usable_for_live_trading"] is False
+
+
+def test_trade_stress_test_rejects_failed_position_snapshot():
+    gateway = _Gateway()
+    gateway.positions_get = lambda: None
+
+    result = run_trade_stress_test(
+        TradeStressTestRequest(shocks={"EURUSD": -1.0}),
+        gateway=gateway,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "positions_snapshot_unavailable"
+
+
+def test_trade_stress_test_fails_when_no_position_matches_shocks():
+    result = run_trade_stress_test(
+        TradeStressTestRequest(shocks={"USDJPY": -1.0}),
+        gateway=_Gateway(),
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "stress_no_positions_evaluated"

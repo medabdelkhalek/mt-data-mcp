@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import time
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Literal, Optional
 
 from ..shared.market_units import forex_points_per_pip
@@ -20,6 +19,7 @@ from ..utils.market_metadata import (
 )
 from ..utils.mt5 import (
     MT5ConnectionError,
+    account_currency_from_gateway,
     describe_mt5_time_normalization,
     ensure_mt5_connection_or_raise,
     mt5,
@@ -27,6 +27,12 @@ from ..utils.mt5 import (
     symbol_price_currency,
     symbol_price_digits,
     symbol_price_point,
+)
+from ..utils.quote import (
+    compute_spread_metrics,
+    resolve_quote_tick,
+    tick_epoch,
+    tick_value,
 )
 from ..utils.symbol import match_symbol_infos
 from ..utils.time import (
@@ -53,6 +59,12 @@ _MARKET_DEPTH_BOOK_UNITS = {
     "volume_real": "book_volume_real",
 }
 _MARKET_DEPTH_TICK_UNITS = {"volume": "mt5_tick_volume"}
+_MARKET_DEPTH_SPREAD_UNITS = {
+    "spread": "absolute_price",
+    "spread_points": "broker_points",
+    "spread_pct": "percentage_points (1.0 = 1%)",
+    "spread_cost_per_lot": "account_currency_per_broker_lot_estimate",
+}
 def _round_market_ticker_value(value: Any, *, digits: int) -> Any:
     return round_finite(value, digits, on_invalid="passthrough")
 
@@ -134,6 +146,7 @@ def _compact_market_ticker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "freshness_state",
         "freshness_reason",
         "data_age_seconds",
+        "data_stale",
         "usable_for_live_trading",
         "usable_for_live_trading_basis",
         "live_max_age_seconds",
@@ -145,6 +158,8 @@ def _compact_market_ticker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "quote_source",
         "quote_source_state",
         "quote_refresh_attempted",
+        "spread_valid",
+        "spread_quality",
         "market_status_reason",
         "time",
         "time_epoch",
@@ -167,60 +182,25 @@ def _compact_market_ticker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("spread", "spread_points", "spread_pips", "spread_pct"):
         if payload.get(key) is not None:
             out[key] = payload[key]
+    units = payload.get("units")
+    if isinstance(units, dict):
+        compact_units = {
+            key: units[key]
+            for key in (
+                "bid",
+                "ask",
+                "spread",
+                "spread_points",
+                "spread_pips",
+                "spread_pct",
+            )
+            if key in out and units.get(key) is not None
+        }
+        if compact_units:
+            out["units"] = compact_units
     if out.get("warning") == out.get("timestamp_warning"):
         out.pop("warning", None)
     return out
-
-
-def _market_ticker_tick_value(tick: Any, field: str) -> Any:
-    if isinstance(tick, dict):
-        return tick.get(field)
-    try:
-        return tick[field]
-    except Exception:
-        return getattr(tick, field, None)
-
-
-def _market_ticker_tick_epoch(tick: Any) -> Optional[float]:
-    time_msc = _market_ticker_tick_value(tick, "time_msc")
-    try:
-        epoch = float(time_msc) / 1000.0
-        if math.isfinite(epoch) and epoch > 0.0:
-            return epoch
-    except (TypeError, ValueError):
-        pass
-    try:
-        epoch = float(_market_ticker_tick_value(tick, "time"))
-    except (TypeError, ValueError):
-        return None
-    return epoch if math.isfinite(epoch) and epoch > 0.0 else None
-
-
-def _market_ticker_stream_tick(
-    gateway: Any,
-    symbol: str,
-    *,
-    now_epoch: float,
-) -> Any:
-    try:
-        rows = gateway.copy_ticks_range(
-            symbol,
-            datetime.fromtimestamp(now_epoch, tz=timezone.utc) - timedelta(minutes=15),
-            datetime.fromtimestamp(now_epoch, tz=timezone.utc) + timedelta(seconds=5),
-            gateway.COPY_TICKS_ALL,
-        )
-    except Exception:
-        return None
-    if rows is None:
-        return None
-    try:
-        candidates = list(rows)
-    except (TypeError, ValueError):
-        return None
-    candidates = [row for row in candidates if _market_ticker_tick_epoch(row) is not None]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda row: float(_market_ticker_tick_epoch(row) or 0.0))
 
 
 def _market_ticker_refresh_tick(
@@ -230,56 +210,13 @@ def _market_ticker_refresh_tick(
     *,
     now_epoch: float,
 ) -> tuple[Any, Dict[str, Any]]:
-    tick_epoch = _market_ticker_tick_epoch(tick)
-    if tick_epoch is None:
-        return tick, {"quote_source": "mt5.symbol_info_tick"}
-    source_freshness = build_tick_freshness_context(
+    return resolve_quote_tick(
+        gateway,
         symbol,
-        tick_epoch=tick_epoch,
+        tick,
         now_epoch=now_epoch,
-        item="tick",
         stale_after_seconds=_MARKET_TICKER_STALE_SECONDS,
-        age_rounder=_market_ticker_age_seconds,
     )
-    if (
-        source_freshness.get("usable_for_live_trading") is not False
-        or source_freshness.get("freshness_policy_relaxed")
-        or source_freshness.get("market_status") == "closed"
-    ):
-        return tick, {
-            "quote_source": "mt5.symbol_info_tick",
-            "quote_source_state": "current",
-        }
-
-    stream_tick = _market_ticker_stream_tick(gateway, symbol, now_epoch=now_epoch)
-    metadata: Dict[str, Any] = {
-        "quote_source": "mt5.symbol_info_tick",
-        "quote_source_state": "unverified_stale",
-        "quote_refresh_attempted": True,
-    }
-    if stream_tick is None:
-        return tick, metadata
-    stream_epoch = _market_ticker_tick_epoch(stream_tick)
-    stream_freshness = build_tick_freshness_context(
-        symbol,
-        tick_epoch=stream_epoch,
-        now_epoch=now_epoch,
-        item="tick",
-        stale_after_seconds=_MARKET_TICKER_STALE_SECONDS,
-        age_rounder=_market_ticker_age_seconds,
-    )
-    if stream_freshness.get("usable_for_live_trading") is not True:
-        metadata["stream_tick_time_epoch"] = stream_epoch
-        return tick, metadata
-    metadata.update(
-        {
-            "quote_source": "mt5.copy_ticks_range",
-            "quote_source_state": "refreshed_from_tick_stream",
-            "symbol_info_tick_time_epoch": tick_epoch,
-            "stream_tick_time_epoch": stream_epoch,
-        }
-    )
-    return stream_tick, metadata
 
 
 def _positive_market_ticker_float(value: Any) -> Optional[float]:
@@ -398,32 +335,32 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
             digits = symbol_price_digits(symbol_info)
             point = symbol_price_point(symbol_info) or 0.0
             tick_size = float(getattr(symbol_info, "trade_tick_size", 0.0) or 0.0)
-            tick_value = float(getattr(symbol_info, "trade_tick_value", 0.0) or 0.0)
+            trade_tick_value = float(
+                getattr(symbol_info, "trade_tick_value", 0.0) or 0.0
+            )
             price_currency = symbol_price_currency(symbol_info)
+            spread_cost_currency = account_currency_from_gateway(mt5_gateway)
 
             def _compute_spread_metrics(bid: Any, ask: Any) -> Dict[str, Any] | None:
-                try:
-                    bid_f = float(bid)
-                    ask_f = float(ask)
-                except Exception:
+                metrics = compute_spread_metrics(
+                    bid,
+                    ask,
+                    point=point,
+                    tick_size=tick_size,
+                    tick_value_money=trade_tick_value,
+                    account_currency=spread_cost_currency,
+                )
+                if metrics["spread"] is None:
                     return None
-                if not (math.isfinite(bid_f) and math.isfinite(ask_f)):
-                    return None
-                spread_abs = float(ask_f - bid_f)
-                if spread_abs < 0:
-                    return None
-                mid = (ask_f + bid_f) / 2.0
-                spread_points = (spread_abs / point) if point > 0 else None
-                spread_pct = ((spread_abs / mid) * 100.0) if mid > 0 else None
-                spread_cost_per_lot = None
-                if tick_size > 0 and tick_value > 0:
-                    spread_cost_per_lot = (spread_abs / tick_size) * tick_value
                 return {
-                    "spread": spread_abs,
-                    "spread_points": spread_points,
-                    "spread_pct": spread_pct,
-                    "spread_cost_per_lot": spread_cost_per_lot,
-                    "pricing_basis": "per_1_lot_estimate" if spread_cost_per_lot is not None else "quote_only",
+                    key: metrics[key]
+                    for key in (
+                        "spread",
+                        "spread_points",
+                        "spread_pct",
+                        "spread_cost_per_lot",
+                        "pricing_basis",
+                    )
                 }
 
             def _price_display(value: Any) -> Any:
@@ -436,6 +373,51 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                     return str(val)
                 except Exception:
                     return None
+
+            def _attach_tick_freshness(
+                payload: Dict[str, Any],
+                tick_value_obj: Any,
+                quote_metadata: Optional[Dict[str, Any]] = None,
+            ) -> None:
+                quote_now = time.time()
+                epoch = tick_epoch(tick_value_obj)
+                payload["observed_at"] = _format_time_second_explicit(quote_now)
+                payload["observed_at_epoch"] = quote_now
+                if quote_metadata:
+                    payload.update(quote_metadata)
+                context = build_tick_freshness_context(
+                    symbol,
+                    tick_epoch=epoch,
+                    now_epoch=quote_now,
+                    item="depth reference tick",
+                    age_rounder=lambda value: round(value, 3),
+                )
+                if context:
+                    payload.update(context)
+                else:
+                    payload.update(
+                        {
+                            "freshness_state": "unknown",
+                            "data_stale": None,
+                            "usable_for_live_trading": False,
+                            "usable_for_live_trading_basis": (
+                                "depth_snapshot_and_reference_tick_freshness"
+                            ),
+                        }
+                    )
+
+                bid = tick_value(tick_value_obj, "bid")
+                ask = tick_value(tick_value_obj, "ask")
+                try:
+                    executable_quote = float(ask) > float(bid) > 0.0
+                except (TypeError, ValueError):
+                    executable_quote = False
+                if not executable_quote:
+                    payload["usable_for_live_trading"] = False
+                    blockers = list(payload.get("execution_blockers") or [])
+                    if "reference_quote_not_executable" not in blockers:
+                        blockers.append("reference_quote_not_executable")
+                    payload["execution_blockers"] = blockers
 
             book_subscription_active = False
             try:
@@ -465,6 +447,7 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
             if depth is not None and len(depth) > 0:
                 buy_orders = []
                 sell_orders = []
+                unclassified_orders = []
 
                 for level in depth:
                     try:
@@ -487,10 +470,14 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                         "volume_real": volume_real,
                     }
 
-                    if level_type == 0:
+                    if level_type in {2, 4}:
                         buy_orders.append(order_data)
-                    else:
+                    elif level_type in {1, 3}:
                         sell_orders.append(order_data)
+                    else:
+                        unclassified_orders.append(
+                            {**order_data, "book_type": level_type}
+                        )
 
                 out = {
                     "success": True,
@@ -498,6 +485,7 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                     "type": "full_depth",
                     "price_precision": digits,
                     "price_currency": price_currency,
+                    "spread_cost_currency": spread_cost_currency,
                     "capabilities": {
                         "dom_available": True,
                         "depth_status": "available",
@@ -512,9 +500,23 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                             "sell": int(len(sell_orders)),
                             "total": int(len(buy_orders) + len(sell_orders)),
                         },
+                        **(
+                            {"unclassified_orders": unclassified_orders}
+                            if unclassified_orders
+                            else {}
+                        ),
                     },
                     "units": dict(_MARKET_DEPTH_BOOK_UNITS),
                 }
+
+                if unclassified_orders:
+                    out["capabilities"]["unclassified_depth_levels"] = int(
+                        len(unclassified_orders)
+                    )
+                    out["warnings"] = [
+                        "Depth rows with unknown MT5 book types were not assigned "
+                        "to either side."
+                    ]
                 if spread and buy_orders and sell_orders:
                     valid_buy_prices = [
                         float(row.get("price"))
@@ -535,6 +537,18 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                             out["data"]["best_ask"] = best_ask
                             out["data"].update(spread_metrics)
                             out["capabilities"]["spread_overlay_applied"] = True
+                            out["units"].update(_MARKET_DEPTH_SPREAD_UNITS)
+                depth_tick = mt5_gateway.symbol_info_tick(symbol)
+                depth_now = time.time()
+                depth_tick, quote_metadata = resolve_quote_tick(
+                    mt5_gateway,
+                    symbol,
+                    depth_tick,
+                    now_epoch=depth_now,
+                    stale_after_seconds=_MARKET_TICKER_STALE_SECONDS,
+                )
+                _attach_tick_freshness(out, depth_tick, quote_metadata)
+                out["freshness_basis"] = "depth_snapshot_and_reference_tick"
                 out["query_latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
                 return out
 
@@ -546,6 +560,14 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                     "error": f"DOM not available for {symbol}. Use market_ticker for bid/ask snapshot instead.",
                     "recommended_alternative": "market_ticker",
                 }
+            quote_now = time.time()
+            tick, quote_metadata = resolve_quote_tick(
+                mt5_gateway,
+                symbol,
+                tick,
+                now_epoch=quote_now,
+                stale_after_seconds=_MARKET_TICKER_STALE_SECONDS,
+            )
 
             out = {
                 "success": True,
@@ -554,6 +576,7 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                 "depth_status": "unavailable",
                 "price_precision": digits,
                 "price_currency": price_currency,
+                "spread_cost_currency": spread_cost_currency,
                 "recommended_alternative": "market_ticker",
                 "capabilities": {
                     "dom_available": False,
@@ -563,10 +586,10 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                     "fallback_reason": "market_book_get returned no levels",
                 },
                 "data": {
-                    "bid": float(tick.bid) if tick.bid else None,
-                    "ask": float(tick.ask) if tick.ask else None,
-                    "last": float(tick.last) if tick.last else None,
-                    "volume": int(tick.volume) if tick.volume else None,
+                    "bid": float(tick_value(tick, "bid")) if tick_value(tick, "bid") else None,
+                    "ask": float(tick_value(tick, "ask")) if tick_value(tick, "ask") else None,
+                    "last": float(tick_value(tick, "last")) if tick_value(tick, "last") else None,
+                    "volume": int(tick_value(tick, "volume")) if tick_value(tick, "volume") else None,
                     "note": "Full market depth not available, showing current bid/ask snapshot.",
                 },
                 "units": dict(_MARKET_DEPTH_TICK_UNITS),
@@ -579,13 +602,16 @@ def _market_depth_fetch_impl(symbol: str, spread: bool = False, require_dom: boo
                 if spread_metrics is not None:
                     out["data"].update(spread_metrics)
                     out["capabilities"]["spread_overlay_applied"] = True
+                    out["units"].update(_MARKET_DEPTH_SPREAD_UNITS)
             _use_ctz = _use_client_tz()
-            if tick.time and _use_ctz:
-                out["data"]["time"] = _format_time_second_explicit_local(float(tick.time))
-                out["data"]["time_epoch"] = int(float(tick.time))
-            elif tick.time:
-                out["data"]["time"] = _format_time_second_explicit(float(tick.time))
-                out["data"]["time_epoch"] = int(float(tick.time))
+            tick_time = tick_epoch(tick)
+            if tick_time and _use_ctz:
+                out["data"]["time"] = _format_time_second_explicit_local(tick_time)
+                out["data"]["time_epoch"] = tick_time
+            elif tick_time:
+                out["data"]["time"] = _format_time_second_explicit(tick_time)
+                out["data"]["time_epoch"] = tick_time
+            _attach_tick_freshness(out, tick, quote_metadata)
             out["timezone"] = display_timezone_label(
                 use_client_tz=_use_ctz,
                 resolve_client_tz=_resolve_client_tz,
@@ -712,20 +738,22 @@ def market_ticker(  # noqa: C901
             digits = symbol_price_digits(symbol_info)
             point = symbol_price_point(symbol_info) or 0.0
             tick_size = float(getattr(symbol_info, "trade_tick_size", 0.0) or 0.0)
-            tick_value = float(getattr(symbol_info, "trade_tick_value", 0.0) or 0.0)
-            spread_cost_currency = symbol_price_currency(symbol_info)
-            price_currency = spread_cost_currency
+            tick_value_money = float(
+                getattr(symbol_info, "trade_tick_value", 0.0) or 0.0
+            )
+            price_currency = symbol_price_currency(symbol_info)
+            spread_cost_currency = account_currency_from_gateway(mt5_gateway)
             contract_size = _positive_market_ticker_float(
                 getattr(symbol_info, "trade_contract_size", None)
             )
 
-            bid_raw = _market_ticker_tick_value(tick, "bid")
-            ask_raw = _market_ticker_tick_value(tick, "ask")
-            last_raw = _market_ticker_tick_value(tick, "last")
+            bid_raw = tick_value(tick, "bid")
+            ask_raw = tick_value(tick, "ask")
+            last_raw = tick_value(tick, "last")
             bid = float(bid_raw) if bid_raw else None
             ask = float(ask_raw) if ask_raw else None
             last = float(last_raw) if last_raw else None
-            tick_time = _market_ticker_tick_epoch(tick)
+            tick_time = tick_epoch(tick)
             if bid is None and ask is None and last is None and tick_time is None:
                 return _finalize(
                     _market_ticker_error(
@@ -740,48 +768,47 @@ def market_ticker(  # noqa: C901
                         ),
                     )
                 )
-            tick_volume = _market_ticker_tick_value(tick, "volume")
+            tick_volume = tick_value(tick, "volume")
             if tick_volume is not None:
                 try:
                     tick_volume = int(tick_volume)
                 except (TypeError, ValueError, OverflowError):
                     tick_volume = None
 
-            spread_abs = None
-            spread_points = None
-            spread_pct = None
-            spread_pips = None
-            mid = None
-            spread_cost_per_lot = None
-            pricing_basis = "quote_only"
-            if bid is not None and ask is not None and ask >= bid:
-                spread_abs = float(ask - bid)
-                mid = (ask + bid) / 2.0
-                spread_points = (spread_abs / point) if point > 0 else None
-                points_per_pip = _market_ticker_points_per_pip(
-                    symbol_info,
-                    symbol=resolved_symbol,
-                    point=point,
-                    digits=digits,
-                )
-                spread_pips = (
-                    spread_points / points_per_pip
-                    if spread_points is not None
-                    and points_per_pip is not None
-                    and points_per_pip > 0
-                    else None
-                )
-                spread_pct = ((spread_abs / mid) * 100.0) if mid > 0 else None
-                spread_abs = _round_market_ticker_value(spread_abs, digits=digits)
-                spread_points = _round_market_ticker_value(spread_points, digits=4)
-                spread_pips = _round_market_ticker_value(spread_pips, digits=4)
-                spread_pct = _round_market_ticker_value(spread_pct, digits=6)
-                if tick_size > 0 and tick_value > 0:
-                    spread_cost_per_lot = _round_market_ticker_value(
-                        (float(spread_abs) / tick_size) * tick_value,
-                        digits=6,
-                    )
-                    pricing_basis = "per_1_lot_estimate"
+            points_per_pip = _market_ticker_points_per_pip(
+                symbol_info,
+                symbol=resolved_symbol,
+                point=point,
+                digits=digits,
+            )
+            spread_metrics = compute_spread_metrics(
+                bid,
+                ask,
+                point=point,
+                points_per_pip=points_per_pip,
+                tick_size=tick_size,
+                tick_value_money=tick_value_money,
+                account_currency=spread_cost_currency,
+            )
+            mid = spread_metrics["mid"]
+            spread_abs = _round_market_ticker_value(
+                spread_metrics["spread"], digits=digits
+            )
+            spread_points = _round_market_ticker_value(
+                spread_metrics["spread_points"], digits=4
+            )
+            spread_pips = _round_market_ticker_value(
+                spread_metrics["spread_pips"], digits=4
+            )
+            spread_pct = _round_market_ticker_value(
+                spread_metrics["spread_pct"], digits=6
+            )
+            spread_cost_per_lot = _round_market_ticker_value(
+                spread_metrics["spread_cost_per_lot"], digits=6
+            )
+            spread_valid = spread_metrics["spread_valid"]
+            spread_quality = spread_metrics["spread_quality"]
+            pricing_basis = spread_metrics["pricing_basis"]
 
             _use_ctz = _use_client_tz()
 
@@ -801,14 +828,16 @@ def market_ticker(  # noqa: C901
                 "spread_pips": spread_pips,
                 "spread_pct": spread_pct,
                 "spread_cost_per_lot": spread_cost_per_lot,
+                "spread_valid": spread_valid,
+                "spread_quality": spread_quality,
                 "pricing_basis": pricing_basis,
                 "units": {
-                    "bid": "price",
-                    "ask": "price",
-                    "mid": "price",
-                    "last": "price",
+                    "bid": "absolute_price",
+                    "ask": "absolute_price",
+                    "mid": "absolute_price",
+                    "last": "absolute_price",
                     "point": "price_increment",
-                    "spread": "price",
+                    "spread": "absolute_price",
                     "spread_points": "broker_points",
                     "spread_pct": "percentage_points (1.0 = 1%)",
                     "spread_cost_per_lot": "currency_per_lot_estimate",
@@ -862,6 +891,22 @@ def market_ticker(  # noqa: C901
                     out["data_age"] = age_display
                 if out["data_stale"]:
                     out["warning"] = _market_ticker_stale_warning(out, tick_time)
+            if not spread_valid:
+                out["usable_for_live_trading"] = False
+                out["usable_for_live_trading_basis"] = (
+                    "quote_age_market_session_and_positive_spread"
+                )
+                quality_warning = (
+                    "Locked quote (bid equals ask) is not usable for live trading."
+                    if spread_quality == "locked"
+                    else "Quote is not a valid positive two-sided market."
+                )
+                existing_warning = out.get("warning")
+                out["warning"] = (
+                    f"{existing_warning} {quality_warning}"
+                    if existing_warning
+                    else quality_warning
+                )
             diagnostics = {
                 "source": out.get("quote_source", "mt5.symbol_info_tick"),
                 "cache_used": False,
@@ -949,7 +994,10 @@ def market_ticker(  # noqa: C901
                     "warning",
                     "quote_source",
                     "quote_source_state",
+                    "quote_source_conflict",
                     "quote_refresh_attempted",
+                    "spread_valid",
+                    "spread_quality",
                 ):
                     if out.get(key) is not None:
                         simple[key] = out.get(key)

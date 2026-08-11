@@ -5,12 +5,16 @@ import pandas as pd
 import pytest
 
 from mtdata.patterns.harmonic import (
-    HarmonicDetectorConfig,
-    _SwingPoint,
+    _OXABC_SPECS,
     _XABCD_SPECS,
+    HarmonicDetectorConfig,
+    _candidate_results,
     _ratio_abs_tolerance,
+    _ratios_oxabc,
     _ratios_xabcd,
+    _score_ratio,
     _score_spec,
+    _SwingPoint,
     detect_harmonic_patterns,
     validate_harmonic_detector_config,
 )
@@ -21,6 +25,18 @@ def test_ratio_tolerance_is_proportional_for_small_and_large_ratios() -> None:
 
     assert _ratio_abs_tolerance(0.382, 0.382, cfg) == 0.06 * 0.382
     assert _ratio_abs_tolerance(2.618, 2.618, cfg) == 0.06 * 2.618
+
+
+@pytest.mark.parametrize("value", [0.382, 0.886])
+def test_harmonic_ratio_band_canonical_endpoints_score_fully(value: float) -> None:
+    score = _score_ratio(
+        value,
+        0.382,
+        0.886,
+        HarmonicDetectorConfig(ratio_tolerance=0.06),
+    )
+
+    assert score == 1.0
 
 
 def _cypher_points(c_price: float, d_price: float) -> list[_SwingPoint]:
@@ -52,6 +68,38 @@ def test_cypher_rejects_bc_ab_fit_without_xa_extension() -> None:
     assert ratios["abc"] == pytest.approx(1.3)
     assert ratios["xca"] == pytest.approx(1.15)
     assert _score_spec(ratios, _XABCD_SPECS["cypher"], cfg) is None
+
+
+def test_shark_uses_its_oxabc_geometry() -> None:
+    points = [
+        _SwingPoint(0, "low", 100.0),
+        _SwingPoint(1, "high", 200.0),
+        _SwingPoint(2, "low", 150.0),
+        _SwingPoint(3, "high", 210.0),
+        _SwingPoint(4, "low", 102.0),
+    ]
+    cfg = HarmonicDetectorConfig(min_confidence=0.3)
+    ratios = _ratios_oxabc(points)
+
+    assert "shark" not in _XABCD_SPECS
+    assert ratios is not None
+    assert ratios["oxa"] == pytest.approx(0.5)
+    assert ratios["xab"] == pytest.approx(1.2)
+    assert ratios["abc"] == pytest.approx(1.8)
+    assert ratios["xc_ox"] == pytest.approx(0.98)
+    assert _score_spec(ratios, _OXABC_SPECS["shark"], cfg) is not None
+
+    results = _candidate_results(
+        points,
+        [_OXABC_SPECS["shark"]],
+        np.arange(10),
+        10,
+        cfg,
+    )
+
+    assert len(results) == 1
+    assert results[0].details["pivot_labels"] == list("OXABC")
+    assert results[0].details["expected_ratios"]["xc_ox"] == [0.886, 1.13]
 
 
 def _harmonic_sample_df() -> pd.DataFrame:
@@ -134,6 +182,18 @@ def test_harmonic_config_does_not_advertise_unsupported_forming_output():
     assert not hasattr(cfg, "include_forming")
     assert patterns
     assert all(pattern.status == "completed" for pattern in patterns)
+
+
+def test_recent_terminal_harmonic_pivot_is_marked_forming():
+    patterns = detect_harmonic_patterns(
+        _harmonic_sample_df().iloc[:103].copy(),
+        _test_config(min_distance=5),
+    )
+
+    assert patterns
+    assert patterns[0].status == "forming"
+    assert patterns[0].details["terminal_pivot_confirmed"] is False
+    assert patterns[0].details["available_at_index"] == 105
 
 
 def test_pattern_type_filter_limits_candidates():

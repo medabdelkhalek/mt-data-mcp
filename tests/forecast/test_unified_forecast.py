@@ -16,8 +16,8 @@ for _p in (_SRC, _ROOT):
 
 from mtdata.forecast.forecast import forecast
 from mtdata.forecast.forecast_engine import forecast_engine
-from mtdata.forecast.interface import ForecastResult
 from mtdata.forecast.forecast_registry import ForecastRegistry
+from mtdata.forecast.interface import ForecastResult
 
 # Ensure engine is imported to register methods
 
@@ -197,7 +197,10 @@ class TestUnifiedForecast(unittest.TestCase):
                 timeframe='H1',
                 method='naive',
                 horizon=3,
-                features={'include': 'ohlcv'},
+                features={
+                    'include': 'ohlcv',
+                    'observed_future_policy': 'carry_forward',
+                },
                 dimred_method='pca',
             )
         self.assertTrue(res['success'])

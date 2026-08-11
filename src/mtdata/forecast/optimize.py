@@ -7,8 +7,8 @@ via genetic algorithms, supporting multi-dimensional search over timeframes, met
 method parameters, and optional feature indicators.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
 import math
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def scale_metric_to_01(value: Optional[float], vmin: float = 0.0, vmax: float = 1.0) -> float:
@@ -97,7 +97,7 @@ def composite_fitness_score(
         if md is not None:
             try:
                 md_f = float(md)
-                if math.isfinite(md_f) and md_f > 0:
+                if math.isfinite(md_f) and md_f >= 0:
                     # Invert: 10% dd → 0.9, 50% dd → 0.5, 100% dd → 0
                     inv_dd = max(0.0, 1.0 - md_f)
                 else:
@@ -129,7 +129,7 @@ def build_comprehensive_search_space(
     Returns a structure like:
     {
         'timeframe': {'type': 'categorical', 'choices': ['H1', 'H4', 'D1']},
-        'method': {'type': 'categorical', 'choices': ['theta', 'fourier_ols', 'chronos']},
+        'method': {'type': 'categorical', 'choices': ['theta', 'fourier_ols', 'drift']},
         '_method_spaces': {
             'theta': {'seasonality': {'type': 'int', 'min': 8, 'max': 72}},
             'fourier_ols': {...},
@@ -139,7 +139,7 @@ def build_comprehensive_search_space(
 
     Args:
         timeframes: List of timeframes to search (default: ['H1', 'H4', 'D1', 'W1'])
-        methods: List of methods to search (default: common fast+pretrained methods)
+        methods: List of methods to search (default: fast classical baselines)
         method_search_spaces: Optional dict of method-specific parameter spaces
         include_features: If True, add feature indicator genes (RSI, MACD, etc.)
 
@@ -149,7 +149,9 @@ def build_comprehensive_search_space(
     if not timeframes:
         timeframes = ['H1', 'H4', 'D1', 'W1']
     if not methods:
-        # Default: fast + pretrained methods only
+        # Keep the implicit search local and predictable. Foundation methods may
+        # download models or initialize heavyweight runtimes, so callers must opt
+        # into them explicitly through ``methods``.
         methods = [
             'theta',
             'fourier_ols',
@@ -158,11 +160,6 @@ def build_comprehensive_search_space(
             'seasonal_naive',
             'ses',
             'holt',
-            'arima',
-            'sarima',
-            'chronos_bolt',
-            'chronos2',
-            'timesfm',
         ]
 
     # Use provided method spaces or fall back to defaults
@@ -234,7 +231,7 @@ def extract_method_params_from_genotype(
     method_space = method_spaces.get(method, {})
 
     params: Dict[str, Any] = {}
-    for param_name, param_spec in method_space.items():
+    for param_name, _param_spec in method_space.items():
         if param_name in genotype:
             params[param_name] = genotype[param_name]
 

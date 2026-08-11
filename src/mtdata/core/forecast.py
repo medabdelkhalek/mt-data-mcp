@@ -9,7 +9,7 @@ from functools import lru_cache
 from importlib import import_module
 from typing import Any, Dict, List, Literal, Optional
 
-from ..forecast.barriers_shared import (
+from ..forecast.barrier_constants import (
     BARRIER_MONTE_CARLO_METHODS,
 )
 from ..forecast.exceptions import ForecastError
@@ -47,6 +47,8 @@ _FORECAST_PROCESS_ISOLATION_ENV = "MTDATA_FORECAST_PROCESS_ISOLATION"
 _FORECAST_PROCESS_TIMEOUT_ENV = "MTDATA_FORECAST_PROCESS_TIMEOUT_SECONDS"
 _FORECAST_PROCESS_CHILD_ENV = "MTDATA_FORECAST_PROCESS_CHILD"
 _FORECAST_PROCESS_ISOLATION_DEFAULT = "gpu"
+_FORECAST_CHILD_TRACEBACK_LIMIT = 12_000
+_FORECAST_CHILD_OUTPUT_LIMIT = 4_000
 _FORECAST_LIBRARY_MODELS_COMPACT_LIMIT = 20
 _FORECAST_ISOLATABLE_OPERATIONS = frozenset(
     {
@@ -310,6 +312,18 @@ def _send_forecast_process_message(channel: Any, message: Dict[str, Any]) -> Non
     raise RuntimeError("Invalid forecast child result channel")
 
 
+def _bounded_diagnostic(value: Any, *, limit: int, tail_only: bool = False) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    marker = "\n... diagnostic truncated ...\n"
+    if tail_only:
+        return marker + text[-max(1, limit - len(marker)) :]
+    head_size = max(1, (limit - len(marker)) // 2)
+    tail_size = max(1, limit - len(marker) - head_size)
+    return text[:head_size] + marker + text[-tail_size:]
+
+
 @contextmanager
 def _suppress_forecast_child_side_output():
     stdout_buffer = io.StringIO()
@@ -332,7 +346,7 @@ def _suppress_forecast_child_side_output():
     try:
         logging.disable(logging.CRITICAL)
         with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-            yield
+            yield stdout_buffer, stderr_buffer
     finally:
         logging.disable(previous_disable)
         for key in env_updates:
@@ -348,7 +362,7 @@ def _suppress_forecast_child_side_output():
 
 def _forecast_process_entry(operation: str, payload: Dict[str, Any], result_channel: Any) -> None:
     os.environ[_FORECAST_PROCESS_CHILD_ENV] = "1"
-    with _suppress_forecast_child_side_output():
+    with _suppress_forecast_child_side_output() as (stdout_buffer, stderr_buffer):
         try:
             result = _run_forecast_payload_direct(operation, payload)
         except ForecastError as exc:
@@ -366,7 +380,20 @@ def _forecast_process_entry(operation: str, payload: Dict[str, Any], result_chan
                     "status": "exception",
                     "type": type(exc).__name__,
                     "message": str(exc),
-                    "traceback": traceback.format_exc(),
+                    "traceback": _bounded_diagnostic(
+                        traceback.format_exc(),
+                        limit=_FORECAST_CHILD_TRACEBACK_LIMIT,
+                    ),
+                    "stdout_tail": _bounded_diagnostic(
+                        stdout_buffer.getvalue(),
+                        limit=_FORECAST_CHILD_OUTPUT_LIMIT,
+                        tail_only=True,
+                    ),
+                    "stderr_tail": _bounded_diagnostic(
+                        stderr_buffer.getvalue(),
+                        limit=_FORECAST_CHILD_OUTPUT_LIMIT,
+                        tail_only=True,
+                    ),
                 },
             )
         else:
@@ -576,13 +603,41 @@ def _run_forecast_payload_in_process(operation: str, payload: Dict[str, Any]) ->
     if status == "forecast_error":
         raise ForecastError(str(message.get("message") or "Forecast child process failed"))
     if status == "exception":
-        tb = str(message.get("traceback") or "")
-        if tb:
-            logger.debug("Forecast child traceback for %s:\n%s", operation, tb)
-        exc_type = str(message.get("type") or "RuntimeError")
-        exc_message = str(message.get("message") or "Forecast child process failed")
-        raise RuntimeError(f"{operation} child process failed with {exc_type}: {exc_message}")
+        _raise_forecast_child_exception(operation, message)
     raise RuntimeError(f"{operation} child process returned an invalid status: {status or '<missing>'}")
+
+
+def _raise_forecast_child_exception(operation: str, message: Dict[str, Any]) -> None:
+    """Log bounded child diagnostics at the default-visible error level."""
+    exc_type = str(message.get("type") or "RuntimeError")
+    exc_message = str(message.get("message") or "Forecast child process failed")
+    traceback_text = _bounded_diagnostic(
+        message.get("traceback"),
+        limit=_FORECAST_CHILD_TRACEBACK_LIMIT,
+    )
+    if traceback_text:
+        logger.error(
+            "Forecast child traceback operation=%s type=%s:\n%s",
+            operation,
+            exc_type,
+            traceback_text,
+        )
+    for stream_name in ("stderr", "stdout"):
+        output = _bounded_diagnostic(
+            message.get(f"{stream_name}_tail"),
+            limit=_FORECAST_CHILD_OUTPUT_LIMIT,
+            tail_only=True,
+        )
+        if output:
+            logger.error(
+                "Forecast child %s tail operation=%s:\n%s",
+                stream_name,
+                operation,
+                output,
+            )
+    raise RuntimeError(
+        f"{operation} child process failed with {exc_type}: {exc_message}"
+    )
 
 
 def _lazy_module(module_name: str):
@@ -919,7 +974,8 @@ def forecast_list_methods(
     Compact output is the default. Standard adds descriptions, capability
     details, and related volatility methods; full adds parameter documentation.
     The default quickstart profile returns a small native baseline set. Use
-    profile='all' for the full available catalog.
+    profile='all' for the full available catalog. An explicit
+    supports_training=True filter searches the full catalog automatically.
     """
     search_term_value = str(search_term or "").strip() or None
     return _run_forecast_operation(
@@ -1755,10 +1811,17 @@ def _forecast_list_methods_impl(  # noqa: C901
         search_value = str(search or "").strip().lower()
         category_filter_value = str(category or "").strip().lower()
         library_value = str(library or "").strip().lower()
-        profile_value = str(profile or "quickstart").strip().lower()
-        if profile_value not in _FORECAST_METHOD_PROFILES:
+        requested_profile_value = str(profile or "quickstart").strip().lower()
+        if requested_profile_value not in _FORECAST_METHOD_PROFILES:
             return {"error": "Invalid profile. Use all, quickstart, or core."}
+        profile_value = requested_profile_value
         profile_methods = _FORECAST_METHOD_PROFILES[profile_value]
+        profile_auto_expanded = bool(
+            supports_training is True and profile_methods is not None
+        )
+        if profile_auto_expanded:
+            profile_value = "all"
+            profile_methods = None
         supported_libraries = {
             "native",
             "statsforecast",
@@ -1899,12 +1962,11 @@ def _forecast_list_methods_impl(  # noqa: C901
             out_full = dict(data)
             out_full["detail"] = "full"
             out_full["methods"] = filtered_full
-            out_full["total"] = int(data.get("total") or len(methods_full))
-            out_full["total_filtered"] = int(total_filtered)
+            out_full["catalog_total"] = int(data.get("total") or len(methods_full))
+            out_full.pop("total", None)
             out_full["available"] = available_count
             out_full["unavailable"] = int(len(filtered_full) - available_count)
-            out_full["methods_shown"] = int(len(filtered_full))
-            out_full["methods_hidden"] = int(
+            hidden_count = int(
                 max(0, total_filtered - offset_value - len(filtered_full))
             )
             out_full["pagination"] = build_pagination_meta(
@@ -1913,14 +1975,7 @@ def _forecast_list_methods_impl(  # noqa: C901
                 offset=offset_value,
                 limit=limit_value,
             )
-            if offset_value:
-                out_full["methods_before"] = int(min(offset_value, total_filtered))
-                out_full["offset"] = int(offset_value)
-            if out_full["methods_hidden"] > 0 or offset_value:
-                out_full["has_more"] = bool(
-                    offset_value + len(filtered_full) < total_filtered
-                )
-            if out_full["methods_hidden"] > 0 and limit_value is not None:
+            if hidden_count > 0 and limit_value is not None:
                 if offset_value:
                     out_full["truncation_reason"] = (
                         f"Limit {limit_value} at offset {offset_value}; "
@@ -1941,6 +1996,12 @@ def _forecast_list_methods_impl(  # noqa: C901
                 "profile": profile_value,
                 "show_unavailable": bool(show_unavailable),
             }
+            if profile_auto_expanded:
+                out_full["profile_auto_expanded"] = {
+                    "requested": requested_profile_value,
+                    "effective": "all",
+                    "reason": "supports_training=true searches the complete method catalog.",
+                }
             if profile_methods is not None:
                 profile_hidden_count = _profile_methods_hidden_count(methods_full)
                 if profile_hidden_count > 0:
@@ -2057,13 +2118,10 @@ def _forecast_list_methods_impl(  # noqa: C901
                     "for all filtered methods."
                 )
         out = {
-            "total": int(data.get("total") or len(compact_methods)),
-            "total_filtered": int(len(compact_methods)),
+            "catalog_total": int(data.get("total") or len(compact_methods)),
             "available": available_count,
             "unavailable": unavailable_count,
             "methods": selected_methods,
-            "methods_shown": int(len(selected_methods)),
-            "methods_hidden": hidden_count,
             "pagination": build_pagination_meta(
                 total=len(compact_methods),
                 returned=len(selected_methods),
@@ -2091,13 +2149,13 @@ def _forecast_list_methods_impl(  # noqa: C901
                     "mtdata-cli forecast_generate SYMBOL --method mc_gbm",
                     "mtdata-cli forecast_volatility_estimate SYMBOL --method ewma",
                 ]
-        if offset_value:
-            out["methods_before"] = int(min(offset_value, len(compact_methods)))
-            out["offset"] = int(offset_value)
-        if hidden_count > 0 or offset_value:
-            out["has_more"] = bool(
-                offset_value + len(selected_methods) < len(compact_methods)
-            )
+        if profile_auto_expanded:
+            out["profile"] = "all"
+            out["profile_auto_expanded"] = {
+                "requested": requested_profile_value,
+                "effective": "all",
+                "reason": "supports_training=true searches the complete method catalog.",
+            }
         if truncation_reason:
             out["truncation_reason"] = truncation_reason
         return out

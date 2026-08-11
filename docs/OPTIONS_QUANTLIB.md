@@ -23,6 +23,9 @@ MTDATA_OPTIONS_PROVIDER=tradier
 MTDATA_OPTIONS_API_KEY=your_tradier_token
 ```
 
+`TRADIER_TOKEN` and `TRADIER_API_KEY` are also accepted as token aliases; use
+`MTDATA_OPTIONS_BASE_URL` only when overriding Tradier's default API base URL.
+
 Run `options_provider_status` to see the configured vs. effective provider and whether mtdata is using authenticated or best-effort fallback access:
 
 ```bash
@@ -142,7 +145,7 @@ mtdata-cli options_heston_calibrate TSLA \
 | `--min-volume` | 0 | Min volume for contract selection |
 | `--max-contracts` | 25 | Max contracts used in calibration |
 | `--calendar` | `UnitedStates.NYSE` | QuantLib calendar name used for maturity assumptions |
-| `--maturity-basis` | `calendar_days` | Interpret days-to-expiry as `calendar_days` or `business_days` in the selected calendar |
+| `--maturity-basis` | `calendar_days` | Basis for the reported `days_to_expiry` diagnostic. The Heston helper maturity is always anchored to the contract's calendar expiry date. |
 
 **Heston parameters returned:**
 

@@ -26,6 +26,9 @@ def _summary_denoise_method(row: Dict[str, Any]) -> Dict[str, Any]:
         "method": row.get("method"),
         "available": bool(row.get("available", False)),
         "causality": list(causality) if isinstance(causality, list) else [],
+        "requires_causality_opt_in": bool(
+            row.get("requires_causality_opt_in", False)
+        ),
         "requires": row.get("requires") or None,
         "params": list(params),
     }
@@ -114,13 +117,21 @@ def denoise_list_methods(
                         if isinstance(row.get("supports"), dict)
                         else []
                     ),
+                    "requires_causality_opt_in": bool(
+                        row.get("requires_causality_opt_in", False)
+                    ),
                 }
                 for row in visible
             ]
             if compact_mode
             else [_summary_denoise_method(row) for row in visible]
         )
-        columns = ["method", "available", "causality"]
+        columns = [
+            "method",
+            "available",
+            "causality",
+            "requires_causality_opt_in",
+        ]
         if not compact_mode:
             columns.extend(["requires", "params"])
         out = {
@@ -128,10 +139,6 @@ def denoise_list_methods(
             "detail": detail_mode,
             "available_only": bool(available_only),
             "count": len(visible),
-            "total": len(methods),
-            "limit": limit_value,
-            "has_more": hidden > 0,
-            "methods_hidden": hidden,
             "pagination": build_pagination_meta(
                 total=len(methods),
                 returned=len(visible),
@@ -162,7 +169,10 @@ def denoise_list_methods(
 
 @mcp.tool()
 def denoise_describe(method: str) -> Dict[str, Any]:
-    """Describe one denoise method and its supported options."""
+    """Describe one denoise method and its supported options.
+
+    Use ``denoise_list_methods`` to browse method names available in this install.
+    """
 
     def _run() -> Dict[str, Any]:
         wanted = str(method or "").strip().lower()

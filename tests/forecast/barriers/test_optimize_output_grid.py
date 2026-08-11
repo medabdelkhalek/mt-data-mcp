@@ -309,6 +309,14 @@ class TestBarrierOptimizeOutputGrid(_BarrierTestBase):
                 viable_only=False,
             )
         self.assertTrue(result["success"])
+        self.assertEqual(
+            result["bridge_dual_barrier_model"],
+            "independent_single_barrier_approximation",
+        )
+        self.assertFalse(result["bridge_joint_first_passage"])
+        self.assertTrue(
+            any("sampled independently" in item for item in result["warnings"])
+        )
         grid = result.get("grid")
         self.assertTrue(grid)
         for entry in grid:
@@ -368,9 +376,10 @@ class TestBarrierOptimizeOutputGrid(_BarrierTestBase):
         self.assertEqual(result.get("status"), "ok")
         self.assertFalse(result.get("no_candidates"))
         self.assertTrue(result.get("viable"))
-        self.assertFalse(result.get("no_action"))
-        self.assertTrue(result.get("trade_gate_passed"))
-        self.assertEqual(result.get("actionability"), "actionable")
+        self.assertTrue(result.get("no_action"))
+        self.assertFalse(result.get("trade_gate_passed"))
+        self.assertFalse(result.get("tradable"))
+        self.assertIn("live_reference_quote_not_used", result["execution_blockers"])
         self.assertNotIn("ev_edge_conflict", result)
         best = result["best"]
         self.assertAlmostEqual(best["prob_win"], 1.0, places=7)

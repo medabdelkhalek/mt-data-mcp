@@ -215,6 +215,10 @@ class TestForecastBacktest:
                     "as_of": kwargs.get("as_of"),
                     "prefetched_len": len(prefetched) if prefetched is not None else None,
                     "prefetched_last_time": float(prefetched["time"].iloc[-1]) if prefetched is not None else None,
+                    "shares_source_memory": np.shares_memory(
+                        prefetched["close"].to_numpy(),
+                        df["close"].to_numpy(),
+                    ),
                 }
             )
             return {"forecast_price": [101.0] * 12}
@@ -235,11 +239,13 @@ class TestForecastBacktest:
                 "as_of": _format_time_minimal(float(df["time"].iloc[474])),
                 "prefetched_len": 475,
                 "prefetched_last_time": float(df["time"].iloc[474]),
+                "shares_source_memory": True,
             },
             {
                 "as_of": _format_time_minimal(float(df["time"].iloc[487])),
                 "prefetched_len": 488,
                 "prefetched_last_time": float(df["time"].iloc[487]),
+                "shares_source_memory": True,
             },
         ]
 
@@ -378,6 +384,20 @@ class TestForecastBacktest:
         assert result["denoise_usage"] == "research_only"
         assert result["history_policy_ok"] is False
         assert any("uses future observations" in warning for warning in result["warnings"])
+
+    @patch("mtdata.forecast.backtest._fetch_history")
+    def test_unsupported_denoise_causality_is_rejected(self, fetch):
+        fetch.return_value = _make_df(500)
+
+        result = forecast_backtest(
+            "EURUSD",
+            timeframe="H1",
+            methods=["naive"],
+            denoise={"method": "wavelet", "causality": "causal"},
+        )
+
+        assert result["error_code"] == "denoise_invalid_configuration"
+        assert "does not support causality='causal'" in result["error"]
 
     @patch("mtdata.forecast.backtest._fetch_history")
     def test_slippage_and_threshold(self, fetch):
@@ -570,6 +590,7 @@ class TestForecastBacktest:
 
 def test_performance_metrics_include_sortino_and_profit_factor():
     import numpy as np
+
     from mtdata.forecast.backtest import _compute_performance_metrics
     np.random.seed(1)
     returns = list(np.random.normal(0.001, 0.02, 60))

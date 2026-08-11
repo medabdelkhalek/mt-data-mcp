@@ -7,7 +7,6 @@ from src.mtdata.core.trading.safety import (
     _evaluate_account_risk_gate,
 )
 
-
 # ---------------------------------------------------------------------------
 # No-limits pass-through
 # ---------------------------------------------------------------------------
@@ -39,9 +38,22 @@ def test_margin_level_allows_sufficient():
     assert _evaluate_account_risk_gate(limits, account_info=acct) is None
 
 
-def test_margin_level_no_account_info_passes():
+def test_margin_level_no_account_info_fails_closed():
     limits = AccountRiskLimits(min_margin_level_pct=200.0)
-    assert _evaluate_account_risk_gate(limits, account_info=None) is None
+    result = _evaluate_account_risk_gate(limits, account_info=None)
+
+    assert result is not None
+    assert result["error_code"] == "account_snapshot_unavailable"
+    assert "snapshot is unavailable" in result["violations"][0].lower()
+
+
+def test_floating_loss_without_profit_field_fails_closed():
+    limits = AccountRiskLimits(max_floating_loss=500.0)
+    result = _evaluate_account_risk_gate(limits, account_info=SimpleNamespace())
+
+    assert result is not None
+    assert result["error_code"] == "account_snapshot_incomplete"
+    assert "snapshot is incomplete" in result["violations"][0].lower()
 
 
 def test_margin_level_allows_flat_account_with_zero_margin_level():
@@ -90,7 +102,7 @@ def test_floating_loss_ignores_positive_profit():
 def test_exposure_blocks_over_limit():
     limits = AccountRiskLimits(max_total_exposure_lots=5.0)
     result = _evaluate_account_risk_gate(
-        limits, existing_volume=4.0, new_volume=2.0,
+        limits, projected_exposure_lots=6.0,
     )
     assert result is not None
     assert "exposure" in result["violations"][0].lower()
@@ -99,7 +111,7 @@ def test_exposure_blocks_over_limit():
 def test_exposure_allows_within_limit():
     limits = AccountRiskLimits(max_total_exposure_lots=5.0)
     assert _evaluate_account_risk_gate(
-        limits, existing_volume=2.0, new_volume=2.5,
+        limits, projected_exposure_lots=4.5,
     ) is None
 
 
@@ -115,7 +127,7 @@ def test_multiple_violations():
     )
     acct = SimpleNamespace(margin_level=100.0, profit=-500.0)
     result = _evaluate_account_risk_gate(
-        limits, account_info=acct, existing_volume=2.0, new_volume=1.0,
+        limits, account_info=acct, projected_exposure_lots=3.0,
     )
     assert result is not None
     assert len(result["violations"]) == 3

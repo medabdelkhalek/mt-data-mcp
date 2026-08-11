@@ -14,11 +14,21 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 --method theta
 
 **Output:**
 ```
-forecast[12]{time,value}:
-    "2026-01-01 18:00",1.17569
-    "2026-01-01 19:00",1.17570
+forecast[12]{time,bar_state,value}:
+    "2026-01-01 18:00",forming,1.17569
+    "2026-01-01 19:00",future,1.17570
     ...
 ```
+
+Forecast row `time` is the target bar's **open timestamp**, while `value` is
+the predicted **bar close**. `bar_state` is `forming` when that target bar is
+already in progress, `future` before it opens, and `closed` when its wall-clock
+interval has elapsed. This is independent of the closed-bars-only input policy.
+
+For `analog` forecasts, compact output retains concise `component_status` and
+`ensemble_metrics` summaries. Raw analog paths, per-timeframe diagnostics, and
+component diagnostic blobs are available with `--detail standard`, `--detail full`,
+or `--extras diagnostics`.
 
 ---
 
@@ -52,7 +62,18 @@ forecast[12]{time,value}:
 ### Uncertainty
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--ci-alpha` | not requested | Request a confidence interval (0.05 = 95% CI) |
+| `--ci-alpha` | 0.05 | Confidence interval alpha (0.05 = 95% CI); use `null` in API payloads to omit intervals |
+
+Not every method can produce a native interval. When the requested interval is
+unavailable, the result is explicitly `signal_status: not_actionable` and keeps
+any model drift under `point_estimate_direction` instead of publishing a
+directional claim. Use `forecast_conformal_intervals` to calibrate empirical
+bands for point-only methods such as the native Theta fallback.
+
+When price intervals are available, `direction` is published only when the
+horizon interval excludes the last observed price. The neutral threshold is
+also scaled from recent absolute bar returns and the forecast horizon, with a
+minimum effect size of 0.05 percentage points.
 
 ### Pipeline
 | Parameter | Description |
@@ -143,7 +164,7 @@ Foundation models pre-trained on large time series datasets.
 
 On the supported Python 3.14 install path:
 - `chronos2` and `chronos_bolt` are part of the package-index install path
-- `timesfm` remains a Git-backed extra
+- `timesfm` uses the package-index 2.x release via its dedicated extra
 
 ```bash
 mtdata-cli forecast_generate EURUSD --library pretrained --method chronos2
@@ -211,7 +232,7 @@ mtdata-cli forecast_generate EURUSD --library mlforecast --method LGBMRegressor
 | Model | Description | Example Params |
 |-------|-------------|----------------|
 | `analog` | Historical pattern matching | `window_size=64 top_k=20` |
-| `ensemble` | Combine multiple methods | `{"methods":["theta","naive"],"mode":"bma"}` |
+| `ensemble` | Combine multiple methods | `{"methods":["theta","naive"],"mode":"rmse_weighted"}` |
 
 ### Foundation
 
@@ -264,9 +285,9 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
 
 `ensemble` combines multiple base methods. Common `--params` keys:
 - `methods` (list): component methods to run
-- `mode` (str): `average`, `bma`, or `stacking`
+- `mode` (str): `average`, `rmse_weighted`, or `stacking`
 - `weights` (list): manual weights (only used when `mode=average`)
-- `cv_points` (int): walk-forward anchors used for `bma`/`stacking` weighting
+- `cv_points` (int): walk-forward anchors used for `rmse_weighted`/`stacking` weighting
 - `method_params` (dict): per-method parameter overrides
 - `expose_components` (bool): include component forecasts in the JSON output
 
@@ -274,9 +295,9 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
 mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
   --method ensemble --params '{"methods":["theta","naive","arima"],"mode":"average"}'
 
-# Bayesian model averaging (weights inferred from walk-forward CV)
+# RMSE-weighted blend (weights inferred from walk-forward CV)
 mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
-  --method ensemble --params '{"methods":["theta","naive","fourier_ols"],"mode":"bma","cv_points":12}'
+  --method ensemble --params '{"methods":["theta","naive","fourier_ols"],"mode":"rmse_weighted","cv_points":12}'
 ```
 
 ---
@@ -285,11 +306,14 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
 
 | Field | Description |
 |-------|-------------|
-| `forecast` | Compact rows for forecast points; each row uses `time` and `value` |
+| `forecast` | Compact rows with target-bar `time`, `bar_state`, and `value` |
+| `data_window` | Closed-history anchor plus forecast timestamp/value semantics and first target-bar state |
 | `forecast_price` | Predicted price values |
 | `forecast_return` | Predicted return values when `quantity=return` |
-| `lower` | Lower confidence bound (if `--ci-alpha`) |
-| `upper` | Upper confidence bound (if `--ci-alpha`) |
+| `lower_price` | Lower confidence bound for price forecasts (if available) |
+| `upper_price` | Upper confidence bound for price forecasts (if available) |
+| `forecast_vs_last_price` | Horizon move, volatility-aware threshold, and confirmed or suppressed direction metadata |
+| `signal_status` | `not_actionable` when uncertainty cannot confirm a directional point estimate |
 | `trend` | Detected trend direction (if available) |
 | `method` | Method used |
 | `params_used` | Actual parameters applied |

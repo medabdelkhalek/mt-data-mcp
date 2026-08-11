@@ -118,7 +118,7 @@ def _should_drop_last_pattern_bar(
     )
 
 
-def _fetch_pattern_data(
+def _fetch_pattern_data(  # noqa: C901
     symbol: str,
     timeframe: str,
     limit: int,
@@ -351,7 +351,7 @@ def _patterns_detect_deps() -> PatternsDetectDeps:
     )
 
 
-def _build_pattern_response(
+def _build_pattern_response(  # noqa: C901
     symbol: str,
     timeframe: str,
     limit: int,
@@ -364,9 +364,9 @@ def _build_pattern_response(
     detail: PatternsDetailLiteral = "compact",
 ) -> Dict[str, Any]:
     """Build the response dict for pattern detection results."""
-    # Harmonic detectors report completed Fibonacci structures only. Treat
-    # those completions as the mode's primary findings instead of applying the
-    # forming-only visibility policy used by lifecycle-aware detectors.
+    # Harmonic candidates have both forming and completed lifecycle states.
+    # Treat both as the mode's primary findings rather than applying the
+    # forming-only visibility policy used by the other detectors.
     include_completed = bool(include_completed or str(mode).lower() == "harmonic")
     # Filter patterns based on include_completed
     filtered = _visible_pattern_rows(patterns, include_completed=include_completed)
@@ -837,8 +837,15 @@ def _format_harmonic_patterns(
             is_recent = age_bars < recent_bars
             row["age_bars"] = age_bars
             row["is_recent"] = is_recent
-            row["signal_eligible"] = is_recent
-            row["bias_scope"] = "current" if is_recent else "historical_structure"
+            signal_eligible = is_recent and str(p.status).lower() == "completed"
+            row["signal_eligible"] = signal_eligible
+            row["bias_scope"] = (
+                "current"
+                if signal_eligible
+                else "provisional_structure"
+                if is_recent
+                else "historical_structure"
+            )
             if target_1 is not None:
                 row["target_price"] = float(target_1)
                 row["target_price_1"] = float(target_1)
@@ -1342,8 +1349,8 @@ def patterns_detect(
     min_strength : float, optional (default=0.70)
         Minimum semantic conviction threshold (0.0 to 1.0). This filters on a
         normalized candlestick strength score that combines pattern reliability,
-        multi-bar span, and any raw detector bonus rather than raw pandas_ta
-        signal magnitude alone.
+        multi-bar span, body/range geometry, directional close location, and
+        range expansion. Backend-native detector magnitude is diagnostic only.
     
     min_gap : int, optional (default=3)
         Minimum gap between patterns (in bars)
@@ -1417,8 +1424,8 @@ def patterns_detect(
     
     include_completed : bool, optional (default=False)
         Include completed structures alongside forming results. Harmonic mode
-        always returns its completed structures because it has no forming
-        lifecycle output.
+        returns both forming and completed candidates because both are its
+        primary findings.
     
     Returns:
     --------

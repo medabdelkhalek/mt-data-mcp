@@ -40,7 +40,7 @@ class ForecastGenerateRequest(BaseModel):
     params: Optional[Dict[str, Any]] = None
     ci_alpha: Optional[float] = Field(
         0.05,
-        ge=0.0,
+        gt=0.0,
         le=0.5,
         description=(
             "Interval tail probability; confidence is 1 - ci_alpha. Defaults "
@@ -59,7 +59,10 @@ class ForecastGenerateRequest(BaseModel):
     target_spec: Optional[Dict[str, Any]] = None
     async_mode: bool = Field(
         False,
-        description="When True, heavy methods submit a background training task and return a task_id instead of blocking.",
+        description=(
+            "When True, trainable methods submit a background training task and "
+            "return a task_id. Non-trainable inference methods reject this flag."
+        ),
     )
     model_id: Optional[str] = Field(
         None,
@@ -111,7 +114,14 @@ class ForecastBacktestRequest(BaseModel):
     )
     start: Optional[str] = None
     end: Optional[str] = None
-    methods: Optional[List[str]] = None
+    methods: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Forecast methods to search. When omitted, uses fast classical "
+            "baselines only. Pass neural or foundation methods explicitly; they "
+            "may initialize large models or download model assets."
+        ),
+    )
     params_per_method: Optional[Dict[str, Any]] = None
     quantity: Literal["price", "return", "volatility"] = "price"
     denoise: Optional[DenoiseSpec] = None
@@ -166,7 +176,7 @@ class StrategyBacktestRequest(BaseModel):
     oversold: float = Field(30.0, gt=0.0, lt=100.0)
     overbought: float = Field(70.0, gt=0.0, lt=100.0)
     max_hold_bars: Optional[int] = Field(None, ge=1)
-    cost_model: Literal["current_spread_proxy", "fixed"] = "current_spread_proxy"
+    cost_model: Literal["historical_bar_spread", "fixed"] = "historical_bar_spread"
     spread_bps: Optional[float] = Field(None, ge=0.0)
     slippage_bps: float = 1.0
 
@@ -176,6 +186,8 @@ class StrategyBacktestRequest(BaseModel):
             raise ValueError("fast_period must be less than slow_period")
         if self.oversold >= self.overbought:
             raise ValueError("oversold must be less than overbought")
+        if self.cost_model == "historical_bar_spread" and self.spread_bps is not None:
+            raise ValueError("spread_bps is only valid with cost_model='fixed'")
         return self
 
 
@@ -192,13 +204,14 @@ class ForecastConformalIntervalsRequest(BaseModel):
     )
     spacing: int = Field(20, ge=1, le=MAX_BACKTEST_SPACING, description="Bars between consecutive calibration anchors.")
     ci_alpha: float = Field(
-        0.1,
+        0.05,
         gt=0.0,
         lt=1.0,
         description=(
             "Residual-quantile alpha for rolling-backtest absolute-error bands "
-            "(not a true conformal coverage guarantee). 0.10 ≈ 90% empirical "
-            "target, 0.05 ≈ 95%. Values outside 0.05-0.20 are warned."
+            "(not a true conformal coverage guarantee). Defaults to 0.05, the "
+            "same 95% target used by forecast_generate; 0.10 targets 90%. "
+            "Values outside 0.05-0.20 are warned."
         ),
     )
     denoise: Optional[DenoiseSpec] = None

@@ -15,17 +15,26 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from ._helpers import (
-    _UTC, _NOW_TS,
-    _mt5_mock,
-    _mock_symbol_guard, _mock_symbol_guard_error,
-    _make_rates, _make_rates_array,
-    _DS, _GUARD, _RATES_FROM, _RATES_RANGE,
-    _CACHED_INFO, _RESOLVE_CTZ, _PARSE_START,
-    _ESTIMATE_WARMUP, _MT5_CONFIG,
-)
-
 from mtdata.services.data_service import fetch_candles
+
+from ._helpers import (
+    _CACHED_INFO,
+    _DS,
+    _ESTIMATE_WARMUP,
+    _GUARD,
+    _MT5_CONFIG,
+    _NOW_TS,
+    _PARSE_START,
+    _RATES_FROM,
+    _RATES_RANGE,
+    _RESOLVE_CTZ,
+    _UTC,
+    _make_rates,
+    _make_rates_array,
+    _mock_symbol_guard,
+    _mock_symbol_guard_error,
+    _mt5_mock,
+)
 
 
 class TestFetchCandlesCore(unittest.TestCase):
@@ -34,6 +43,21 @@ class TestFetchCandlesCore(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # Success paths                                                        #
     # ------------------------------------------------------------------ #
+
+    def test_noncausal_denoise_fails_before_fetch_with_actionable_error(self):
+        result = fetch_candles("EURUSD", denoise="wavelet")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(
+            result["error_code"],
+            "denoise_non_causal_requires_opt_in",
+        )
+        self.assertNotIn("Error getting rates", result["error"])
+        self.assertIn(
+            "--denoise-params causality=zero_phase",
+            result["remediation"],
+        )
+        self.assertTrue(result["details"]["uses_future_bars"])
 
     @patch(_MT5_CONFIG)
     @patch(_RATES_FROM)
@@ -203,17 +227,40 @@ class TestFetchCandlesCore(unittest.TestCase):
         result = fetch_candles('EURUSD', limit=5, ohlcv='C', include_spread=True)
         self.assertTrue(result.get('success'))
         row_keys = list(result['data'][0].keys())
-        self.assertEqual(row_keys, ['time', 'close', 'spread', 'spread_points'])
+        self.assertEqual(
+            row_keys,
+            ['time', 'close', 'spread', 'spread_points', 'spread_available'],
+        )
         self.assertEqual(result['data'][0]['spread'], 0.00001)
         self.assertEqual(result['data'][0]['spread_points'], 1)
+        self.assertTrue(result['data'][0]['spread_available'])
         self.assertEqual(result['units']['spread'], 'absolute_price')
         self.assertEqual(result['units']['spread_points'], 'broker_points')
         self.assertEqual(result['spread_source'], 'mt5_candle')
+        self.assertEqual(result['spread_mode'], 'per_bar')
+        self.assertEqual(result['spread_historical_coverage_pct'], 100.0)
+        self.assertEqual(result['spread_missing_count'], 0)
 
+    @patch(
+        f'{_DS}._live_tick_spread_reference',
+        return_value=(
+            0.00009,
+            {
+                'reference_time': None,
+                'reference_time_epoch': None,
+                'data_age_seconds': None,
+                'freshness_state': 'unknown',
+                'usable_for_live_trading': False,
+            },
+        ),
+    )
     @patch(f'{_DS}.fetch_ticks')
     @patch(_MT5_CONFIG)
     @patch(_RATES_FROM)
-    @patch(_CACHED_INFO, return_value=MagicMock())
+    @patch(
+        _CACHED_INFO,
+        return_value=SimpleNamespace(digits=5, point=0.00001),
+    )
     @patch(_RESOLVE_CTZ, return_value=None)
     @patch(_ESTIMATE_WARMUP, return_value=0)
     @patch(_GUARD, _mock_symbol_guard)
@@ -225,33 +272,87 @@ class TestFetchCandlesCore(unittest.TestCase):
         mock_from,
         mock_cfg,
         mock_fetch_ticks,
+        mock_live_spread,
     ):
         mock_cfg.get_time_offset_seconds.return_value = 0
         mock_from.return_value = _make_rates(10, spread=0)
-        mock_fetch_ticks.return_value = {
-            'stats': {
-                'spread': {
-                    'mean': 0.00009,
-                },
-            },
-        }
-
         result = fetch_candles('EURUSD', limit=5, ohlcv='C', include_spread=True)
 
         self.assertTrue(result.get('success'))
         row = result['data'][0]
-        self.assertNotIn('spread', row)
+        self.assertIsNone(row['spread'])
+        self.assertIsNone(row['spread_points'])
+        self.assertFalse(row['spread_available'])
         self.assertFalse(result['spread_historical_available'])
-        self.assertNotIn('spread', result.get('units', {}))
-        self.assertNotIn('spread_points', result.get('units', {}))
+        self.assertEqual(result['spread_mode'], 'single_reference')
+        self.assertEqual(result['spread_source'], 'live_ticker')
+        self.assertEqual(result['spread_historical_source'], 'mt5_candle')
+        self.assertEqual(result['spread_historical_coverage_pct'], 0.0)
+        self.assertEqual(result['spread_missing_count'], 5)
+        self.assertEqual(result['units']['spread'], 'absolute_price')
+        self.assertEqual(result['units']['spread_points'], 'broker_points')
         self.assertEqual(
             result['spread_reference'],
             {
                 'value': 0.00009,
                 'unit': 'price',
-                'source': 'tick_stats',
+                'source': 'live_ticker',
                 'basis': 'single_reference_not_per_bar_historical',
+                'reference_time': None,
+                'reference_time_epoch': None,
+                'data_age_seconds': None,
+                'freshness_state': 'unknown',
+                'usable_for_live_trading': False,
             },
+        )
+        spread_warnings = [
+            item for item in result.get('warnings', [])
+            if 'include_spread requested' in item
+        ]
+        self.assertEqual(len(spread_warnings), 1)
+        mock_live_spread.assert_called_once_with('EURUSD')
+        mock_fetch_ticks.assert_not_called()
+
+    @patch(_MT5_CONFIG)
+    @patch(_RATES_FROM)
+    @patch(
+        _CACHED_INFO,
+        return_value=SimpleNamespace(digits=5, point=0.00001),
+    )
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_ESTIMATE_WARMUP, return_value=0)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_mixed_historical_spread_marks_only_zero_rows_unavailable(
+        self,
+        mock_warmup,
+        mock_ctz,
+        mock_info,
+        mock_from,
+        mock_cfg,
+    ):
+        mock_cfg.get_time_offset_seconds.return_value = 0
+        rates = _make_rates(10)
+        for index, row in enumerate(rates):
+            if index % 2:
+                row['spread'] = 0
+        mock_from.return_value = rates
+
+        result = fetch_candles('EURUSD', limit=5, ohlcv='C', include_spread=True)
+
+        self.assertTrue(result.get('success'))
+        self.assertFalse(result['spread_historical_available'])
+        self.assertEqual(result['spread_mode'], 'partial_per_bar')
+        self.assertGreater(result['spread_historical_coverage_pct'], 0.0)
+        self.assertLess(result['spread_historical_coverage_pct'], 100.0)
+        self.assertGreater(result['spread_missing_count'], 0)
+        self.assertLess(result['spread_missing_count'], len(result['data']))
+        unavailable_rows = [
+            row for row in result['data'] if not row['spread_available']
+        ]
+        self.assertTrue(unavailable_rows)
+        self.assertTrue(all(row['spread'] is None for row in unavailable_rows))
+        self.assertTrue(
+            all(row['spread_points'] is None for row in unavailable_rows)
         )
 
     @patch(_MT5_CONFIG)
@@ -355,13 +456,13 @@ class TestFetchCandlesCore(unittest.TestCase):
             result = fetch_candles('EURUSD', timeframe='H1', limit=5, time_as_epoch=True)
         self.assertTrue(result.get('success'))
         returned_times = [row['time'] for row in result.get('data', [])]
-        self.assertIn(base_ts, returned_times)
-        self.assertEqual(returned_times[-1], base_ts)
+        self.assertNotIn(base_ts, returned_times)
+        self.assertEqual(returned_times[-1], base_ts - 3600)
         self.assertNotIn('last_candle_open', result)
-        self.assertFalse(result['has_forming_candle'])
-        self.assertEqual(result['forming_candle_status'], 'none')
+        self.assertTrue(result['has_forming_candle'])
+        self.assertEqual(result['forming_candle_status'], 'skipped')
         self.assertFalse(result['forming_candle_included'])
-        self.assertFalse(result['forming_candle_skipped'])
+        self.assertTrue(result['forming_candle_skipped'])
 
     @patch(_MT5_CONFIG)
     @patch(_RATES_FROM)
@@ -380,15 +481,15 @@ class TestFetchCandlesCore(unittest.TestCase):
         self.assertTrue(result.get('success'))
         returned_times = [row['time'] for row in result.get('data', [])]
         self.assertEqual(len(returned_times), 5)
-        self.assertEqual(returned_times[0], base_ts - (4 * 3600))
-        self.assertEqual(returned_times[-1], base_ts)
+        self.assertEqual(returned_times[0], base_ts - (5 * 3600))
+        self.assertEqual(returned_times[-1], base_ts - 3600)
         self.assertEqual(result['candles'], 5)
         self.assertEqual(result['candles_excluded'], 0)
-        self.assertEqual(result['incomplete_candles_skipped'], 0)
-        self.assertFalse(result['has_forming_candle'])
-        self.assertEqual(result['forming_candle_status'], 'none')
+        self.assertEqual(result['incomplete_candles_skipped'], 1)
+        self.assertTrue(result['has_forming_candle'])
+        self.assertEqual(result['forming_candle_status'], 'skipped')
         self.assertFalse(result['forming_candle_included'])
-        self.assertFalse(result['forming_candle_skipped'])
+        self.assertTrue(result['forming_candle_skipped'])
 
     @patch(_MT5_CONFIG)
     @patch(_RATES_FROM)
@@ -683,7 +784,7 @@ class TestFetchCandlesCore(unittest.TestCase):
             include_incomplete=True,
         )
 
-        self.assertTrue(result.get('success'))
+        self.assertTrue(result.get('success'), result)
         self.assertEqual(result['candles'], 4)
         times = [float(row['time']) for row in result['data']]
         self.assertEqual(times, sorted(times))
@@ -774,13 +875,15 @@ class TestFetchCandlesCore(unittest.TestCase):
         self.assertTrue(result.get('success'))
         self.assertNotIn('error', result)
         freshness = result['meta']['diagnostics']['freshness']
+        expected_end_epoch = float(to_date.timestamp() + (24 * 60 * 60) - 1e-6)
+        last_bar_epoch = float(to_date.timestamp() - (9 * 60 * 60))
         self.assertEqual(
             freshness,
             {
-                'last_bar_epoch': float(to_date.timestamp() - (10 * 60 * 60)),
-                'expected_end_epoch': float(to_date.timestamp()),
-                'freshness_cutoff_epoch': float(to_date.timestamp() - (4 * 60 * 60)),
-                'data_freshness_seconds': float(10 * 60 * 60),
+                'last_bar_epoch': last_bar_epoch,
+                'expected_end_epoch': expected_end_epoch,
+                'freshness_cutoff_epoch': expected_end_epoch - (4 * 60 * 60),
+                'data_freshness_seconds': round(expected_end_epoch - last_bar_epoch),
                 'last_bar_within_policy_window': False,
                 'data_freshness_anchor': 'query_expected_end',
                 'data_freshness_metric': 'requested_range_end_gap_seconds',
@@ -820,7 +923,12 @@ class TestFetchCandlesCore(unittest.TestCase):
         self.assertNotIn('error', result)
         freshness = result['meta']['diagnostics']['freshness']
         self.assertFalse(freshness['last_bar_within_policy_window'])
-        self.assertEqual(freshness['data_freshness_seconds'], float(10 * 60 * 60))
+        expected_end_epoch = float(to_date.timestamp() + (24 * 60 * 60) - 1e-6)
+        last_bar_epoch = float(to_date.timestamp() - (9 * 60 * 60))
+        self.assertEqual(
+            freshness['data_freshness_seconds'],
+            round(expected_end_epoch - last_bar_epoch),
+        )
 
     # ------------------------------------------------------------------ #
     # Start / End datetime queries                                         #
@@ -838,21 +946,78 @@ class TestFetchCandlesCore(unittest.TestCase):
         mock_range.return_value = _make_rates(20, base_ts=base + 20 * 60, step=60)
         result = fetch_candles('EURUSD', limit=100, start='2025-01-01', end='2025-01-01 00:20')
         self.assertTrue(result.get('success'))
+        self.assertEqual(
+            result['query_applied'],
+            {
+                'mode': 'range',
+                'timeframe': 'H1',
+                'limit': 100,
+                'start': '2025-01-01',
+                'resolved_start': '2025-01-01T00:00:00Z',
+                'start_bound': 'inclusive_day_start',
+                'end': '2025-01-01 00:20',
+                'resolved_end': '2025-01-01T00:20:00Z',
+                'end_bound': 'inclusive_instant',
+            },
+        )
 
     @patch(_MT5_CONFIG)
-    @patch(_RATES_FROM)
+    @patch(_RATES_RANGE)
     @patch(_CACHED_INFO, return_value=MagicMock())
     @patch(_RESOLVE_CTZ, return_value=None)
     @patch(_ESTIMATE_WARMUP, return_value=0)
     @patch(_GUARD, _mock_symbol_guard)
-    def test_start_only(self, mock_warmup, mock_ctz, mock_info, mock_from, mock_cfg):
-        # start-only queries fetch recent bars via copy_rates_from (bounded by limit),
-        # not a full open-ended range fetch.
+    def test_future_range_end_does_not_mark_live_bar_complete(
+        self,
+        mock_warmup,
+        mock_ctz,
+        mock_info,
+        mock_range,
+        mock_cfg,
+    ):
         mock_cfg.get_time_offset_seconds.return_value = 0
-        mock_from.return_value = _make_rates(20)
+        bar_18 = datetime(2026, 8, 6, 18, tzinfo=_UTC).timestamp()
+        live_now = datetime(2026, 8, 6, 21, 34, tzinfo=_UTC).timestamp()
+        mock_range.return_value = _make_rates(
+            4,
+            base_ts=bar_18 + (3 * 3600),
+            step=3600,
+        )
+
+        with patch(
+            f'{_DS}._resolve_live_bar_reference_epoch',
+            return_value=live_now,
+        ):
+            result = fetch_candles(
+                'EURUSD',
+                timeframe='H1',
+                limit=100,
+                start='2026-08-06T18:00:00Z',
+                end='2026-08-06T22:00:00Z',
+                time_as_epoch=True,
+            )
+
+        self.assertTrue(result.get('success'), result)
+        returned_times = [row['time'] for row in result['data']]
+        self.assertNotIn(bar_18 + (3 * 3600), returned_times)
+        self.assertEqual(returned_times[-1], bar_18 + (2 * 3600))
+        self.assertEqual(result['forming_candle_status'], 'skipped')
+        self.assertTrue(result['forming_candle_skipped'])
+        self.assertTrue(result['data_window']['latest_bar_complete'])
+
+    @patch(_MT5_CONFIG)
+    @patch(_RATES_RANGE)
+    @patch(_CACHED_INFO, return_value=MagicMock())
+    @patch(_RESOLVE_CTZ, return_value=None)
+    @patch(_ESTIMATE_WARMUP, return_value=0)
+    @patch(_GUARD, _mock_symbol_guard)
+    def test_start_only(self, mock_warmup, mock_ctz, mock_info, mock_range, mock_cfg):
+        # start-only queries return the first bounded window after start.
+        mock_cfg.get_time_offset_seconds.return_value = 0
+        mock_range.return_value = _make_rates(20)
         result = fetch_candles('EURUSD', limit=5, start='2025-01-01')
         self.assertTrue(result.get('success'))
-        mock_from.assert_called()
+        mock_range.assert_called()
 
     @patch(_MT5_CONFIG)
     @patch(_RATES_FROM)

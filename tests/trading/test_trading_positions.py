@@ -85,6 +85,28 @@ def test_normalize_trade_read_output_open_positions_includes_as_of():
     assert isinstance(out.get("as_of"), str) and out["as_of"].endswith("Z")
 
 
+def test_open_position_protection_summary_surfaces_missing_levels():
+    out = {
+        "success": True,
+        "items": [
+            {"ticket": 1, "sl": 0.0, "tp": 1.2},
+            {"ticket": 2, "sl": None, "tp": 0.0},
+            {"ticket": 3, "sl": 1.0, "tp": 1.3},
+        ],
+    }
+
+    positions._attach_open_position_protection_summary(out)
+
+    assert out["protection_summary"] == {
+        "positions": 3,
+        "positions_without_stop_loss": 2,
+        "positions_without_take_profit": 1,
+        "positions_missing_any_protection": 2,
+        "fully_unprotected_positions": 1,
+    }
+    assert "2 open position(s)" in out["protection_warning"]
+
+
 def test_normalize_trade_read_output_compact_empty_keeps_contract_shape():
     out = positions._normalize_trade_read_output(
         [],
@@ -494,20 +516,20 @@ def test_resolve_open_position_magic_filter_hedged():
     assert info.get("magic_filter") == 1000
 
 
-def test_resolve_open_position_magic_no_match_falls_through():
-    """If no position matches the magic filter, still resolves via other criteria."""
+def test_resolve_open_position_magic_no_match_returns_none():
+    """An explicit magic number is a hard strategy-ownership filter."""
     all_positions = [
         SimpleNamespace(ticket=100, identifier=100, position_id=None, position=None, order=None, deal=None,
                         symbol="EURUSD", type=0, volume=0.1, magic=1000, time_update_msc=5000),
     ]
     mt5 = _HedgedFakeMt5(all_positions)
 
-    # Magic 9999 doesn't match, but position still found via symbol/side/volume
     pos, ticket, info = positions._resolve_open_position(
         mt5, symbol="EURUSD", side="BUY", volume=0.1, magic=9999,
     )
-    assert pos is not None
-    assert pos.ticket == 100
+    assert pos is None
+    assert ticket is None
+    assert info["magic_filter"] == 9999
 
 
 def test_select_position_candidate_ticket_candidates_disambiguates():

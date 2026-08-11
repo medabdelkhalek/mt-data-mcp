@@ -59,10 +59,14 @@ _COMPACT_TICK_TOP_LEVEL_FIELDS = (
     "spread_statistics_basis",
     "freshness",
     "freshness_state",
+    "freshness_reason",
     "data_age_seconds",
     "data_age_anchor",
     "data_age_metric",
     "data_stale",
+    "timestamp_in_future",
+    "timestamp_skew_seconds",
+    "timestamp_warning",
     "history_policy_ok",
     "usable_for_live_trading",
     "usable_for_live_trading_basis",
@@ -205,41 +209,6 @@ def _run_data_fetch_candles_impl(
         allow_stale=request.allow_stale,
     )
     result = _normalize_candle_query_error(result, request=request)
-    # Detect missing or all-zero spread when include_spread requested.
-    # MT5 often only reports spread at tick level; aggregated higher-timeframe bars may show spread==0.
-    if isinstance(result, dict) and getattr(request, "include_spread", False):
-        data = result.get("data")
-        if isinstance(data, list) and len(data) > 0:
-            has_spread_values = False
-            spread_all_zero = True
-            for bar in data:
-                if isinstance(bar, dict):
-                    spread_value = bar.get("spread_points", bar.get("spread"))
-                    if spread_value is not None:
-                        has_spread_values = True
-                        try:
-                            if float(spread_value) != 0.0:
-                                spread_all_zero = False
-                                break
-                        except Exception:
-                            # non-numeric spread; treat as available
-                            has_spread_values = True
-                            spread_all_zero = False
-                            break
-                # If bars are lists/sequences, skip detection here.
-            if not has_spread_values:
-                # No spread values present at all
-                result.setdefault("warnings", []).append(
-                    "include_spread requested but returned bars do not contain "
-                    "spread or spread_points values; spread unavailable at this "
-                    "timeframe or source."
-                )
-                result["spread_unavailable"] = True
-            elif spread_all_zero:
-                result.setdefault("warnings", []).append(
-                    "include_spread requested but all returned spread values are zero; spread likely unavailable at this timeframe/source."
-                )
-                result["spread_unavailable"] = True
     detail_mode = str(request.detail or "compact").strip().lower()
     if isinstance(result, dict):
         if bool(getattr(request, "explain_indicators", False)):
@@ -345,6 +314,12 @@ def _normalize_candle_query_error(
         remediation = (
             "Use the broker's exact MT5 symbol name; call market_ticker for symbol "
             "discovery when the broker uses suffixes or aliases."
+        )
+    elif "could not parse date" in normalized or "invalid date" in normalized:
+        error_code = "data_fetch_candles_invalid_date"
+        remediation = (
+            "Use an ISO 8601 date or timestamp, for example 2026-08-03 or "
+            "2026-08-03T14:30:00Z."
         )
     elif (
         "start_datetime must be before end_datetime" in normalized
@@ -495,24 +470,42 @@ def _apply_range_limit_cap(result: Dict[str, Any], *, limit: int) -> None:
     except Exception:
         return
     available = len(data)
-    if available <= limit_value:
+    provider_bounded = bool(query.get("provider_bounded"))
+    if available <= limit_value and not provider_bounded:
         return
 
-    retained = data[-limit_value:]
+    retained = data[-limit_value:] if available > limit_value else data
     result["data"] = retained
     result["count"] = len(retained)
-    result["available_count"] = available
     result["limit_applied"] = limit_value
     result["truncated"] = True
     result["truncation"] = {
         "reason": "limit",
         "retained": "last",
-        "excluded_count": available - len(retained),
     }
-    result.setdefault("warnings", []).append(
-        f"Range contained {available} bars; returned the latest {len(retained)} "
-        f"because limit={limit_value}. Set limit>={available} to return the full range."
-    )
+    if available > limit_value:
+        result["available_count"] = available
+        result["truncation"]["excluded_count"] = available - len(retained)
+        warning = (
+            f"Fetched range contained {available} bars; returned the latest "
+            f"{len(retained)} because limit={limit_value}."
+        )
+    else:
+        result["truncation"]["excluded_count"] = None
+        warning = (
+            "The requested range began before the bounded provider window; "
+            f"returned up to the latest {limit_value} bars. Increase limit or "
+            "move the range start forward to retrieve an earlier page."
+        )
+    result.setdefault("warnings", []).append(warning)
+    data_window = result.get("data_window")
+    if isinstance(data_window, dict) and retained:
+        first_row = retained[0]
+        last_row = retained[-1]
+        if isinstance(first_row, dict) and first_row.get("time") is not None:
+            data_window["start"] = first_row["time"]
+        if isinstance(last_row, dict) and last_row.get("time") is not None:
+            data_window["end"] = last_row["time"]
     candle_counts = result.get("candle_counts")
     if isinstance(candle_counts, dict):
         candle_counts["returned"] = len(retained)
@@ -520,8 +513,9 @@ def _apply_range_limit_cap(result: Dict[str, Any], *, limit: int) -> None:
         if not isinstance(excluded, dict):
             excluded = {}
             candle_counts["excluded"] = excluded
-        excluded["limit_truncated"] = max(0, available - len(retained))
-        excluded["total"] = int(excluded.get("total") or 0) + max(0, available - len(retained))
+        excluded_count = max(0, available - len(retained))
+        excluded["limit_truncated"] = excluded_count
+        excluded["total"] = int(excluded.get("total") or 0) + excluded_count
     query["limit_applied_to_range"] = True
     query["available_rows_before_limit"] = available
     query["returned_rows_after_limit"] = len(retained)
@@ -549,6 +543,17 @@ def _compact_candles_payload(
 ) -> Dict[str, Any]:
     compact = dict(result)
     public_diagnostics = _public_candle_diagnostics(result)
+    try:
+        requested_count = int(result["candles_requested"])
+        returned_count = int(compact["count"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    else:
+        if requested_count >= 0 and returned_count >= 0:
+            # Compact responses omit the detailed exclusion breakdown, but a
+            # caller must still be able to distinguish a complete response
+            # from one shortened by the source, filters, or a forming bar.
+            compact["limit_satisfied"] = returned_count >= requested_count
     for key in (
         "candles_requested",
         "candle_counts",
@@ -560,9 +565,7 @@ def _compact_candles_payload(
         "bar_time_convention",
         "meta",
         "raw_time_basis",
-        "time_basis",
         "time_normalization",
-        "timestamp_mode",
         "broker_server_tz",
         "broker_utc_offset_seconds",
         "timezone_note",
@@ -709,7 +712,6 @@ def _slim_projected_candles_payload(payload: Dict[str, Any]) -> None:
         payload.pop("spread_unavailable", None)
     _filter_candle_units_to_projected_fields(payload, projected_fields)
     if not bool(payload.get("forming_candle_included")):
-        payload.pop("forming_candle_status", None)
         payload.pop("has_forming_candle", None)
         payload.pop("forming_candle_included", None)
         payload.pop("forming_candle_skipped", None)
@@ -908,7 +910,7 @@ def _candle_summary_statistics(rows: List[Any]) -> Dict[str, Any]:
     return stats
 
 
-def _public_candle_diagnostics(result: Dict[str, Any]) -> Dict[str, Any]:
+def _public_candle_diagnostics(result: Dict[str, Any]) -> Dict[str, Any]:  # noqa: C901
     meta = result.get("meta")
     diagnostics = meta.get("diagnostics") if isinstance(meta, dict) else None
     if not isinstance(diagnostics, dict):
@@ -1190,7 +1192,7 @@ def _attach_tick_pagination(payload: Any, *, requested_limit: int) -> None:
     """Echo the requested limit and disclose whether the source cap was reached."""
     if not isinstance(payload, dict) or payload.get("error"):
         return
-    count = payload.get("count")
+    count = payload.get("tick_count", payload.get("count"))
     if not isinstance(count, int):
         return
     try:
@@ -1219,7 +1221,6 @@ def _compact_tick_rows_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if key in payload and payload[key] not in (None, "", [], {})
     }
     rows = compact.get("data")
-    price_point = _tick_price_point(payload)
     if isinstance(rows, list):
         compact_rows: List[Any] = []
         last_spread: Optional[float] = None
@@ -1227,7 +1228,6 @@ def _compact_tick_rows_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             compact_row, row_spread = _compact_tick_row(
                 row,
                 last_spread=last_spread,
-                price_point=price_point,
             )
             if row_spread is not None:
                 last_spread = row_spread
@@ -1255,13 +1255,6 @@ def _compact_tick_rows_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         for field in ("bid", "ask", "mid", "spread"):
             if any(isinstance(row, dict) and field in row for row in compact["data"]):
                 compact_units.setdefault(field, "absolute_price")
-        for field, unit in (
-            ("spread_points", "broker_points"),
-            ("spread_pips", "pips"),
-            ("spread_pct", "percentage_points (1.0 = 1%)"),
-        ):
-            if any(isinstance(row, dict) and field in row for row in compact["data"]):
-                compact_units.setdefault(field, unit)
         if compact_units:
             compact["units"] = compact_units
         compact["volume_fields"] = [
@@ -1323,7 +1316,6 @@ def _compact_tick_row(
     row: Any,
     *,
     last_spread: Optional[float] = None,
-    price_point: Optional[float] = None,
 ) -> tuple[Any, Optional[float]]:
     if not isinstance(row, dict):
         return row, None
@@ -1337,10 +1329,18 @@ def _compact_tick_row(
     spread = row.get("spread")
     if spread in (None, ""):
         spread = _tick_row_spread(row.get("bid"), row.get("ask"))
-    compact["spread"] = spread if spread not in ("",) else None
     bid = _tick_row_price(row.get("bid"))
     ask = _tick_row_price(row.get("ask"))
     numeric_spread = _tick_row_price(spread)
+    spread_valid = bool(
+        bid is not None
+        and ask is not None
+        and numeric_spread is not None
+        and ask > bid
+        and numeric_spread > 0.0
+    )
+    if spread_valid:
+        compact["spread"] = numeric_spread
     if bid is not None and ask is not None:
         compact["mid"] = round((bid + ask) / 2.0, 10)
     elif last_spread is not None and bid is not None:
@@ -1349,18 +1349,6 @@ def _compact_tick_row(
     elif last_spread is not None and ask is not None:
         compact["mid"] = round(ask - (last_spread / 2.0), 10)
         compact["mid_inferred"] = True
-    row_spread_points = _tick_row_price(row.get("spread_points"))
-    if row_spread_points is not None:
-        compact["spread_points"] = row_spread_points
-    elif numeric_spread is not None and price_point is not None and price_point > 0.0:
-        compact["spread_points"] = round(numeric_spread / price_point, 4)
-    row_spread_pct = _tick_row_price(row.get("spread_pct"))
-    if row_spread_pct is not None:
-        compact["spread_pct"] = row_spread_pct
-    elif numeric_spread is not None:
-        spread_mid = _tick_row_price(compact.get("mid"))
-        if spread_mid is not None and spread_mid > 0.0:
-            compact["spread_pct"] = round((numeric_spread / spread_mid) * 100.0, 6)
     last = _tick_row_price(row.get("last"))
     if last is not None and last > 0.0:
         compact["last"] = last
@@ -1369,42 +1357,20 @@ def _compact_tick_row(
         if volume is not None and volume != 0.0:
             compact[field] = volume
     decoded = row.get("flags_decoded")
-    sample_eligible: Optional[bool] = None
     if isinstance(decoded, list) and decoded:
         quote_flags = {str(value).strip().lower() for value in decoded}
         bid_updated = "bid" in quote_flags
         ask_updated = "ask" in quote_flags
-        compact["bid_changed"] = bid_updated
-        compact["ask_changed"] = ask_updated
-        sample_eligible = bid_updated and ask_updated
         if bid_updated != ask_updated:
             compact["quote_update_type"] = (
                 "bid_only_update" if bid_updated else "ask_only_update"
             )
-        elif bid_updated and ask_updated:
-            compact["quote_update_type"] = "bid_ask_update"
-    if row.get("spread_sample_eligible") is not None:
-        sample_eligible = bool(row.get("spread_sample_eligible"))
-    if sample_eligible is not None:
-        compact["spread_sample_eligible"] = sample_eligible
-    compact["spread_valid"] = bool(
-        bid is not None
-        and ask is not None
-        and numeric_spread is not None
-        and ask > bid
-        and numeric_spread > 0.0
-    )
-    compact["spread_basis"] = (
-        "quote_snapshot" if compact["spread_valid"] else "unavailable"
-    )
-    return compact, numeric_spread if compact["spread_valid"] else None
-
-
-def _tick_price_point(payload: Dict[str, Any]) -> Optional[float]:
-    point = _tick_row_price(payload.get("price_point"))
-    if point is not None and point > 0.0:
-        return point
-    return None
+    elif str(row.get("quote_update_type") or "") in {
+        "bid_only_update",
+        "ask_only_update",
+    }:
+        compact["quote_update_type"] = row["quote_update_type"]
+    return compact, numeric_spread if spread_valid else None
 
 
 def _tick_row_spread(bid: Any, ask: Any) -> Optional[float]:
@@ -1440,15 +1406,20 @@ def _run_wait_candle_impl(
         )
         max_wait_seconds = request.max_wait_seconds
         if max_wait_seconds is not None and float(preview["sleep_seconds"]) > float(max_wait_seconds):
-            preview["success"] = True
-            preview["status"] = "deferred_timeout_risk"
+            preview["success"] = False
+            preview["status"] = "wait_budget_exceeded"
+            preview["error_code"] = "wait_budget_exceeded"
+            preview["error"] = (
+                "The next candle boundary is beyond max_wait_seconds; no wait was "
+                "performed and no candle-close event was observed."
+            )
+            preview["not_waited"] = True
             preview["slept"] = False
             preview["slept_seconds"] = 0.0
             preview["remaining_seconds"] = float(preview["sleep_seconds"])
             preview["max_wait_seconds"] = float(max_wait_seconds)
-            preview["warning"] = (
-                "Skipping blocking wait because the remaining candle wait exceeds max_wait_seconds. "
-                "Increase max_wait_seconds in clients that allow longer MCP tool timeouts."
+            preview["remediation"] = (
+                "Increase max_wait_seconds beyond remaining_seconds and retry."
             )
             return Ok(preview)
 

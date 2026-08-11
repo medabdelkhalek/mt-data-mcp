@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from ..core.error_envelope import build_error_payload
 from ..core.execution_logging import (
     infer_result_success,
     log_operation_exception,
@@ -29,7 +30,7 @@ from .barriers_shared import barrier_method_error, normalize_barrier_method
 from .capabilities import resolve_capability_request
 from .exceptions import ForecastError, raise_if_error_result
 from .forecast import execute_forecast as _forecast_impl
-from .forecast_methods import get_forecast_method_names
+from .forecast_methods import get_forecast_method_names, get_forecast_methods_snapshot
 from .forecast_validation import format_invalid_method_error
 from .requests import (
     ForecastBacktestRequest,
@@ -70,7 +71,9 @@ _TUNING_METRICS = frozenset(
 _VOLATILITY_PROXY_METHODS = {"arima", "sarima", "ets", "theta"}
 _PRETRAINED_FORECAST_METHODS = ("chronos2", "chronos_bolt", "timesfm")
 _DEFAULT_VOLATILITY_PROXY = "squared_return"
-_FORECAST_DIRECTION_NEUTRAL_THRESHOLD_PCT = 0.01
+_FORECAST_DIRECTION_MIN_THRESHOLD_PCT = 0.05
+
+
 def _format_forecast_time_utc(value: Any) -> Any:
     if value in (None, ""):
         return value
@@ -237,6 +240,7 @@ def _forecast_compact_ci(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     )
     forecasts = payload.get(forecast_key)
     times = payload.get("forecast_time")
+    bar_states = payload.get("forecast_bar_states")
     count = min(len(lower_vals), len(upper_vals))
     if isinstance(forecasts, list):
         count = min(count, len(forecasts))
@@ -245,6 +249,8 @@ def _forecast_compact_ci(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         row: Dict[str, Any] = {}
         if isinstance(times, list) and idx < len(times):
             row["time"] = times[idx]
+        if isinstance(bar_states, list) and idx < len(bar_states):
+            row["bar_state"] = bar_states[idx]
         if isinstance(forecasts, list):
             row["forecast"] = forecasts[idx]
         row["low"] = lower_vals[idx]
@@ -521,7 +527,10 @@ def _forecast_vs_last_price(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if last_price:
         first_delta_pct = first_delta / last_price * 100.0
         horizon_delta_pct = horizon_delta / last_price * 100.0
-    if horizon_delta_pct is not None and abs(horizon_delta_pct) <= _FORECAST_DIRECTION_NEUTRAL_THRESHOLD_PCT:
+    threshold_pct = _finite_float(payload.get("direction_threshold_pct"))
+    if threshold_pct is None or threshold_pct < _FORECAST_DIRECTION_MIN_THRESHOLD_PCT:
+        threshold_pct = _FORECAST_DIRECTION_MIN_THRESHOLD_PCT
+    if horizon_delta_pct is not None and abs(horizon_delta_pct) <= threshold_pct:
         direction = "neutral"
     elif horizon_delta > 0:
         direction = "bullish"
@@ -532,7 +541,9 @@ def _forecast_vs_last_price(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
     out: Dict[str, Any] = {
         "direction": direction,
         "direction_basis": "horizon_end",
-        "direction_threshold_pct": _FORECAST_DIRECTION_NEUTRAL_THRESHOLD_PCT,
+        "direction_threshold_pct": float(round(threshold_pct, 6)),
+        "direction_threshold_basis": payload.get("direction_threshold_basis")
+        or "minimum_effect_size_0.05_pct",
         "first_step_delta": float(round(first_delta, delta_digits)),
         "horizon_delta": float(round(horizon_delta, delta_digits)),
     }
@@ -542,7 +553,42 @@ def _forecast_vs_last_price(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return out
 
 
-def _annotate_forecast_direction_significance(
+def _gate_forecast_direction(
+    payload: Dict[str, Any],
+    price_context: Dict[str, Any],
+) -> None:
+    direction = str(price_context.get("direction") or "").strip().lower()
+    if direction not in {"bullish", "bearish"}:
+        price_context["direction_status"] = "neutral"
+        price_context["direction_actionable"] = False
+        return
+
+    interval_excludes_anchor = price_context.get(
+        "direction_interval_excludes_last_price"
+    )
+    if interval_excludes_anchor is True:
+        price_context["direction_status"] = "interval_confirmed"
+        price_context["direction_actionable"] = True
+        return
+
+    price_context["point_estimate_direction"] = direction
+    price_context.pop("direction", None)
+    price_context["direction_status"] = "unconfirmed"
+    price_context["direction_actionable"] = False
+    interval_basis = str(
+        price_context.get("direction_interval_basis") or ""
+    ).strip()
+    if interval_basis == "not_available":
+        reason = "forecast_uncertainty_not_available"
+    elif interval_basis == "not_comparable":
+        reason = "interval_not_comparable_to_price_anchor"
+    else:
+        reason = "horizon_interval_contains_last_price"
+    price_context.setdefault("direction_suppressed_reason", reason)
+    payload["signal_status"] = "not_actionable"
+
+
+def _annotate_forecast_direction_interval(
     payload: Dict[str, Any],
     price_context: Dict[str, Any],
 ) -> None:
@@ -557,43 +603,46 @@ def _annotate_forecast_direction_significance(
         and bool(upper_prices)
     )
     if not has_price_interval:
-        price_context["direction_significant"] = None
-        price_context["direction_significance_basis"] = "not_tested"
+        price_context["direction_interval_excludes_last_price"] = None
+        price_context["direction_interval_basis"] = "not_available"
         price_context["direction_interpretation"] = (
-            "interval_unavailable_not_significance_tested"
+            "interval_unavailable"
             if ci_status == "unavailable"
-            else "point_estimate_only_not_significance_tested"
+            else "point_estimate_only"
         )
+        _gate_forecast_direction(payload, price_context)
         return
 
     last_price = _finite_float(payload.get("last_price"))
     horizon_low = _finite_float(lower_prices[-1])
     horizon_high = _finite_float(upper_prices[-1])
     if last_price is None or horizon_low is None or horizon_high is None:
-        price_context["direction_significant"] = None
-        price_context["direction_significance_basis"] = "not_tested"
+        price_context["direction_interval_excludes_last_price"] = None
+        price_context["direction_interval_basis"] = "not_comparable"
         price_context["direction_interpretation"] = (
             "interval_not_comparable_to_price_anchor"
         )
+        _gate_forecast_direction(payload, price_context)
         return
 
     direction = str(price_context.get("direction") or "").strip().lower()
-    significant = (
+    excludes_last_price = (
         horizon_low > last_price
         if direction == "bullish"
         else horizon_high < last_price
         if direction == "bearish"
         else False
     )
-    price_context["direction_significant"] = significant
-    price_context["direction_significance_basis"] = (
+    price_context["direction_interval_excludes_last_price"] = excludes_last_price
+    price_context["direction_interval_basis"] = (
         "horizon_interval_vs_last_price"
     )
     price_context["direction_interpretation"] = (
         "interval_excludes_last_price"
-        if significant
+        if excludes_last_price
         else "interval_contains_last_price_or_direction_is_neutral"
     )
+    _gate_forecast_direction(payload, price_context)
 
 
 def _forecast_path_flatness(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -650,6 +699,11 @@ def _annotate_forecast_generate_quality(payload: Dict[str, Any]) -> Dict[str, An
                 "recommended_tool": "forecast_conformal_intervals",
             },
         )
+    if str(out.get("ci_status") or "").strip().lower() in {
+        "not_requested",
+        "unavailable",
+    }:
+        out.setdefault("signal_status", "not_actionable")
     path_flatness = _forecast_path_flatness(out)
     price_context = _forecast_vs_last_price(out)
     if price_context:
@@ -657,11 +711,17 @@ def _annotate_forecast_generate_quality(payload: Dict[str, Any]) -> Dict[str, An
             price_context["direction"] = "neutral"
             price_context["direction_basis"] = "flat_path"
             price_context["direction_suppressed_reason"] = "flat_path"
-        _annotate_forecast_direction_significance(out, price_context)
-        out.setdefault("forecast_vs_last_price", price_context)
+        _annotate_forecast_direction_interval(out, price_context)
+        out["forecast_vs_last_price"] = price_context
+        out.pop("direction_threshold_pct", None)
+        out.pop("direction_threshold_basis", None)
         units = dict(out.get("units") or {})
         units.setdefault(
             "forecast_vs_last_price.*_delta_pct",
+            "percentage_points (1.0 = 1%)",
+        )
+        units.setdefault(
+            "forecast_vs_last_price.direction_threshold_pct",
             "percentage_points (1.0 = 1%)",
         )
         out["units"] = units
@@ -671,6 +731,62 @@ def _annotate_forecast_generate_quality(payload: Dict[str, Any]) -> Dict[str, An
         out["forecast_status"] = "non_informative"
         out["signal_status"] = "not_actionable"
         _append_forecast_warning(out, _FORECAST_FLAT_PATH_WARNING)
+    out.setdefault("forecast_reliability_basis", "history_sample_size")
+    trust_blockers: List[str] = []
+    if str(out.get("forecast_reliability") or "").strip().lower() == "low":
+        trust_blockers.append("insufficient_history_sample")
+    if out.get("history_policy_ok") is False:
+        trust_blockers.append("history_freshness_policy_not_met")
+    ci_status = str(out.get("ci_status") or "").strip().lower()
+    if ci_status in {"not_requested", "unavailable"}:
+        trust_blockers.append("forecast_uncertainty_not_available")
+    if path_flatness:
+        trust_blockers.append("non_informative_forecast_path")
+    out["trust_level"] = (
+        "low"
+        if any(
+            blocker in trust_blockers
+            for blocker in (
+                "insufficient_history_sample",
+                "non_informative_forecast_path",
+            )
+        )
+        else "degraded"
+        if trust_blockers
+        else "adequate"
+    )
+    out["trust_level_basis"] = [
+        "history_sample_size",
+        "history_freshness_policy",
+        "forecast_uncertainty",
+    ]
+    if trust_blockers:
+        out["trust_blockers"] = trust_blockers
+    return out
+
+
+def _attach_invalid_method_guidance(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    error = str(payload.get("error") or "").strip()
+    if not error.lower().startswith("invalid method:"):
+        return payload
+    methods = get_forecast_methods_snapshot().get("methods", [])
+    available = sorted(
+        {
+            str(row.get("method"))
+            for row in methods
+            if isinstance(row, dict)
+            and row.get("method")
+            and row.get("available") is not False
+        }
+    )
+    out = dict(payload)
+    display_limit = 20
+    out["valid_values"] = {"method": available[:display_limit]}
+    if len(available) > display_limit:
+        out["valid_values_truncated"] = len(available) - display_limit
+    out["related_tools"] = ["forecast_list_methods"]
     return out
 
 
@@ -716,10 +832,15 @@ def _forecast_generate_data_window(payload: Dict[str, Any]) -> Optional[Dict[str
     for source_key, target_key in (
         ("forecast_start_time", "forecast_start"),
         ("forecast_start_gap_bars", "forecast_start_gap_bars"),
+        ("forecast_time_semantics", "forecast_time_semantics"),
+        ("forecast_value_semantics", "forecast_value_semantics"),
     ):
         value = payload.get(source_key)
         if value not in (None, "", [], {}):
             out[target_key] = value
+    bar_states = payload.get("forecast_bar_states")
+    if isinstance(bar_states, list) and bar_states:
+        out["first_forecast_bar_state"] = bar_states[0]
     age_seconds = payload.get("last_price_age_seconds")
     if age_seconds not in (None, "", [], {}):
         out["last_observation_age_seconds"] = age_seconds
@@ -758,13 +879,25 @@ def _forecast_generate_compact_rows(payload: Dict[str, Any]) -> List[Dict[str, A
     if not isinstance(lower_values, list) or not isinstance(upper_values, list):
         lower_values = payload.get("lower")
         upper_values = payload.get("upper")
+    if quantity == "return" and forecast_key == "forecast_return":
+        lower_field = "lower_return"
+        upper_field = "upper_return"
+    elif quantity == "price" and forecast_key == "forecast_price":
+        lower_field = "lower_price"
+        upper_field = "upper_price"
+    else:
+        lower_field = "lower"
+        upper_field = "upper"
     market_status = payload.get("forecast_market_status")
+    bar_states = payload.get("forecast_bar_states")
 
     count = min(len(times), len(forecast_values))
     price_values = payload.get("forecast_price")
     rows: List[Dict[str, Any]] = []
     for idx in range(count):
         row: Dict[str, Any] = {"time": _format_forecast_time_utc(times[idx])}
+        if isinstance(bar_states, list) and idx < len(bar_states):
+            row["bar_state"] = bar_states[idx]
         if quantity == "return" and forecast_key == "forecast_return":
             row["return"] = forecast_values[idx]
             if isinstance(price_values, list) and idx < len(price_values):
@@ -775,8 +908,8 @@ def _forecast_generate_compact_rows(payload: Dict[str, Any]) -> List[Dict[str, A
             row["market_status"] = market_status[idx]
         if isinstance(lower_values, list) and isinstance(upper_values, list):
             if idx < len(lower_values) and idx < len(upper_values):
-                row["lower"] = lower_values[idx]
-                row["upper"] = upper_values[idx]
+                row[lower_field] = lower_values[idx]
+                row[upper_field] = upper_values[idx]
         rows.append(row)
     return rows
 
@@ -838,12 +971,103 @@ def _forecast_generate_volatility_rows(
     return [row]
 
 
-def _apply_forecast_generate_detail(
+_ANALOG_COMPACT_COMPONENT_KEYS = (
+    "timeframe",
+    "role",
+    "status",
+    "n_paths",
+    "component_weight",
+    "reason",
+)
+_ANALOG_COMPACT_METRIC_KEYS = (
+    "n_paths",
+    "effective_paths",
+    "spread",
+    "weighted",
+)
+_ANALOG_VERBOSE_METADATA_KEYS = frozenset(
+    {
+        "analogs",
+        "component_status",
+        "ensemble_metrics",
+        "timeframe_diagnostics",
+    }
+)
+
+
+def _compact_analog_metadata(metadata: Any) -> Dict[str, Any]:
+    """Keep the decision-facing analog diagnostics without repeated detail blobs."""
+    if not isinstance(metadata, dict):
+        return {}
+
+    compact: Dict[str, Any] = {}
+    statuses = metadata.get("component_status")
+    if isinstance(statuses, list):
+        compact_statuses: List[Dict[str, Any]] = []
+        for status in statuses:
+            if not isinstance(status, dict):
+                continue
+            row = {
+                key: status[key]
+                for key in _ANALOG_COMPACT_COMPONENT_KEYS
+                if status.get(key) not in (None, "", [], {})
+            }
+            if row:
+                compact_statuses.append(row)
+        if compact_statuses:
+            compact["component_status"] = compact_statuses
+
+    metrics = metadata.get("ensemble_metrics")
+    if isinstance(metrics, dict):
+        compact_metrics = {
+            key: metrics[key]
+            for key in _ANALOG_COMPACT_METRIC_KEYS
+            if metrics.get(key) not in (None, "", [], {})
+        }
+        score_summary = metrics.get("score_summary")
+        if isinstance(score_summary, dict):
+            compact_scores = {
+                key: score_summary[key]
+                for key in ("best", "median")
+                if score_summary.get(key) is not None
+            }
+            if compact_scores:
+                compact_metrics["score_summary"] = compact_scores
+        quality_gate = metrics.get("quality_gate")
+        if isinstance(quality_gate, dict):
+            compact_quality_gate = {
+                key: quality_gate[key]
+                for key in ("status", "failed_check")
+                if quality_gate.get(key) not in (None, "", [], {})
+            }
+            if compact_quality_gate:
+                compact_metrics["quality_gate"] = compact_quality_gate
+        if compact_metrics:
+            compact["ensemble_metrics"] = compact_metrics
+    return compact
+
+
+def _compact_ensemble_metadata(metadata: Any) -> Dict[str, Any]:
+    """Project nested ensemble metadata while applying analog's compact contract."""
+    if not isinstance(metadata, dict):
+        return {}
+    compact = {
+        key: value
+        for key, value in metadata.items()
+        if key not in _ANALOG_VERBOSE_METADATA_KEYS
+    }
+    compact.update(_compact_analog_metadata(metadata))
+    return compact
+
+
+def _apply_forecast_generate_detail(  # noqa: C901
     payload: Dict[str, Any],
     request: ForecastGenerateRequest,
 ) -> Dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("error"):
         return payload
+    payload = dict(payload)
+    payload.setdefault("quantity", request.quantity)
     payload = _round_forecast_generate_payload(payload)
     payload = _normalize_forecast_time_fields(payload)
     if str(payload.get("quantity") or request.quantity or "").strip().lower() == "volatility":
@@ -981,7 +1205,10 @@ def _apply_forecast_generate_detail(
             "last": forecast_rows[-1],
             "path_omitted": "non_informative_flat_path",
         }
-    elif forecast_rows and not ci_has_intervals:
+    elif forecast_rows and (
+        not ci_has_intervals
+        or str(compact.get("quantity") or "").strip().lower() == "return"
+    ):
         compact["forecast"] = forecast_rows
     elif volatility_rows:
         compact["forecast"] = volatility_rows
@@ -1016,6 +1243,9 @@ def _apply_forecast_generate_detail(
             "forecast_start_gap_bars",
             "forecast_start_gap_note",
             "forecast_time",
+            "forecast_bar_states",
+            "forecast_time_semantics",
+            "forecast_value_semantics",
             "forecast_price",
             "forecast_return",
             "forecast_anchor",
@@ -1041,6 +1271,11 @@ def _apply_forecast_generate_detail(
             "ci_available",
             "diagnostics",
             "params_used",
+            "analogs",
+            "component_status",
+            "ensemble_metrics",
+            "timeframe_diagnostics",
+            "ensemble",
             "detail",
         }:
             continue
@@ -1051,6 +1286,10 @@ def _apply_forecast_generate_detail(
         if key == "denoise_applied" and value is False:
             continue
         compact[key] = value
+    compact.update(_compact_analog_metadata(payload))
+    ensemble = _compact_ensemble_metadata(payload.get("ensemble"))
+    if ensemble:
+        compact["ensemble"] = ensemble
     return compact
 
 
@@ -1226,11 +1465,24 @@ def _apply_conformal_intervals_detail(
         "ci_warning",
         "last_price",
         "last_price_source",
+        "last_price_age_seconds",
+        "last_price_stale",
+        "history_policy_ok",
+        "freshness_basis",
+        "stale_after_seconds",
+        "market_status",
+        "market_status_reason",
+        "retrieved_at",
+        "retrieval_time",
         "warnings",
     ):
         value = payload.get(key)
         if value not in (None, "", [], {}):
             out[key] = value
+    if "last_price_age_seconds" in out:
+        out["data_age_seconds"] = out["last_price_age_seconds"]
+    if "last_price_stale" in out:
+        out["data_stale"] = out["last_price_stale"]
     conformal = _conformal_summary(payload.get("conformal"))
     if conformal:
         out["conformal"] = conformal
@@ -1390,6 +1642,11 @@ def _apply_barrier_prob_detail(
         "probability_edge",
         "probability_unit",
         "probability_edge_definition",
+        "intra_bar_hit_detection",
+        "bridge_correction",
+        "bridge_dual_barrier_model",
+        "bridge_joint_first_passage",
+        "same_bar_policy",
         "n_sims",
         "seed",
         "seed_source",
@@ -1639,6 +1896,22 @@ def _compact_forecast_warnings(
     return None
 
 
+def _compact_backtest_units(
+    raw_units: Any,
+    ranked_methods: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not isinstance(raw_units, dict):
+        return {}
+    visible_unit_keys = {"forecast_error"}
+    for row in ranked_methods:
+        visible_unit_keys.update(row.keys())
+    return {
+        key: value
+        for key, value in raw_units.items()
+        if key in visible_unit_keys
+    }
+
+
 def _compact_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
     raw_results = result.get("results")
     if not isinstance(raw_results, dict):
@@ -1652,6 +1925,8 @@ def _compact_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "win_rate_pct": 4,
         "max_drawdown": 4,
         "max_drawdown_pct": 4,
+        "cumulative_return": 6,
+        "cumulative_return_pct": 4,
         "avg_return": 6,
         "avg_return_pct": 4,
         "avg_return_per_trade": 6,
@@ -1737,6 +2012,8 @@ def _compact_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
                 else (
                     "win_rate",
                     "win_rate_pct",
+                    "cumulative_return",
+                    "cumulative_return_pct",
                     "max_drawdown",
                     "max_drawdown_pct",
                     "avg_return",
@@ -1779,8 +2056,14 @@ def _compact_backtest_result(result: Dict[str, Any]) -> Dict[str, Any]:
     compact_out.pop("request", None)
     compact_out.pop("resolved_request", None)
     compact_out.pop("detail", None)
-    if isinstance(compact_out.pop("units", None), dict):
-        compact_out["units_profile"] = "forecast_backtest_v1"
+    compact_units = _compact_backtest_units(
+        compact_out.get("units"),
+        ranked_methods,
+    )
+    if compact_units:
+        compact_out["units"] = compact_units
+    else:
+        compact_out.pop("units", None)
     if compact_out.get("slippage_bps") in (0, 0.0, None):
         compact_out.pop("slippage_bps", None)
     if compact_out.get("trade_threshold") in (0, 0.0, None):
@@ -1942,7 +2225,7 @@ def _resolve_sktime_forecaster(method: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def run_forecast_generate(
+def run_forecast_generate(  # noqa: C901
     request: ForecastGenerateRequest,
     *,
     forecast_impl: Any = _forecast_impl,
@@ -2094,6 +2377,8 @@ def run_forecast_generate(
             async_mode=getattr(request, 'async_mode', False),
             model_id=getattr(request, 'model_id', None),
         )
+        if isinstance(out, dict):
+            out = _attach_invalid_method_guidance(out)
         if isinstance(out, dict) and "success" not in out and infer_result_success(out):
             out["success"] = True
         if proxy_defaulted and isinstance(out, dict) and not out.get("error"):
@@ -2904,21 +3189,23 @@ def run_forecast_barrier_prob(
                 )
             )
             if not has_resolved_barriers:
-                result = {
-                    "success": False,
-                    "error": (
+                result = build_error_payload(
+                    (
                         "Barrier probabilities require an explicit take-profit and "
                         "stop-loss pair."
                     ),
-                    "error_code": "barrier_parameters_missing",
-                    "operation": "forecast_barrier_prob",
-                    "remediation": (
+                    code="barrier_parameters_missing",
+                    operation="forecast_barrier_prob",
+                    remediation=(
                         "Provide tp_pct/sl_pct, tp_abs/sl_abs, or tp_ticks/sl_ticks "
                         "scaled to the symbol and forecast horizon. Use "
                         "forecast_barrier_optimize for data-driven candidates."
                     ),
-                    "related_tools": ["forecast_barrier_optimize", "labels_triple_barrier"],
-                }
+                    related_tools=[
+                        "forecast_barrier_optimize",
+                        "labels_triple_barrier",
+                    ],
+                )
                 log_operation_finish(
                     logger,
                     operation="forecast_barrier_prob",

@@ -38,6 +38,57 @@ def test_normalize_weights_and_lookback_helpers():
     assert fe._normalize_weights([1], 2) is None
     assert fe._normalize_weights([-1, 0], 2) is None
 
+
+def test_training_context_versions_return_value_policy():
+    df = _df(4)
+    target = pd.Series([1.0, 2.0, 3.0], index=df.index[-3:])
+    kwargs = {
+        "df": df,
+        "target_series": target,
+        "base_col": "close",
+        "denoise": None,
+        "features": None,
+        "target_spec": None,
+        "exog": None,
+    }
+
+    price_context = fe._training_context_fingerprint(quantity="price", **kwargs)
+    return_context = fe._training_context_fingerprint(quantity="return", **kwargs)
+
+    assert "invalid_target_value_policy" not in price_context
+    assert return_context["invalid_target_value_policy"] == "mask_v1"
+
+
+def test_available_methods_filters_dependency_unavailable_registry_entries(monkeypatch):
+    monkeypatch.setattr(
+        fe.ForecastRegistry,
+        "get_all_method_names",
+        lambda: ("naive", "sf_autoarima"),
+    )
+    monkeypatch.setattr(
+        fe,
+        "get_forecast_method_availability_snapshot",
+        lambda: {"naive": True, "sf_autoarima": False},
+    )
+
+    assert fe._get_available_methods() == ("naive",)
+
+
+def test_ensemble_adaptive_lookback_covers_requested_cv_window():
+    assert fe._calculate_lookback_bars(
+        "ensemble",
+        horizon=12,
+        lookback=None,
+        seasonality=24,
+        timeframe="H1",
+        params={
+            "mode": "stacking",
+            "methods": ["naive", "theta", "fourier_ols"],
+            "min_train_size": 300,
+            "cv_points": 50,
+        },
+    ) == 364
+
     assert fe._calculate_lookback_bars("theta", horizon=4, lookback=10, seasonality=24, timeframe="H1") == 12
     assert fe._calculate_lookback_bars("analog", horizon=4, lookback=None, seasonality=24, timeframe="H1") == 5131
     assert fe._calculate_lookback_bars(
@@ -56,6 +107,49 @@ def test_normalize_weights_and_lookback_helpers():
     ) == 6002
     assert fe._calculate_lookback_bars("seasonal_naive", horizon=4, lookback=None, seasonality=12, timeframe="H1") == 36
     assert fe._calculate_lookback_bars("fourier_ols", horizon=4, lookback=None, seasonality=24, timeframe="H1") >= 300
+
+
+def test_forecast_history_sample_quality_flags_short_windows():
+    low = fe._forecast_history_sample_quality(
+        method="theta",
+        horizon=12,
+        history_bars=3,
+    )
+    adequate = fe._forecast_history_sample_quality(
+        method="theta",
+        horizon=12,
+        history_bars=36,
+    )
+
+    assert low["history_sample_ok"] is False
+    assert low["forecast_reliability"] == "low"
+    assert low["forecast_reliability_reason"] == "below_recommended_history"
+    assert low["recommended_history_bars"] == 36
+    assert low["history_shortfall_bars"] == 33
+    assert "used 3 bars" in low["warning"]
+    assert adequate == {
+        "history_sample_ok": True,
+        "forecast_reliability": "adequate",
+        "recommended_history_bars": 36,
+    }
+
+
+def test_forecast_engine_surfaces_short_history_reliability():
+    out = fe.forecast_engine(
+        symbol="EURUSD",
+        timeframe="H1",
+        method="theta",
+        horizon=12,
+        ci_alpha=None,
+        prefetched_df=_df(3),
+    )
+
+    assert out["success"] is True
+    assert out["history_sample_ok"] is False
+    assert out["forecast_reliability"] == "low"
+    assert out["forecast_reliability_reason"] == "below_recommended_history"
+    assert out["recommended_history_bars"] == 36
+    assert any("Low-history forecast" in item for item in out["warnings"])
 
 
 def test_preprocessing_helpers_and_output_format():
@@ -693,6 +787,25 @@ def test_forecast_engine_applies_denoise_to_prefetched_raw_history(monkeypatch):
     assert captured["last_value"] == float(df["close"].iloc[-1] * 10.0)
 
 
+def test_forecast_engine_rejects_unsupported_denoise_causality(monkeypatch):
+    monkeypatch.setattr(fe, "TIMEFRAME_MAP", {"H1": 1})
+    monkeypatch.setattr(fe, "TIMEFRAME_SECONDS", {"H1": 3600})
+    monkeypatch.setattr(fe, "_get_available_methods", lambda: ("naive",))
+    monkeypatch.setattr(fe, "_parse_kv_or_json", lambda value: dict(value or {}))
+
+    out = fe.forecast_engine(
+        symbol="EURUSD",
+        timeframe="H1",
+        method="naive",
+        horizon=1,
+        denoise={"method": "wavelet", "causality": "causal"},
+        prefetched_df=_df(20),
+    )
+
+    assert "success" not in out
+    assert "does not support causality='causal'" in out["error"]
+
+
 def test_forecast_engine_surfaces_denoise_warnings(monkeypatch):
     class CaptureForecaster:
         def forecast(self, series, horizon, seasonality, params, exog_future=None, **kwargs):
@@ -771,7 +884,11 @@ def test_forecast_engine_builds_exog_and_aligns_for_returns(monkeypatch):
         horizon=5,
         quantity="return",
         params={"alpha": 1},
-        features={"include": "open,high low", "future_covariates": "hour,dow,fourier:24,is_weekend"},
+        features={
+            "include": "open,high low",
+            "future_covariates": "hour,dow,fourier:24,is_weekend",
+            "observed_future_policy": "carry_forward",
+        },
         prefetched_df=_df(30),
     )
 
@@ -781,7 +898,7 @@ def test_forecast_engine_builds_exog_and_aligns_for_returns(monkeypatch):
     assert captured["exog_future"].shape == (5, 10)
 
 
-def test_forecast_engine_dimred_failure_falls_back_to_raw_features(monkeypatch):
+def test_forecast_engine_dimred_failure_is_an_error(monkeypatch):
     captured = {}
 
     class CaptureForecaster:
@@ -817,15 +934,17 @@ def test_forecast_engine_dimred_failure_falls_back_to_raw_features(monkeypatch):
         prefetched_df=_df(20),
     )
 
-    assert out["success"] is True
-    assert captured["exog_used"].shape == (20, 2)
-    assert captured["exog_future"].shape == (4, 2)
+    assert out["error_code"] == "feature_build_error"
+    assert "dimensionality reduction" in out["error"]
+    assert captured == {}
 
 
 def test_forecast_engine_forwards_ci_alpha_in_params_and_kwargs(monkeypatch):
     captured = {}
 
     class CaptureForecaster:
+        PARAMS = [{"name": "ci_alpha"}]
+
         def forecast(self, series, horizon, seasonality, params, exog_future=None, **kwargs):
             captured["params"] = dict(params)
             captured["kwargs"] = dict(kwargs)
@@ -946,9 +1065,26 @@ def test_forecast_engine_inverts_price_target_transform_and_intervals(monkeypatc
     )
 
     assert out["success"] is True
-    assert out["forecast_price"] == pytest.approx([106.0, 107.0])
-    assert out["lower_price"] == pytest.approx([105.0, 106.0])
-    assert out["upper_price"] == pytest.approx([107.0, 108.0])
+    assert out["forecast_target"] == pytest.approx(np.log([106.0, 107.0]))
+    assert out["lower_target"] == pytest.approx(np.log([105.0, 106.0]))
+    assert out["upper_target"] == pytest.approx(np.log([107.0, 108.0]))
+
+
+def test_return_price_intervals_accumulate_variance_not_tail_paths():
+    point_returns = np.zeros(4)
+    point_prices = np.full(4, 100.0)
+
+    lower, upper = fe._reconstruct_price_intervals_from_target(
+        point_returns,
+        (np.full(4, -0.01), np.full(4, 0.01)),
+        point_prices,
+        np.array([100.0]),
+        {"transform": "log_return"},
+    )
+
+    assert lower[-1] == pytest.approx(100.0 * np.exp(-0.02))
+    assert upper[-1] == pytest.approx(100.0 * np.exp(0.02))
+    assert upper[-1] < 100.0 * np.exp(0.04)
 
 
 def test_forecast_engine_injects_context_for_analog(monkeypatch):
@@ -1221,9 +1357,11 @@ def test_forecast_engine_surfaces_broker_time_misalignment_warning(monkeypatch):
 
     assert out["success"] is True
     assert out["diagnostics"]["broker_time_check"]["status"] == "misaligned"
-    assert out["warnings"] == [
+    assert any("Low-history forecast" in item for item in out["warnings"])
+    assert (
         "MT5 UTC timestamp sanity check failed: latest tick is 3600s in the future"
-    ]
+        in out["warnings"]
+    )
 
 
 def test_forecast_engine_keeps_stale_broker_time_check_diagnostic_only(monkeypatch):
@@ -1270,7 +1408,8 @@ def test_forecast_engine_keeps_stale_broker_time_check_diagnostic_only(monkeypat
 
     assert out["success"] is True
     assert out["diagnostics"]["broker_time_check"]["status"] == "stale"
-    assert "warnings" not in out
+    assert any("Low-history forecast" in item for item in out["warnings"])
+    assert not any("market is closed" in item for item in out["warnings"])
 
 
 def test_forecast_engine_skips_broker_time_check_for_prefetched_and_asof(monkeypatch):
@@ -1427,8 +1566,9 @@ def test_forecast_engine_reconstructs_custom_simple_return_targets(monkeypatch):
     )
 
     assert out["success"] is True
-    assert out["forecast_return"] == [0.1, 0.1]
-    np.testing.assert_allclose(out["forecast_price"], np.array([115.5, 127.05]))
+    assert out["forecast_target"] == [0.1, 0.1]
+    assert out["target"]["mode"] == "custom"
+    assert "forecast_price" not in out
 
 
 def test_forecast_engine_reconstructs_custom_k_lag_return_targets(monkeypatch):
@@ -1463,19 +1603,9 @@ def test_forecast_engine_reconstructs_custom_k_lag_return_targets(monkeypatch):
         target_spec={"base": "close", "transform": "return", "k": 2},
     )
 
-    closes = df["close"].to_numpy(dtype=float)
-    expected = np.array(
-        [
-            closes[-2] * 1.1,
-            closes[-1] * 1.1,
-            (closes[-2] * 1.1) * 1.1,
-        ],
-        dtype=float,
-    )
-
     assert out["success"] is True
-    assert out["forecast_return"] == [0.1, 0.1, 0.1]
-    np.testing.assert_allclose(np.asarray(out["forecast_price"], dtype=float), expected)
+    assert out["forecast_target"] == [0.1, 0.1, 0.1]
+    assert "forecast_price" not in out
 
 
 def test_forecast_engine_ensemble_paths(monkeypatch):
@@ -1507,7 +1637,7 @@ def test_forecast_engine_ensemble_paths(monkeypatch):
         timeframe="H1",
         method="ensemble",
         horizon=2,
-        params={"methods": "naive,theta", "weights": "1,3", "mode": "bma"},
+        params={"methods": "naive,theta", "weights": "1,3", "mode": "average"},
         prefetched_df=_df(20),
     )
     assert out["success"] is True
@@ -1525,5 +1655,5 @@ def test_forecast_engine_ensemble_paths(monkeypatch):
         params={"methods": "naive,theta"},
         prefetched_df=_df(20),
     )
-    assert out["error"] == "Ensemble failed: no component forecasts"
+    assert "requested component forecasts were not all available" in out["error"]
 

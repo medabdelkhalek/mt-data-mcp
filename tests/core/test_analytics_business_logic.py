@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,8 +10,12 @@ import pytest
 
 from mtdata.analytics.engines import (
     _barrier_returns,
-    _filtered_historical_returns,
+    _builtin_signal,
+    _classify_trade_sides,
+    _execution_duration_display,
     _execution_percentiles,
+    _filtered_historical_returns,
+    _portfolio_mark_context,
     _tick_frame,
     analyze_execution_quality,
     analyze_microstructure,
@@ -22,9 +27,51 @@ from mtdata.core.analytics_requests import (
     MarketMicrostructureRequest,
     MarketRelativeStrengthRequest,
     PortfolioRiskDecomposeRequest,
+    StrategyCandidate,
     StrategyValidateRequest,
     TradeExecutionQualityRequest,
 )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        ("sma_cross", [0.0, 0.0, 1.0, 0.0, -1.0]),
+        ("ema_cross", [0.0, 0.0, 1.0, -1.0, 0.0]),
+    ],
+)
+def test_builtin_ma_cross_signals_only_on_cross_events(
+    strategy: str,
+    expected: list[float],
+) -> None:
+    close = pd.Series([3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0])
+    candidate = StrategyCandidate(
+        id="cross",
+        type="builtin_strategy",
+        strategy=strategy,
+        params={"fast_period": 2, "slow_period": 3},
+    )
+
+    signal = _builtin_signal(close, candidate)
+
+    assert signal.iloc[:2].isna().all()
+    assert signal.iloc[2:].tolist() == expected
+
+
+def test_builtin_rsi_reversion_signals_only_on_zone_entry() -> None:
+    close = pd.Series([100.0, 90.0, 80.0, 90.0, 100.0, 90.0, 80.0])
+    candidate = StrategyCandidate(
+        id="rsi",
+        type="builtin_strategy",
+        strategy="rsi_reversion",
+        params={"rsi_length": 2, "oversold": 40, "overbought": 60},
+    )
+
+    signal = _builtin_signal(close, candidate)
+
+    assert signal.iloc[:2].isna().all()
+    assert signal.iloc[2:].tolist() == [0.0, 0.0, -1.0, 1.0, 0.0]
+from mtdata.utils.sessions import market_session_label
 
 
 def _now() -> int:
@@ -117,7 +164,7 @@ class FakeGateway:
         return [SimpleNamespace(name=name, path="Forex\\Majors", visible=True) for name in self.bar_rows]
 
     def symbol_info_tick(self, symbol):
-        return SimpleNamespace(bid=1.0999, ask=1.1001)
+        return SimpleNamespace(bid=1.0999, ask=1.1001, time=_now())
 
     def symbol_info(self, symbol):
         return SimpleNamespace(point=0.00001, digits=5)
@@ -163,15 +210,48 @@ def test_microstructure_compact_output_omits_research_events() -> None:
 
     assert result["summary"]["feed_tier"] == "trade_volume"
     assert result["summary"]["spread"]["unit"] == "fx_pips"
-    assert result["summary"]["spread"]["median"] == pytest.approx(1.0)
+    assert result["summary"]["spread"]["latest"] == pytest.approx(1.0)
+    assert result["summary"]["spread"]["recent_5m_median"] == pytest.approx(1.0)
+    assert result["summary"]["spread"]["window_median"] == pytest.approx(1.0)
+    assert result["summary"]["spread"]["window_p95"] == pytest.approx(1.0)
+    assert result["summary"]["spread"]["regime"] == "near_window_median"
+    assert result["summary"]["spread"]["basis"] == "historical_tick_window_distribution"
+    assert result["summary"]["spread"]["source"] == "mt5.copy_ticks_range"
+    assert result["observed_window"]["start"].endswith("Z")
+    assert result["observed_window"]["end"].endswith("Z")
     assert "liquidity_events" not in result
     assert "method_applicability" not in result
     assert set(result["data_quality"]) == {
         "quote_coverage",
         "invalid_partial_quote_ticks",
+        "locked_quote_ticks",
+        "latest_spread_quality",
         "truncated",
     }
     assert any("broker's tick feed" in warning for warning in result["warnings"])
+
+
+def test_microstructure_compact_distinguishes_latest_from_window_spread() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = _ticks(count=900)
+    for row in gateway.tick_rows[-300:]:
+        mid = (row["bid"] + row["ask"]) / 2.0
+        row["bid"] = mid - 0.00025
+        row["ask"] = mid + 0.00025
+
+    result = analyze_microstructure(
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60),
+        gateway,
+    )
+
+    spread = result["summary"]["spread"]
+    assert spread["window_median"] == pytest.approx(1.0)
+    assert spread["latest"] == pytest.approx(5.0)
+    assert spread["recent_5m_median"] == pytest.approx(5.0)
+    assert spread["latest_as_of"].endswith("Z")
+    assert spread["regime"] == "wider_than_window"
+    assert spread["latest_to_window_median_ratio"] == pytest.approx(5.0)
+    assert any("differs materially" in warning for warning in result["warnings"])
 
 
 def test_microstructure_does_not_recount_last_trade_snapshots() -> None:
@@ -191,6 +271,31 @@ def test_microstructure_does_not_recount_last_trade_snapshots() -> None:
     assert result["success"] is True
     assert result["summary"]["trade_count"] == 1
     assert result["data_quality"]["trade_tick_coverage"] == pytest.approx(1 / 200)
+
+
+def test_microstructure_tick_rule_uses_immediately_preceding_trade() -> None:
+    trades = pd.DataFrame({"last": [100.0, 101.0, 100.5]}, index=[0, 1, 2])
+    prevailing_mid = pd.Series([100.0, 100.5, 100.5], index=[0, 1, 2])
+
+    sides = _classify_trade_sides(trades, prevailing_mid)
+
+    assert list(sides) == [0.0, 1.0, -1.0]
+
+
+def test_microstructure_keeps_single_sided_quote_updates() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = _ticks(real_volume=False)
+    for index, row in enumerate(gateway.tick_rows):
+        row["flags"] = 2 if index % 2 == 0 else 4
+
+    result = analyze_microstructure(
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60),
+        gateway,
+    )
+
+    assert result["success"] is True
+    assert result["data_quality"]["quote_coverage"] == pytest.approx(1.0)
+    assert result["data_quality"]["invalid_partial_quote_ticks"] == 0
 
 
 def test_tick_frame_keeps_distinct_same_timestamp_events() -> None:
@@ -264,7 +369,43 @@ def test_microstructure_reports_closed_session_for_short_tick_stream(monkeypatch
     assert "reopen" in result["remediation"]
 
 
-def test_tick_frame_nulls_derived_quotes_for_one_sided_updates() -> None:
+def test_microstructure_uses_completed_session_window_when_weekend_is_closed(
+    monkeypatch,
+) -> None:
+    gateway = FakeGateway()
+    completed_end = datetime(2026, 7, 31, 21, tzinfo=timezone.utc)
+    completed_start = completed_end - timedelta(minutes=60)
+    rows = _ticks(30, start=int(completed_start.timestamp()))
+    gateway.copy_ticks_range = lambda _symbol, start, _end, _flags: (
+        rows if start == completed_start else []
+    )
+    monkeypatch.setattr(
+        "mtdata.analytics.engines.closed_session_context",
+        lambda *args, **kwargs: {
+            "market_status": "closed",
+            "market_status_reason": "weekend",
+            "note": "Market is closed; showing the latest completed session tick stream.",
+        },
+    )
+    monkeypatch.setattr(
+        "mtdata.analytics.engines.standard_weekend_window",
+        lambda _now: (
+            completed_end,
+            datetime(2026, 8, 2, 21, tzinfo=timezone.utc),
+        ),
+    )
+
+    result = analyze_microstructure(
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60), gateway
+    )
+
+    assert result["success"] is True
+    assert result["summary"]["ticks"] == 30
+    assert result["market_status"] == "closed"
+    assert any("completed-session" in warning for warning in result["warnings"])
+
+
+def test_tick_frame_marks_locked_quotes_as_unusable() -> None:
     gateway = FakeGateway()
     gateway.tick_rows = [
         {"time": 1, "bid": 1.1, "ask": 1.1, "flags": 2},
@@ -279,40 +420,208 @@ def test_tick_frame_nulls_derived_quotes_for_one_sided_updates() -> None:
         100,
     )
 
-    assert np.isnan(frame.iloc[0]["mid"])
-    assert np.isnan(frame.iloc[0]["spread"])
+    assert bool(frame.iloc[0]["spread_valid"]) is False
+    assert frame.iloc[0]["spread_quality"] == "locked"
+    assert math.isnan(frame.iloc[0]["mid"])
+    assert math.isnan(frame.iloc[0]["spread"])
+    assert bool(frame.iloc[1]["spread_valid"]) is True
+    assert frame.iloc[1]["spread_quality"] == "two_sided"
     assert frame.iloc[1]["spread"] == pytest.approx(0.0002)
+
+
+def test_microstructure_marks_latest_locked_quote_unsafe() -> None:
+    gateway = FakeGateway()
+    gateway.tick_rows = _ticks()
+    latest = gateway.tick_rows[-1]
+    latest["ask"] = latest["bid"]
+
+    result = analyze_microstructure(
+        MarketMicrostructureRequest(symbol="EURUSD", minutes_back=60),
+        gateway,
+    )
+
+    spread = result["summary"]["spread"]
+    assert spread["latest"] == pytest.approx(0.0)
+    assert spread["spread_valid"] is False
+    assert spread["spread_quality"] == "locked"
+    assert spread["regime"] == "locked_quote"
+    assert spread["latest_to_window_median_ratio"] is None
+    assert result["data_quality"]["locked_quote_ticks"] == 1
+    assert any("locked" in warning.lower() for warning in result["warnings"])
 
 
 def test_execution_quality_matches_order_and_computes_markout() -> None:
     gateway = FakeGateway()
+    gateway.account_info = lambda: SimpleNamespace(currency="USD")
     start = _now() - 100
     gateway.tick_rows = _ticks(100, start=start)
     gateway.orders = [
         {"ticket": 10, "type": 0, "price_open": 1.10005, "volume_initial": 1.0, "time_setup_msc": (start + 9) * 1000}
     ]
     gateway.deals = [
-        {"ticket": 20, "order": 10, "position_id": 30, "symbol": "EURUSD", "type": 0, "volume": 1.0, "price": 1.10008, "time": start + 10, "time_msc": (start + 10) * 1000}
+        {"ticket": 20, "order": 10, "position_id": 30, "symbol": "EURUSD", "type": 0, "volume": 1.0, "price": 1.10008, "time": start + 10, "time_msc": (start + 10) * 1000, "commission": -0.25, "fee": -0.05}
     ]
     result = analyze_execution_quality(
         TradeExecutionQualityRequest(minutes_back=60, markout_seconds=[1, 5], detail="full"),
         gateway,
     )
     assert result["summary"]["fills"] == 1
+    assert result["currency"] == "USD"
+    assert result["units"]["commission_fee_per_lot"] == (
+        "account_currency_per_broker_lot"
+    )
     assert result["items"][0]["benchmark_source"] == "arrival_quote"
-    assert result["items"][0]["order_to_fill_ms"] == 1000.0
-    assert result["summary"]["market_order_latency_ms"]["mean"] == 1000.0
+    assert result["items"][0]["benchmark_price"] == pytest.approx(1.100059)
+    assert result["items"][0]["fill_time_quote"] == pytest.approx(1.10006)
+    assert result["items"][0]["benchmark_epoch"] == start + 9
+    assert result["items"][0]["execution_shortfall_currency_estimate"] > 0
+    assert result["units"]["execution_shortfall_currency_estimate"] == (
+        "account_currency_positive_is_worse"
+    )
+    assert result["items"][0]["order_to_fill_duration_ms"] == 1000.0
+    assert result["items"][0]["fill_timing_basis"] == "market_fill_latency"
+    assert result["summary"]["market_fill_latency_ms"]["mean"] == 1000.0
     assert result["summary"]["market_order_fills"] == 1
     assert result["summary"]["non_market_order_fills"] == 0
-    assert result["summary"]["non_market_order_latency_ms"]["mean"] is None
-    assert result["latency_definition"]["order_to_fill_ms"].endswith(
-        "including_pending_wait"
+    assert result["summary"]["pending_time_to_fill_ms"]["mean"] is None
+    assert result["timing_definition"]["order_to_fill_duration_ms"].endswith(
+        "not_execution_latency"
     )
     assert result["items"][0]["markout_bps"]["5"] is not None
     assert result["items"][0]["order_type"] == "BUY"
     assert result["items"][0]["order_type_code"] == 0
     assert result["breakdowns"]["by_order_type"][0]["order_type"] == "BUY"
     assert result["breakdowns"]["by_order_type"][0]["order_type_code"] == 0
+    assert result["data_quality"]["session_definition"]["basis"] == (
+        "dst_aware_market_sessions"
+    )
+
+
+def test_execution_quality_aggregates_partial_fills_by_order() -> None:
+    gateway = FakeGateway()
+    start = _now() - 100
+    gateway.tick_rows = _ticks(100, start=start)
+    gateway.orders = [
+        {
+            "ticket": 10,
+            "type": 0,
+            "price_open": 1.10005,
+            "volume_initial": 1.0,
+            "time_setup_msc": (start + 9) * 1000,
+        }
+    ]
+    gateway.deals = [
+        {
+            "ticket": 20,
+            "order": 10,
+            "symbol": "EURUSD",
+            "type": 0,
+            "volume": 0.4,
+            "price": 1.10008,
+            "time_msc": (start + 10) * 1000,
+        },
+        {
+            "ticket": 21,
+            "order": 10,
+            "symbol": "EURUSD",
+            "type": 0,
+            "volume": 0.6,
+            "price": 1.10009,
+            "time_msc": (start + 11) * 1000,
+        },
+    ]
+
+    result = analyze_execution_quality(
+        TradeExecutionQualityRequest(
+            minutes_back=60,
+            benchmark="order_price",
+            markout_seconds=[1],
+            detail="full",
+        ),
+        gateway,
+    )
+
+    assert result["summary"]["fills"] == 2
+    assert result["summary"]["orders"] == 1
+    assert result["summary"]["partial_orders"] == 0
+    assert result["summary"]["partial_fill_rate"] == 0.0
+    assert result["summary"]["partial_fill_rate_basis"] == (
+        "orders_aggregated_from_deals"
+    )
+    assert [row["deal_fill_ratio"] for row in result["items"]] == [0.4, 0.6]
+
+
+def test_execution_session_clock_tracks_london_new_york_dst_mismatch() -> None:
+    winter = datetime(2026, 1, 12, 12, 30, tzinfo=timezone.utc)
+    summer = datetime(2026, 7, 13, 12, 30, tzinfo=timezone.utc)
+
+    assert market_session_label(winter, session_calendar="fx") == "london"
+    assert market_session_label(summer, session_calendar="fx") == (
+        "london_ny_overlap"
+    )
+
+
+def test_execution_quality_separates_pending_wait_from_market_latency() -> None:
+    gateway = FakeGateway()
+    start = _now() - 100
+    gateway.tick_rows = _ticks(100, start=start)
+    gateway.orders = [
+        {
+            "ticket": 10,
+            "type": 0,
+            "price_open": 1.10005,
+            "volume_initial": 1.0,
+            "time_setup_msc": (start + 9) * 1000,
+        },
+        {
+            "ticket": 11,
+            "type": 2,
+            "price_open": 1.10005,
+            "volume_initial": 1.0,
+            "time_setup_msc": start * 1000,
+        },
+    ]
+    gateway.deals = [
+        {
+            "ticket": 20,
+            "order": 10,
+            "symbol": "EURUSD",
+            "type": 0,
+            "volume": 1.0,
+            "price": 1.10008,
+            "time_msc": (start + 10) * 1000,
+        },
+        {
+            "ticket": 21,
+            "order": 11,
+            "symbol": "EURUSD",
+            "type": 0,
+            "volume": 1.0,
+            "price": 1.10008,
+            "time_msc": (start + 10) * 1000,
+        },
+    ]
+
+    result = analyze_execution_quality(
+        TradeExecutionQualityRequest(
+            minutes_back=60,
+            benchmark="order_price",
+            markout_seconds=[1],
+            detail="full",
+        ),
+        gateway,
+    )
+
+    assert result["summary"]["market_fill_latency_ms"]["mean"] == 1000.0
+    assert result["summary"]["pending_time_to_fill_ms"]["mean"] == 10000.0
+    assert result["summary"]["order_to_fill_duration_ms"]["mean"] == 5500.0
+    duration_display = result["summary"]["duration_display"]
+    assert duration_display["pending_time_to_fill"]["mean"] == "10s"
+    assert duration_display["pending_time_to_fill"]["p95"] == "10s"
+    assert duration_display["order_to_fill_duration"]["mean"] == "6s"
+    assert duration_display["order_to_fill_duration"]["p95"] == "10s"
+    assert result["items"][1]["fill_timing_basis"] == "pending_time_to_fill"
+    assert any("not broker execution latency" in item for item in result["warnings"])
 
 
 def test_execution_quality_statistics_remove_binary_float_tails() -> None:
@@ -323,6 +632,14 @@ def test_execution_quality_statistics_remove_binary_float_tails() -> None:
     assert stats["mean"] == pytest.approx(0.386918)
     assert stats["median"] == pytest.approx(0.262394)
     assert stats["p95"] == pytest.approx(1.26392)
+
+
+def test_execution_quality_formats_long_pending_durations() -> None:
+    display = _execution_duration_display(
+        {"mean": 7_063_990.0, "p95": 41_793_600.0, "max": 48_936_100.0}
+    )
+
+    assert display == {"mean": "1h 57m", "p95": "11h 36m", "max": "13h 35m"}
 
 
 def test_execution_quality_handles_empty_tick_history() -> None:
@@ -441,6 +758,15 @@ def test_strategy_validation_returns_walk_forward_oos_metrics() -> None:
     assert result["rankings"][0]["id"] == "cross"
     assert result["rankings"][0]["trades"] > 0
     assert result["rankings"][0]["evaluation_status"] == "complete"
+    candidate = result["rankings"][0]
+    assert candidate["signal_definition"] == "cross_event"
+    assert "calibration" not in candidate
+    assert "direction_base_rate_stability" in candidate
+    if candidate["sharpe"] is not None:
+        assert candidate["mean_return_t_stat"] == pytest.approx(
+            candidate["sharpe"] * math.sqrt(candidate["trades"])
+        )
+    assert result["units"]["trades"] == "non_overlapping_positions"
     assert result["rankings"][0]["evidence"]["classification"] in {
         "positive", "negative", "inconclusive"
     }
@@ -469,6 +795,52 @@ def test_strategy_barrier_entry_uses_next_bar_open_after_gap() -> None:
 
     assert indices.tolist() == [0]
     assert outcomes.tolist() == pytest.approx([0.0])
+
+
+def test_strategy_barrier_returns_do_not_overlap_persistent_signals() -> None:
+    frame = pd.DataFrame(
+        {
+            "open": np.full(12, 100.0),
+            "high": np.full(12, 100.1),
+            "low": np.full(12, 99.9),
+            "close": np.full(12, 100.0),
+        }
+    )
+    signal = pd.Series(np.ones(12))
+
+    indices, outcomes = _barrier_returns(
+        frame,
+        signal,
+        horizon=3,
+        tp_pct=5.0,
+        sl_pct=5.0,
+    )
+
+    assert indices.tolist() == [0, 3, 6]
+    assert outcomes.tolist() == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_strategy_validation_fails_when_cost_spread_is_unavailable() -> None:
+    gateway = FakeGateway()
+    gateway.copy_ticks_range = lambda *_args, **_kwargs: []
+    request = StrategyValidateRequest(
+        symbol="EURUSD",
+        lookback=400,
+        candidates=[
+            {
+                "id": "cross",
+                "type": "builtin_strategy",
+                "strategy": "sma_cross",
+                "params": {"fast_period": 5, "slow_period": 20},
+            }
+        ],
+    )
+
+    result = validate_strategies(request, gateway)
+
+    assert result["success"] is False
+    assert result["error_code"] == "cost_model_unavailable"
+    assert result["cost_model"]["spread_bps"] is None
 
 
 def test_forecast_strategy_folds_cover_computed_signal_window(monkeypatch) -> None:
@@ -535,6 +907,31 @@ def test_portfolio_risk_marks_empty_position_book() -> None:
     assert result["model_context"]["random_seed"] == 42
 
 
+def test_portfolio_mark_freshness_is_aggregated_by_symbol() -> None:
+    gateway = FakeGateway()
+    calls = []
+
+    def _tick(symbol):
+        calls.append(symbol)
+        return SimpleNamespace(bid=1.0999, ask=1.1001, time=_now())
+
+    gateway.symbol_info_tick = _tick
+    context = _portfolio_mark_context(
+        gateway,
+        [
+            {"ticket": 1, "symbol": "EURUSD"},
+            {"ticket": 2, "symbol": "EURUSD"},
+            {"ticket": 3, "symbol": "GBPUSD"},
+        ],
+    )
+
+    assert calls == ["EURUSD", "GBPUSD"]
+    assert [
+        (row["symbol"], row["positions"])
+        for row in context["mark_freshness"]
+    ] == [("EURUSD", 2), ("GBPUSD", 1)]
+
+
 def test_portfolio_risk_reconciles_component_expected_shortfall() -> None:
     gateway = FakeGateway()
     gateway.account_info = lambda: SimpleNamespace(currency="USD", equity=25000.0)
@@ -542,6 +939,12 @@ def test_portfolio_risk_reconciles_component_expected_shortfall() -> None:
         {"ticket": 1, "symbol": "EURUSD", "type": 0, "volume": 1.0, "price_current": 1.1},
         {"ticket": 2, "symbol": "GBPUSD", "type": 1, "volume": 0.5, "price_current": 1.1},
     ]
+    stale_mark_time = _now() - 3600
+    gateway.symbol_info_tick = lambda symbol: SimpleNamespace(
+        bid=1.0999,
+        ask=1.1001,
+        time=stale_mark_time,
+    )
     result = decompose_portfolio_risk(
         PortfolioRiskDecomposeRequest(lookback=300, horizon_bars=[1], confidence=[0.95], simulations=500),
         gateway,
@@ -568,7 +971,10 @@ def test_portfolio_risk_reconciles_component_expected_shortfall() -> None:
         "random_seed": 42,
         "completion_policy": "fail_closed",
         "valuation_time": result["model_context"]["valuation_time"],
-        "valuation_basis": "live_position_marks_with_completed_bar_return_history",
+        "valuation_basis": "stale_or_unverified_position_marks_with_completed_bar_return_history",
+        "data_stale": True,
+        "usable_for_live_trading": False,
+        "mark_freshness": result["model_context"]["mark_freshness"],
         "aligned_returns": result["summary"]["aligned_rows"],
         "data_start": result["model_context"]["data_start"],
         "data_end": result["model_context"]["data_end"],
@@ -576,6 +982,13 @@ def test_portfolio_risk_reconciles_component_expected_shortfall() -> None:
     assert datetime.fromisoformat(
         result["model_context"]["valuation_time"].replace("Z", "+00:00")
     ).tzinfo == timezone.utc
+    assert result["model_context"]["valuation_time"] == datetime.fromtimestamp(
+        stale_mark_time, tz=timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+    assert all(
+        mark["usable_for_live_trading"] is False
+        for mark in result["model_context"]["mark_freshness"]
+    )
     assert "as_of" not in result["model_context"]
 
 
@@ -674,3 +1087,49 @@ def test_relative_strength_ranks_and_reports_breadth() -> None:
     assert result["rank_quality"] == "illustrative_small_universe"
     assert result["score_definition"]["weights"] == [0.4, 0.6]
     assert all("rank_percentile" not in row for row in result["leaders"])
+
+
+def test_relative_strength_limit_caps_total_returned_rankings() -> None:
+    gateway = FakeGateway()
+    result = rank_relative_strength(
+        MarketRelativeStrengthRequest(
+            symbols="EURUSD,GBPUSD,USDJPY",
+            horizons=[5],
+            weights=[1.0],
+            volatility_lookback=30,
+            limit=1,
+        ),
+        gateway,
+    )
+
+    assert result["success"] is True
+    assert result["returned_count"] == 1
+    assert result["applied_limit"] == 1
+    assert len(result["leaders"]) == 1
+    assert result["laggards"] == []
+
+
+def test_relative_strength_rejects_one_symbol_before_fetching_history() -> None:
+    with pytest.raises(ValueError, match="requires at least two comma-separated symbols"):
+        MarketRelativeStrengthRequest(symbols="EURUSD")
+
+
+def test_relative_strength_fetches_external_benchmark_without_ranking_it() -> None:
+    gateway = FakeGateway()
+    request = MarketRelativeStrengthRequest(
+        symbols="EURUSD,GBPUSD",
+        benchmark="USDJPY",
+        horizons=[5],
+        weights=[1.0],
+        volatility_lookback=30,
+        limit=2,
+        detail="full",
+    )
+
+    result = rank_relative_strength(request, gateway)
+
+    assert result["success"] is True
+    assert result["universe_size"] == 2
+    assert result["data_quality"]["selected_symbols"] == 2
+    assert result["data_quality"]["data_symbols_fetched"] == 3
+    assert "USDJPY" not in {row["symbol"] for row in result["all_rankings"]}

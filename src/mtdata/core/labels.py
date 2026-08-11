@@ -12,7 +12,7 @@ from ..utils.barriers import (
 from ..utils.barriers import (
     build_barrier_kwargs_from as _build_barrier_kwargs_from,
 )
-from ..utils.barriers import get_tick_size as _get_pip_size
+from ..utils.barriers import get_tick_size as _get_tick_size
 from ..utils.barriers import (
     normalize_same_bar_policy,
     validate_barrier_unit_family_exclusivity,
@@ -71,7 +71,8 @@ def _round_label_price(value: Any, *, digits: int) -> Optional[float]:
 
 def _triple_barrier_sample_row(
     *,
-    idx: int,
+    result_idx: int,
+    source_idx: int,
     closes: np.ndarray,
     t_entry: List[str],
     labels: List[int],
@@ -79,33 +80,33 @@ def _triple_barrier_sample_row(
     tp_times: List[Optional[str]],
     sl_times: List[Optional[str]],
     direction_value: str,
-    pip_size: float,
+    tick_size: float,
     barrier_kwargs: Dict[str, Any],
     price_digits: int = 0,
     same_bar_flags: Optional[List[bool]] = None,
 ) -> Dict[str, Any]:
-    label = int(labels[idx])
+    label = int(labels[result_idx])
     row: Dict[str, Any] = {
-        "entry_time": t_entry[idx],
+        "entry_time": t_entry[result_idx],
         "label": label,
         "outcome": (
             "same_bar_neutral"
-            if same_bar_flags and same_bar_flags[idx] and label == 0
+            if same_bar_flags and same_bar_flags[result_idx] and label == 0
             else _label_outcome(label)
         ),
-        "holding_bars": hold[idx],
-        "tp_time": tp_times[idx],
-        "sl_time": sl_times[idx],
-        "same_bar": bool(same_bar_flags and same_bar_flags[idx]),
+        "holding_bars": hold[result_idx],
+        "tp_time": tp_times[result_idx],
+        "sl_time": sl_times[result_idx],
+        "same_bar": bool(same_bar_flags and same_bar_flags[result_idx]),
     }
     try:
-        entry_price = float(closes[idx])
+        entry_price = float(closes[source_idx])
         if math.isfinite(entry_price):
             row["entry_price"] = _round_label_price(entry_price, digits=price_digits)
             tp_price, sl_price = _resolve_barrier_prices(
                 price=entry_price,
                 direction=direction_value,
-                pip_size=pip_size,
+                tick_size=tick_size,
                 adjust_inverted=False,
                 **barrier_kwargs,
             )
@@ -136,7 +137,7 @@ def _build_triple_barrier_outputs(
     horizon: int,
     label_on: str,
     direction_value: str,
-    pip_size: float,
+    tick_size: float,
     barrier_kwargs: Dict[str, Any],
     same_bar_policy: str = "sl_first",
 ) -> tuple[
@@ -148,11 +149,14 @@ def _build_triple_barrier_outputs(
     List[bool],
     List[float],
     List[float],
+    List[int],
+    int,
+    int,
     int,
 ]:
     max_entry_index = len(closes) - int(horizon)
     if max_entry_index <= 0:
-        return [], [], [], [], [], [], [], [], 0
+        return [], [], [], [], [], [], [], [], [], 0, 0, 0
 
     entry_prices = closes[:max_entry_index]
     valid_price_mask = np.isfinite(entry_prices) & (entry_prices > 0.0)
@@ -165,7 +169,7 @@ def _build_triple_barrier_outputs(
         tp_price, sl_price = _resolve_barrier_prices(
             price=price,
             direction=direction_value,
-            pip_size=pip_size,
+            tick_size=tick_size,
             adjust_inverted=False,
             **barrier_kwargs,
         )
@@ -183,7 +187,11 @@ def _build_triple_barrier_outputs(
         valid_barrier_mask[idx] = True
 
     valid_entry_mask = valid_price_mask & valid_barrier_mask
-    skipped_entries = int(max_entry_index - np.count_nonzero(valid_entry_mask))
+    invalid_price_entries = int(np.count_nonzero(~valid_price_mask))
+    invalid_barrier_entries = int(
+        np.count_nonzero(valid_price_mask & ~valid_barrier_mask)
+    )
+    skipped_entries = invalid_price_entries + invalid_barrier_entries
 
     high_values = highs if highs is not None else closes
     low_values = lows if lows is not None else closes
@@ -223,8 +231,10 @@ def _build_triple_barrier_outputs(
     same_bar_flags: List[bool] = []
     max_favorable_moves_pct: List[float] = []
     max_adverse_moves_pct: List[float] = []
+    source_indices: List[int] = []
 
     for idx in np.flatnonzero(valid_entry_mask):
+        source_indices.append(int(idx))
         entry_price = float(entry_prices[idx])
         future_high = np.asarray(high_values[idx + 1 : idx + int(horizon) + 1], dtype=float)
         future_low = np.asarray(low_values[idx + 1 : idx + int(horizon) + 1], dtype=float)
@@ -265,6 +275,11 @@ def _build_triple_barrier_outputs(
             hold.append(tp_offset)
             tp_times.append(_format_time_minimal(times[idx + tp_offset]))
             sl_times.append(_format_time_minimal(times[idx + sl_offset]))
+        elif is_same_bar and same_bar_policy == "sl_first":
+            labels.append(-1)
+            hold.append(sl_offset)
+            tp_times.append(_format_time_minimal(times[idx + tp_offset]))
+            sl_times.append(_format_time_minimal(times[idx + sl_offset]))
         elif sl_offset > 0 and (tp_offset < 0 or sl_offset <= tp_offset):
             labels.append(-1)
             hold.append(sl_offset)
@@ -281,12 +296,28 @@ def _build_triple_barrier_outputs(
         same_bar_flags,
         max_favorable_moves_pct,
         max_adverse_moves_pct,
+        source_indices,
+        invalid_price_entries,
+        invalid_barrier_entries,
         skipped_entries,
     )
 
 
+def _skipped_entry_warning(
+    *, invalid_price_entries: int, invalid_barrier_entries: int
+) -> str:
+    reasons = []
+    if invalid_price_entries:
+        reasons.append(f"{invalid_price_entries} invalid or non-positive price(s)")
+    if invalid_barrier_entries:
+        reasons.append(
+            f"{invalid_barrier_entries} TP/SL pair(s) that did not bracket the entry"
+        )
+    return "Skipped entries: " + "; ".join(reasons) + "."
+
+
 @mcp.tool()
-def labels_triple_barrier(
+def labels_triple_barrier(  # noqa: C901
     symbol: str,
     timeframe: TimeframeLiteral = "H1",
     limit: int = _DEFAULT_LABEL_LIMIT,
@@ -312,14 +343,17 @@ def labels_triple_barrier(
       - Ticks: tp_ticks/sl_ticks (trade_tick_size from symbol info)
       Use exactly one barrier unit family per call; mixed units are rejected.
 
-    label_on='high_low' considers intrabar extremes for barrier hits; 'close' uses closes only.
+    label_on='high_low' considers raw intrabar extremes for barrier hits, even
+    when denoise changes the close used to anchor barriers. Real observed price
+    touches are not smoothed away. Use label_on='close' for close-series-only
+    labeling on the resolved (and potentially denoised) base series.
     same_bar_policy explicitly resolves bars that touch both barriers; the default
     is conservative SL-first because the intrabar ordering is unknowable.
     direction='long' or 'short' controls which side is treated as TP/SL.
     Outputs label: +1 (TP first), -1 (SL first), 0 (neither by horizon), and holding_bars until decision.
     """
 
-    def _run() -> Dict[str, Any]:
+    def _run() -> Dict[str, Any]:  # noqa: C901
         try:
             mt5_gateway = create_mt5_gateway(
                 ensure_connection_impl=ensure_mt5_connection_or_raise
@@ -400,7 +434,7 @@ def labels_triple_barrier(
             lows = df["low"].astype(float).to_numpy() if "low" in df.columns else None
             times = df["time"].astype(float).to_numpy()
 
-            pip_size = _get_pip_size(symbol)
+            tick_size = _get_tick_size(symbol)
 
             N = len(closes)
             barrier_kwargs = _build_barrier_kwargs_from(barrier_values)
@@ -420,7 +454,7 @@ def labels_triple_barrier(
             sample_tp, sample_sl = _resolve_barrier_prices(
                 price=sample_entry_price,
                 direction=direction_value,
-                pip_size=pip_size,
+                tick_size=tick_size,
                 adjust_inverted=False,
                 **barrier_kwargs,
             )
@@ -510,6 +544,9 @@ def labels_triple_barrier(
                 same_bar_flags,
                 max_favorable_moves_pct,
                 max_adverse_moves_pct,
+                source_indices,
+                invalid_price_entries,
+                invalid_barrier_entries,
                 skipped_entries,
             ) = _build_triple_barrier_outputs(
                 closes=closes,
@@ -519,7 +556,7 @@ def labels_triple_barrier(
                 horizon=horizon_bars,
                 label_on=label_on,
                 direction_value=direction_value,
-                pip_size=pip_size,
+                tick_size=tick_size,
                 barrier_kwargs=barrier_kwargs,
                 same_bar_policy=same_bar_policy_value,
             )
@@ -539,6 +576,8 @@ def labels_triple_barrier(
                 "horizon_trimmed": horizon_trimmed,
                 "horizon_trim_fraction": round(horizon_trim_fraction, 4),
                 "invalid_entry_skipped": int(skipped_entries),
+                "invalid_price_skipped": int(invalid_price_entries),
+                "invalid_barrier_skipped": int(invalid_barrier_entries),
             }
             if rows_after_labeling < requested_lookback:
                 warnings_out.append(
@@ -558,6 +597,9 @@ def labels_triple_barrier(
                     "direction": direction_value,
                     "label_on": str(label_on),
                     "entry_price_source": str(base_col),
+                    "hit_price_source": (
+                        "raw_high_low" if label_on == "high_low" else str(base_col)
+                    ),
                     "same_bar_policy": same_bar_policy_value,
                     "horizon_bars": horizon_bars,
                     "barrier_unit": next(
@@ -627,9 +669,16 @@ def labels_triple_barrier(
                 payload["warnings"] = list(warnings_out)
             if skipped_entries > 0:
                 payload.setdefault("warnings", []).append(
-                    f"Skipped {int(skipped_entries)} entries with invalid or non-positive entry prices."
+                    _skipped_entry_warning(
+                        invalid_price_entries=invalid_price_entries,
+                        invalid_barrier_entries=invalid_barrier_entries,
+                    )
                 )
                 payload["skipped_entries"] = int(skipped_entries)
+                payload["skipped_entry_reasons"] = {
+                    "invalid_price": int(invalid_price_entries),
+                    "invalid_barrier": int(invalid_barrier_entries),
+                }
             if output_mode in ("summary", "compact", "standard"):
                 import numpy as _np
 
@@ -745,9 +794,16 @@ def labels_triple_barrier(
                         out["warnings"] = list(warnings_out)
                     if skipped_entries > 0:
                         out.setdefault("warnings", []).append(
-                            f"Skipped {int(skipped_entries)} entries with invalid or non-positive entry prices."
+                            _skipped_entry_warning(
+                                invalid_price_entries=invalid_price_entries,
+                                invalid_barrier_entries=invalid_barrier_entries,
+                            )
                         )
                         out["skipped_entries"] = int(skipped_entries)
+                        out["skipped_entry_reasons"] = {
+                            "invalid_price": int(invalid_price_entries),
+                            "invalid_barrier": int(invalid_barrier_entries),
+                        }
                     return out
                 payload["sample_quality_status"] = sample_quality["status"]
                 payload["summary"] = summary
@@ -759,7 +815,8 @@ def labels_triple_barrier(
                 def _sample_rows(indices: List[int]) -> List[Dict[str, Any]]:
                     return [
                         _triple_barrier_sample_row(
-                            idx=idx,
+                            result_idx=idx,
+                            source_idx=source_indices[idx],
                             closes=closes,
                             t_entry=t_entry,
                             labels=labels,
@@ -768,7 +825,7 @@ def labels_triple_barrier(
                             sl_times=sl_times,
                             same_bar_flags=same_bar_flags,
                             direction_value=direction_value,
-                            pip_size=pip_size,
+                            tick_size=tick_size,
                             barrier_kwargs=barrier_kwargs,
                             price_digits=price_digits,
                         )

@@ -68,6 +68,10 @@ def test_run_data_fetch_candles_passes_allow_stale_to_service():
             "start datetime 2099-01-01 is in the future; no historical data is available for future dates.",
             "data_fetch_candles_future_date_range",
         ),
+        (
+            "Could not parse date 'tomorrowish'",
+            "data_fetch_candles_invalid_date",
+        ),
     ],
 )
 def test_run_data_fetch_candles_classifies_query_errors(message, expected_code):
@@ -214,6 +218,13 @@ def test_data_fetch_candles_schema_documents_ohlcv():
     assert "open,high,low,close,volume" in ohlcv["description"]
 
 
+def test_data_fetch_candles_schema_documents_inclusive_date_bounds():
+    schema = DataFetchCandlesRequest.model_json_schema()
+
+    assert "00:00:00 UTC" in schema["properties"]["start"]["description"]
+    assert "23:59:59.999999 UTC" in schema["properties"]["end"]["description"]
+
+
 def test_run_data_fetch_candles_omits_contract_metadata_in_compact_detail():
     rows = [{"time": 1.0, "close": 1.1}]
     request = DataFetchCandlesRequest(symbol="EURUSD", timeframe="H1", limit=10)
@@ -259,6 +270,7 @@ def test_run_data_fetch_candles_compact_omits_default_metadata():
         "symbol": "EURUSD",
         "timeframe": "H1",
         "count": 5,
+        "limit_satisfied": True,
         "data": [],
     }
 
@@ -529,6 +541,7 @@ def test_run_data_fetch_candles_range_applies_limit_cap():
             "success": True,
             "candles": 5,
             "data": rows,
+            "data_window": {"start": "t0", "end": "t4"},
             "meta": {"diagnostics": {"query": {"mode": "range"}}},
         },
     )
@@ -544,9 +557,9 @@ def test_run_data_fetch_candles_range_applies_limit_cap():
         "retained": "last",
         "excluded_count": 3,
     }
+    assert result["data_window"] == {"start": "t3", "end": "t4"}
     assert result["warnings"] == [
-        "Range contained 5 bars; returned the latest 2 because limit=2. "
-        "Set limit>=5 to return the full range."
+        "Fetched range contained 5 bars; returned the latest 2 because limit=2."
     ]
     assert result["query_type"] == "historical"
 
@@ -613,7 +626,7 @@ def test_run_data_fetch_candles_normalizes_count_metadata():
     assert result["requested_limit"] == 2
     assert "candles" not in result
     assert "returned_count" not in result
-    assert result["data_window"] == {"start": "t1", "end": "t2"}
+    assert result["data_window"] == {"start": "t3", "end": "t4"}
 
 
 def test_run_data_fetch_candles_compact_keeps_spread_estimate_without_meta():
@@ -647,6 +660,64 @@ def test_run_data_fetch_candles_compact_keeps_spread_estimate_without_meta():
         "value": 0.00009,
         "source": "tick_stats",
     }
+
+
+def test_run_data_fetch_candles_does_not_duplicate_structured_spread_warning():
+    request = DataFetchCandlesRequest(
+        symbol="EURUSD",
+        timeframe="H1",
+        include_spread=True,
+    )
+    warning = (
+        "include_spread requested but per-bar spread unavailable; a single "
+        "reference spread is returned at payload level."
+    )
+
+    result = run_data_fetch_candles(
+        request,
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_candles_impl=lambda **kwargs: {
+            "success": True,
+            "candles": 1,
+            "data": [{"time": 1.0, "close": 1.1}],
+            "spread_mode": "single_reference",
+            "spread_historical_available": False,
+            "spread_reference": {
+                "value": 0.00009,
+                "unit": "price",
+                "source": "tick_stats",
+                "basis": "single_reference_not_per_bar_historical",
+            },
+            "warnings": [warning],
+        },
+    )
+
+    assert result["spread_mode"] == "single_reference"
+    assert result["warnings"] == [warning]
+    assert "spread_unavailable" not in result
+
+
+def test_run_data_fetch_candles_does_not_reinfer_service_spread_contract():
+    request = DataFetchCandlesRequest(
+        symbol="EURUSD",
+        timeframe="H1",
+        include_spread=True,
+        detail="full",
+    )
+
+    result = run_data_fetch_candles(
+        request,
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_candles_impl=lambda **kwargs: {
+            "success": True,
+            "candles": 1,
+            "data": [[1.0, 1.1, 0.0]],
+        },
+    )
+
+    assert "spread_mode" not in result
+    assert "spread_unavailable" not in result
+    assert "warnings" not in result
 
 
 def test_run_data_fetch_candles_compact_exposes_range_gap_metadata():
@@ -994,6 +1065,8 @@ def test_run_data_fetch_candles_compact_keeps_anomaly_metadata():
             "candles": 4,
             "candles_requested": 5,
             "candles_excluded": 1,
+            "time_basis": "utc",
+            "timestamp_mode": "native_utc",
             "candle_counts": {
                 "requested": 5,
                 "returned": 4,
@@ -1028,6 +1101,9 @@ def test_run_data_fetch_candles_compact_keeps_anomaly_metadata():
     assert result["symbol"] == "EURUSD"
     assert result["timeframe"] == "H1"
     assert "candles_requested" not in result
+    assert result["limit_satisfied"] is False
+    assert result["time_basis"] == "utc"
+    assert result["timestamp_mode"] == "native_utc"
 
 
 def test_compact_indicator_candles_disclose_warmup_history() -> None:
@@ -1117,6 +1193,32 @@ def test_run_data_fetch_candles_standard_keeps_forming_booleans():
     assert result["forming_candle_status"] == "skipped"
     assert result["forming_candle_included"] is False
     assert result["forming_candle_skipped"] is True
+
+
+def test_projected_compact_candles_keep_skipped_forming_status():
+    request = DataFetchCandlesRequest(symbol="EURUSD", timeframe="H1", limit=5)
+
+    result = run_data_fetch_candles(
+        request,
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_candles_impl=lambda **kwargs: {
+            "success": True,
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "candles": 4,
+            "has_forming_candle": True,
+            "forming_candle_status": "skipped",
+            "forming_candle_included": False,
+            "forming_candle_skipped": True,
+            "ohlcv_filter_applied": True,
+            "data": [{"time": 1.0, "close": 1.1}],
+        },
+    )
+
+    assert result["forming_candle_status"] == "skipped"
+    assert "has_forming_candle" not in result
+    assert "forming_candle_included" not in result
+    assert "forming_candle_skipped" not in result
 
 
 def test_run_data_fetch_candles_full_omits_zero_exclusion_categories():
@@ -1281,16 +1383,28 @@ def test_run_data_fetch_ticks_echoes_limit_and_cap_signal():
     assert partial["requested_limit"] == 20
     assert partial["limit_reached"] is False
 
+    simplified = run_data_fetch_ticks(
+        DataFetchTicksRequest(symbol="EURUSD", limit=100, detail="standard"),
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_ticks_impl=lambda **_kwargs: {
+            "success": True,
+            "count": 30,
+            "tick_count": 100,
+            "data": [],
+        },
+    )
+    assert simplified["requested_limit"] == 100
+    assert simplified["limit_reached"] is True
+
 
 def test_compact_tick_row_marks_locked_quote_spread_unavailable():
     row, spread_sample = _compact_tick_row(
         {"time": "2026-07-17T01:53:23Z", "bid": 1.14396, "ask": 1.14396},
-        price_point=0.00001,
     )
 
-    assert row["spread"] == 0.0
-    assert row["spread_valid"] is False
-    assert row["spread_basis"] == "unavailable"
+    assert "spread" not in row
+    assert "spread_valid" not in row
+    assert "spread_basis" not in row
     assert spread_sample is None
 
 
@@ -1310,8 +1424,8 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
                     "ask": 1.16596,
                     "volume": 3.0,
                     "volume_real": 1.25,
-                    "flags": 1026,
-                    "flags_decoded": ["bid", "volume_real"],
+                    "flags": 2,
+                    "flags_decoded": ["bid"],
                     "quote_update_type": "bid_only_update",
                     "spread_valid": False,
                 },
@@ -1321,8 +1435,8 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
                     "ask": 1.16599,
                     "volume": 4.0,
                     "volume_real": 0.0,
-                    "flags": 1030,
-                    "flags_decoded": ["bid", "ask", "volume_real"],
+                    "flags": 6,
+                    "flags_decoded": ["bid", "ask"],
                     "quote_update_type": "bid_ask_update",
                     "spread_valid": True,
                 },
@@ -1338,7 +1452,7 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             },
             "stats": {"spread": {"low": 0.00006, "high": 0.00008}},
             "last_quote": {"bid": 1.16591, "ask": 1.16599},
-            "flags_legend": {"1026": ["bid", "volume_real"]},
+            "flags_legend": {"2": ["bid"]},
             "duration_seconds": 1,
             "tick_rate_per_second": 2,
             "price_precision": 5,
@@ -1372,16 +1486,9 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
                 "ask": 1.16596,
                 "spread": 0.00006,
                 "mid": 1.16593,
-                "spread_points": 6.0,
-                "spread_pct": 0.005146,
                 "volume": 3.0,
                 "volume_real": 1.25,
-                "bid_changed": True,
-                "ask_changed": False,
                 "quote_update_type": "bid_only_update",
-                "spread_sample_eligible": False,
-                "spread_valid": True,
-                "spread_basis": "quote_snapshot",
             },
             {
                 "time": "2026-05-29 20:57",
@@ -1389,15 +1496,7 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
                 "ask": 1.16599,
                 "spread": 0.00008,
                 "mid": 1.16595,
-                "spread_points": 8.0,
-                "spread_pct": 0.006861,
                 "volume": 4.0,
-                "bid_changed": True,
-                "ask_changed": True,
-                "quote_update_type": "bid_ask_update",
-                "spread_sample_eligible": True,
-                "spread_valid": True,
-                "spread_basis": "quote_snapshot",
             },
         ],
         "timezone": "UTC",
@@ -1414,8 +1513,6 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
             "ask": "absolute_price",
             "spread": "absolute_price",
             "mid": "absolute_price",
-            "spread_points": "broker_points",
-            "spread_pct": "percentage_points (1.0 = 1%)",
             "volume": "last_trade_volume",
             "volume_real": "last_trade_volume_real",
         },
@@ -1425,6 +1522,34 @@ def test_run_data_fetch_ticks_compact_prunes_row_diagnostics():
         "requested_limit": 2,
         "limit_reached": True,
     }
+
+
+def test_run_data_fetch_ticks_compact_retains_clock_skew_safety_fields():
+    result = run_data_fetch_ticks(
+        DataFetchTicksRequest(symbol="EURUSD", limit=1, detail="compact"),
+        gateway=SimpleNamespace(ensure_connection=lambda: None),
+        fetch_ticks_impl=lambda **_kwargs: {
+            "success": True,
+            "symbol": "EURUSD",
+            "count": 1,
+            "data": [{"time": "2026-07-17T23:56:59Z", "bid": 1.1, "ask": 1.1001}],
+            "freshness": "clock skew, tick timestamp 4m 44s ahead of wall clock",
+            "freshness_state": "clock_skew",
+            "freshness_reason": "future_timestamp",
+            "data_stale": True,
+            "timestamp_in_future": True,
+            "timestamp_skew_seconds": 284.0,
+            "timestamp_warning": "Latest tick timestamp is ahead of the wall clock.",
+            "usable_for_live_trading": False,
+        },
+    )
+
+    assert result["freshness_state"] == "clock_skew"
+    assert result["freshness_reason"] == "future_timestamp"
+    assert result["timestamp_in_future"] is True
+    assert result["timestamp_skew_seconds"] == 284.0
+    assert "ahead of the wall clock" in result["timestamp_warning"]
+    assert result["usable_for_live_trading"] is False
 
 
 @pytest.mark.parametrize(

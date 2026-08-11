@@ -39,6 +39,7 @@ Usage::
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import quote
 
 from .interface import TrainedModelHandle
 
@@ -206,7 +208,7 @@ class ModelStore:
     def _model_dir(self, method: str, data_scope: str, params_hash: str) -> Path:
         safe_method = self._validate_path_component(method, name="method")
         safe_scope = self._validate_path_component(
-            str(data_scope).replace("/", "_").replace("\\", "_"),
+            quote(str(data_scope), safe=""),
             name="data_scope",
         )
         safe_hash = self._validate_path_component(params_hash, name="params_hash")
@@ -218,11 +220,23 @@ class ModelStore:
     def _model_id(cls, method: str, data_scope: str, params_hash: str) -> str:
         safe_method = cls._validate_path_component(method, name="method")
         safe_scope = cls._validate_path_component(
-            str(data_scope).replace("/", "_").replace("\\", "_"),
+            quote(str(data_scope), safe=""),
             name="data_scope",
         )
         safe_hash = cls._validate_path_component(params_hash, name="params_hash")
         return f"{safe_method}/{safe_scope}/{safe_hash}"
+
+    def _model_dir_from_id(self, model_id: str) -> Path:
+        parts = str(model_id).split("/")
+        if len(parts) != 3:
+            raise ValueError(f"Invalid model_id format: {model_id}")
+        method, encoded_scope, params_hash = parts
+        safe_method = self._validate_path_component(method, name="method")
+        safe_scope = self._validate_path_component(encoded_scope, name="data_scope")
+        safe_hash = self._validate_path_component(params_hash, name="params_hash")
+        return self._resolve_within_root(
+            self._root / safe_method / safe_scope / safe_hash
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -274,6 +288,7 @@ class ModelStore:
                     "last_used": now,
                     "metadata": handle.metadata,
                     "store_metadata": handle.store_metadata,
+                    "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
                 }
                 meta_path = model_dir / "metadata.json"
                 self._atomic_write_text(
@@ -286,15 +301,12 @@ class ModelStore:
     def load_bytes(self, model_id: str) -> bytes:
         """Load raw artifact bytes by *model_id*.
 
-        Updates ``last_used`` on successful access.
+        Loading opaque bytes does not renew the model TTL. Call ``mark_used``
+        only after method-owned deserialization and prediction succeed.
         Raises ``FileNotFoundError`` if the model does not exist.
         """
-        parts = model_id.split("/")
-        if len(parts) != 3:
-            raise FileNotFoundError(f"Invalid model_id format: {model_id}")
-        method, data_scope, params_hash = parts
         try:
-            model_dir = self._model_dir(method, data_scope, params_hash)
+            model_dir = self._model_dir_from_id(model_id)
         except ValueError as exc:
             raise FileNotFoundError(f"Invalid model_id format: {model_id}") from exc
         artifact_path = model_dir / "model.bin"
@@ -304,8 +316,35 @@ class ModelStore:
                 raise FileNotFoundError(f"No model artifact at {artifact_path}")
 
             data = artifact_path.read_bytes()
-            self._touch_last_used(model_dir)
+            metadata = self._read_raw_meta(model_dir)
+            expected_digest = (
+                str(metadata.get("artifact_sha256") or "")
+                if isinstance(metadata, dict)
+                else ""
+            )
+            actual_digest = hashlib.sha256(data).hexdigest()
+            if not expected_digest or expected_digest != actual_digest:
+                raise FileNotFoundError(
+                    f"Model record {model_id} is incomplete or contains an "
+                    "artifact/metadata generation mismatch."
+                )
         return data
+
+    def mark_used(self, model_id: str) -> bool:
+        """Renew idle TTL after an artifact has been used successfully."""
+        try:
+            model_dir = self._model_dir_from_id(model_id)
+            with self._model_dir_lock(model_dir, blocking=True):
+                with self._lock:
+                    if not (model_dir / "model.bin").is_file():
+                        return False
+                    if self._read_raw_meta(model_dir) is None:
+                        return False
+                    self._touch_last_used(model_dir)
+            return True
+        except Exception as exc:
+            logger.debug("Failed to mark model %s as used: %s", model_id, exc)
+            return False
 
     def find(
         self,
@@ -360,12 +399,8 @@ class ModelStore:
 
     def delete(self, model_id: str) -> bool:
         """Delete a model by *model_id*. Returns ``True`` if it existed."""
-        parts = model_id.split("/")
-        if len(parts) != 3:
-            return False
-        method, data_scope, params_hash = parts
         try:
-            model_dir = self._model_dir(method, data_scope, params_hash)
+            model_dir = self._model_dir_from_id(model_id)
         except ValueError:
             return False
         with self._model_dir_lock(model_dir, blocking=True):
@@ -412,6 +447,7 @@ class ModelStore:
 
     def cleanup_expired(self) -> int:
         """Remove all models that have exceeded the TTL. Returns count removed."""
+        self._sweep_deleted()
         if self._ttl <= 0:
             return 0
         removed = 0
@@ -439,11 +475,52 @@ class ModelStore:
                         continue
                     if self._remove_dir(model_dir):
                         removed += 1
+        removed += self._cleanup_expired_orphans(now)
         return removed
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _cleanup_expired_orphans(self, now: float) -> int:
+        """Remove old artifacts that have no readable metadata handle."""
+        if not self._root.is_dir():
+            return 0
+        removed = 0
+        for method_dir in list(self._root.iterdir()):
+            if not method_dir.is_dir() or method_dir.name.startswith("."):
+                continue
+            for scope_dir in list(method_dir.iterdir()):
+                if not scope_dir.is_dir() or scope_dir.name.startswith("."):
+                    continue
+                for model_dir in list(scope_dir.iterdir()):
+                    if not model_dir.is_dir() or model_dir.name.startswith("."):
+                        continue
+                    artifact_path = model_dir / "model.bin"
+                    if not artifact_path.is_file() or self._read_raw_meta(model_dir) is not None:
+                        continue
+                    metadata_path = model_dir / "metadata.json"
+                    mtimes = [artifact_path.stat().st_mtime]
+                    if metadata_path.exists():
+                        mtimes.append(metadata_path.stat().st_mtime)
+                    if (now - max(mtimes)) <= self._ttl:
+                        continue
+                    with self._model_dir_lock(model_dir, blocking=False) as locked:
+                        if not locked:
+                            continue
+                        with self._lock:
+                            if self._read_raw_meta(model_dir) is not None:
+                                continue
+                            if not artifact_path.is_file():
+                                continue
+                            current_mtimes = [artifact_path.stat().st_mtime]
+                            if metadata_path.exists():
+                                current_mtimes.append(metadata_path.stat().st_mtime)
+                            if (time.time() - max(current_mtimes)) <= self._ttl:
+                                continue
+                            if self._remove_dir(model_dir):
+                                removed += 1
+        return removed
 
     def _read_handle(
         self, model_dir: Path, *, skip_expiry: bool = False,
@@ -568,6 +645,29 @@ class ModelStore:
 
     def _deleted_root(self) -> Path:
         return self._resolve_within_root(self._root / ".deleted")
+
+    def _sweep_deleted(self) -> int:
+        """Retry physical removal of model directories staged as tombstones."""
+        deleted_root = self._deleted_root()
+        if not deleted_root.is_dir():
+            return 0
+        removed = 0
+        for tombstone in list(deleted_root.iterdir()):
+            try:
+                if tombstone.is_dir():
+                    shutil.rmtree(tombstone)
+                else:
+                    tombstone.unlink()
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "Failed to remove staged model tombstone %s: %s",
+                    tombstone,
+                    exc,
+                )
+        return removed
 
     def _lock_path_for_model_dir(self, model_dir: Path) -> Path:
         safe_model_dir = self._resolve_within_root(model_dir)

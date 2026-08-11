@@ -5,19 +5,16 @@ import pytest
 
 from mtdata.utils.minimal_output import (
     _encode_tabular,
-    _format_complex_value,
     _headers_from_dicts,
-    _indent_text,
     _quote_key,
     _stringify_for_toon_value,
-    _stringify_scalar,
 )
 from mtdata.utils.minimal_output_toon import (
     _column_decimals,
-    _minify_number,
     _quote_if_needed,
     _stringify_cell,
     _stringify_for_toon,
+    _stringify_scalar,
 )
 
 
@@ -32,19 +29,6 @@ class TestStringifyCell:
         result = _stringify_cell({"a": None, "b": 1})
         assert "a=" not in result
         assert "b=" in result
-
-
-class TestIndentText:
-    @pytest.mark.parametrize(
-        ("text", "indent", "expected"),
-        [
-            ("hello", "  ", "  hello"),
-            ("a\nb", "  ", "  a\n  b"),
-            ("x", ">>", ">>x"),
-        ],
-    )
-    def test_indent_variants(self, text, indent, expected):
-        assert _indent_text(text, indent=indent) == expected
 
 
 class TestQuoteIfNeeded:
@@ -174,21 +158,6 @@ class TestStringifyForToonValue:
         assert result == '"1|2|3"'
 
 
-class TestFormatComplexValue:
-    def test_list_of_dicts(self):
-        result = _format_complex_value([{"a": 1}, {"a": 2}])
-        assert "a" in result
-
-    def test_nested_dict_with_multiline(self):
-        result = _format_complex_value({"outer": {"a": 1, "b": 2}})
-        assert "outer:" in result
-
-    def test_empty_values_skipped(self):
-        result = _format_complex_value({"a": None, "b": 1})
-        assert "a:" not in result
-        assert "b: 1" in result
-
-
 class TestEncodeTabularNestedCells:
     def test_nested_cells_do_not_render_python_repr(self):
         result = _encode_tabular(
@@ -200,3 +169,23 @@ class TestEncodeTabularNestedCells:
         assert "prob_win_ci95" in result
         assert "low=0.3; high=0.5" in result
         assert "{'low': 0.3, 'high': 0.5}" not in result
+
+    def test_row_price_point_preserves_price_column_precision(self):
+        result = _encode_tabular(
+            "data",
+            ["close", "score"],
+            [{"close": 1.14328, "score": 1, "price_point": 0.00001}],
+            simplify_numbers=True,
+        )
+
+        assert "1.14328,1" in result
+
+    def test_full_nested_cells_keep_integers_as_integers(self):
+        result = _encode_tabular(
+            "data",
+            ["stats"],
+            [{"stats": {"count": 2, "mean": 1.23456789}}],
+            simplify_numbers=False,
+        )
+
+        assert "count=2; mean=1.23456789" in result

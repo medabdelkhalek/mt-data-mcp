@@ -12,6 +12,8 @@ Use them when you already have a research loop and want **execution-aware** or *
 
 `market_microstructure_analyze` measures spread distributions, quote-update
 intensity, gaps, mid-price volatility, and liquidity-stress windows.
+Its compact spread summary marks locked, one-sided, and inverted latest quotes as
+unsafe rather than treating them as unusually tight execution spreads.
 
 ```bash
 mtdata-cli market_microstructure_analyze EURUSD --minutes-back 60 --json
@@ -56,6 +58,12 @@ mtdata-cli strategy_validate EURUSD --timeframe H1 --lookback 3000 \
 
 Candidate parameters are fixed before validation; this tool does not optimize
 and validate on the same sample.
+
+Built-in `sma_cross` and `ema_cross` candidates enter only on fast/slow moving-
+average cross events; `rsi_reversion` enters only when RSI crosses into an
+oversold or overbought zone. Flat bars do not create periodic re-entries.
+Each ranking exposes this contract in `signal_definition` (`cross_event`,
+`zone_entry_event`, or `forecast_threshold_anchor`).
 
 Forecast-threshold candidates execute at most the latest 200 eligible forecast
 anchors to keep validation bounded. Their folds partition that computed signal

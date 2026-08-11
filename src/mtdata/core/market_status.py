@@ -13,14 +13,17 @@ import holidays
 
 from ..shared.schema import DetailLiteral
 from ..shared.symbols import is_probably_crypto_symbol, is_probably_forex_symbol
-from ..utils.market_metadata import build_tick_freshness_context
 from ..utils.freshness import is_standard_weekend_closure
+from ..utils.market_metadata import build_tick_freshness_context
 from ..utils.mt5 import (
     MT5ConnectionError,
     _normalize_times_in_struct,
     ensure_mt5_connection_or_raise,
+    resolve_broker_symbol_name,
 )
 from ..utils.mt5_enums import decode_mt5_enum_label
+from ..utils.quote import resolve_quote_tick, tick_epoch, tick_value
+from ..utils.time import format_datetime_utc
 from ._mcp_instance import mcp
 from .execution_logging import run_logged_operation
 from .mt5_gateway import create_mt5_gateway
@@ -47,6 +50,7 @@ _MARKETS = {
     "NYSE": {
         "name": "New York Stock Exchange",
         "country": "US",
+        "exchange_calendar": "XNYS",
         "timezone": "America/New_York",
         "open": (9, 30),  # 9:30 AM
         "close": (16, 0),  # 4:00 PM
@@ -58,6 +62,7 @@ _MARKETS = {
     "NASDAQ": {
         "name": "NASDAQ",
         "country": "US",
+        "exchange_calendar": "XNYS",
         "timezone": "America/New_York",
         "open": (9, 30),
         "close": (16, 0),
@@ -72,12 +77,14 @@ _MARKETS = {
         "timezone": "Europe/London",
         "open": (8, 0),  # 8:00 AM
         "close": (16, 30),  # 4:30 PM
-        "early_close": None,
+        "early_close": (12, 30),
         "early_close_holidays": [],
+        "early_close_last_business_day_before": ["Christmas Day", "New Year's Day"],
     },
     "XETRA": {
         "name": "Xetra (Frankfurt)",
         "country": "DE",
+        "exchange_calendar": "XETR",
         "timezone": "Europe/Berlin",
         "open": (9, 0),  # 9:00 AM
         "close": (17, 30),  # 5:30 PM
@@ -96,9 +103,10 @@ _MARKETS = {
     "TSE": {
         "name": "Tokyo Stock Exchange",
         "country": "JP",
+        "exchange_calendar": "XJPX",
         "timezone": "Asia/Tokyo",
         "open": (9, 0),  # 9:00 AM
-        "close": (15, 0),  # 3:00 PM
+        "close": (15, 30),  # 3:30 PM since 2024-11-05
         "lunch_start": (11, 30),
         "lunch_end": (12, 30),
         "early_close": None,
@@ -107,6 +115,7 @@ _MARKETS = {
     "HKEX": {
         "name": "Hong Kong Stock Exchange",
         "country": "HK",
+        "exchange_calendar": "XHKG",
         "timezone": "Asia/Hong_Kong",
         "open": (9, 30),  # 9:30 AM
         "close": (16, 0),  # 4:00 PM
@@ -119,6 +128,7 @@ _MARKETS = {
     "SSE": {
         "name": "Shanghai Stock Exchange",
         "country": "CN",
+        "exchange_calendar": "XSHG",
         "timezone": "Asia/Shanghai",
         "open": (9, 30),  # 9:30 AM
         "close": (15, 0),  # 3:00 PM
@@ -146,9 +156,23 @@ def _get_holidays(country: str, year: int) -> holidays.HolidayBase:
     return holidays.country_holidays(country, years=[int(year)])
 
 
-def _is_holiday(country: str, dt: datetime) -> Tuple[bool, Optional[str]]:
+@lru_cache(maxsize=128)
+def _get_exchange_holidays(exchange: str, year: int) -> holidays.HolidayBase:
+    """Return the venue trading calendar supplied by python-holidays."""
+    return holidays.financial_holidays(exchange, years=[int(year)])
+
+
+def _is_holiday(
+    country: str,
+    dt: datetime,
+    exchange: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
     """Check if date is a holiday and return holiday name if so."""
-    h = _get_holidays(country, dt.year)
+    h = (
+        _get_exchange_holidays(exchange, dt.year)
+        if exchange
+        else _get_holidays(country, dt.year)
+    )
     date_key = dt.date()
     if date_key in h:
         return True, str(h[date_key])
@@ -181,17 +205,6 @@ def _coerce_optional_bool(value: Any) -> Optional[bool]:
         return bool(value)
     except Exception:
         return None
-
-
-def _format_utc_iso_z(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (
-        dt.astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
 
 
 def _format_local_iso(dt: datetime) -> str:
@@ -235,7 +248,7 @@ def _format_market_time(value: Any, display: str) -> Any:
         return value
     if dt.tzinfo is None:
         return value
-    return _format_utc_iso_z(dt)
+    return format_datetime_utc(dt)
 
 
 def _apply_market_timezone_display(
@@ -247,7 +260,7 @@ def _apply_market_timezone_display(
     if display != "utc":
         return status
     out = dict(status)
-    out["display_time"] = _format_utc_iso_z(now_local)
+    out["display_time"] = format_datetime_utc(now_local)
     for key in ("next_open", "next_close"):
         if key in out:
             out[key] = _format_market_time(out[key], display)
@@ -292,7 +305,8 @@ def _is_early_close_session(
     session_dt: datetime,
 ) -> bool:
     """Return whether *session_dt* should trade as an early-close session."""
-    is_holiday_result, holiday_name = _is_holiday(country, session_dt)
+    exchange = market.get("exchange_calendar")
+    is_holiday_result, holiday_name = _is_holiday(country, session_dt, exchange)
 
     if is_holiday_result and holiday_name and market.get("early_close_holidays"):
         for h_name in market["early_close_holidays"]:
@@ -307,7 +321,7 @@ def _is_early_close_session(
 
     if market.get("early_close_day_after"):
         yesterday = session_dt - timedelta(days=1)
-        _, yesterday_holiday = _is_holiday(country, yesterday)
+        _, yesterday_holiday = _is_holiday(country, yesterday, exchange)
         if yesterday_holiday:
             for h_name in market["early_close_day_after"]:
                 if h_name.lower() in yesterday_holiday.lower():
@@ -315,11 +329,26 @@ def _is_early_close_session(
 
     if market.get("early_close_eves"):
         tomorrow = session_dt + timedelta(days=1)
-        _, tomorrow_holiday = _is_holiday(country, tomorrow)
+        _, tomorrow_holiday = _is_holiday(country, tomorrow, exchange)
         if tomorrow_holiday:
             for eve_name in market["early_close_eves"]:
                 if eve_name.lower() in tomorrow_holiday.lower():
                     return True
+
+    if market.get("early_close_last_business_day_before"):
+        target_names = market["early_close_last_business_day_before"]
+        for days_ahead in range(1, 8):
+            next_day = session_dt + timedelta(days=days_ahead)
+            next_is_holiday, next_holiday = _is_holiday(country, next_day, exchange)
+            if next_is_holiday and next_holiday:
+                if any(
+                    target.lower() in next_holiday.lower()
+                    for target in target_names
+                ):
+                    return True
+                continue
+            if next_day.weekday() < 5:
+                break
 
     return False
 
@@ -335,7 +364,9 @@ def _next_market_open_datetime(
         if next_open.weekday() >= 5:
             next_open += timedelta(days=1)
             continue
-        is_holiday_result, _holiday_name = _is_holiday(country, next_open)
+        is_holiday_result, _holiday_name = _is_holiday(
+            country, next_open, market.get("exchange_calendar")
+        )
         if is_holiday_result and not _is_early_close_session(market, country, next_open):
             next_open += timedelta(days=1)
             continue
@@ -369,7 +400,9 @@ def _check_market_status(market_id: str, now_local: datetime) -> Dict[str, Any]:
         }
     
     # Check holidays
-    is_holiday_result, holiday_name = _is_holiday(country, now_local)
+    is_holiday_result, holiday_name = _is_holiday(
+        country, now_local, market.get("exchange_calendar")
+    )
 
     # Determine early close BEFORE the holiday return so same-day
     # half-holidays are not treated as full closures.
@@ -472,110 +505,153 @@ def _check_market_status(market_id: str, now_local: datetime) -> Dict[str, Any]:
     }
 
 
-def _get_upcoming_holidays(market_ids: List[str], days_ahead: int = 14) -> List[Dict[str, Any]]:
-    """Get upcoming holidays that will close markets within the next N days."""
-    upcoming: List[Dict[str, Any]] = []
-    now = datetime.now(timezone.utc)
-    seen: set = set()
-    
+def _get_upcoming_holidays(
+    market_ids: List[str],
+    days_ahead: int = 14,
+    *,
+    now_utc: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Get venue-local closure and shortened-session events."""
+    events: Dict[Tuple[str, str, str, Optional[str], str], Dict[str, Any]] = {}
+    current_utc = now_utc or datetime.now(timezone.utc)
+
+    def _upsert(
+        *,
+        market_id: str,
+        market: Dict[str, Any],
+        event_date: Any,
+        holiday_name: str,
+        impact: str,
+        early_close_time: Optional[str],
+        days_away: int,
+    ) -> None:
+        country = str(market["country"])
+        key = (
+            event_date.isoformat(),
+            country,
+            impact,
+            early_close_time,
+            holiday_name,
+        )
+        row = events.get(key)
+        if row is None:
+            row = {
+                "date": event_date.isoformat(),
+                "holiday": holiday_name,
+                "country": country,
+                "markets_affected": [],
+                "impact": impact,
+                "early_close_time": early_close_time,
+                "days_away": int(days_away),
+                "calendar_source": (
+                    "exchange_calendar"
+                    if market.get("exchange_calendar")
+                    else "country_calendar_fallback"
+                ),
+            }
+            events[key] = row
+        if market_id not in row["markets_affected"]:
+            row["markets_affected"].append(market_id)
+
     for market_id in market_ids:
-        if market_id not in _MARKETS:
+        market = _MARKETS.get(market_id)
+        if market is None:
             continue
-        
-        market = _MARKETS[market_id]
-        country = market["country"]
-        
+        country = str(market["country"])
+        exchange = market.get("exchange_calendar")
+        now_local = current_utc.astimezone(ZoneInfo(str(market["timezone"])))
         try:
-            # Check next N days
-            for i in range(1, days_ahead + 1):
-                check_date = now + timedelta(days=i)
-                date_key = check_date.date()
+            for days_away in range(0, days_ahead + 1):
+                check_local = now_local + timedelta(days=days_away)
+                is_holiday_result, holiday_name = _is_holiday(
+                    country, check_local, exchange
+                )
+                if not is_holiday_result or holiday_name is None:
+                    continue
+                event_date = check_local.date()
+                same_day_early = any(
+                    name.lower() in holiday_name.lower()
+                    for name in market.get("early_close_holidays", [])
+                )
+                early_time = (
+                    f"{market['early_close'][0]:02d}:{market['early_close'][1]:02d}"
+                    if same_day_early and market.get("early_close")
+                    else None
+                )
+                _upsert(
+                    market_id=market_id,
+                    market=market,
+                    event_date=event_date,
+                    holiday_name=holiday_name,
+                    impact="early_close" if same_day_early else "closed",
+                    early_close_time=early_time,
+                    days_away=days_away,
+                )
 
-                is_holiday_result, holiday_name = _is_holiday(country, check_date)
-                if is_holiday_result and holiday_name is not None:
-                    key = (country, date_key.isoformat())
-                    
-                    if key not in seen:
-                        seen.add(key)
-                        
-                        # Determine impact: same-day half-holiday
-                        is_early_close = False
-                        early_close_time = None
-                        if market.get("early_close_holidays"):
-                            for h_name in market["early_close_holidays"]:
-                                if h_name.lower() in holiday_name.lower():
-                                    is_early_close = True
-                                    break
-
-                        if is_early_close and market.get("early_close"):
-                            early_close_time = f"{market['early_close'][0]:02d}:{market['early_close'][1]:02d}"
-                        
-                        upcoming.append({
-                            "date": date_key.isoformat(),
-                            "holiday": holiday_name,
-                            "country": country,
-                            "markets_affected": [market_id],
-                            "impact": "early_close" if is_early_close else "closed",
-                            "early_close_time": early_close_time,
-                            "days_away": i,
-                        })
-
-                        # Day-after: the day after this holiday may be an
-                        # early close (e.g. Black Friday after Thanksgiving).
-                        if market.get("early_close_day_after"):
-                            for h_name in market["early_close_day_after"]:
-                                if h_name.lower() in holiday_name.lower():
-                                    after_date = check_date + timedelta(days=1)
-                                    after_key = (country, after_date.date().isoformat())
-                                    if after_key not in seen and after_date.date().weekday() < 5:
-                                        seen.add(after_key)
-                                        ect = None
-                                        if market.get("early_close"):
-                                            ect = f"{market['early_close'][0]:02d}:{market['early_close'][1]:02d}"
-                                        upcoming.append({
-                                            "date": after_date.date().isoformat(),
-                                            "holiday": f"Day after {holiday_name}",
-                                            "country": country,
-                                            "markets_affected": [market_id],
-                                            "impact": "early_close",
-                                            "early_close_time": ect,
-                                            "days_away": i + 1,
-                                        })
-                                    break
-
-                        # Eve: the day before this holiday may be an early close.
-                        if market.get("early_close_eves"):
-                            for eve_name in market["early_close_eves"]:
-                                if eve_name.lower() in holiday_name.lower():
-                                    eve_date = check_date - timedelta(days=1)
-                                    eve_key = (country, eve_date.date().isoformat())
-                                    if eve_key not in seen and eve_date.date().weekday() < 5:
-                                        seen.add(eve_key)
-                                        ect = None
-                                        if market.get("early_close"):
-                                            ect = f"{market['early_close'][0]:02d}:{market['early_close'][1]:02d}"
-                                        upcoming.append({
-                                            "date": eve_date.date().isoformat(),
-                                            "holiday": f"Eve of {holiday_name}",
-                                            "country": country,
-                                            "markets_affected": [market_id],
-                                            "impact": "early_close",
-                                            "early_close_time": ect,
-                                            "days_away": max(0, i - 1),
-                                        })
-                                    break
-                    else:
-                        # Add market to existing holiday entry
-                        for entry in upcoming:
-                            if entry["date"] == date_key.isoformat() and entry["country"] == country:
-                                if market_id not in entry["markets_affected"]:
-                                    entry["markets_affected"].append(market_id)
-                                break
+                derived_time = (
+                    f"{market['early_close'][0]:02d}:{market['early_close'][1]:02d}"
+                    if market.get("early_close")
+                    else None
+                )
+                if any(
+                    name.lower() in holiday_name.lower()
+                    for name in market.get("early_close_day_after", [])
+                ):
+                    after_date = event_date + timedelta(days=1)
+                    if after_date.weekday() < 5:
+                        _upsert(
+                            market_id=market_id,
+                            market=market,
+                            event_date=after_date,
+                            holiday_name=f"Day after {holiday_name}",
+                            impact="early_close",
+                            early_close_time=derived_time,
+                            days_away=days_away + 1,
+                        )
+                if any(
+                    name.lower() in holiday_name.lower()
+                    for name in market.get("early_close_eves", [])
+                ):
+                    eve_date = event_date - timedelta(days=1)
+                    if eve_date.weekday() < 5:
+                        _upsert(
+                            market_id=market_id,
+                            market=market,
+                            event_date=eve_date,
+                            holiday_name=f"Eve of {holiday_name}",
+                            impact="early_close",
+                            early_close_time=derived_time,
+                            days_away=max(0, days_away - 1),
+                        )
+                if any(
+                    name.lower() in holiday_name.lower()
+                    for name in market.get("early_close_last_business_day_before", [])
+                ):
+                    previous_session = event_date - timedelta(days=1)
+                    while previous_session.weekday() >= 5 or _is_holiday(
+                        country,
+                        datetime.combine(previous_session, datetime.min.time()).replace(
+                            tzinfo=ZoneInfo(str(market["timezone"]))
+                        ),
+                        exchange,
+                    )[0]:
+                        previous_session -= timedelta(days=1)
+                    _upsert(
+                        market_id=market_id,
+                        market=market,
+                        event_date=previous_session,
+                        holiday_name=f"Last business day before {holiday_name}",
+                        impact="early_close",
+                        early_close_time=derived_time,
+                        days_away=max(0, (previous_session - now_local.date()).days),
+                    )
         except Exception as exc:
-            logger.warning(f"Failed to get holidays for {country}: {exc}")
-    
-    # Sort by date
-    upcoming.sort(key=lambda x: (x["date"], x["country"]))
+            logger.warning("Failed to get exchange holidays for %s: %s", market_id, exc)
+
+    upcoming = list(events.values())
+    for row in upcoming:
+        row["markets_affected"].sort()
+    upcoming.sort(key=lambda row: (row["date"], row["country"], row["impact"]))
     return upcoming
 
 
@@ -642,31 +718,44 @@ def _symbol_trade_mode_status(gateway: Any, trade_mode: Any) -> Dict[str, Any]:
     if trade_mode in disabled_values or "disabled" in normalized:
         status = "disabled"
         can_open = False
+        is_tradable = False
     elif trade_mode in close_only_values or "close" in normalized:
         status = "close_only"
         can_open = False
+        is_tradable = True
     elif trade_mode in long_only_values or "long" in normalized:
         status = "long_only"
         can_open = True
+        is_tradable = True
     elif trade_mode in short_only_values or "short" in normalized:
         status = "short_only"
         can_open = True
+        is_tradable = True
     elif trade_mode in full_values or "full" in normalized:
         status = "tradable"
         can_open = True
+        is_tradable = True
     else:
         status = "unknown"
         can_open = None
+        is_tradable = None
 
     return {
         "trade_mode": trade_mode,
         "trade_mode_label": label_text or None,
         "status": status,
         "can_open_new_positions": can_open,
+        "is_tradable": is_tradable,
     }
 
 
-def _symbol_tick_snapshot(symbol: str, tick: Any, *, now_utc: datetime) -> Dict[str, Any]:
+def _symbol_tick_snapshot(
+    symbol: str,
+    tick: Any,
+    *,
+    now_utc: datetime,
+    source_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     if tick is None:
         return {
             "tick_available": False,
@@ -676,16 +765,17 @@ def _symbol_tick_snapshot(symbol: str, tick: Any, *, now_utc: datetime) -> Dict[
     out: Dict[str, Any] = {
         "tick_available": True,
     }
-    tick_time = getattr(tick, "time", None)
-    if tick_time is not None:
+    if source_metadata:
+        out.update(source_metadata)
+    quote_epoch = tick_epoch(tick)
+    if quote_epoch is not None:
         try:
-            tick_epoch = float(tick_time)
-            out["last_tick_time"] = _format_utc_iso_z(
-                datetime.fromtimestamp(tick_epoch, tz=timezone.utc)
+            out["last_tick_time"] = format_datetime_utc(
+                datetime.fromtimestamp(quote_epoch, tz=timezone.utc)
             )
             freshness = build_tick_freshness_context(
                 symbol,
-                tick_epoch=tick_epoch,
+                tick_epoch=quote_epoch,
                 now_epoch=now_utc.timestamp(),
                 item="tick",
                 age_rounder=lambda value: round(value, 3),
@@ -717,7 +807,7 @@ def _symbol_tick_snapshot(symbol: str, tick: Any, *, now_utc: datetime) -> Dict[
         out["tick_freshness"] = "unknown"
 
     for field in ("bid", "ask", "last", "volume"):
-        value = getattr(tick, field, None)
+        value = tick_value(tick, field)
         if value is not None:
             out[field] = value
     return out
@@ -869,18 +959,18 @@ def _symbol_market_now(
 ) -> tuple[str, str, str]:
     display_mode = str(display or "server").strip().lower()
     if display_mode == "utc":
-        return "utc", "UTC", _format_utc_iso_z(now_utc)
+        return "utc", "UTC", format_datetime_utc(now_utc)
     if display_mode == "local":
         client_tzinfo, client_label = _runtime_meta_tzinfo(client)
         if client_tzinfo is not None:
             market_now = now_utc.astimezone(client_tzinfo).replace(microsecond=0).isoformat()
             return "client", client_label or "local", market_now
-        return "utc", "UTC", _format_utc_iso_z(now_utc)
+        return "utc", "UTC", format_datetime_utc(now_utc)
     server_tzinfo, server_label = _runtime_meta_tzinfo(server, allow_offset=True)
     if server_tzinfo is not None:
         market_now = now_utc.astimezone(server_tzinfo).replace(microsecond=0).isoformat()
         return "server", server_label or "server", market_now
-    return "utc", "UTC", _format_utc_iso_z(now_utc)
+    return "utc", "UTC", format_datetime_utc(now_utc)
 
 
 def _check_symbol_market_status(
@@ -890,8 +980,8 @@ def _check_symbol_market_status(
     timezone_display: str = "server",
     gateway: Any = None,
 ) -> Dict[str, Any]:
-    symbol_name = str(symbol or "").strip().upper()
-    if not symbol_name:
+    symbol_input = str(symbol or "").strip()
+    if not symbol_input:
         return {"error": "symbol cannot be empty."}
 
     mt5_gateway = gateway if gateway is not None else create_mt5_gateway(
@@ -902,6 +992,11 @@ def _check_symbol_market_status(
     except MT5ConnectionError as exc:
         return {"error": str(exc)}
 
+    symbol_name = resolve_broker_symbol_name(
+        symbol_input.upper(),
+        gateway=mt5_gateway,
+    )
+
     info = mt5_gateway.symbol_info(symbol_name)
     if info is None:
         return {"error": f"Symbol {symbol_name} not found"}
@@ -909,8 +1004,19 @@ def _check_symbol_market_status(
     now_utc = datetime.now(timezone.utc)
     trade_mode = getattr(info, "trade_mode", None)
     mode_status = _symbol_trade_mode_status(mt5_gateway, trade_mode)
-    tick = mt5_gateway.symbol_info_tick(symbol_name)
-    tick_status = _symbol_tick_snapshot(symbol_name, tick, now_utc=now_utc)
+    raw_tick = mt5_gateway.symbol_info_tick(symbol_name)
+    tick, quote_source = resolve_quote_tick(
+        mt5_gateway,
+        symbol_name,
+        raw_tick,
+        now_epoch=now_utc.timestamp(),
+    )
+    tick_status = _symbol_tick_snapshot(
+        symbol_name,
+        tick,
+        now_utc=now_utc,
+        source_metadata=quote_source,
+    )
     schedule_status = _infer_symbol_schedule_from_recent_candles(
         symbol_name,
         mt5_gateway,
@@ -919,6 +1025,7 @@ def _check_symbol_market_status(
 
     trade_mode_can_open = _coerce_optional_bool(mode_status["can_open_new_positions"])
     can_open = trade_mode_can_open
+    live_ready = _coerce_optional_bool(tick_status.get("usable_for_live_trading"))
     tick_freshness = tick_status.get("tick_freshness")
     reason = None
     is_crypto_symbol = is_probably_crypto_symbol(symbol_name)
@@ -926,12 +1033,7 @@ def _check_symbol_market_status(
         _coerce_optional_bool(schedule_status.get("current_time_in_active_session"))
         is True
     )
-    weekend_closed_now = (
-        is_standard_weekend_closure(now_utc)
-        if is_probably_forex_symbol(symbol_name)
-        else now_utc.weekday() >= 5
-    )
-    tick_available = tick_status.get("tick_available") is True
+    weekend_closed_now = is_standard_weekend_closure(now_utc)
     if (
         can_open is True
         and weekend_closed_now
@@ -941,16 +1043,11 @@ def _check_symbol_market_status(
         open_state = "weekend_closed"
         can_open = False
         reason = "weekend"
-    elif can_open is True and tick_status.get("data_stale") is True:
+    elif can_open is True and live_ready is not True:
         open_state = "quote_not_live_ready"
         can_open = False
-        reason = str(tick_status.get("freshness_reason") or "stale_quote")
-    elif can_open is True and tick_freshness in {"live", "recent"}:
-        open_state = "probably_open"
-    elif can_open is True and recent_schedule_allows_now and tick_available:
-        # Recent M1 candles show this hour is an active session (e.g. weekend-trading
-        # metals). Treat as open even when weekend freshness policy labels the tick
-        # as a closed-session snapshot rather than "fresh".
+        reason = str(tick_status.get("freshness_reason") or "quote_not_live_ready")
+    elif can_open is True and tick_freshness == "live":
         open_state = "probably_open"
     elif can_open is True:
         open_state = "trade_mode_allows_opening"
@@ -961,7 +1058,8 @@ def _check_symbol_market_status(
 
     if reason == "weekend":
         message = (
-            f"{symbol_name}: closed for UTC weekend even though MT5 trade_mode "
+            f"{symbol_name}: closed for the standard Friday 17:00 through Sunday "
+            "17:00 America/New_York weekend window even though MT5 trade_mode "
             "allows opening."
         )
     else:
@@ -979,8 +1077,8 @@ def _check_symbol_market_status(
         "status_confidence": "heuristic",
         "heuristic_note": _symbol_status_heuristic_note(symbol_name),
         "can_open_new_positions": can_open,
-        "is_tradable": can_open,
-        "is_tradable_confidence": "heuristic",
+        "is_tradable": _coerce_optional_bool(mode_status["is_tradable"]),
+        "is_tradable_confidence": "broker_trade_mode",
         "trade_mode_allows_opening": trade_mode_can_open,
         "trade_mode_label": mode_status.get("trade_mode_label"),
         "tick_freshness": tick_freshness,
@@ -999,13 +1097,15 @@ def _check_symbol_market_status(
             "inferred_24_7": schedule_status.get("inferred_24_7"),
         },
         "message": message,
-        "data_fetched_at": _format_utc_iso_z(now_utc),
+        "data_fetched_at": format_datetime_utc(now_utc),
         "timezone": "UTC",
         "timezone_context": _symbol_market_status_timezone_context(
             timezone_display,
             now_utc=now_utc,
         ),
     }
+    if symbol_name != symbol_input:
+        result["symbol_input"] = symbol_input
     if reason:
         result["reason"] = reason
     if detail == "full":
@@ -1050,6 +1150,8 @@ def _check_symbol_market_status(
             "timestamp_in_future",
             "timestamp_skew_seconds",
             "timestamp_warning",
+            "quote_source",
+            "quote_source_state",
         ):
             if key in tick_status:
                 result[key] = tick_status[key]
@@ -1063,7 +1165,8 @@ def _symbol_status_heuristic_note(symbol_name: str) -> str:
     )
     if is_probably_forex_symbol(symbol_name):
         note += (
-            " FX weekly sessions typically run Sun 22:00-Fri 22:00 UTC, "
+            " FX weekly sessions typically run Sun 17:00-Fri 17:00 "
+            "America/New_York, "
             "subject to broker holidays and session gaps."
         )
     return note
@@ -1118,6 +1221,8 @@ def _compact_symbol_market_status(row: Dict[str, Any], *, detail: str) -> Dict[s
         "is_tradable",
         "is_tradable_confidence",
         "can_open_new_positions",
+        "trade_mode_allows_opening",
+        "usable_for_live_trading",
         "tick_freshness",
         "market_clock",
         "market_clock_timezone",
@@ -1379,7 +1484,7 @@ def market_status(
                 "This no-symbol view covers major equity exchanges only; pass a "
                 "broker symbol for MT5 tradability and quote-freshness status."
             ),
-            "data_fetched_at": _format_utc_iso_z(now_utc),
+            "data_fetched_at": format_datetime_utc(now_utc),
             "timezone": "UTC",
             "day_of_week": now_utc.strftime("%A"),
             "region": region or "all",

@@ -13,6 +13,32 @@ from pydantic import ValidationError
 from mtdata.utils.mt5 import MT5ConnectionError
 
 
+def test_barrier_best_summary_keeps_text_and_structured_fields_aligned():
+    from mtdata.core.report.use_cases import _build_barrier_best_summary
+
+    details, entry = _build_barrier_best_summary(
+        {
+            "tp": 1.234,
+            "sl": 0.456,
+            "ev": 0.25,
+            "edge": 0.1,
+            "edge_vs_breakeven": -0.2,
+        },
+        direction="long",
+        include_direction_field=True,
+        format_number=str,
+    )
+
+    assert details[:3] == ["dir=long", "tp=1.23%", "sl=0.46%"]
+    assert entry["direction"] == "long"
+    assert entry["tp_pct"] == 1.23
+    assert entry["sl_pct"] == 0.46
+    assert entry["probability_edge"] == 0.1
+    assert entry["edge_vs_breakeven"] == -0.2
+    assert entry["ev_edge_conflict"] is True
+    assert "ev_edge_conflict=true" in details
+
+
 def test_sections_status_preserves_intentional_omissions():
     from mtdata.core.report.use_cases import _build_sections_status
 
@@ -35,6 +61,21 @@ def test_sections_status_preserves_intentional_omissions():
         "total": 2,
     }
     assert status["details"]["pivot"]["reason"] == "current_only_section_omitted"
+
+
+def test_sections_status_marks_scheduled_missing_sections_as_errors():
+    from mtdata.core.report.use_cases import _build_sections_status
+
+    status = _build_sections_status(
+        {"context": {"close": 1.2}},
+        expected_sections=["context", "forecast"],
+    )
+
+    assert status["sections"] == {"context": "ok", "forecast": "error"}
+    assert status["details"]["forecast"]["reason"] == (
+        "scheduled section returned no payload"
+    )
+    assert status["summary"]["error"] == 1
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,6 +170,22 @@ def test_report_section_plan_limits_every_template_to_context(template: str) -> 
     assert plan["execution"] == ["context"]
 
 
+def test_report_section_plan_only_runs_dependencies_available_to_template() -> None:
+    from mtdata.core.report.use_cases import _resolve_report_section_plan
+
+    minimal = _resolve_report_section_plan(
+        "minimal",
+        include_sections=["forecast"],
+    )
+    basic = _resolve_report_section_plan(
+        "basic",
+        include_sections=["forecast"],
+    )
+
+    assert minimal["execution"] == ["forecast"]
+    assert basic["execution"] == ["forecast", "backtest"]
+
+
 def test_report_generate_request_template_choices_are_validated():
     from mtdata.core.report.requests import ReportGenerateRequest
 
@@ -162,11 +219,68 @@ def test_basic_report_volatility_failure_keeps_method_errors(monkeypatch):
     assert "unavailable" in volatility["errors"][0]["error"]
 
 
+def test_basic_report_does_not_fallback_outside_rmse_gate(monkeypatch):
+    from mtdata.core.report_templates import basic as template_basic_mod
+
+    forecast_calls = []
+
+    def fake_raw_result(func, *args, **kwargs):
+        name = getattr(func, "__name__", "")
+        if name == "forecast_backtest_run":
+            return {
+                "results": {
+                    "theta": {
+                        "success": True,
+                        "avg_rmse": 0.9,
+                        "avg_directional_accuracy": 0.7,
+                    },
+                    "naive": {
+                        "success": True,
+                        "avg_rmse": 0.95,
+                        "avg_directional_accuracy": 0.8,
+                    },
+                }
+            }
+        if name == "forecast_generate":
+            forecast_calls.append(kwargs["method"])
+            if kwargs["method"] == "theta":
+                return {"error": "model unavailable"}
+            return {"forecast_price": [1.1, 1.2]}
+        return {"error": "section not requested"}
+
+    monkeypatch.setattr(template_basic_mod, "_get_raw_result", fake_raw_result)
+    monkeypatch.setattr(
+        template_basic_mod,
+        "pick_best_forecast_method",
+        lambda *args, **kwargs: (
+            "theta",
+            {
+                "success": True,
+                "avg_rmse": 0.9,
+                "avg_directional_accuracy": 0.7,
+            },
+        ),
+    )
+
+    out = template_basic_mod.template_basic(
+        "EURUSD",
+        horizon=3,
+        denoise=None,
+        params={"_report_execution_sections": ["backtest", "forecast"]},
+    )
+
+    assert forecast_calls == ["theta"]
+    assert out["sections"]["forecast"]["error"] == "model unavailable"
+    assert out["sections"]["forecast"]["eligible_methods"] == ["theta"]
+
+
 def test_run_report_generate_logs_finish_event(caplog):
     from mtdata.core.report.requests import ReportGenerateRequest
     from mtdata.core.report.use_cases import run_report_generate
 
-    basic_template = MagicMock(return_value={"sections": {}, "diagnostics": {}})
+    basic_template = MagicMock(
+        return_value={"sections": _make_full_sections(), "diagnostics": {}}
+    )
     with patch("mtdata.core.report_templates.template_basic", basic_template, create=True), \
          patch("mtdata.core.report_templates.template_minimal", basic_template, create=True), \
          patch("mtdata.core.report_templates.template_advanced", basic_template, create=True), \
@@ -188,6 +302,76 @@ def test_run_report_generate_logs_finish_event(caplog):
         "event=finish operation=report_generate success=True" in record.message
         for record in caplog.records
     )
+
+
+def test_run_report_generate_scopes_volatility_rate_cache():
+    from mtdata.core.report.requests import ReportGenerateRequest
+    from mtdata.core.report.use_cases import run_report_generate
+    from mtdata.forecast import volatility
+
+    cache_states = []
+
+    def basic_template(*args, **kwargs):
+        cache_states.append(volatility._RATES_CACHE.get() is not None)
+        return {"sections": _make_full_sections(), "diagnostics": {}}
+
+    with (
+        patch("mtdata.core.report_templates.template_basic", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_minimal", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_advanced", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_scalping", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_intraday", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_swing", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_position", basic_template, create=True),
+    ):
+        run_report_generate(
+            ReportGenerateRequest(symbol="EURUSD"),
+            format_number=lambda value: str(value),
+            get_indicator_value=lambda payload, key: payload.get(key),
+            report_error_payload=lambda message: {"error": str(message)},
+            append_diagnostic_warning=lambda report, message: None,
+        )
+
+    assert cache_states == [True]
+    assert volatility._RATES_CACHE.get() is None
+
+
+def test_run_report_generate_warns_once_for_degraded_sections(caplog):
+    from mtdata.core.report.requests import ReportGenerateRequest
+    from mtdata.core.report.use_cases import run_report_generate
+
+    sections = _make_full_sections()
+    sections["backtest"] = {"error": "model artifact disappeared"}
+    basic_template = MagicMock(
+        return_value={"sections": sections, "diagnostics": {}}
+    )
+    with (
+        patch("mtdata.core.report_templates.template_basic", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_minimal", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_advanced", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_scalping", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_intraday", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_swing", basic_template, create=True),
+        patch("mtdata.core.report_templates.template_position", basic_template, create=True),
+        caplog.at_level(logging.WARNING, logger="mtdata.core.report.use_cases"),
+    ):
+        result = run_report_generate(
+            ReportGenerateRequest(symbol="EURUSD", detail="full"),
+            format_number=lambda value: str(value),
+            get_indicator_value=lambda payload, key: payload.get(key),
+            report_error_payload=lambda message: {"error": str(message)},
+            append_diagnostic_warning=lambda report, message: None,
+        )
+
+    assert result["section_run_status"] == "partial"
+    records = [
+        record
+        for record in caplog.records
+        if "event=report_sections_degraded" in record.message
+    ]
+    assert len(records) == 1
+    assert "error_sections=backtest" in records[0].message
+    assert "backtest:model artifact disappeared" in records[0].message
 
 
 def test_report_generate_returns_connection_error_payload(monkeypatch):
@@ -268,13 +452,44 @@ def test_compact_report_payload_omits_string_summary_when_structured_exists():
     assert "summary" not in out
 
 
+def test_compact_report_payload_rounds_summary_floats_to_six_significant_digits():
+    from mtdata.core.report.use_cases import _compact_report_payload
+
+    out = _compact_report_payload(
+        {
+            "success": True,
+            "summary_structured": {
+                "market": {"close": 1.14375, "rsi": 47.792770221604044},
+                "backtest": {
+                    "stats": {
+                        "avg_rmse": 0.0018917237203165866,
+                        "avg_directional_accuracy": 0.5309090909090909,
+                    }
+                },
+                "volatility": {"sigma": 0.001660812248886065},
+            },
+        },
+        symbol="EURUSD",
+        template="basic",
+    )
+
+    structured = out["summary_structured"]
+    assert structured["market"] == {"close": 1.14375, "rsi": 47.7928}
+    assert structured["backtest"]["stats"] == {
+        "avg_rmse": 0.00189172,
+        "avg_directional_accuracy": 0.530909,
+    }
+    assert structured["volatility"]["sigma"] == 0.00166081
+
+
 def test_compact_report_payload_omits_duplicate_assessment_blocks():
     from mtdata.core.report.use_cases import _compact_report_payload
 
     out = _compact_report_payload(
         {
             "success": True,
-            "completeness": "partial",
+            "section_run_status": "partial",
+            "content_detail": "summary_only",
             "executive_summary": {
                 "recommended_action": "review_partial_sections",
                 "confidence": "medium",
@@ -308,6 +523,8 @@ def test_compact_report_payload_omits_duplicate_assessment_blocks():
     )
 
     assert out["assessment"]["partial_sections"] == ["barriers"]
+    assert out["section_run_status"] == "partial"
+    assert out["content_detail"] == "summary_only"
     assert "section_health" not in out["assessment"]
     assert out["summary_structured"]["template_focus"] == {"profile": "balanced"}
     assert "executive_summary" not in out
@@ -397,8 +614,21 @@ def test_report_generate_compact_keeps_actionable_section_summaries():
         "timezone": "UTC",
     }
     sections["volatility"] = {
-        "methods": ["ewma"],
-        "matrix": [{"horizon": 3, "ewma": 0.0041, "avg": 0.0041}],
+        "methods": ["ewma", "parkinson"],
+        "aggregate_method": "ensemble_mean",
+        "matrix": [
+            {
+                "horizon": 3,
+                "ewma": 0.0041,
+                "parkinson": 0.0039,
+                "avg": 0.004,
+                "avg_method": "ensemble_mean",
+                "contributors": [
+                    {"method": "ewma", "value": 0.0041, "weight": 0.5},
+                    {"method": "parkinson", "value": 0.0039, "weight": 0.5},
+                ],
+            }
+        ],
     }
     sections["forecast"] = {
         "method": "EMA",
@@ -438,7 +668,11 @@ def test_report_generate_compact_keeps_actionable_section_summaries():
         "S1": 1.098,
         "display_timezone": "UTC",
     }
-    assert structured["volatility"] == {"horizon": 3, "sigma": 0.0041, "method": "ewma"}
+    assert structured["volatility"] == {
+        "horizon": 3,
+        "sigma": 0.004,
+        "method": "ensemble_mean",
+    }
     assert structured["forecast"]["first"] == 1.101
     assert structured["forecast"]["last"] == 1.104
     assert structured["backtest"]["best_method"] == "EMA"
@@ -476,6 +710,8 @@ def test_report_generate_compact_exposes_template_focus():
         out = fn("EURUSD", template="swing", horizon=24, detail="compact")
 
     focus = out["summary_structured"]["template_focus"]
+    assert out["section_run_status"] == "complete"
+    assert out["content_detail"] == "summary_only"
     assert focus["profile"] == "swing_mtf"
     assert focus["base_timeframe"] == "H4"
     assert focus["horizon"] == 24
@@ -502,10 +738,18 @@ def test_report_generate_standard_infers_root_timezone_from_sections():
          patch("mtdata.core.report_templates.template_intraday", mock_basic, create=True), \
          patch("mtdata.core.report_templates.template_swing", mock_basic, create=True), \
          patch("mtdata.core.report_templates.template_position", mock_basic, create=True):
-        out = fn("EURUSD", template="basic", horizon=3, detail="standard")
+        out = fn(
+            "EURUSD",
+            template="basic",
+            horizon=3,
+            detail="standard",
+            include_sections=["context"],
+        )
 
     assert out["timezone"] == "America/Chicago"
     assert out["sections"]["context"]["timezone"] == "America/Chicago"
+    assert out["section_run_status"] == "complete"
+    assert out["content_detail"] == "selected_sections"
 
 
 def _make_full_sections():
@@ -527,8 +771,13 @@ def _make_full_sections():
             ],
             "methods": [{"method": "classic"}],
         },
+        "contexts_multi": {"H1": {"trend_compact": "up"}},
+        "pivot_multi": {"D1": {"levels": {}}},
         "volatility": {
             "horizon_sigma_price": 0.0045,
+        },
+        "backtest": {
+            "best_method": {"method": "EMA", "stats": {"avg_rmse": 0.001}},
         },
         "forecast": {
             "method": "EMA",
@@ -542,6 +791,7 @@ def _make_full_sections():
                 "best": {"tp": 1.2, "sl": 0.7, "edge": 0.2},
             },
         },
+        "patterns": {"recent": []},
     }
 
 
@@ -1150,7 +1400,8 @@ class TestReportWarnings:
         assert sorted(res["sections_available"]) == sorted(_make_full_sections().keys())
         assert res["sections_status"]["summary"]["total"] > 0
         assert res["overall_assessment"]["section_health"]["total"] > 0
-        assert res["completeness"] == "summary_only"
+        assert res["section_run_status"] == "complete"
+        assert res["content_detail"] == "summary_only"
         assert res["detail"] == "summary"
         assert "diagnostics" not in res
         assert res["overall_assessment"]["summary"] != (
@@ -1172,7 +1423,7 @@ class TestReportWarnings:
 
         assert res["sections"] == {}
         assert res["success"] is False
-        assert res["completeness"] == "failed"
+        assert res["section_run_status"] == "failed"
         assert res["error_code"] == "report_sections_not_found"
         assert res["section_controls"]["missing_requested_sections"] == ["not-a-section"]
 
@@ -1267,7 +1518,7 @@ class TestReportWarnings:
         assert res["overall_assessment"]["recommended_action"] == "review_partial_sections"
         assert res["sections_status"]["details"]["barriers"]["errors"][0]["path"] == "short"
         assert "usable data" in res["sections_status"]["definitions"]["partial"]
-        assert res["completeness"] == "partial"
+        assert res["section_run_status"] == "partial"
         assert res["success"] is True
 
     def test_sections_status_filters_placeholder_error_noise(self):
@@ -1297,7 +1548,7 @@ class TestReportWarnings:
         assert {"path": "error", "message": "Volatility estimation failed."} in errors
         assert all(item["message"] != "no value" for item in errors)
 
-    def test_error_only_section_marks_report_failed(self):
+    def test_error_section_marks_otherwise_usable_report_partial(self):
         fn = _get_report_generate()
         sec = _make_full_sections()
         sec["forecast"] = {"error": "forecast failed"}
@@ -1313,8 +1564,36 @@ class TestReportWarnings:
             res = fn("EURUSD", template="basic", format="toon")
 
         assert res["sections_status"]["sections"]["forecast"] == "error"
-        assert res["completeness"] == "failed"
+        assert res["section_run_status"] == "partial"
+        assert res["success"] is True
+        assert res["sections_to_retry"] == ["forecast"]
+
+    def test_all_error_sections_mark_report_failed(self):
+        fn = _get_report_generate()
+        rep = _make_report(
+            sections={
+                "forecast": {"error": "forecast failed"},
+                "context": {"error": "context failed"},
+            }
+        )
+        mock_basic = MagicMock(return_value=rep)
+        with patch("mtdata.core.report_templates.template_basic", mock_basic, create=True), \
+             patch(_FMT_NUM, side_effect=str):
+            res = fn("EURUSD", template="basic", format="toon")
+
+        assert res["section_run_status"] == "failed"
         assert res["success"] is False
+        assert res["sections_to_retry"] == [
+            "context",
+            "pivot",
+            "contexts_multi",
+            "pivot_multi",
+            "volatility",
+            "backtest",
+            "forecast",
+            "barriers",
+            "patterns",
+        ]
 
     def test_forecast_section_without_finite_values_is_not_healthy(self):
         from mtdata.core.report.use_cases import _build_sections_status
@@ -1433,6 +1712,33 @@ def test_report_assessment_names_section_health_confidence_explicitly():
     assert assessment["assembly_confidence_basis"] == "report_section_health"
     assert "confidence" not in assessment
     assert assessment["is_trade_signal"] is False
+
+
+def test_report_assessment_elevates_closed_session_freshness():
+    from mtdata.core.report.use_cases import _build_overall_report_assessment
+
+    assessment = _build_overall_report_assessment(
+        {
+            "sections_status": {
+                "summary": {"total": 2, "ok": 2, "partial": 0, "error": 0}
+            },
+            "sections": {
+                "context": {
+                    "freshness": {"market_status": "closed", "data_stale": True}
+                },
+                "forecast": {"last_observation_stale": True},
+            },
+        }
+    )
+
+    assert assessment["recommended_action"] == (
+        "review_stale_or_closed_session_data"
+    )
+    assert assessment["data_trust"] == {
+        "status": "closed_session",
+        "affected_sections": ["context", "forecast"],
+    }
+    assert "closed-session data" in assessment["summary"]
 
 
 @pytest.mark.parametrize("horizon", [0, -1])

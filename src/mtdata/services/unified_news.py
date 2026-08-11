@@ -1083,13 +1083,24 @@ def _score_systemic_impact(item: NewsItem, context: InstrumentContext) -> tuple[
     matched_terms: List[str] = []
     score = 0.0
 
+    def _matches_term(term: str) -> bool:
+        normalized = str(term or "").strip().lower()
+        if not normalized:
+            return False
+        return bool(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(normalized)}(?:s|es)?(?![a-z0-9])",
+                text,
+            )
+        )
+
     for term, weight in _SYSTEMIC_IMPACT_TERMS.items():
-        if term in text:
+        if _matches_term(term):
             score += weight
             matched_terms.append(term)
 
     for term, weight in _ASSET_CLASS_IMPACT_TERMS.get(context.asset_class, {}).items():
-        if term in text:
+        if _matches_term(term):
             score += weight
             matched_terms.append(term)
 
@@ -1151,6 +1162,20 @@ def _dedupe_items(items: Iterable[NewsItem]) -> List[NewsItem]:
         ):
             deduped[key] = item
     return list(deduped.values())
+
+
+def _score_then_dedupe_items(
+    items: Iterable[NewsItem],
+    context: Optional[InstrumentContext] = None,
+) -> List[NewsItem]:
+    scored = list(items)
+    for item in scored:
+        item.importance_score = _score_importance(item)
+        if context is not None:
+            item.relevance_score, matched_terms = _score_relevance(item, context)
+            if matched_terms:
+                item.metadata["matched_terms"] = matched_terms
+    return _dedupe_items(scored)
 
 
 def _build_equity_symbol_candidates(context: InstrumentContext) -> List[str]:
@@ -1633,7 +1658,7 @@ class MT5NewsSource:
                         provider=self.name,
                         source=_safe_text(item.get("source") or item.get("category")) or "MT5",
                         kind="headline",
-                        published_at=_parse_relative_time(_safe_text(item.get("relative_time"))),
+                        published_at=_maybe_parse_datetime(item.get("published_at")),
                         category=_safe_text(item.get("category")) or None,
                         priority=priority,
                         metadata={
@@ -1758,9 +1783,7 @@ class NewsAggregator:
                 "recent_count": 0,
             }
 
-        general_pool = _dedupe_items(general_candidates)
-        for item in general_pool:
-            item.importance_score = _score_importance(item)
+        general_pool = _score_then_dedupe_items(general_candidates)
         general_pool.sort(
             key=lambda item: (
                 item.importance_score + _general_news_recency_boost(item.published_at),
@@ -1776,12 +1799,10 @@ class NewsAggregator:
         upcoming_events: List[NewsItem] = []
         recent_events: List[NewsItem] = []
         if context is not None:
-            market_context_pool = _dedupe_items(market_context_candidates)
-            for item in market_context_pool:
-                item.importance_score = _score_importance(item)
-                item.relevance_score, matched_terms = _score_relevance(item, context)
-                if matched_terms:
-                    item.metadata["matched_terms"] = matched_terms
+            market_context_pool = _score_then_dedupe_items(
+                market_context_candidates,
+                context,
+            )
             market_context_pool.sort(
                 key=lambda item: (
                     item.relevance_score,
@@ -1796,15 +1817,14 @@ class NewsAggregator:
                 item for item in general_pool
                 if _should_promote_general_item_to_related(item, context)
             ]
-            related_pool = _dedupe_items(list(related_candidates) + promoted_general_candidates)
+            related_pool = _score_then_dedupe_items(
+                list(related_candidates) + promoted_general_candidates,
+                context,
+            )
             upcoming_candidates: List[NewsItem] = []
             recent_candidates: List[NewsItem] = []
             filtered_related: List[NewsItem] = []
             for item in related_pool:
-                item.importance_score = _score_importance(item)
-                item.relevance_score, matched_terms = _score_relevance(item, context)
-                if matched_terms:
-                    item.metadata["matched_terms"] = matched_terms
                 if _passes_upcoming_event_gate(item, context):
                     upcoming_candidates.append(item)
                 if _passes_recent_event_gate(item, context):
@@ -1856,7 +1876,10 @@ class NewsAggregator:
                 )
             related_news = [item for item in filtered_related if item.dedupe_key() not in upcoming_keys][:bucket_size]
 
-            impact_pool = _dedupe_items(list(related_candidates) + list(general_pool))
+            impact_pool = _score_then_dedupe_items(
+                list(related_candidates) + list(general_pool),
+                context,
+            )
             impact_candidates: List[NewsItem] = []
             for item in impact_pool:
                 systemic_score, impact_terms = _score_systemic_impact(item, context)
@@ -1912,6 +1935,13 @@ class NewsAggregator:
         payload = {
             "success": True,
             "symbol": context.symbol if context is not None else None,
+            "relevance_status": (
+                "market_wide"
+                if context is None
+                else "symbol_matched"
+                if related_news
+                else "no_symbol_specific_news"
+            ),
             "instrument": context.to_dict() if context is not None else None,
             "sources_used": list(selected_sources.keys()),
             "source_details": source_details,

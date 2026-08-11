@@ -122,6 +122,14 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
         self.assertEqual(result["method"], "mc_gbm_bb")
         self.assertEqual(result["intra_bar_hit_detection"], "brownian_bridge")
         self.assertTrue(result["bridge_correction"])
+        self.assertEqual(
+            result["bridge_dual_barrier_model"],
+            "independent_single_barrier_approximation",
+        )
+        self.assertFalse(result["bridge_joint_first_passage"])
+        self.assertTrue(
+            any("sampled independently" in item for item in result["warnings"])
+        )
         self.assertFalse(
             any("intra-bar touches" in item for item in result.get("warnings", []))
         )
@@ -152,6 +160,37 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
         self.assertEqual(first["prob_tp_first"], second["prob_tp_first"])
         self.assertEqual(first["prob_sl_first"], second["prob_sl_first"])
         self.assertEqual(first["prob_no_hit"], second["prob_no_hit"])
+
+    def test_default_seed_is_stable_across_live_tick_changes(self):
+        self._set_flat_history(1.0, bars=200)
+        kwargs = {
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "horizon": 4,
+            "method": "mc_gbm",
+            "direction": "long",
+            "tp_pct": 0.5,
+            "sl_pct": 0.5,
+            "params": {"n_sims": 10},
+        }
+
+        with patch(
+            f'{_BARRIER_PROB_ROOT}._get_live_reference_price',
+            return_value=(1.2345, "live_tick_ask"),
+        ):
+            first = forecast_barrier_hit_probabilities(**kwargs)
+        with patch(
+            f'{_BARRIER_PROB_ROOT}._get_live_reference_price',
+            return_value=(1.2346, "live_tick_ask"),
+        ):
+            second = forecast_barrier_hit_probabilities(**kwargs)
+
+        self.assertTrue(first["success"])
+        self.assertTrue(second["success"])
+        self.assertNotEqual(first["last_price"], second["last_price"])
+        self.assertEqual(first["seed"], second["seed"])
+        self.assertEqual(first["seed_source"], "derived_from_request")
+        self.assertEqual(second["seed_source"], "derived_from_request")
 
     def test_forecast_barrier_hit_probabilities_normalizes_oversized_seed(self):
         self._set_flat_history(1.0)
@@ -336,6 +375,26 @@ class TestBarrierHitProbabilities(_BarrierTestBase):
         self.assertTrue(result["success"])
         self.assertIn("prob_hit", result)
         self.assertEqual(result["last_price_source"], "candle_close")
+
+    def test_closed_form_discloses_denoise_failure(self):
+        with patch(
+            "mtdata.utils.denoise.apply_denoise",
+            side_effect=ValueError("invalid filter setup"),
+        ):
+            result = forecast_barrier_closed_form(
+                symbol="EURUSD",
+                timeframe="H1",
+                horizon=10,
+                direction="long",
+                barrier=1.2,
+                denoise={"method": "ema"},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["denoise_applied"])
+        self.assertEqual(result["denoise_status"], "failed")
+        self.assertEqual(result["denoise_error"], "invalid filter setup")
+        self.assertIn("using raw close prices", result["warnings"][0])
 
     def test_gbm_single_barrier_upcross_prob_returns_one_when_barrier_below_start(self):
         self.assertAlmostEqual(

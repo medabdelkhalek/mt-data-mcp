@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from mtdata.bootstrap.settings import trade_guardrails_config
-from mtdata.core.trading.execution import _modify_pending_order, _modify_position
+from mtdata.core.trading.execution import (
+    _evaluate_position_modify_guardrails,
+    _modify_pending_order,
+    _modify_position,
+)
 from mtdata.core.trading.gateway import (
     create_trading_gateway as create_real_trading_gateway,
+)
+from mtdata.core.trading.orders import (
+    _TRADE_DECISION_LOCK,
+    _evaluate_live_trade_guardrails,
+    _place_market_order,
+    _place_pending_order,
 )
 
 
@@ -28,6 +40,8 @@ def mock_mt5():
     mt5.ORDER_TYPE_SELL_LIMIT = 3
     mt5.ORDER_TYPE_BUY_STOP = 4
     mt5.ORDER_TYPE_SELL_STOP = 5
+    mt5.ORDER_TYPE_BUY_STOP_LIMIT = 6
+    mt5.ORDER_TYPE_SELL_STOP_LIMIT = 7
     mt5.ORDER_TYPE_BUY = 0
     mt5.ORDER_TYPE_SELL = 1
     mt5.POSITION_TYPE_BUY = 0
@@ -56,7 +70,9 @@ def mock_mt5():
         trade_tick_value=10.0,
         trade_tick_value_loss=10.0,
     )
-    mt5.symbol_info_tick = lambda symbol: SimpleNamespace(bid=1.1002, ask=1.1004)
+    mt5.symbol_info_tick = lambda symbol: SimpleNamespace(
+        bid=1.1002, ask=1.1004, time=4_102_444_800
+    )
     mt5.orders_get = lambda *args, **kwargs: [
         SimpleNamespace(
             ticket=100,
@@ -85,12 +101,11 @@ def mock_mt5():
 
 @pytest.fixture
 def patch_gateway(mock_mt5):
-    def _build_gateway(*, gateway=None, include_retcode_name=False, **_kwargs):
+    def _build_gateway(*, gateway=None, **_kwargs):
         if gateway is not None:
             return gateway
         return create_real_trading_gateway(
             adapter=mock_mt5,
-            include_retcode_name=include_retcode_name,
             ensure_connection_impl=lambda: None,
         )
 
@@ -111,6 +126,113 @@ def test_modify_pending_order_blocks_risk_increase(
     assert result["guardrail_rule"] == "wallet_risk"
 
 
+def test_modify_pending_order_blocks_failed_position_snapshot(
+    restore_trade_guardrails,
+    patch_gateway,
+):
+    trade_guardrails_config.enabled = True
+    trade_guardrails_config.wallet_risk_limits.max_risk_pct_of_equity = 5.0
+    patch_gateway.positions_get = lambda *args, **kwargs: None
+
+    result = _modify_pending_order(ticket=100, price=1.1000, stop_loss=1.0940)
+
+    assert result["guardrail_blocked"] is True
+    assert result["error_code"] == "positions_snapshot_unavailable"
+    assert result["guardrail_rule"] == "snapshot_integrity"
+
+
+def test_trade_guardrails_block_failed_pending_order_snapshot(
+    restore_trade_guardrails,
+    patch_gateway,
+):
+    trade_guardrails_config.enabled = True
+    trade_guardrails_config.account_risk_limits.max_total_exposure_lots = 5.0
+    patch_gateway.orders_get = lambda *args, **kwargs: None
+    patch_gateway.last_error = lambda: (1, "snapshot unavailable")
+
+    result = _evaluate_live_trade_guardrails(
+        create_real_trading_gateway(
+            adapter=patch_gateway,
+            ensure_connection_impl=lambda: None,
+        ),
+        symbol="EURUSD",
+        volume=1.0,
+        stop_loss=1.09,
+        deviation=20,
+        side="BUY",
+        entry_price=1.1,
+        symbol_info=patch_gateway.symbol_info("EURUSD"),
+    )
+
+    assert result is not None
+    assert result["guardrail_blocked"] is True
+    assert result["error_code"] == "orders_snapshot_unavailable"
+    assert result["guardrail_rule"] == "snapshot_integrity"
+
+
+@pytest.mark.parametrize(
+    ("place_order", "kwargs"),
+    [
+        (_place_market_order, {"order_type": "BUY", "stop_loss": 1.09}),
+        (
+            _place_pending_order,
+            {"order_type": "BUY_LIMIT", "price": 1.09, "stop_loss": 1.08},
+        ),
+    ],
+)
+def test_live_order_entry_points_block_wallet_risk_before_order_send(
+    restore_trade_guardrails,
+    patch_gateway,
+    place_order,
+    kwargs,
+):
+    trade_guardrails_config.enabled = True
+    trade_guardrails_config.ignore_on_demo = False
+    trade_guardrails_config.wallet_risk_limits.max_risk_pct_of_equity = 0.1
+    patch_gateway.order_send = MagicMock()
+    gateway = create_real_trading_gateway(
+        adapter=patch_gateway,
+        ensure_connection_impl=lambda: None,
+    )
+
+    result = place_order(
+        "EURUSD",
+        100.0,
+        gateway=gateway,
+        **kwargs,
+    )
+
+    assert result["guardrail_blocked"] is True
+    assert result["guardrail_rule"] == "wallet_risk"
+    patch_gateway.order_send.assert_not_called()
+
+
+def test_market_order_decision_is_serialized_across_threads():
+    entered_decision = threading.Event()
+
+    def _symbol_context(*_args, **_kwargs):
+        entered_decision.set()
+        return None, {"error": "stop after lock assertion"}
+
+    with (
+        patch(
+            "mtdata.core.trading.orders._prepare_order_gateway",
+            return_value=(MagicMock(), None),
+        ),
+        patch(
+            "mtdata.core.trading.orders._prepare_order_symbol_context",
+            side_effect=_symbol_context,
+        ),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        with _TRADE_DECISION_LOCK:
+            future = executor.submit(_place_market_order, "EURUSD", 0.6, "BUY")
+            assert entered_decision.wait(timeout=0.1) is False
+
+        assert future.result(timeout=2.0)["error"] == "stop after lock assertion"
+        assert entered_decision.is_set()
+
+
 def test_modify_pending_order_allows_tighter_stop_loss(
     restore_trade_guardrails,
     patch_gateway,
@@ -122,6 +244,34 @@ def test_modify_pending_order_allows_tighter_stop_loss(
 
     assert result["success"] is True
     assert result["pending_order_ticket"] == 100
+
+
+def test_modify_buy_stop_limit_uses_buy_side_risk_logic(
+    restore_trade_guardrails,
+    patch_gateway,
+):
+    trade_guardrails_config.enabled = True
+    trade_guardrails_config.wallet_risk_limits.max_risk_pct_of_equity = 5.0
+    order = patch_gateway.orders_get()[0]
+    order.type = patch_gateway.ORDER_TYPE_BUY_STOP_LIMIT
+    order.sl = 1.0995
+    patch_gateway.orders_get = lambda *args, **kwargs: [order]
+
+    with patch(
+        "mtdata.core.trading.execution.validation._validate_pending_order_levels",
+        return_value=None,
+    ), patch(
+        "mtdata.core.trading.execution.pending_order_risk_increased",
+        return_value=False,
+    ) as mock_risk:
+        result = _modify_pending_order(
+            ticket=100,
+            price=1.1000,
+            stop_loss=1.0995,
+        )
+
+    assert result["success"] is True
+    assert mock_risk.call_args.kwargs["side"] == "BUY"
 
 
 def test_modify_pending_order_ignores_guardrails_for_demo_account(
@@ -224,3 +374,119 @@ def test_modify_position_allows_tighter_stop_loss(
 
     assert result["success"] is True
     assert result["position_ticket"] == 200
+
+
+def test_modify_position_marks_missing_broker_response_ambiguous(
+    restore_trade_guardrails,
+    patch_gateway,
+):
+    position = SimpleNamespace(
+        ticket=200,
+        symbol="EURUSD",
+        price_open=1.1000,
+        sl=1.0990,
+        tp=1.1200,
+        type=patch_gateway.POSITION_TYPE_BUY,
+        volume=1.0,
+        magic=123,
+    )
+    patch_gateway.positions_get = lambda *args, **kwargs: [position]
+    patch_gateway.order_send = MagicMock(return_value=None)
+    patch_gateway.last_error = lambda: (1, "timeout")
+
+    result = _modify_position(ticket=200, stop_loss=1.0995)
+
+    assert result["error_code"] == "order_send_ambiguous"
+    assert result["ambiguous"] is True
+    assert result["position_ticket"] == 200
+
+
+def test_modify_pending_marks_missing_broker_response_ambiguous(
+    restore_trade_guardrails,
+    patch_gateway,
+):
+    patch_gateway.order_send = MagicMock(return_value=None)
+    patch_gateway.last_error = lambda: (1, "timeout")
+
+    result = _modify_pending_order(
+        ticket=100,
+        price=1.1000,
+        stop_loss=1.0995,
+    )
+
+    assert result["error_code"] == "order_send_ambiguous"
+    assert result["ambiguous"] is True
+    assert result["pending_order_ticket"] == 100
+
+
+def test_position_modify_wallet_risk_uses_current_mark(
+    restore_trade_guardrails,
+    patch_gateway,
+):
+    trade_guardrails_config.enabled = True
+    captured: dict[str, object] = {}
+    position = SimpleNamespace(
+        ticket=200,
+        symbol="EURUSD",
+        price_open=1.1000,
+        price_current=1.1100,
+        volume=1.0,
+    )
+
+    with (
+        patch(
+            "mtdata.core.trading.execution.load_guardrail_book_snapshots",
+            return_value=([], [], None),
+        ),
+        patch(
+            "mtdata.core.trading.execution.evaluate_trade_guardrails",
+            side_effect=lambda *_args, **kwargs: captured.update(kwargs) or None,
+        ),
+    ):
+        result = _evaluate_position_modify_guardrails(
+            patch_gateway,
+            position=position,
+            resolved_ticket=200,
+            requested_ticket=200,
+            side="BUY",
+            symbol_info=patch_gateway.symbol_info("EURUSD"),
+            current_stop_loss=1.1080,
+            candidate_stop_loss=1.1050,
+        )
+
+    assert result is None
+    assert captured["entry_price"] == pytest.approx(1.1100)
+    assert captured["enforce_safety_policy"] is False
+
+
+def test_position_modify_does_not_apply_reduce_only_policy(
+    restore_trade_guardrails,
+    patch_gateway,
+):
+    trade_guardrails_config.enabled = True
+    trade_guardrails_config.ignore_on_demo = False
+    trade_guardrails_config.safety_policy.reduce_only = True
+    position = SimpleNamespace(
+        ticket=200,
+        symbol="EURUSD",
+        price_open=1.1000,
+        price_current=1.1100,
+        volume=1.0,
+    )
+
+    with patch(
+        "mtdata.core.trading.execution.load_guardrail_book_snapshots",
+        return_value=([], [], None),
+    ):
+        result = _evaluate_position_modify_guardrails(
+            patch_gateway,
+            position=position,
+            resolved_ticket=200,
+            requested_ticket=200,
+            side="BUY",
+            symbol_info=patch_gateway.symbol_info("EURUSD"),
+            current_stop_loss=1.1080,
+            candidate_stop_loss=1.1050,
+        )
+
+    assert result is None

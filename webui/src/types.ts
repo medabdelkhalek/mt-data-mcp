@@ -49,6 +49,7 @@ export type HistoryResponse = {
   forming_candle_skipped?: boolean
   incomplete_candles_skipped?: number
   server_utc_offset_seconds?: number
+  server_timezone?: string
   meta?: {
     runtime?: {
       timezone?: RuntimeTimezoneMeta
@@ -155,11 +156,12 @@ export type SupportResistanceResponse = {
     current_atr_pct?: number | null
     baseline_atr_pct?: number | null
   }>
-  limit: number
-  method: string
-  tolerance_pct: number
+  lookback?: number
+  limit?: number
+  method?: string
+  tolerance_pct?: number
   effective_tolerance_pct?: number
-  min_touches: number
+  min_touches?: number
   qualification_basis?: 'episodes'
   max_levels?: number
   reaction_bars?: number
@@ -171,7 +173,8 @@ export type SupportResistanceResponse = {
   baseline_atr_pct?: number | null
   current_price?: number | null
   window?: { start?: string | null; end?: string | null }
-  levels: SupportResistanceLevel[]
+  scan_window?: { start?: string | null; end?: string | null }
+  levels?: SupportResistanceLevel[]
   supports?: SupportResistanceLevel[]
   resistances?: SupportResistanceLevel[]
 }
@@ -189,6 +192,29 @@ export type ForecastPayload = {
   lower_price?: number[]
   upper_price?: number[]
   forecast_quantiles?: Record<string, number[]>
+  forecast?: Array<{
+    time?: string
+    value?: number
+    price?: number
+    return?: number
+    lower_price?: number
+    upper_price?: number
+    lower?: number
+    upper?: number
+  }>
+  uncertainty?: {
+    intervals?: Array<{
+      time?: string
+      forecast?: number
+      low?: number
+      high?: number
+    }>
+  }
+  quantity?: 'price' | 'return' | 'volatility'
+  data_window?: {
+    last_observation?: string | number
+    forecast_start?: string | number
+  }
   // client-only context
   __anchor?: number
   __kind?: 'full' | 'partial' | 'backtest'
@@ -202,7 +228,7 @@ export type VolatilityPayload = {
   forecast_epoch?: number[]
   forecast_time?: string[]
   forecast_vol?: number[]
-  annualized_vol?: number
+  volatility_annualized?: number
 }
 
 // ============================================================================
@@ -247,6 +273,14 @@ export type DenoiseMethodInfo = {
   requires?: string
   description: string
   params: ParamDef[]
+  supports_causal?: boolean
+  requires_causality_opt_in?: boolean
+  supports?: { causality?: string[] }
+  defaults?: {
+    causality?: 'zero_phase' | 'causal'
+    when?: 'pre_ti' | 'post_ti'
+    keep_original?: boolean
+  }
 }
 
 export type DenoiseMethodsMeta = {
@@ -280,6 +314,35 @@ export type SktimeEstimatorsResponse = {
   available: boolean
   estimators: SktimeEstimator[]
   error?: string
+}
+
+export type StoredModelInfo = {
+  id?: string
+  model_id?: string
+  method?: string
+  symbol?: string
+  timeframe?: string
+  created_at?: string
+  updated_at?: string
+  path?: string
+  [key: string]: unknown
+}
+
+export type ModelsResponse = {
+  success?: boolean
+  detail?: string
+  count?: number
+  models: StoredModelInfo[]
+}
+
+export type ReadyResponse = {
+  status?: string
+  ready?: boolean
+  service?: string
+  detail?: string
+  message?: string
+  mt5?: { connected?: boolean; error?: string }
+  [key: string]: unknown
 }
 
 // ============================================================================
@@ -353,14 +416,17 @@ export type BacktestResult = {
   horizon: number
   steps: number
   spacing: number
-  results: Record<string, {
-    success: boolean
+  results?: Record<string, BacktestMethodResult>
+  ranked_methods?: Array<BacktestMethodResult & { method: string }>
+}
+
+export type BacktestMethodResult = {
+    success?: boolean
     avg_mae?: number
     avg_rmse?: number
     avg_directional_accuracy?: number
     successful_tests?: number
     num_tests?: number
-  }>
 }
 
 // ============================================================================

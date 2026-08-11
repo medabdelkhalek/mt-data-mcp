@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import warnings
 from typing import Any, Dict, List, Optional
@@ -8,8 +9,14 @@ import numpy as np
 import pandas as pd
 
 from ..common import build_ci_diagnostics as _build_ci_diagnostics
-from ..interface import CancelToken, ForecastMethod, ForecastResult, ProgressReporter, TrainResult
 from ..forecast_registry import ForecastRegistry
+from ..interface import (
+    CancelToken,
+    ForecastMethod,
+    ForecastResult,
+    ProgressReporter,
+    TrainResult,
+)
 
 try:
     import importlib.util as _importlib_util
@@ -18,7 +25,21 @@ except Exception:
     _HAS_SKTIME = False
 
 _SKTIME_IMPORT_ERROR = "sktime is not installed; install it to enable sktime-based forecast methods."
+_SKTIME_ESTIMATOR_NAMESPACE = "sktime.forecasting."
 logger = logging.getLogger(__name__)
+
+
+def _validated_estimator_path(value: Any) -> str:
+    """Return a normalized sktime forecaster path or reject unsafe imports."""
+    estimator_path = str(value or "").strip()
+    if not estimator_path:
+        return "sktime.forecasting.theta.ThetaForecaster"
+    if not estimator_path.startswith(_SKTIME_ESTIMATOR_NAMESPACE):
+        raise ValueError(
+            f"Estimator '{estimator_path}' is not allowed for the sktime method. "
+            "Estimator paths must be inside sktime.forecasting."
+        )
+    return estimator_path
 
 class SktimeMethod(ForecastMethod):
     """Base class for Sktime methods."""
@@ -44,6 +65,10 @@ class SktimeMethod(ForecastMethod):
 
     @property
     def supports_training(self) -> bool:
+        return True
+
+    @property
+    def supports_live_model_update(self) -> bool:
         return True
 
     @property
@@ -109,7 +134,7 @@ class SktimeMethod(ForecastMethod):
             params_used={"seasonality": seasonality, **params},
         )
 
-    def predict_with_model(
+    def predict_with_model(  # noqa: C901
         self,
         model,
         series: pd.Series,
@@ -124,6 +149,44 @@ class SktimeMethod(ForecastMethod):
             raise RuntimeError(_SKTIME_IMPORT_ERROR)
 
         estimator = model  # deserialized sktime estimator
+        y = series.copy()
+        if not isinstance(y.index, pd.RangeIndex) and getattr(y.index, "freq", None) is None:
+            try:
+                y.index.freq = pd.infer_freq(y.index)
+            except Exception:
+                pass
+        if not isinstance(y.index, pd.RangeIndex) and getattr(y.index, "freq", None) is None:
+            y = y.reset_index(drop=True)
+
+        cutoff = getattr(estimator, "cutoff", None)
+        if cutoff is None:
+            raise RuntimeError("Stored sktime model does not expose a training cutoff for live refresh.")
+        if isinstance(cutoff, (pd.Index, np.ndarray, list, tuple)):
+            if len(cutoff) == 0:
+                raise RuntimeError(
+                    "Stored sktime model does not expose a usable training cutoff for live refresh."
+                )
+            cutoff = cutoff[-1]
+        try:
+            new_y = y.loc[y.index > cutoff]
+        except Exception as exc:
+            raise RuntimeError("Stored sktime model cutoff is incompatible with live history.") from exc
+        if len(new_y):
+            X_update = kwargs.get("exog_used")
+            if X_update is None:
+                X_update = params.get("exog_used")
+            if isinstance(X_update, np.ndarray):
+                X_update = pd.DataFrame(X_update, index=y.index)
+            if isinstance(X_update, pd.DataFrame):
+                try:
+                    X_update = X_update.loc[new_y.index]
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Stored sktime model cannot align live exogenous history for refresh."
+                    ) from exc
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                estimator.update(y=new_y, X=X_update, update_params=False)
         fh = np.arange(1, horizon + 1)
 
         X_future = kwargs.get('exog_future')
@@ -144,9 +207,55 @@ class SktimeMethod(ForecastMethod):
         else:
             f_vals = np.array(y_pred)
 
+        ci_values = None
+        metadata = None
+        ci_alpha = kwargs.get("ci_alpha", params.get("ci_alpha"))
+        if ci_alpha is not None:
+            alpha = float(ci_alpha)
+            coverage = 1.0 - alpha
+            try:
+                intervals = estimator.predict_interval(
+                    fh=fh, X=X_future, coverage=coverage
+                )
+                lower = upper = None
+                for column in intervals.columns:
+                    if not isinstance(column, tuple) or len(column) < 3:
+                        continue
+                    if not np.isclose(float(column[1]), coverage, atol=1e-3):
+                        continue
+                    if column[2] == "lower":
+                        lower = intervals[column].to_numpy(dtype=float)
+                    elif column[2] == "upper":
+                        upper = intervals[column].to_numpy(dtype=float)
+                if lower is not None and upper is not None:
+                    ci_values = (lower, upper)
+                    metadata = _build_ci_diagnostics(
+                        provider=self.name,
+                        requested=True,
+                        available=True,
+                        status="available",
+                        alpha=alpha,
+                        coverage=coverage,
+                    )
+                else:
+                    raise ValueError("matching interval columns were not returned")
+            except Exception as exc:
+                metadata = _build_ci_diagnostics(
+                    provider=self.name,
+                    requested=True,
+                    available=False,
+                    status="error",
+                    alpha=alpha,
+                    coverage=coverage,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+
         return ForecastResult(
             forecast=f_vals,
+            ci_values=ci_values,
             params_used={"seasonality": seasonality, **params},
+            metadata=metadata,
         )
 
     def forecast(  # noqa: C901
@@ -359,17 +468,13 @@ class GenericSktimeMethod(SktimeMethod):
         return "sktime"
         
     def _get_estimator(self, seasonality: int, params: Dict[str, Any]):
+        estimator_path = _validated_estimator_path(params.get('estimator'))
         if not _HAS_SKTIME:
             raise RuntimeError(_SKTIME_IMPORT_ERROR)
-        estimator_path = params.get('estimator')
-        if not estimator_path:
-            # Default to a robust, commonly available estimator.
-            estimator_path = "sktime.forecasting.theta.ThetaForecaster"
             
         # Import dynamically
         try:
             module_path, class_name = estimator_path.rsplit('.', 1)
-            import importlib
             # sktime 1.0+ forecasting package eagerly imports torch-backed
             # aliases (e.g. cinn) when any sktime.forecasting.* module loads.
             # Prefer a successful torch import first so that path is cheap/safe.
@@ -388,7 +493,23 @@ class GenericSktimeMethod(SktimeMethod):
                 module = importlib.import_module(module_path)
             estimator_cls = getattr(module, class_name)
         except (ValueError, ImportError, AttributeError) as e:
-             raise ValueError(f"Could not import sktime estimator '{estimator_path}': {e}")
+            raise ValueError(f"Could not import sktime estimator '{estimator_path}': {e}")
+
+        try:
+            from sktime.forecasting.base import BaseForecaster
+
+            is_forecaster = isinstance(estimator_cls, type) and issubclass(
+                estimator_cls,
+                BaseForecaster,
+            )
+        except (ImportError, TypeError) as exc:
+            raise ValueError(
+                f"Could not validate sktime estimator '{estimator_path}': {exc}"
+            ) from exc
+        if not is_forecaster:
+            raise ValueError(
+                f"Estimator '{estimator_path}' is not a sktime BaseForecaster."
+            )
              
         # Filter params
         import inspect

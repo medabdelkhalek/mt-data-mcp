@@ -31,18 +31,20 @@ MT5_TIMEOUT=30
 ## Timezone
 
 MT5 documents UTC request datetimes and returned epochs. mtdata also supports
-broker terminals that expose server-clock epochs: it detects that mode from a
-fresh tick and uses the broker setting below to normalize request bounds and
-results at the adapter boundary. Public payload timestamps remain UTC.
+broker terminals that expose server-clock epochs: configure the broker setting
+below so a fresh tick can verify that mode and the adapter can normalize request
+bounds and results. Public payload timestamps remain UTC after normalization.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MT5_SERVER_TZ` | — | IANA timezone used for broker session/calendar boundaries and detected server-clock conversion (e.g. `Europe/Athens`). Handles DST automatically. |
+| `MT5_SERVER_TZ` | — | IANA timezone used for broker session/calendar boundaries and server-clock recognition/conversion (e.g. `Europe/Athens`). Handles DST automatically. |
 | `MT5_TIME_OFFSET_MINUTES` | `0` | Fixed broker offset from UTC in minutes. A non-zero value overrides `MT5_SERVER_TZ`. |
 | `MT5_CLIENT_TZ` / `CLIENT_TZ` | auto-detect | IANA timezone of the local machine. `CLIENT_TZ` takes precedence if both are set. |
 
 Configure these when broker-local boundaries matter or when the terminal uses
-broker server-clock epochs. Timestamp-mode detection is automatic.
+broker server-clock epochs. Detection verifies a configured offset; without
+one, mtdata follows MT5's native-UTC contract rather than inferring a clock
+offset from a potentially stale tick.
 Prefer `MT5_SERVER_TZ` because it adjusts for DST. Use
 `MT5_TIME_OFFSET_MINUTES` only when you know a fixed session offset, and avoid
 setting both unless you intentionally want the fixed offset to win.
@@ -79,8 +81,10 @@ Control how the MCP server binds and exposes endpoints.
 | `FASTMCP_PORT` | `8000` | Listen port |
 | `FASTMCP_ALLOW_REMOTE` | `false` | Set to `1` to allow non-loopback binds (e.g. `0.0.0.0`) |
 | `MCP_AUTH_TOKEN` | — | Bearer / API-key token for SSE and streamable-HTTP. **Required** when binding to a non-loopback address. Optional on loopback; when set, clients must send `Authorization: Bearer <token>` or `X-API-Key: <token>`. Not used for `stdio`. |
+| `MCP_ALLOWED_HOSTS` | — | Comma-separated externally used host patterns (for example `mt5.example.com:*`). Required for wildcard remote binds such as `0.0.0.0`. |
+| `MCP_ALLOWED_ORIGINS` | — | Comma-separated allowed HTTP Origin patterns for remote MCP clients. |
 | `FASTMCP_LOG_LEVEL` | `INFO` | Logging level |
-| `FASTMCP_MOUNT_PATH` | `/` | Base mount path |
+| `FASTMCP_MOUNT_PATH` | `/` | SSE base mount path or streamable-HTTP endpoint path |
 | `FASTMCP_SSE_PATH` | `/sse` | SSE event-stream path |
 | `FASTMCP_MESSAGE_PATH` | `/message` | Message endpoint path |
 
@@ -97,7 +101,7 @@ Settings for the FastAPI server that powers the React Web UI.
 | `WEBAPI_ALLOW_REMOTE` | `false` | Set to `1` to allow non-loopback binds |
 | `WEBAPI_AUTH_TOKEN` | — | Bearer / API-key token. **Required** when binding to a non-loopback address. |
 | `CORS_ORIGINS` | `http://127.0.0.1:5173,http://localhost:5173` | Comma-separated allowed origins. Wildcard `*` is rejected when credentials are enabled. |
-| `WEBUI_DIST_DIR` | `webui/dist` | Path to the built Web UI static files |
+| `WEBUI_DIST_DIR` | `webui/dist` | Path to the built Web UI static files (`index.html` required). When missing, `/app` returns enablement guidance instead of a silent skip. |
 
 ```ini
 # Expose the Web API on the local network with auth
@@ -179,6 +183,7 @@ Concurrency caps and on-disk cache used by `forecast_train` / `forecast_task_*` 
 | `MTDATA_FORECAST_HEARTBEAT_SECONDS` | `2` | Heartbeat interval used by heavy-process training jobs. Values below 0.5 seconds are clamped. |
 | `MTDATA_FORECAST_CANCEL_GRACE_SECONDS` | `3` | Grace period after cancellation before a still-running heavy worker is terminated. Values below 0.1 seconds are clamped. |
 | `MTDATA_FORECAST_SWEEPER_SECONDS` | `60` | Interval for cleaning completed task records and expired model artifacts. Values below 5 seconds are clamped. |
+| `MTDATA_FORECAST_TASK_TTL_SECONDS` | `86400` | Retention for terminal task records, including bounded failure diagnostics. Values below 60 seconds are clamped. |
 | `MTDATA_MODEL_STORE` | `~/.mtdata/models` | Root directory used by the model store. Trained models are keyed by `method/data_scope/params_hash`. |
 | `MTDATA_MODEL_TTL_DAYS` | `7` | Cached model idle expiry in days since last use. Idle models are evicted on access; frequently used models do not expire by age. |
 
@@ -229,6 +234,13 @@ Optional pre-trade controls that can block `trade_place` and risk-increasing pen
 Notes:
 
 - Wallet-risk caps require a quantifiable stop-loss and valid broker tick metadata.
+- Existing position risk is measured from the current mark to each stop, so
+  trailed stops still reserve the equity that would be lost from the current
+  account state. If the position snapshot is unavailable, snapshot-dependent
+  guardrails block the action.
+- Wallet-risk guardrails reserve risk from open positions, existing pending
+  orders, and the candidate order. They fail closed when any of those records
+  lacks a quantifiable stop-loss or valid broker tick metadata.
 - Leave any variable unset to disable only that rule.
 - `trade_modify` guardrails apply only to pending-order changes and position SL changes that increase risk; close/reduce flows stay allowed.
 
@@ -328,6 +340,7 @@ A starter template with all sections. Uncomment and fill in what you need.
 # MTDATA_FORECAST_HEARTBEAT_SECONDS=2
 # MTDATA_FORECAST_CANCEL_GRACE_SECONDS=3
 # MTDATA_FORECAST_SWEEPER_SECONDS=60
+# MTDATA_FORECAST_TASK_TTL_SECONDS=86400
 # MTDATA_MODEL_STORE=~/.mtdata/models
 # MTDATA_MODEL_TTL_DAYS=7
 

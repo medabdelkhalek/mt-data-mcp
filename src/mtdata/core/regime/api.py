@@ -54,6 +54,40 @@ from .smoothing import (
 
 logger = logging.getLogger(__name__)
 
+
+def _rolling_prefix_std(values: np.ndarray, lookback: int) -> np.ndarray:
+    """Return the legacy inclusive rolling standard deviation without Python loops."""
+    array = np.asarray(values, dtype=float)
+    ends = np.arange(1, array.size + 1, dtype=int)
+    starts = np.maximum(0, ends - (int(lookback) + 1))
+    counts = ends - starts
+    cumulative = np.concatenate(([0.0], np.cumsum(array)))
+    cumulative_squares = np.concatenate(([0.0], np.cumsum(array**2)))
+    means = (cumulative[ends] - cumulative[starts]) / counts
+    variances = (
+        (cumulative_squares[ends] - cumulative_squares[starts]) / counts
+        - means**2
+    )
+    return np.sqrt(np.maximum(variances, 0.0))
+
+
+def _rolling_band_energy(bands: List[np.ndarray], window: int) -> np.ndarray:
+    """Compute leading-partial rolling mean-square energy for each band."""
+    if not bands:
+        return np.empty((0, 0), dtype=float)
+    n_bars = len(bands[0])
+    energy_matrix = np.zeros((n_bars, len(bands)), dtype=float)
+    window_ends = np.arange(1, n_bars + 1, dtype=int)
+    window_starts = np.maximum(0, window_ends - int(window))
+    window_lengths = window_ends - window_starts
+    for band_index, band in enumerate(bands):
+        squared = np.asarray(band, dtype=float) ** 2
+        cumulative = np.concatenate(([0.0], np.cumsum(squared)))
+        energy_matrix[:, band_index] = (
+            cumulative[window_ends] - cumulative[window_starts]
+        ) / window_lengths
+    return energy_matrix
+
 _PELT_DIRECTION_T_STAT_THRESHOLD = 1.96
 _ENSEMBLE_STATE_METHODS = frozenset(
     {"hmm", "gmm", "ms_ar", "clustering", "wavelet"}
@@ -203,12 +237,10 @@ def _normalize_direction_signal(
     if "neutral" in text:
         return "neutral"
 
-    mean_value = _coerce_optional_float(mean_return)
-    if mean_value is None:
-        return None
-    if abs(mean_value) < 1e-4:
-        return "neutral"
-    return "bullish" if mean_value > 0 else "bearish"
+    # A mean without state dispersion and occupancy cannot support a
+    # timeframe-independent direction claim. State labels encode the shared
+    # t-statistic criterion when sufficient evidence exists.
+    return None
 
 
 def _normalize_volatility_signal(
@@ -556,12 +588,14 @@ def _method_parameter_warnings(
 
 
 def _smoothing_warnings(method: str, smoothing_meta: Dict[str, Any]) -> List[str]:
-    if bool(smoothing_meta.get("min_regime_bars_satisfied", True)):
+    pending_state = smoothing_meta.get("pending_state")
+    pending_bars = int(smoothing_meta.get("pending_bars", 0) or 0)
+    if pending_state is None or pending_bars <= 0:
         return []
     return [
-        "min_regime_bars could not be fully satisfied for "
-        f"method='{method}' with the available decoded state sequence; "
-        f"{int(smoothing_meta.get('remaining_short_runs', 0))} short run(s) remain."
+        f"method='{method}' has candidate state {pending_state} pending confirmation "
+        f"({pending_bars}/{int(smoothing_meta.get('pending_bars_required', 1))} "
+        "required consecutive bars); the current emitted regime is retained."
     ]
 
 
@@ -901,8 +935,19 @@ def _mark_collapsed_state_confidence(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Prevent a one-state posterior from masquerading as model certainty."""
     current = payload.get("current_regime")
     if isinstance(current, dict):
+        if current.get("regime_confidence") is not None:
+            current["raw_posterior_mass"] = current["regime_confidence"]
         current["regime_confidence"] = 0.0
         current["label_quality"] = "unidentifiable_state_collapse"
+    regimes = payload.get("regimes")
+    if isinstance(regimes, list):
+        for segment in regimes:
+            if not isinstance(segment, dict):
+                continue
+            if segment.get("regime_confidence") is not None:
+                segment["raw_posterior_mass"] = segment["regime_confidence"]
+            segment["regime_confidence"] = 0.0
+            segment["label_quality"] = "unidentifiable_state_collapse"
     payload["signal_status"] = "not_actionable"
     return payload
 
@@ -1133,15 +1178,18 @@ def regime_detect(  # noqa: C901
           when include_series=True. Reliability is based on calibration quality.
           Best for detecting transition timing.
         - 'hmm', 'ms_ar', 'clustering': Return 'state' array and 'state_probabilities'.
+          HMM/MS-AR probabilities are model posteriors before causal state-change
+          confirmation, so their argmax can temporarily differ from emitted state.
           Labels like 'positive_low_vol' describe regime characteristics (return + volatility).
           Reliability based on model fit or cluster separation.
         - 'garch': Fits GARCH(1,1), then classifies its conditional-volatility
           path into relative full-window percentile tiers (or an explicit
           absolute threshold for two states). This is not a switching-GARCH model.
           n_states is AUTO-DETECTED by default from realized-vol percentile spread
-          (vol_ratio_90_10) plus return kurtosis (see docs/forecast/REGIMES.md):
-            wider 90/10 vol spread and/or heavy tails → more states (up to 4)
-            tighter spreads → 2 states (low/high)
+          (vol_ratio_90_10) plus raw return kurtosis:
+            vol_ratio > 10 or kurtosis > 6 → 4 states
+            vol_ratio > 5 or kurtosis > 4 → 3 states
+            otherwise → 2 states (10 or fewer usable volatility observations defaults to 3)
           Explicit n_states parameter overrides auto-detection.
           Uses percentile-based classification with volatility characteristics reported in output.
         - 'rule_based': Returns `current_regime` and a single-item `regimes` list with
@@ -1155,7 +1203,8 @@ def regime_detect(  # noqa: C901
           Default voters are HMM, clustering, and wavelet. Only state methods
           whose IDs are canonicalized by return are accepted; change-point,
           rule-based, and GARCH volatility-tier methods cannot vote.
-          When omitted, n_states is selected by return-distribution kurtosis:
+          For ensemble only, omitted n_states is selected by raw
+          return-distribution kurtosis:
             kurtosis > 6.0 → 6 states
             kurtosis > 4.5 → 5 states
             kurtosis > 3.5 → 4 states
@@ -1540,6 +1589,7 @@ def regime_detect(  # noqa: C901
                         step=cal_step,
                         max_windows=cal_max_windows,
                         bootstrap_runs=cal_boot,
+                        max_run_length=max_rl,
                     )
                 )
             bocpd_priors = _resolve_bocpd_priors(p, x)
@@ -1885,13 +1935,13 @@ def regime_detect(  # noqa: C901
 
         elif method == "ms_ar":
             try:
-                from statsmodels.tsa.regime_switching.markov_regression import (
-                    MarkovRegression,  # type: ignore
+                from statsmodels.tsa.regime_switching.markov_autoregression import (
+                    MarkovAutoregression,  # type: ignore
                 )
             except ImportError:
                 return _finish(
                     {
-                        "error": "statsmodels MarkovRegression not available. Install statsmodels.",
+                        "error": "statsmodels MarkovAutoregression not available. Install statsmodels.",
                         "error_code": "dependency_missing",
                         "details": {"method": "ms_ar", "requires": ["statsmodels"]},
                     }
@@ -1907,14 +1957,25 @@ def regime_detect(  # noqa: C901
                 return _finish({"error": n_states_error})
             if n_states_msar is None or n_states_msar < 2:
                 return _finish({"error": "n_states must be >= 2 for ms_ar."})
-            # Default AR(1) so MS-AR is an actual switching autoregression, not intercept-only.
             order, _ = _coerce_param(p, "order", default=1, cast=int)
+            if order < 1:
+                return _finish({"error": "params.order must be >= 1 for ms_ar."})
+            if x.size <= order:
+                return _finish(
+                    {
+                        "error": (
+                            f"ms_ar order={order} requires more than {order} "
+                            "usable observations."
+                        )
+                    }
+                )
             try:
-                mod = MarkovRegression(
+                mod = MarkovAutoregression(
                     endog=x,
                     k_regimes=max(2, n_states_msar),
                     trend="c",
-                    order=max(0, order),
+                    order=order,
+                    switching_ar=True,
                     switching_variance=True,
                 )
                 maxiter, _ = _coerce_param(p, "maxiter", default=100, cast=int)
@@ -1930,6 +1991,13 @@ def regime_detect(  # noqa: C901
                 if hasattr(marginal, "values"):
                     marginal = marginal.values
                 probs = np.asarray(marginal, dtype=float)
+                x_model = np.asarray(x[order:], dtype=float)
+                t_fmt_model = list(t_fmt[order:])
+                if probs.ndim != 2 or probs.shape[0] != x_model.size:
+                    raise ValueError(
+                        "MarkovAutoregression probability rows did not match "
+                        "the AR-aligned analysis window"
+                    )
                 raw_state = np.argmax(probs, axis=1)
                 state, smoothing_meta = _confirm_state_changes_causally(
                     np.asarray(raw_state, dtype=int), min_regime_bars_val
@@ -1937,7 +2005,7 @@ def regime_detect(  # noqa: C901
                 state, probs, canon_meta = _canonicalize_regime_labels(
                     state,
                     probs,
-                    x,
+                    x_model,
                 )
                 smoothing_meta["relabeled"] = canon_meta.get("relabeled", False)
                 mle_retvals = getattr(res, "mle_retvals", None)
@@ -1949,6 +2017,16 @@ def regime_detect(  # noqa: C901
                         converged = mle_retvals.get("converged")
                     except Exception:
                         converged = getattr(mle_retvals, "converged", None)
+                param_names = list(getattr(getattr(res, "model", None), "param_names", []) or [])
+                try:
+                    param_values = np.asarray(getattr(res, "params", []), dtype=float).reshape(-1)
+                except Exception:
+                    param_values = np.array([], dtype=float)
+                fitted_params = {
+                    str(name): float(value)
+                    for name, value in zip(param_names, param_values)
+                    if np.isfinite(value)
+                }
             except Exception as ex:
                 return _finish({"error": f"MS-AR fitting error: {ex}"})
 
@@ -1958,15 +2036,45 @@ def regime_detect(  # noqa: C901
             # mean / 0.0 vol) for states that smoothing had eliminated,
             # which then leaked into payload labels and downstream scoring.
             unique_canonical_states = sorted(int(s) for s in np.unique(state).tolist())
-            msar_regime_params = {"mean_return": [], "volatility": []}
+            msar_regime_params: Dict[str, Any] = {
+                "mean_return": [],
+                "volatility": [],
+            }
+            label_mapping = {
+                int(old): int(new)
+                for old, new in canon_meta.get("mapping", {}).items()
+            }
+            canonical_to_native = {new: old for old, new in label_mapping.items()}
+            intercepts: List[float] = []
+            innovation_volatility: List[float] = []
+            ar_coefficients: List[List[float]] = []
             for s in unique_canonical_states:
                 mask = state == s
                 if mask.any():
-                    msar_regime_params["mean_return"].append(float(np.mean(x[mask])))
-                    msar_regime_params["volatility"].append(float(np.std(x[mask])))
+                    msar_regime_params["mean_return"].append(float(np.mean(x_model[mask])))
+                    msar_regime_params["volatility"].append(float(np.std(x_model[mask])))
                 else:
                     msar_regime_params["mean_return"].append(0.0)
                     msar_regime_params["volatility"].append(0.0)
+                native_state = canonical_to_native.get(s, s)
+                intercept = fitted_params.get(f"const[{native_state}]")
+                sigma2 = fitted_params.get(f"sigma2[{native_state}]")
+                ar_values = [
+                    fitted_params.get(f"ar.L{lag}[{native_state}]")
+                    for lag in range(1, order + 1)
+                ]
+                if intercept is not None:
+                    intercepts.append(float(intercept))
+                if sigma2 is not None and sigma2 >= 0.0:
+                    innovation_volatility.append(float(np.sqrt(sigma2)))
+                if all(value is not None for value in ar_values):
+                    ar_coefficients.append([float(value) for value in ar_values])
+            if len(intercepts) == len(unique_canonical_states):
+                msar_regime_params["intercept"] = intercepts
+            if len(innovation_volatility) == len(unique_canonical_states):
+                msar_regime_params["innovation_volatility"] = innovation_volatility
+            if len(ar_coefficients) == len(unique_canonical_states):
+                msar_regime_params["ar_coefficients"] = ar_coefficients
 
             payload = {
                 "success": True,
@@ -1974,7 +2082,7 @@ def regime_detect(  # noqa: C901
                 "timeframe": timeframe,
                 "method": method,
                 "target": target,
-                "times": t_fmt,
+                "times": t_fmt_model,
                 "state": [int(s) for s in state.tolist()],
                 "state_probabilities": [
                     [float(v) for v in row] for row in probs.tolist()
@@ -1987,6 +2095,8 @@ def regime_detect(  # noqa: C901
                     "inference": inference,
                     "model_fit_scope": "full_window",
                     "state_postprocess": "causal_confirmation",
+                    "state_probability_alignment": "pre_confirmation_model_probabilities",
+                    "regime_params_order": "canonical",
                     "min_regime_bars": int(min_regime_bars_val),
                     "relabeled": bool(canon_meta.get("relabeled", False)),
                     "smoothing_applied": bool(
@@ -2198,6 +2308,7 @@ def regime_detect(  # noqa: C901
                     "inference": inference if method == "hmm" else "component_responsibility",
                     "model_fit_scope": "full_window",
                     "state_postprocess": "causal_confirmation",
+                    "state_probability_alignment": "pre_confirmation_model_probabilities",
                     "min_regime_bars": int(min_regime_bars_val),
                     "relabeled": bool(canon_meta.get("relabeled", False)),
                     "regime_params_order": "canonical",
@@ -2405,9 +2516,10 @@ def regime_detect(  # noqa: C901
                 sc = spectral_cls(**sc_kwargs)
                 labels = sc.fit_predict(X_final)
             else:
-                # KMeans — seed centroids from evenly-spaced rows so KMeans++
-                # init is skipped.  KMeans++ triggers joblib CPU-topology probing
-                # which blocks indefinitely in asyncio.to_thread workers on Windows.
+                # Seed centroids from evenly-spaced rows for deterministic
+                # initialization. KMeans still asks joblib for its OpenMP thread
+                # count before initialization; MCP startup warms that Windows CPU
+                # topology cache before requests enter asyncio worker threads.
                 idx = np.round(np.linspace(0, n_samples - 1, n_states_cluster)).astype(int)
                 kmeans = kmeans_cls(
                     n_clusters=n_states_cluster,
@@ -2585,9 +2697,9 @@ def regime_detect(  # noqa: C901
                     window = 5
 
                 # Rolling standard deviation of returns
-                rolling_vol = np.array(
-                    [np.std(x[max(0, i - window) : i + 1]) for i in range(len(x))]
-                )
+                # The historical implementation used ``i - window`` as the
+                # inclusive start, so preserve its window + 1 observations.
+                rolling_vol = _rolling_prefix_std(x, window)
                 rolling_vol = rolling_vol[np.isfinite(rolling_vol) & (rolling_vol > 0)]
 
                 if len(rolling_vol) > 10:
@@ -3195,15 +3307,7 @@ def regime_detect(  # noqa: C901
             # Compute rolling energy (variance) for each band
             n_bars = len(x)
             n_bands = len(bands)
-            energy_matrix = np.zeros((n_bars, n_bands))
-            for bi, band in enumerate(bands):
-                sq = band**2
-                # Cumulative sum for fast rolling mean
-                cs = np.concatenate([[0.0], np.cumsum(sq)])
-                for t in range(n_bars):
-                    lo = max(0, t - energy_window + 1)
-                    hi = t + 1
-                    energy_matrix[t, bi] = (cs[hi] - cs[lo]) / max(1, hi - lo)
+            energy_matrix = _rolling_band_energy(bands, energy_window)
 
             # Normalize energy rows to proportions (energy distribution across scales)
             row_sums = energy_matrix.sum(axis=1, keepdims=True)

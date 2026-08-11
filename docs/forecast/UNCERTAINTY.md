@@ -16,7 +16,7 @@ Intervals from the model’s assumptions (for example normal errors).
 **Limitation:** Markets often have fat tails and regime shifts, so these bands can be **too narrow**.
 
 ### Conformal intervals
-Bands calibrated from **historical forecast errors** — empirical coverage without strong distributional assumptions.
+Bands calibrated from **historical forecast errors** — empirical residual-quantile coverage without strong distributional assumptions.
 
 **Advantage:** More realistic bounds based on actual performance.
 
@@ -38,22 +38,37 @@ mtdata-cli forecast_generate EURUSD --timeframe H1 --horizon 12 \
 **Output includes:**
 ```json
 {
-  "forecast": [...],
-  "lower": [...],
-  "upper": [...]
+  "uncertainty": {
+    "status": "available",
+    "mode": "interval",
+    "alpha": 0.1,
+    "intervals": [
+      {"time": "2026-01-01T18:00Z", "forecast": 1.1755, "low": 1.1740, "high": 1.1770}
+    ]
+  }
 }
 ```
 
 **Interpretation:**
-- "If model assumptions hold, the true value will fall between `lower` and `upper` about 90% (or 95%) of the time."
+- Each `uncertainty.intervals[]` row is a forecast step. `low` and `high` are the
+  model interval bounds for that row (price or return, matching the requested
+  quantity).
+- If model assumptions hold, the true value will fall between `low` and `high`
+  about 90% (or 95%) of the time.
 
 **Caution:** Financial markets have fat tails. Model CIs often underestimate extreme moves.
+
+`forecast_generate` does not promote a bullish or bearish point estimate to
+`direction` unless the horizon interval excludes the last observed price. If a
+method cannot supply the requested interval, the response reports
+`signal_status: not_actionable`, `direction_actionable: false`, and preserves
+the model-only label as `point_estimate_direction` for research diagnostics.
 
 ---
 
 ## Conformal Intervals (`forecast_conformal_intervals`)
 
-Conformal prediction calibrates intervals from rolling backtest residuals, making no distributional assumptions.
+Residual-quantile calibration builds intervals from rolling backtest residuals, making no distributional assumptions.
 
 ### How It Works
 1. Run a rolling-origin backtest on historical data
@@ -64,7 +79,7 @@ Conformal prediction calibrates intervals from rolling backtest residuals, makin
 
 ```bash
 mtdata-cli forecast_conformal_intervals EURUSD --timeframe H1 \
-  --method theta --horizon 12 --steps 50 --spacing 20 --ci-alpha 0.1 --json
+  --method theta --horizon 12 --steps 50 --spacing 20 --json
 ```
 
 **Parameters:**
@@ -74,7 +89,7 @@ mtdata-cli forecast_conformal_intervals EURUSD --timeframe H1 \
 | `--horizon` | Forecast horizon | 12 |
 | `--steps` | Number of calibration anchors (default 50 for stabler quantiles) | 50 |
 | `--spacing` | Bars between calibration anchors | 20 |
-| `--ci-alpha` | Miscoverage rate (0.1 = 90% interval) | 0.1 |
+| `--ci-alpha` | Miscoverage rate (0.05 = 95% interval; 0.1 = 90%) | 0.05 |
 
 > When `--steps > 1`, `--spacing` must be `>= --horizon` so calibration windows do not overlap; otherwise the request is rejected.
 
@@ -82,16 +97,24 @@ mtdata-cli forecast_conformal_intervals EURUSD --timeframe H1 \
 
 ```json
 {
-  "forecast": [1.1755, 1.1756, ...],
-  "lower_price": [1.1740, 1.1738, ...],
-  "upper_price": [1.1770, 1.1774, ...],
-  "conformal_residual_quantiles": [0.0005, 0.0008, ...]
+  "forecast": [
+    {"time": "2026-01-01T18:00Z", "value": 1.1755, "lower": 1.1740, "upper": 1.1770}
+  ],
+  "conformal": {
+    "interval_method": "rolling_residual_quantiles",
+    "coverage_target": 0.95,
+    "empirical_coverage": 0.92
+  }
 }
 ```
 
 **Interpretation:**
-- `lower_price` / `upper_price`: Empirically calibrated bounds
-- "Based on the last 50 forecasts, the actual price stayed within these bounds ~90% of the time."
+- Each `forecast[]` row has its point `value` and empirically calibrated
+  `lower` / `upper` price bounds.
+- With the default alpha, the empirical target coverage is 95%. This is a calibration target, not a finite-sample guarantee.
+
+Use `--detail full` when you need the raw `lower_price` / `upper_price` arrays
+or calibration diagnostics such as `conformal.per_step_q` and per-step coverage.
 
 ### When to Use
 - When you don't trust model-based intervals
@@ -117,6 +140,12 @@ In `high_low` mode, `same_bar_policy` resolves a bar that touches both
 barriers. The default is conservatively `sl_first`; `tp_first` and `neutral`
 are explicit alternatives.
 
+When denoising is enabled, the resolved close series anchors each barrier.
+`high_low` still uses raw intrabar highs and lows so an observed tradable touch
+is not smoothed away; `labeling_spec.hit_price_source` reports this as
+`raw_high_low`. Choose `label_on=close` to use only the resolved close series
+for both anchors and hits.
+
 ### Usage
 
 ```bash
@@ -130,7 +159,11 @@ mtdata-cli labels_triple_barrier EURUSD --timeframe H1 --horizon 12 \
 | `--horizon` | Maximum bars to wait |
 | `--tp-pct` | Take-profit distance (% of price) |
 | `--sl-pct` | Stop-loss distance (% of price) |
-| `--tp-pips` / `--sl-pips` | Alternative: distance in pips |
+| `--tp-ticks` / `--sl-ticks` | Alternative: distance in MT5 `trade_tick_size` units |
+
+A conventional FX pip is not the same unit as an MT5 tick. Convert pips using
+the symbol's quote precision before supplying tick distances (for many
+five-digit FX quotes, one pip is 10 ticks).
 
 ### Output
 
@@ -161,8 +194,8 @@ Use conformal intervals instead of model CIs:
 # Get conformal intervals
 mtdata-cli forecast_conformal_intervals EURUSD --horizon 12 --ci-alpha 0.1
 
-# Use lower_price as stop-loss floor
-# Size position so max loss (if lower_price is hit) is within risk budget
+# Use the first forecast row's lower value as a stop-loss floor
+# Size position so max loss (if that lower bound is hit) is within risk budget
 ```
 
 ### Validating Signal Quality

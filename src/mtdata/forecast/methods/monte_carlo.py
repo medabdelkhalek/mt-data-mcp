@@ -4,9 +4,9 @@ import numpy as np
 import pandas as pd
 
 from ..common import log_returns_from_prices as _log_returns_from_prices
+from ..forecast_registry import ForecastRegistry
 from ..interface import ForecastMethod, ForecastResult
 from ..monte_carlo import simulate_gbm_mc, simulate_hmm_mc
-from ..forecast_registry import ForecastRegistry
 
 
 def _ci_from_sims(paths: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -201,12 +201,29 @@ class MonteCarloHMMMethod(ForecastMethod):
                 "n_sims": n_sims,
                 "seed": seed,
                 "n_states": n_states,
+                "requested_n_states": int(sim["requested_n_states"]),
+                "fitted_n_states": int(sim["fitted_n_states"]),
+                "effective_model_type": str(sim["model_type"]),
                 "mu": [float(v) for v in np.asarray(sim.get("mu", []), dtype=float).tolist()],
                 "sigma": [float(v) for v in np.asarray(sim.get("sigma", []), dtype=float).tolist()],
             }
             if ci_alpha is not None:
                 params_used["ci_alpha"] = float(ci_alpha)
-            return ForecastResult(forecast=point, ci_values=ci, params_used=params_used)
+            metadata = None
+            if sim["fitted_n_states"] != sim["requested_n_states"]:
+                metadata = {
+                    "warnings": [
+                        "HMM fit collapsed from "
+                        f"{sim['requested_n_states']} requested regimes to "
+                        f"{sim['fitted_n_states']} fitted regimes."
+                    ]
+                }
+            return ForecastResult(
+                forecast=point,
+                ci_values=ci,
+                params_used=params_used,
+                metadata=metadata,
+            )
 
         # Return-series target: treat inputs as log-returns and build a pseudo price series.
         rets = x
@@ -221,10 +238,27 @@ class MonteCarloHMMMethod(ForecastMethod):
             "n_sims": n_sims,
             "seed": seed,
             "n_states": n_states,
+            "requested_n_states": int(sim["requested_n_states"]),
+            "fitted_n_states": int(sim["fitted_n_states"]),
+            "effective_model_type": str(sim["model_type"]),
             "target": "return",
             "mu": [float(v) for v in np.asarray(sim.get("mu", []), dtype=float).tolist()],
             "sigma": [float(v) for v in np.asarray(sim.get("sigma", []), dtype=float).tolist()],
         }
         if ci_alpha is not None:
             params_used["ci_alpha"] = float(ci_alpha)
-        return ForecastResult(forecast=point, ci_values=ci, params_used=params_used)
+        metadata = None
+        if sim["fitted_n_states"] != sim["requested_n_states"]:
+            metadata = {
+                "warnings": [
+                    "HMM fit collapsed from "
+                    f"{sim['requested_n_states']} requested regimes to "
+                    f"{sim['fitted_n_states']} fitted regimes."
+                ]
+            }
+        return ForecastResult(
+            forecast=point,
+            ci_values=ci,
+            params_used=params_used,
+            metadata=metadata,
+        )

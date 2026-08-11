@@ -24,7 +24,7 @@ new trade. Supports two sizing methods: fixed-fraction and Kelly.
 mtdata-cli trade_risk_analyze --json
 
 # Size a new long: risk-based volume from entry + stop
-mtdata-cli trade_risk_analyze --symbol EURUSD --direction long \
+mtdata-cli trade_risk_analyze EURUSD --direction long \
   --entry 1.0850 --stop-loss 1.0800 --desired-risk-pct 1.0 --json
 ```
 
@@ -36,7 +36,7 @@ mtdata-cli trade_risk_analyze --symbol EURUSD --direction long \
 | `strict_risk` | `true` | Return `suggested_volume=0.0` if the broker minimum lot would exceed `desired_risk_pct`. |
 | `include_pending` | `true` | Include contingent stop-loss risk from pending orders in portfolio totals. |
 | `direction` | — | `long`/`short` (aliases accepted) for the proposed trade. |
-| `entry` | — | Proposed entry price. With `symbol`+`stop_loss` but no entry, it is resolved from the live tick (ask for long, bid for short, mid otherwise). |
+| `entry` | — | Proposed entry price. With `symbol`+`stop_loss` but no entry, it is resolved from the latest tick (ask for long, bid for short, mid otherwise). A closed/stale quote is labeled `last_available_tick_*` and `sizing_reference_only`; refresh it before submission. |
 | `stop_loss` | — | Proposed stop (alias `sl`). Required to compute risk-based volume. |
 | `take_profit` | — | Optional target (alias `tp`) for reward/risk context. |
 
@@ -46,12 +46,18 @@ account-wide margin stress remains a hard safety gate. Existing positions on oth
 symbols do not prevent sizing, but the returned `sizing_risk_policy` states that the
 suggestion is not an aggregate portfolio stop-risk cap.
 
+Candidate validation is independent of portfolio observation. A valid proposed
+trade returns `candidate_valid: true`. If its direction, stop, or target is
+invalid, the response retains the account and portfolio snapshot but returns
+`success: false`, `candidate_valid: false`, a structured `error_code`, and
+`portfolio_snapshot_status: available`; CLI callers receive a nonzero exit status.
+
 ### Kelly sizing
 
 Set `sizing_method=kelly` and supply edge statistics:
 
 ```bash
-mtdata-cli trade_risk_analyze --symbol EURUSD --direction long \
+mtdata-cli trade_risk_analyze EURUSD --direction long \
   --entry 1.0850 --stop-loss 1.0800 --sizing-method kelly \
   --kelly-win-rate 0.55 --kelly-avg-win 0.012 --kelly-avg-loss 0.010 \
   --kelly-fraction-multiplier 0.5 --kelly-max-risk-pct 2.0 --json
@@ -60,8 +66,8 @@ mtdata-cli trade_risk_analyze --symbol EURUSD --direction long \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `kelly_win_rate` | — | Win probability as a fraction in `[0, 1]`. |
-| `kelly_avg_win` | — | Average winning return. |
-| `kelly_avg_loss` | — | Average losing return magnitude. |
+| `kelly_avg_win` | — | Average winning return normalized to a consistent stake or unit of risk (for example, an R-multiple). |
+| `kelly_avg_loss` | — | Average losing return magnitude on the same normalized basis. |
 | `kelly_fraction_multiplier` | `0.5` | Multiplier on the raw Kelly fraction (half-Kelly = `0.5`). |
 | `kelly_max_risk_pct` | `2.0` | Hard cap on account risk (%) for Kelly sizing. |
 | `kelly_metrics` | — | Dict alternative carrying `win_rate`, `avg_win_return`, `avg_loss_return`; explicit `kelly_*` fields override it. |
@@ -71,10 +77,18 @@ by `kelly_fraction_multiplier` and capped by `kelly_max_risk_pct` (and
 `desired_risk_pct` when set). On a non-positive edge the tool reports
 `status="kelly_no_edge"` and a suggested volume of `0.0`.
 
-Portfolio stop risk is the gross sum of defined per-ticket losses at each stop. It is
-a conservative path-risk measure, not a same-symbol net-exposure estimate; a path can
-trigger both sides of a hedge sequentially. Pending-order stop risk is reported
-separately as contingent and is included in the total only when `include_pending=true`.
+`trade_journal_analyze` reports `avg_win` and `avg_loss` in account currency. Those
+raw PnL averages are not Kelly inputs because deal sizes and capital at risk can vary.
+Normalize each historical outcome to a consistent stake or initial risk before
+computing the average return metrics supplied here.
+
+Portfolio stop risk is the gross sum of each ticket's remaining loss from its
+current MT5 mark to its stop. This measures equity at risk now; it does not reuse
+the original entry-to-stop loss after unrealized P&L has changed. It is a
+conservative path-risk measure, not a same-symbol net-exposure estimate; a path
+can trigger both sides of a hedge sequentially. Pending-order stop risk is
+reported separately as contingent and is included in the total only when
+`include_pending=true`.
 
 `notional_value` and portfolio notional fields are linearized account-currency
 exposures derived from the broker's tick value and tick size. The per-position
@@ -95,7 +109,7 @@ symbol.
 mtdata-cli trade_var_cvar_calculate --timeframe H1 --lookback 500 --confidence 95 --json
 
 # Symbol-scoped, parametric/Gaussian, percentage returns
-mtdata-cli trade_var_cvar_calculate --symbol EURUSD --method gaussian \
+mtdata-cli trade_var_cvar_calculate EURUSD --method gaussian \
   --transform pct --lookback 300 --json
 ```
 
@@ -118,6 +132,10 @@ symbol's broker-provided tick value and tick size (`pnl_model` is
 `tick_value_linear_sensitivity`). Positions without usable tick economics are rejected
 rather than mixed into a portfolio in incompatible quote-currency units. The model is
 linearized and does not include gaps, spread changes, swaps, or nonlinear payoff effects.
+Every open position must have usable account-currency valuation and every
+included symbol must have usable history. The tool returns
+`portfolio_var_incomplete` instead of silently calculating a smaller portfolio
+when any position lacks valuation inputs or any symbol history is unavailable.
 
 ---
 
@@ -150,12 +168,15 @@ metadata is available — `equity_before`/`equity_after`/`impact_pct`.
 ## Caveats
 
 - All three tools read live MT5 state; results change as positions and quotes move.
+- A `None` position/order response from MT5 is a failed snapshot, not an empty
+  book. Snapshot-dependent analytics return a `*_snapshot_unavailable` error;
+  empty tuples/lists remain valid empty books.
 - VaR/CVaR assume the recent return distribution persists and use a single-bar holding
   period; they are not a guarantee of maximum loss.
 - Stress shocks are deterministic and linear in price; they do not model spread
   widening, gaps, swaps, or correlation breaks.
-- Kelly sizing is only as good as its inputs — estimate `win_rate` and average win/loss
-  from a sufficient out-of-sample track record (see `trade_journal_analyze`).
+- Kelly sizing is only as good as its inputs — estimate `win_rate` and normalized
+  average win/loss returns from a sufficient out-of-sample track record.
 
 ## See also
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 from ...shared.schema import DenoiseSpec
 from ..report.utils import (
     adapt_forecast_payload_for_report,
+    normalize_report_methods,
     now_utc_iso,
     parse_table_tail,
     report_section_enabled,
@@ -23,25 +24,11 @@ _MINIMAL_SKIPPED_SECTIONS = (
 )
 
 
-def _iter_requested_methods(value: Any) -> Iterable[str]:
-    if isinstance(value, str):
-        for token in value.split(","):
-            text = str(token or "").strip()
-            if text:
-                yield text
-        return
-    if isinstance(value, (list, tuple)):
-        for token in value:
-            text = str(token or "").strip()
-            if text:
-                yield text
-
-
 def _resolve_minimal_forecast_method(params: Dict[str, Any]) -> str:
     direct_method = str(params.get("method") or "").strip()
     if direct_method:
         return direct_method
-    for method_name in _iter_requested_methods(params.get("methods")):
+    for method_name in normalize_report_methods(params.get("methods")):
         return method_name
     return "theta"
 
@@ -88,7 +75,6 @@ def template_minimal(
             end=end,
             indicators=indicators,  # type: ignore[arg-type]
             denoise=denoise,
-            simplify={"mode": "select", "method": "lttb", "ratio": 0.2},  # type: ignore[arg-type]
         )
         if report_section_enabled(p, "context")
         else {"error": "context section not requested"}
@@ -97,15 +83,20 @@ def template_minimal(
     if "error" in ctx:
         report["sections"]["context"] = {"error": ctx["error"]}
     else:
+        context_limit = int(p.get("context_limit", 200))
+        context_rows = parse_table_tail(ctx, tail=context_limit)
         tail_n = int(p.get("context_tail", 40))
-        tail_rows = parse_table_tail(ctx, tail=tail_n)
+        tail_rows = context_rows[-tail_n:]
         if not tail_rows:
             if isinstance(ctx, dict) and isinstance(ctx.get("bars"), list):
-                tail_rows = ctx.get("bars")[-tail_n:]  # type: ignore[index]
+                context_rows = list(ctx.get("bars"))  # type: ignore[arg-type]
+                tail_rows = context_rows[-tail_n:]
             elif isinstance(ctx, dict) and isinstance(ctx.get("data"), list):
-                tail_rows = ctx.get("data")[-tail_n:]  # type: ignore[index]
+                context_rows = list(ctx.get("data"))  # type: ignore[arg-type]
+                tail_rows = context_rows[-tail_n:]
             elif isinstance(ctx, list):
-                tail_rows = ctx
+                context_rows = ctx
+                tail_rows = context_rows[-tail_n:]
             else:
                 tail_rows = []
 
@@ -113,7 +104,7 @@ def template_minimal(
             report["sections"]["context"] = {"error": "No candle data available for context section."}
         else:
             last = tail_rows[-1] if tail_rows else {}
-            compact = _compute_compact_trend(tail_rows)
+            compact = _compute_compact_trend(context_rows)
             ctx_obj: Dict[str, Any] = {
                 "symbol": symbol,
                 "timeframe": tf,

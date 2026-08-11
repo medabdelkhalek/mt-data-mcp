@@ -330,17 +330,22 @@ def test_forecast_generate_defaults_to_compact_payload(monkeypatch):
     assert "freshness_basis" not in out
     assert "stale_after_seconds" not in out
     assert out["forecast_vs_last_price"] == {
-        "direction": "bullish",
         "direction_basis": "horizon_end",
-        "direction_threshold_pct": 0.01,
+        "direction_threshold_pct": 0.05,
+        "direction_threshold_basis": "minimum_effect_size_0.05_pct",
         "first_step_delta": -0.05,
         "horizon_delta": 0.15,
         "first_step_delta_pct": -4.7619,
         "horizon_delta_pct": 14.2857,
-        "direction_significant": None,
-        "direction_significance_basis": "not_tested",
-        "direction_interpretation": "point_estimate_only_not_significance_tested",
+        "direction_interval_excludes_last_price": None,
+        "direction_interval_basis": "not_available",
+        "direction_interpretation": "point_estimate_only",
+        "point_estimate_direction": "bullish",
+        "direction_status": "unconfirmed",
+        "direction_actionable": False,
+        "direction_suppressed_reason": "forecast_uncertainty_not_available",
     }
+    assert out["signal_status"] == "not_actionable"
     assert out["uncertainty"] == {
         "status": "not_requested",
         "mode": "point_only",
@@ -415,7 +420,6 @@ def test_forecast_generate_compact_volatility_uses_summary_row(monkeypatch):
             "success": True,
             "method": kwargs["method"],
             "horizon": kwargs["horizon"],
-            "quantity": kwargs["quantity"],
             "volatility_per_bar": 0.012345,
             "volatility_annualized": 0.194444,
             "volatility_horizon": 0.021234,
@@ -434,6 +438,7 @@ def test_forecast_generate_compact_volatility_uses_summary_row(monkeypatch):
     )
 
     assert out["volatility_per_bar"] == pytest.approx(0.012345)
+    assert out["quantity"] == "volatility"
     assert out["volatility_horizon"] == pytest.approx(0.021234)
     assert out["forecast_summary_mode"] == "scalar_volatility_estimate"
     assert "no distinct per-step path is implied" in out["quantity_note"]
@@ -468,7 +473,10 @@ def test_forecast_generate_compact_normalizes_utc_times_and_neutral_delta(monkey
             "last_price_stale": False,
             "denoise_applied": False,
             "forecast_time": ["2026-06-02 20:00", "2026-06-02 21:00"],
-            "forecast_price": [1.00004, 1.00005],
+            "forecast_bar_states": ["forming", "future"],
+            "forecast_time_semantics": "target_bar_open_time",
+            "forecast_value_semantics": "target_bar_close",
+            "forecast_price": [1.00004, 1.00006],
             "last_price": 1.0,
             "digits": 5,
         },
@@ -491,6 +499,9 @@ def test_forecast_generate_compact_normalizes_utc_times_and_neutral_delta(monkey
         "input_bar_policy": "closed_bars_only",
         "forecast_start": "2026-06-02T20:00Z",
         "forecast_start_gap_bars": 1.0,
+        "forecast_time_semantics": "target_bar_open_time",
+        "forecast_value_semantics": "target_bar_close",
+        "first_forecast_bar_state": "forming",
         "last_observation_age_seconds": 3600,
         "last_observation_stale": False,
     }
@@ -499,11 +510,113 @@ def test_forecast_generate_compact_normalizes_utc_times_and_neutral_delta(monkey
     assert "last_price_stale" not in out
     assert "denoise_applied" not in out
     assert out["forecast"] == [
-        {"time": "2026-06-02T20:00Z", "value": 1.00004},
-        {"time": "2026-06-02T21:00Z", "value": 1.00005},
+        {
+            "time": "2026-06-02T20:00Z",
+            "bar_state": "forming",
+            "value": 1.00004,
+        },
+        {
+            "time": "2026-06-02T21:00Z",
+            "bar_state": "future",
+            "value": 1.00006,
+        },
     ]
     assert out["forecast_vs_last_price"]["direction"] == "neutral"
-    assert out["forecast_vs_last_price"]["direction_threshold_pct"] == 0.01
+    assert out["forecast_vs_last_price"]["direction_threshold_pct"] == 0.05
+    assert out["forecast_vs_last_price"]["direction_actionable"] is False
+
+
+def test_forecast_generate_compact_preserves_history_reliability(monkeypatch):
+    raw = _unwrap(cf.forecast_generate)
+    monkeypatch.setattr(
+        cf,
+        "_forecast_impl",
+        lambda **kwargs: {
+            "success": True,
+            "method": kwargs["method"],
+            "horizon": kwargs["horizon"],
+            "quantity": kwargs["quantity"],
+            "last_observation_time": "2026-06-02 19:00",
+            "forecast_time": ["2026-06-02 20:00"],
+            "forecast_price": [1.0],
+            "last_price": 1.0,
+            "history_sample_ok": False,
+            "forecast_reliability": "low",
+            "forecast_reliability_reason": "below_recommended_history",
+            "recommended_history_bars": 36,
+            "history_shortfall_bars": 33,
+            "warnings": ["Low-history forecast."],
+        },
+    )
+
+    out = raw(
+        request=ForecastGenerateRequest(
+            symbol="EURUSD",
+            timeframe="H1",
+            method="theta",
+            horizon=12,
+        )
+    )
+
+    assert out["history_sample_ok"] is False
+    assert out["forecast_reliability"] == "low"
+    assert out["forecast_reliability_basis"] == "history_sample_size"
+    assert out["forecast_reliability_reason"] == "below_recommended_history"
+    assert out["trust_level"] == "low"
+    assert "insufficient_history_sample" in out["trust_blockers"]
+    assert out["recommended_history_bars"] == 36
+    assert out["history_shortfall_bars"] == 33
+    assert "Low-history forecast." in out["warnings"]
+
+
+def test_forecast_generate_combines_sample_and_history_policy_trust(monkeypatch):
+    raw = _unwrap(cf.forecast_generate)
+    monkeypatch.setattr(
+        cf,
+        "_forecast_impl",
+        lambda **kwargs: {
+            "success": True,
+            "method": kwargs["method"],
+            "horizon": kwargs["horizon"],
+            "quantity": kwargs["quantity"],
+            "forecast_time": ["2026-06-02 20:00"],
+            "forecast_price": [1.0],
+            "forecast_reliability": "adequate",
+            "history_policy_ok": False,
+            "ci_status": "available",
+        },
+    )
+
+    out = raw(request=ForecastGenerateRequest(symbol="EURUSD", method="theta"))
+
+    assert out["forecast_reliability"] == "adequate"
+    assert out["forecast_reliability_basis"] == "history_sample_size"
+    assert out["trust_level"] == "degraded"
+    assert out["trust_blockers"] == ["history_freshness_policy_not_met"]
+
+
+def test_run_forecast_generate_adds_available_methods_to_invalid_error(monkeypatch):
+    monkeypatch.setattr(
+        forecast_use_cases,
+        "get_forecast_methods_snapshot",
+        lambda: {
+            "methods": [
+                {"method": "theta", "available": True},
+                {"method": "drift", "available": True},
+                {"method": "missing_dependency", "available": False},
+            ]
+        },
+    )
+
+    result = forecast_use_cases.run_forecast_generate(
+        ForecastGenerateRequest(symbol="EURUSD", method="nope"),
+        forecast_impl=lambda **kwargs: {
+            "error": "Invalid method: nope. Run forecast_list_methods for the full catalog."
+        },
+    )
+
+    assert result["valid_values"] == {"method": ["drift", "theta"]}
+    assert result["related_tools"] == ["forecast_list_methods"]
 
 
 def test_forecast_backtest_request_rejects_singular_method_alias():
@@ -616,17 +729,22 @@ def test_forecast_generate_rounds_price_outputs_to_symbol_digits(monkeypatch):
     out = raw(request=ForecastGenerateRequest(symbol="EURUSD", timeframe="H1", method="theta", horizon=2))
 
     assert out["forecast_vs_last_price"] == {
-        "direction": "bullish",
         "direction_basis": "horizon_end",
-        "direction_threshold_pct": 0.01,
+        "direction_threshold_pct": 0.05,
+        "direction_threshold_basis": "minimum_effect_size_0.05_pct",
         "first_step_delta": 0.00048,
         "horizon_delta": 0.00149,
         "first_step_delta_pct": 0.0409,
         "horizon_delta_pct": 0.1271,
-        "direction_significant": None,
-        "direction_significance_basis": "not_tested",
-        "direction_interpretation": "point_estimate_only_not_significance_tested",
+        "direction_interval_excludes_last_price": None,
+        "direction_interval_basis": "not_available",
+        "direction_interpretation": "point_estimate_only",
+        "point_estimate_direction": "bullish",
+        "direction_status": "unconfirmed",
+        "direction_actionable": False,
+        "direction_suppressed_reason": "forecast_uncertainty_not_available",
     }
+    assert out["signal_status"] == "not_actionable"
     assert "forecast_price" not in out
     assert out["forecast"] == [
         {"time": "t1", "value": 1.17314},
@@ -808,6 +926,7 @@ def test_forecast_generate_compact_nests_available_ci(monkeypatch):
             "horizon": kwargs["horizon"],
             "quantity": kwargs["quantity"],
             "forecast_time": ["t1", "t2"],
+            "forecast_bar_states": ["forming", "future"],
             "forecast_price": [100.0, 101.0],
             "lower_price": [99.0, 99.5],
             "upper_price": [101.0, 102.5],
@@ -831,8 +950,20 @@ def test_forecast_generate_compact_nests_available_ci(monkeypatch):
         "mode": "interval",
         "alpha": 0.05,
         "intervals": [
-            {"time": "t1", "forecast": 100.0, "low": 99.0, "high": 101.0},
-            {"time": "t2", "forecast": 101.0, "low": 99.5, "high": 102.5},
+            {
+                "time": "t1",
+                "bar_state": "forming",
+                "forecast": 100.0,
+                "low": 99.0,
+                "high": 101.0,
+            },
+            {
+                "time": "t2",
+                "bar_state": "future",
+                "forecast": 101.0,
+                "low": 99.5,
+                "high": 102.5,
+            },
         ],
         "summary": {
             "first_low": 99.0,
@@ -850,14 +981,218 @@ def test_forecast_generate_compact_nests_available_ci(monkeypatch):
     assert "forecast_time" not in out
     assert "forecast_price" not in out
     assert "forecast" not in out
-    assert out["forecast_vs_last_price"]["direction"] == "bullish"
-    assert out["forecast_vs_last_price"]["direction_significant"] is False
-    assert out["forecast_vs_last_price"]["direction_significance_basis"] == (
+    assert "direction" not in out["forecast_vs_last_price"]
+    assert out["forecast_vs_last_price"]["point_estimate_direction"] == "bullish"
+    assert out["forecast_vs_last_price"]["direction_actionable"] is False
+    assert out["forecast_vs_last_price"]["direction_status"] == "unconfirmed"
+    assert out["forecast_vs_last_price"]["direction_suppressed_reason"] == (
+        "horizon_interval_contains_last_price"
+    )
+    assert out["forecast_vs_last_price"]["direction_interval_excludes_last_price"] is False
+    assert out["forecast_vs_last_price"]["direction_interval_basis"] == (
         "horizon_interval_vs_last_price"
     )
     assert out["forecast_vs_last_price"]["direction_interpretation"] == (
         "interval_contains_last_price_or_direction_is_neutral"
     )
+    assert out["signal_status"] == "not_actionable"
+
+
+def test_forecast_generate_keeps_direction_when_horizon_interval_confirms_it():
+    out = forecast_use_cases._apply_forecast_generate_detail(
+        {
+            "success": True,
+            "method": "arima",
+            "horizon": 2,
+            "quantity": "price",
+            "forecast_time": ["t1", "t2"],
+            "forecast_price": [100.5, 101.0],
+            "lower_price": [99.5, 100.4],
+            "upper_price": [101.0, 102.0],
+            "ci_status": "available",
+            "ci_alpha": 0.05,
+            "last_price": 100.0,
+        },
+        ForecastGenerateRequest(
+            symbol="BTCUSD",
+            timeframe="H1",
+            method="arima",
+            horizon=2,
+        ),
+    )
+
+    context = out["forecast_vs_last_price"]
+    assert context["direction"] == "bullish"
+    assert context["direction_actionable"] is True
+    assert context["direction_status"] == "interval_confirmed"
+    assert context["direction_interval_excludes_last_price"] is True
+    assert "point_estimate_direction" not in context
+    assert "signal_status" not in out
+
+
+def test_forecast_generate_compact_return_keeps_price_path_with_labeled_ci():
+    out = forecast_use_cases._apply_forecast_generate_detail(
+        {
+            "success": True,
+            "method": "arima",
+            "horizon": 2,
+            "quantity": "return",
+            "forecast_time": ["t1", "t2"],
+            "forecast_return": [0.01, -0.005],
+            "forecast_price": [101.0, 100.4963],
+            "lower_return": [0.002, -0.012],
+            "upper_return": [0.018, 0.002],
+            "ci_status": "available",
+            "ci_alpha": 0.05,
+            "last_price": 100.0,
+        },
+        ForecastGenerateRequest(
+            symbol="BTCUSD",
+            timeframe="H1",
+            method="arima",
+            horizon=2,
+            quantity="return",
+        ),
+    )
+
+    assert out["forecast"] == [
+        {
+            "time": "t1",
+            "return": 0.01,
+            "price": 101.0,
+            "lower_return": 0.002,
+            "upper_return": 0.018,
+        },
+        {
+            "time": "t2",
+            "return": -0.005,
+            "price": 100.4963,
+            "lower_return": -0.012,
+            "upper_return": 0.002,
+        },
+    ]
+    assert out["uncertainty"]["intervals"] == [
+        {"time": "t1", "forecast": 0.01, "low": 0.002, "high": 0.018},
+        {"time": "t2", "forecast": -0.005, "low": -0.012, "high": 0.002},
+    ]
+    assert out["return_unit"] == "return_fraction"
+    assert "forecast_price" not in out
+    assert "forecast_return" not in out
+
+
+def test_forecast_generate_compact_projects_analog_diagnostics():
+    metadata = {
+        "component_status": [
+            {
+                "timeframe": "H1",
+                "role": "primary",
+                "status": "contributed",
+                "n_paths": 12,
+                "component_weight": 1.0,
+                "diagnostic": {
+                    "window_size": 64,
+                    "search_depth": 5000,
+                    "ensemble_metrics": {"effective_paths": 8.6},
+                },
+            }
+        ],
+        "analogs": [{"values": [1.01, 1.02], "meta": {"score": 0.2}}],
+        "ensemble_metrics": {
+            "n_paths": 12,
+            "effective_paths": 8.6,
+            "spread": 0.003,
+            "weighted": True,
+            "score_summary": {"best": 0.1, "median": 0.2, "worst": 0.9},
+            "quality_gate": {
+                "status": "passed",
+                "ensemble": {"total_paths": 12, "effective_paths": 8.6},
+            },
+        },
+        "timeframe_diagnostics": {"H1": {"window_size": 64}},
+    }
+    payload = {
+        "success": True,
+        "method": "analog",
+        "horizon": 2,
+        "quantity": "price",
+        "forecast_time": ["t1", "t2"],
+        "forecast_price": [1.01, 1.02],
+        **metadata,
+    }
+    compact = forecast_use_cases._apply_forecast_generate_detail(
+        payload,
+        ForecastGenerateRequest(symbol="EURUSD", timeframe="H1", method="analog", horizon=2),
+    )
+
+    assert "analogs" not in compact
+    assert "timeframe_diagnostics" not in compact
+    assert compact["component_status"] == [
+        {
+            "timeframe": "H1",
+            "role": "primary",
+            "status": "contributed",
+            "n_paths": 12,
+            "component_weight": 1.0,
+        }
+    ]
+    assert compact["ensemble_metrics"] == {
+        "n_paths": 12,
+        "effective_paths": 8.6,
+        "spread": 0.003,
+        "weighted": True,
+        "score_summary": {"best": 0.1, "median": 0.2},
+        "quality_gate": {"status": "passed"},
+    }
+
+    standard = forecast_use_cases._apply_forecast_generate_detail(
+        payload,
+        ForecastGenerateRequest(
+            symbol="EURUSD",
+            timeframe="H1",
+            method="analog",
+            horizon=2,
+            detail="standard",
+        ),
+    )
+    assert standard["analogs"] == metadata["analogs"]
+    assert standard["timeframe_diagnostics"] == metadata["timeframe_diagnostics"]
+
+
+def test_forecast_generate_compact_projects_nested_ensemble_analog_metadata():
+    out = forecast_use_cases._apply_forecast_generate_detail(
+        {
+            "success": True,
+            "method": "ensemble",
+            "horizon": 1,
+            "quantity": "price",
+            "forecast_time": ["t1"],
+            "forecast_price": [1.01],
+            "ensemble": {
+                "methods": ["analog", "theta"],
+                "analogs": [{"values": [1.01]}],
+                "component_status": [
+                    {
+                        "timeframe": "H1",
+                        "role": "primary",
+                        "status": "contributed",
+                        "n_paths": 3,
+                        "diagnostic": {"window_size": 64},
+                    }
+                ],
+                "ensemble_metrics": {"n_paths": 3, "effective_paths": 2.5},
+                "timeframe_diagnostics": {"H1": {"window_size": 64}},
+            },
+        },
+        ForecastGenerateRequest(symbol="EURUSD", timeframe="H1", method="ensemble", horizon=1),
+    )
+
+    assert out["ensemble"] == {
+        "methods": ["analog", "theta"],
+        "component_status": [
+            {"timeframe": "H1", "role": "primary", "status": "contributed", "n_paths": 3}
+        ],
+        "ensemble_metrics": {"n_paths": 3, "effective_paths": 2.5},
+    }
 
 
 def test_forecast_generate_standard_preserves_full_arrays(monkeypatch):
@@ -947,7 +1282,12 @@ def test_run_forecast_backtest_strips_per_anchor_details_in_compact_mode():
             "success": True,
             "request": {"detail": "compact"},
             "resolved_request": {"detail": "compact", "methods": ["theta"]},
-            "units": {"returns": "return_fraction", "forecast_error": "price"},
+            "units": {
+                "returns": "return_fraction",
+                "forecast_error": "price",
+                "avg_mae": "price",
+                "avg_rmse": "price",
+            },
             "results": {
                 "theta": {
                     "avg_mae": 1.0,
@@ -973,8 +1313,11 @@ def test_run_forecast_backtest_strips_per_anchor_details_in_compact_mode():
     assert "request" not in result
     assert "resolved_request" not in result
     assert "results" not in result
-    assert "units" not in result
-    assert result["units_profile"] == "forecast_backtest_v1"
+    assert result["units"] == {
+        "forecast_error": "price",
+        "avg_mae": "price",
+    }
+    assert "units_profile" not in result
     assert result["ranked_methods"][0]["method"] == "theta"
     assert result["ranked_methods"][0]["details_count"] == 1
     assert "metrics" not in result["ranked_methods"][0]
@@ -1636,7 +1979,7 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
     )
     compact = _unwrap(cf.forecast_list_methods)(profile="quickstart")
     assert "detail" not in compact
-    assert compact["total"] == 2
+    assert compact["catalog_total"] == 2
     assert compact["available"] == 1
     assert compact["unavailable"] == 0
     assert compact["methods"][0]["method"] == "theta"
@@ -1654,8 +1997,8 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
     assert "selector" not in compact["methods"][0]
     assert "params" not in compact["methods"][0]
     assert all("requires" not in row for row in compact["methods"])
-    assert compact["methods_shown"] == 1
-    assert compact["methods_hidden"] == 0
+    assert compact["pagination"]["returned"] == 1
+    assert compact["pagination"]["more_available"] == 0
     assert compact["profile"] == "quickstart"
     assert compact["profile_methods_hidden"] == 1
     assert compact["profile_hint"] == "Use profile=all to list all registered methods."
@@ -1688,10 +2031,9 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
 
     full = _unwrap(cf.forecast_list_methods)(detail="full", show_unavailable=True, profile="all")
     assert full["detail"] == "full"
-    assert full["total"] == 2
-    assert full["total_filtered"] == 2
-    assert full["methods_shown"] == 2
-    assert full["methods_hidden"] == 0
+    assert full["catalog_total"] == 2
+    assert full["pagination"]["total"] == 2
+    assert full["pagination"]["returned"] == 2
     assert isinstance(full.get("methods"), list)
     assert "params" in full["methods"][0]
     assert full["methods"][0]["params"] == [{"name": "window"}]
@@ -1739,11 +2081,11 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
                 "statsforecast": ["sf_autoarima", "sf_theta", "sf_ets", "sf_naive"],
             },
             "methods": [
-                {"method": "theta", "available": True, "description": "Theta.", "params": [], "requires": []},
-                {"method": "sf_autoarima", "available": True, "description": "A", "params": [], "requires": []},
-                {"method": "sf_theta", "available": True, "description": "B", "params": [], "requires": []},
-                {"method": "sf_ets", "available": False, "description": "C", "params": [], "requires": []},
-                {"method": "sf_naive", "available": True, "description": "D", "params": [], "requires": []},
+                {"method": "theta", "available": True, "description": "Theta.", "params": [], "requires": [], "supports_training": False},
+                {"method": "sf_autoarima", "available": True, "description": "A", "params": [], "requires": [], "supports_training": True},
+                {"method": "sf_theta", "available": True, "description": "B", "params": [], "requires": [], "supports_training": True},
+                {"method": "sf_ets", "available": False, "description": "C", "params": [], "requires": [], "supports_training": True},
+                {"method": "sf_naive", "available": True, "description": "D", "params": [], "requires": [], "supports_training": True},
             ],
         },
     )
@@ -1759,11 +2101,11 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
     sf_rows = [r for r in grouped["methods"] if r.get("category") == "statsforecast"]
     assert len(sf_rows) == 3
     assert all(str(r.get("category")) == "statsforecast" for r in sf_rows)
-    assert grouped["methods_hidden"] == 0
+    assert grouped["pagination"]["more_available"] == 0
     filtered = _unwrap(cf.forecast_list_methods)(search_term="theta", limit=1, profile="all")
     assert "filters" not in filtered
     assert len(filtered["methods"]) == 1
-    assert filtered["methods_hidden"] >= 1
+    assert filtered["pagination"]["more_available"] >= 1
     assert "theta" in str(filtered["methods"][0]["method"]).lower()
     sf_only = _unwrap(cf.forecast_list_methods)(library="statsforecast", profile="all")
     assert "filters" not in sf_only
@@ -1777,6 +2119,18 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
     assert "filters" not in ci_only
     assert ci_only["methods"]
     assert all(row.get("supports_ci") is True for row in ci_only["methods"])
+    trainable_auto = _unwrap(cf.forecast_list_methods)(supports_training=True)
+    assert [row["method"] for row in trainable_auto["methods"]] == [
+        "sf_autoarima",
+        "sf_naive",
+        "sf_theta",
+    ]
+    assert trainable_auto["profile"] == "all"
+    assert trainable_auto["profile_auto_expanded"] == {
+        "requested": "quickstart",
+        "effective": "all",
+        "reason": "supports_training=true searches the complete method catalog.",
+    }
     no_ci = _unwrap(cf.forecast_list_methods)(supports_ci=False, show_unavailable=True, profile="all")
     assert "filters" not in no_ci
     assert all(row.get("supports_ci") is False for row in no_ci["methods"])
@@ -1806,9 +2160,6 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
     )
     default_out = _unwrap(cf.forecast_list_methods)(profile="all")
     assert "filters" not in default_out
-    assert default_out["methods_shown"] == 25
-    assert default_out["methods_hidden"] == 0
-    assert "has_more" not in default_out
     assert default_out["pagination"] == {
         "total": 25,
         "returned": 25,
@@ -1827,10 +2178,6 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
         "m08",
         "m09",
     ]
-    assert page["methods_before"] == 5
-    assert page["methods_hidden"] == 15
-    assert page["offset"] == 5
-    assert page["has_more"] is True
     assert page["pagination"] == {
         "total": 25,
         "returned": 5,
@@ -1839,20 +2186,49 @@ def test_forecast_list_library_models_and_list_methods(monkeypatch):
         "has_more": True,
         "more_available": 15,
     }
+    assert not {
+        "total_filtered",
+        "methods_shown",
+        "methods_hidden",
+        "methods_before",
+        "offset",
+        "has_more",
+    } & page.keys()
     assert page["truncation_reason"] == (
         "Limit 5 at offset 5; set offset=10 for more filtered methods."
     )
 
     filtered_uncapped = _unwrap(cf.forecast_list_methods)(category="classical", profile="all")
     assert "filters" not in filtered_uncapped
-    assert filtered_uncapped["methods_shown"] == 25
-    assert filtered_uncapped["methods_hidden"] == 0
+    assert filtered_uncapped["pagination"]["returned"] == 25
+    assert filtered_uncapped["pagination"]["more_available"] == 0
     assert "truncation_reason" not in filtered_uncapped
 
     monkeypatch.setattr(cf, "_get_forecast_methods_data", lambda: {"methods": [1]})
     assert _unwrap(cf.forecast_list_methods)() == {"methods": [1]}
     monkeypatch.setattr(cf, "_get_forecast_methods_data", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     assert "Error listing forecast methods" in _unwrap(cf.forecast_list_methods)()["error"]
+
+
+def test_forecast_generate_standard_preserves_requested_volatility_quantity():
+    out = forecast_use_cases._apply_forecast_generate_detail(
+        {
+            "success": True,
+            "method": "ewma",
+            "horizon": 3,
+            "volatility_per_bar": 0.01,
+        },
+        ForecastGenerateRequest(
+            symbol="EURUSD",
+            timeframe="H1",
+            method="ewma",
+            quantity="volatility",
+            horizon=3,
+            detail="standard",
+        ),
+    )
+
+    assert out["quantity"] == "volatility"
 
 
 def test_forecast_list_methods_standard_exposes_ci_method(monkeypatch):
@@ -2213,6 +2589,7 @@ def test_forecast_conformal_intervals_request_defaults_and_spacing_validation():
     assert request.horizon == 12
     assert request.steps == 50
     assert request.spacing == 20
+    assert request.ci_alpha == 0.05
     assert request.detail == "compact"
 
     with pytest.raises(ValidationError, match="spacing must be greater than or equal to horizon when steps > 1"):
@@ -2328,10 +2705,19 @@ def test_run_forecast_conformal_intervals_compact_omits_technical_metadata():
             "forecast": [{"time": "2026-05-29 21:00", "value": 100.123456789}],
             "params_used": {"alpha": 0.2, "trend_slope": -0.000012493247702752267},
             "price_precision": 5,
+            "last_price_age_seconds": 12.5,
+            "last_price_stale": False,
+            "history_policy_ok": True,
+            "freshness_basis": "last_completed_bar_close",
         },
     )
 
     assert result["detail"] == "compact"
+    assert result["last_price_age_seconds"] == 12.5
+    assert result["data_age_seconds"] == 12.5
+    assert result["last_price_stale"] is False
+    assert result["data_stale"] is False
+    assert result["history_policy_ok"] is True
     # Compact mode folds point/interval series into forecast rows and drops the
     # parallel technical arrays/metadata fields.
     assert "forecast_time" not in result
@@ -2584,6 +2970,8 @@ def test_forecast_barrier_prob_requires_explicit_barriers(monkeypatch):
     assert called is False
     assert out["success"] is False
     assert out["error_code"] == "barrier_parameters_missing"
+    assert isinstance(out["request_id"], str)
+    assert out["operation"] == "forecast_barrier_prob"
     assert "forecast_barrier_optimize" in out["remediation"]
 
 
@@ -2889,6 +3277,11 @@ def test_forecast_barrier_prob_compact_omits_confidence_diagnostics():
         "prob_tp_first_ci95": {"low": 0.5, "high": 0.6},
         "prob_sl_first_ci95": {"low": 0.25, "high": 0.35},
         "prob_no_hit_ci95": {"low": 0.1, "high": 0.2},
+        "intra_bar_hit_detection": "brownian_bridge",
+        "bridge_correction": True,
+        "bridge_dual_barrier_model": "independent_single_barrier_approximation",
+        "bridge_joint_first_passage": False,
+        "same_bar_policy": "random",
     }
 
     out = forecast_use_cases._apply_barrier_prob_detail(
@@ -2906,6 +3299,13 @@ def test_forecast_barrier_prob_compact_omits_confidence_diagnostics():
     assert "prob_tp_first_se" not in out
     assert "prob_sl_first_se" not in out
     assert "prob_no_hit_se" not in out
+    assert out["intra_bar_hit_detection"] == "brownian_bridge"
+    assert out["bridge_correction"] is True
+    assert out["bridge_dual_barrier_model"] == (
+        "independent_single_barrier_approximation"
+    )
+    assert out["bridge_joint_first_passage"] is False
+    assert out["same_bar_policy"] == "random"
 
 
 def test_forecast_barrier_prob_compact_uses_reference_price_context():
@@ -3099,7 +3499,7 @@ def _ready_options_provider():
         "effective_provider": "tradier",
         "api_key_configured": True,
         "chain_data_ready": True,
-        "chain_data_access_available": True,
+        "chain_request_supported": True,
         "action_required": None,
         "remediation": None,
     }
@@ -3191,6 +3591,34 @@ def test_options_tools_validate_and_normalize_symbols(monkeypatch):
     assert out["symbol"] == "BRK.B"
 
 
+def test_options_tools_validate_expiration_before_provider_calls(monkeypatch):
+    raw_chain = _unwrap(opt.options_chain)
+    raw_cal = _unwrap(opt.options_heston_calibrate)
+
+    import mtdata.forecast.quantlib_tools as quantlib_tools
+    import mtdata.services.options_service as options_service
+
+    def fail_call(**kwargs):
+        raise AssertionError("options provider should not be queried")
+
+    monkeypatch.setattr(options_service, "get_options_chain", fail_call)
+    monkeypatch.setattr(
+        quantlib_tools,
+        "calibrate_heston_quantlib_from_options",
+        fail_call,
+    )
+    monkeypatch.setattr(opt, "_options_provider_readiness", _ready_options_provider)
+
+    for expiration in ("GTC", "2026/07/17", "2026-02-30"):
+        for tool in (raw_chain, raw_cal):
+            out = tool(symbol="AAPL", expiration=expiration)
+            assert out["success"] is False
+            assert out["error_code"] == "invalid_expiration"
+            assert out["parameter"] == "expiration"
+            assert out["value"] == expiration
+            assert out["expected_format"] == "YYYY-MM-DD"
+
+
 def test_options_chain_tools_short_circuit_when_provider_not_ready(monkeypatch):
     raw_exp = _unwrap(opt.options_expirations)
     raw_chain = _unwrap(opt.options_chain)
@@ -3249,7 +3677,7 @@ def test_options_chain_tools_allow_yahoo_best_effort_provider(monkeypatch):
             "effective_provider": "yahoo",
             "api_key_configured": False,
             "chain_data_ready": False,
-            "chain_data_access_available": True,
+            "chain_request_supported": True,
             "provider_mode": "best_effort",
             "action_required": None,
         },

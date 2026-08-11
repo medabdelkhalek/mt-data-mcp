@@ -5,22 +5,21 @@ from mtdata.utils.minimal_output import (
     _build_forecast_meta,
     _compact_forecast_ci,
     _encode_expanded_array,
-    _format_complex_value,
     _format_to_toon,
     _is_empty_value,
-    _is_scalar_value,
     _normalize_forecast_payload,
     _normalize_market_status_payload,
     _normalize_market_ticker_payload,
     _normalize_trade_payload,
     _normalize_trade_table_payload,
     _normalize_triple_barrier_payload,
-    _stringify_scalar,
     format_result_minimal,
 )
 from mtdata.utils.minimal_output_toon import (
     _encode_inline_array,
+    _is_scalar_value,
     _stringify_cell,
+    _stringify_scalar,
     format_table_toon,
 )
 
@@ -903,6 +902,12 @@ class TestFormatResultMinimal:
             "type": "quote",
             "spread": 0.00022,
             "spread_pips": 2.2,
+            "units": {
+                "bid": "absolute_price",
+                "ask": "absolute_price",
+                "spread": "absolute_price",
+                "spread_pips": "pips",
+            },
         }
 
         result = _normalize_market_ticker_payload(
@@ -913,7 +918,9 @@ class TestFormatResultMinimal:
 
         # spread_pips is the standard FX spread unit and must survive compact mode
         # for parity with market_snapshot.
+        assert result["spread"] == 0.00022
         assert result["spread_pips"] == 2.2
+        assert result["units"] == {"spread": "absolute_price", "spread_pips": "pips"}
 
     def test_market_ticker_minimal_preserves_error_envelope(self):
         payload = {
@@ -965,7 +972,7 @@ class TestFormatResultMinimal:
         )
 
         assert result["freshness"] == "closed weekend, tick 1h 36m ago"
-        assert "data_stale" not in result
+        assert result["data_stale"] is False
         assert "stale_after_seconds" not in result
         assert "market_status" not in result
         assert result["market_status_reason"] == "weekend"
@@ -1487,20 +1494,6 @@ class TestFormatResultMinimal:
         assert "preview_scope_summary" not in result
         assert "actionability_reason" not in result
         assert "warnings" not in result
-
-
-class TestFormatComplexValue:
-    def test_dict(self):
-        result = _format_complex_value({"key": "val"})
-        assert "key" in result
-
-    def test_list(self):
-        result = _format_complex_value([1, 2, 3])
-        assert len(result) > 0
-
-    def test_scalar(self):
-        result = _format_complex_value(42)
-        assert "42" in result
 
 
 @pytest.mark.parametrize(

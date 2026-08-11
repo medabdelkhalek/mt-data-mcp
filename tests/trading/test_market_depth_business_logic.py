@@ -76,6 +76,9 @@ def test_market_depth_tick_fallback_includes_price_display() -> None:
     assert out["data"]["time"] == "2023-11-14T22:13:20Z"
     assert out["data"]["time_epoch"] == 1700000000
     assert out["units"] == {"volume": "mt5_tick_volume"}
+    assert out["freshness_state"] == "stale"
+    assert out["usable_for_live_trading"] is False
+    assert out["observed_at_epoch"] > 0
     assert isinstance(out.get("query_latency_ms"), float)
 
 
@@ -102,9 +105,33 @@ def test_market_depth_tick_fallback_hides_zero_last_display() -> None:
     assert "last_display" not in out["data"]
 
 
+def test_market_depth_tick_fallback_marks_fresh_quote_live_ready() -> None:
+    tick = SimpleNamespace(
+        bid=100.0,
+        ask=100.5,
+        last=100.25,
+        volume=12,
+        time=1_700_000_000,
+    )
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.time", return_value=1_700_000_005.0
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_get.return_value = []
+        mt5.symbol_info_tick.return_value = tick
+
+        out = _raw_market_depth_fetch("BTCUSD")
+
+    assert out["success"] is True
+    assert out["freshness_state"] == "live"
+    assert out["data_age_seconds"] == 5.0
+    assert out["usable_for_live_trading"] is True
+
+
 def test_market_depth_full_depth_includes_price_display() -> None:
     depth = [
-        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 2},
         {"price": 65602.5, "volume": 2.0, "volume_real": 2.0, "type": 1},
     ]
     with patch("mtdata.core.market_depth.mt5") as mt5:
@@ -127,7 +154,7 @@ def test_market_depth_full_depth_includes_price_display() -> None:
 def test_market_depth_full_depth_accepts_mt5_bookinfo_volume_dbl() -> None:
     BookInfo = namedtuple("BookInfo", ["type", "price", "volume", "volume_dbl"])
     depth = [
-        BookInfo(type=0, price=65601.0, volume=1, volume_dbl=1.25),
+        BookInfo(type=2, price=65601.0, volume=1, volume_dbl=1.25),
         BookInfo(type=1, price=65602.5, volume=2, volume_dbl=2.5),
     ]
     with patch("mtdata.core.market_depth.mt5") as mt5:
@@ -144,9 +171,31 @@ def test_market_depth_full_depth_accepts_mt5_bookinfo_volume_dbl() -> None:
     assert out["data"]["sell_orders"][0]["volume_real"] == 2.5
 
 
+def test_market_depth_classifies_all_official_mt5_book_types() -> None:
+    depth = [
+        {"price": 101.0, "volume": 1.0, "volume_real": 1.0, "type": 1},
+        {"price": 100.0, "volume": 1.0, "volume_real": 1.0, "type": 2},
+        {"price": 102.0, "volume": 1.0, "volume_real": 1.0, "type": 3},
+        {"price": 99.0, "volume": 1.0, "volume_real": 1.0, "type": 4},
+        {"price": 98.0, "volume": 1.0, "volume_real": 1.0, "type": 99},
+    ]
+    with patch("mtdata.core.market_depth.mt5") as mt5:
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(digits=2)
+        mt5.market_book_get.return_value = depth
+
+        out = _raw_market_depth_fetch("BTCUSD", spread=True)
+
+    assert out["data"]["depth_levels"] == {"buy": 2, "sell": 2, "total": 4}
+    assert out["data"]["best_bid"] == 100.0
+    assert out["data"]["best_ask"] == 101.0
+    assert out["data"]["unclassified_orders"][0]["book_type"] == 99
+    assert out["capabilities"]["unclassified_depth_levels"] == 1
+
+
 def test_market_depth_subscribes_and_releases_book_snapshot() -> None:
     depth = [
-        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 2},
         {"price": 65602.5, "volume": 2.0, "volume_real": 2.0, "type": 1},
     ]
     with patch("mtdata.core.market_depth.mt5") as mt5:
@@ -190,7 +239,7 @@ def test_market_depth_releases_book_after_empty_snapshot() -> None:
 
 def test_market_depth_waits_for_initial_subscribed_snapshot() -> None:
     depth = [
-        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": 65601.0, "volume": 1.0, "volume_real": 1.0, "type": 2},
     ]
     with patch("mtdata.core.market_depth.mt5") as mt5, patch(
         "mtdata.core.market_depth.time.sleep"
@@ -229,6 +278,7 @@ def test_market_depth_tick_fallback_includes_spread_metrics_when_requested() -> 
         )
         mt5.market_book_get.return_value = []
         mt5.symbol_info_tick.return_value = tick
+        mt5.account_info.return_value = SimpleNamespace(currency="USD")
         out = _raw_market_depth_fetch("BTCUSD", spread=True)
 
     assert out["success"] is True
@@ -237,6 +287,12 @@ def test_market_depth_tick_fallback_includes_spread_metrics_when_requested() -> 
     assert abs(out["data"]["spread_pct"] - (100.0 / 100.5)) < 1e-12
     assert out["data"]["spread_cost_per_lot"] == 100.0
     assert out["capabilities"]["spread_overlay_applied"] is True
+    assert out["units"]["spread"] == "absolute_price"
+    assert out["units"]["spread_points"] == "broker_points"
+    assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
+    assert out["units"]["spread_cost_per_lot"] == (
+        "account_currency_per_broker_lot_estimate"
+    )
 
 
 def test_market_depth_compact_mode_fails_fast_without_dom() -> None:
@@ -261,7 +317,7 @@ def test_market_depth_compact_mode_fails_fast_without_dom() -> None:
 
 def test_market_depth_full_depth_includes_spread_metrics_when_requested() -> None:
     depth = [
-        {"price": 100.0, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": 100.0, "volume": 1.0, "volume_real": 1.0, "type": 2},
         {"price": 101.0, "volume": 2.0, "volume_real": 2.0, "type": 1},
     ]
     with patch("mtdata.core.market_depth.mt5") as mt5:
@@ -280,11 +336,13 @@ def test_market_depth_full_depth_includes_spread_metrics_when_requested() -> Non
     assert out["data"]["best_ask"] == 101.0
     assert out["data"]["spread"] == 1.0
     assert out["capabilities"]["spread_overlay_applied"] is True
+    assert out["units"]["spread"] == "absolute_price"
+    assert out["units"]["spread_points"] == "broker_points"
 
 
 def test_market_depth_spread_overlay_skips_all_none_book_prices() -> None:
     depth = [
-        {"price": None, "volume": 1.0, "volume_real": 1.0, "type": 0},
+        {"price": None, "volume": 1.0, "volume_real": 1.0, "type": 2},
         {"price": None, "volume": 2.0, "volume_real": 2.0, "type": 1},
     ]
     with patch("mtdata.core.market_depth.mt5") as mt5:
@@ -335,7 +393,13 @@ def test_market_ticker_returns_lightweight_spread_snapshot() -> None:
     assert out["spread_pct"] == 0.498753
     assert out["point"] == 0.01
     assert "market_state" not in out
-    assert "units" not in out
+    assert out["units"] == {
+        "bid": "absolute_price",
+        "ask": "absolute_price",
+        "spread": "absolute_price",
+        "spread_points": "broker_points",
+        "spread_pct": "percentage_points (1.0 = 1%)",
+    }
     assert "contract_size" not in out
     assert "lot_definition" not in out
     assert "pricing_basis" not in out
@@ -347,7 +411,7 @@ def test_market_ticker_returns_lightweight_spread_snapshot() -> None:
     assert out["spread_points"] == 100.0
     assert "spread_pips" not in out
     assert "spread_pct_display" not in out
-    assert "data_stale" not in out
+    assert out["data_stale"] is True
     assert out["data_age_seconds"] > out["stale_after_seconds"]
     assert out["freshness_state"] == "stale"
     assert out["usable_for_live_trading"] is False
@@ -415,7 +479,9 @@ def test_market_ticker_compact_detail_omits_verbose_fields() -> None:
     assert out["ask"] == 201.0
     assert out["spread_pct"] == 0.498753
     assert "market_state" not in out
-    assert "units" not in out
+    assert out["units"]["spread"] == "absolute_price"
+    assert out["units"]["spread_points"] == "broker_points"
+    assert out["units"]["spread_pct"] == "percentage_points (1.0 = 1%)"
     assert "contract_size" not in out
     assert out["freshness"].startswith("stale, tick ")
     assert "spread_display" not in out
@@ -427,7 +493,7 @@ def test_market_ticker_compact_detail_omits_verbose_fields() -> None:
     assert "tick_volume" not in out
     assert out["time"] == "2023-11-14T22:13:20Z"
     assert "time_display" not in out
-    assert "data_stale" not in out
+    assert out["data_stale"] is True
     assert out["stale_after_seconds"] == 300
     assert "freshness_basis" not in out
     assert "data_age" not in out
@@ -479,8 +545,8 @@ def test_market_ticker_price_field_returns_simple_price() -> None:
         time=1700000000,
     )
     with patch("mtdata.core.market_depth.mt5") as mt5, patch(
-        "mtdata.core.market_depth._use_client_tz", return_value=False
-    ):
+        "mtdata.core.market_depth.time.time", return_value=1_700_001_000.0
+    ), patch("mtdata.core.market_depth._use_client_tz", return_value=False):
         mt5.symbol_select.return_value = True
         mt5.symbol_info.return_value = SimpleNamespace(
             digits=5,
@@ -556,6 +622,156 @@ def test_market_ticker_refreshes_stale_symbol_tick_from_live_stream() -> None:
     assert out["quote_refresh_attempted"] is True
 
 
+def test_market_ticker_prefers_stream_for_equal_timestamp_quote_conflict() -> None:
+    now = 1_700_000_100.0
+    cached_tick = SimpleNamespace(
+        bid=1.15304,
+        ask=1.15326,
+        time=now - 1.0,
+        time_msc=(now - 1.0) * 1000.0,
+    )
+    stream_tick = {
+        "bid": 1.15308,
+        "ask": 1.15322,
+        "time": now - 1.0,
+        "time_msc": (now - 1.0) * 1000.0,
+    }
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.time", return_value=now
+    ), patch("mtdata.core.market_depth._use_client_tz", return_value=False):
+        mt5.COPY_TICKS_ALL = 0
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = cached_tick
+        mt5.copy_ticks_range.return_value = [stream_tick]
+
+        out = _raw_market_ticker("EURUSD", detail="full")
+
+    assert out["bid"] == 1.15308
+    assert out["ask"] == 1.15322
+    assert out["quote_source"] == "mt5.copy_ticks_range"
+    assert out["quote_source_state"] == "reconciled_equal_timestamp_conflict"
+    assert out["quote_source_conflict"]["symbol_info_tick"] == {
+        "bid": 1.15304,
+        "ask": 1.15326,
+    }
+
+
+def test_market_ticker_uses_last_stream_tick_when_millisecond_timestamps_tie() -> None:
+    now = 1_700_000_100.0
+    cached_tick = SimpleNamespace(
+        bid=1.15308,
+        ask=1.15322,
+        time=now - 1.0,
+        time_msc=(now - 1.0) * 1000.0,
+    )
+    earlier_same_millisecond_tick = {
+        "bid": 1.15304,
+        "ask": 1.15326,
+        "time": now - 1.0,
+        "time_msc": (now - 1.0) * 1000.0,
+    }
+    latest_same_millisecond_tick = {
+        "bid": 1.15308,
+        "ask": 1.15322,
+        "time": now - 1.0,
+        "time_msc": (now - 1.0) * 1000.0,
+    }
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.time", return_value=now
+    ), patch("mtdata.core.market_depth._use_client_tz", return_value=False):
+        mt5.COPY_TICKS_ALL = 0
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = cached_tick
+        mt5.copy_ticks_range.return_value = [
+            earlier_same_millisecond_tick,
+            latest_same_millisecond_tick,
+        ]
+
+        out = _raw_market_ticker("EURUSD", detail="full")
+
+    assert out["bid"] == 1.15308
+    assert out["ask"] == 1.15322
+    assert out["quote_source"] == "mt5.symbol_info_tick"
+    assert out["quote_source_state"] == "current"
+    assert "quote_source_conflict" not in out
+
+
+def test_market_ticker_keeps_positive_cached_quote_over_locked_stream_conflict() -> None:
+    now = 1_700_000_100.0
+    cached_tick = SimpleNamespace(
+        bid=1.15304,
+        ask=1.15326,
+        time=now - 1.0,
+        time_msc=(now - 1.0) * 1000.0,
+    )
+    stream_tick = {
+        "bid": 1.15310,
+        "ask": 1.15310,
+        "time": now - 1.0,
+        "time_msc": (now - 1.0) * 1000.0,
+    }
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.time", return_value=now
+    ), patch("mtdata.core.market_depth._use_client_tz", return_value=False):
+        mt5.COPY_TICKS_ALL = 0
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = cached_tick
+        mt5.copy_ticks_range.return_value = [stream_tick]
+
+        out = _raw_market_ticker("EURUSD", detail="compact")
+
+    assert out["bid"] == 1.15304
+    assert out["ask"] == 1.15326
+    assert out["quote_source"] == "mt5.symbol_info_tick"
+    assert out["quote_source_state"] == "reconciled_equal_timestamp_conflict"
+    assert "quote_source_conflict" not in out
+    assert out["spread_valid"] is True
+    assert out["spread_quality"] == "two_sided"
+
+
+def test_market_ticker_marks_locked_quote_unusable() -> None:
+    now = 1_700_000_100.0
+    tick = SimpleNamespace(bid=1.1, ask=1.1, last=1.1, time=now - 1.0)
+    with patch("mtdata.core.market_depth.mt5") as mt5, patch(
+        "mtdata.core.market_depth.time.time", return_value=now
+    ):
+        mt5.symbol_select.return_value = True
+        mt5.symbol_info.return_value = SimpleNamespace(
+            digits=5,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+        )
+        mt5.symbol_info_tick.return_value = tick
+        mt5.copy_ticks_range.return_value = []
+
+        out = _raw_market_ticker("EURUSD", detail="compact")
+
+    assert out["spread"] == 0.0
+    assert out["spread_valid"] is False
+    assert out["spread_quality"] == "locked"
+    assert out["usable_for_live_trading"] is False
+    assert "Locked quote" in out["warning"]
+
+
 def test_market_ticker_compact_explains_unrefreshable_future_tick() -> None:
     now = 1_700_000_100.0
     future_tick = SimpleNamespace(
@@ -581,8 +797,10 @@ def test_market_ticker_compact_explains_unrefreshable_future_tick() -> None:
 
         out = _raw_market_ticker("EURUSD", detail="compact")
 
-    assert out["freshness"] == "stale, tick 0s ago"
+    assert out["freshness"] == "clock skew, tick timestamp 10s ahead of wall clock"
+    assert out["freshness_state"] == "clock_skew"
     assert out["freshness_reason"] == "future_timestamp"
+    assert out.get("data_age_seconds") is None
     assert out["timestamp_in_future"] is True
     assert out["timestamp_skew_seconds"] == 10.0
     assert "MT5 time alignment" in out["timestamp_warning"]
@@ -661,15 +879,17 @@ def test_market_ticker_full_detail_preserves_verbose_fields() -> None:
             point=0.01,
             trade_tick_size=0.01,
             trade_tick_value=1.0,
-            currency_profit="USD",
+            currency_profit="JPY",
             trade_contract_size=1.0,
         )
         mt5.symbol_info_tick.return_value = tick
+        mt5.account_info.return_value = SimpleNamespace(currency="USD")
         out = _raw_market_ticker("BTCUSD", detail="full")
 
     assert out["last"] == 200.5
     assert out["tick_volume"] == 5
     assert out["spread_cost_per_lot"] == 100.0
+    assert out["price_currency"] == "JPY"
     assert out["spread_cost_currency"] == "USD"
     assert out["pricing_basis"] == "per_1_lot_estimate"
     assert out["contract_size"] == 1.0
@@ -791,7 +1011,8 @@ def test_market_ticker_rounds_tick_precision_noise() -> None:
     assert out["bid"] == 1.17581
     assert out["ask"] == 1.1759
     assert out["spread_pips"] == 0.9
-    assert "units" not in out
+    assert out["units"]["spread"] == "absolute_price"
+    assert out["units"]["spread_pips"] == "pips"
     assert out["spread"] == 0.00009
     assert out["spread_points"] == 9.0
     assert "last" not in out

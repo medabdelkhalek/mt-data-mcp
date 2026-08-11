@@ -6,12 +6,15 @@ Automatically discovers function parameters and creates CLI arguments
 import argparse
 import difflib
 import json
+import logging
 import os
 import shlex
 import sys
 import types
 import warnings
+from contextlib import redirect_stderr, redirect_stdout
 from importlib import metadata as importlib_metadata
+from io import StringIO
 from pathlib import Path
 from typing import (
     Any,
@@ -32,11 +35,14 @@ from pydantic import BaseModel, ValidationError
 from ...bootstrap.settings import load_environment
 from ...bootstrap.tools import bootstrap_tools, cli_tool_module_names
 from ...forecast.requests import ForecastGenerateRequest
+from ...utils.coercion import UNPARSED_BOOL, parse_bool_like
 from .._mcp_instance import mcp
 from .._mcp_tools import _get_pydantic_model_fields, _select_output_fields
 from .._mcp_tools import get_tool_registry as get_registered_tools
 from ..error_envelope import build_error_payload
+from ..execution_logging import infer_result_success
 from ..output_contract import resolve_output_contract
+from ..request_context import ensure_request_id_scope
 from .formatting import (
     _attach_cli_meta,
     _format_result_for_cli,
@@ -102,6 +108,8 @@ from .runtime.commands import (
     parse_set_overrides as _parse_set_overrides_impl,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class _CLIHelpFormatter(
     argparse.RawDescriptionHelpFormatter,
@@ -130,10 +138,26 @@ def _is_typed_dict_type(value: Any) -> bool:
 def _invoke_cli_tool_function(
     func: Any, *, args: Any, cmd_name: str, kwargs: Dict[str, Any]
 ) -> Any:
-    del cmd_name
-    with _capture_runtime_warnings() as warning_records:
-        with _suppress_cli_side_output(enabled=True):
-            result = func(**kwargs)
+    with ensure_request_id_scope() as request_id:
+        try:
+            with _capture_runtime_warnings() as warning_records:
+                with _suppress_cli_side_output(enabled=True):
+                    result = func(**kwargs)
+        except Exception:
+            logger.exception(
+                "transport=cli event=error operation=%s request_id=%s",
+                cmd_name,
+                request_id,
+            )
+            raise
+        success = infer_result_success(result)
+        log = logger.debug if success else logger.warning
+        log(
+            "transport=cli event=finish operation=%s success=%s request_id=%s",
+            cmd_name,
+            success,
+            request_id,
+        )
 
     warning_texts: List[str] = []
     seen: set[str] = set()
@@ -200,6 +224,11 @@ ToolInfo = Dict[str, Any]
 
 CLI_PROGRAM = "mtdata-cli"
 PACKAGE_NAME = "mtdata"
+_SHELL_SESSION_DEPTH = 0
+_BACKGROUND_COMMAND_REMEDIATION = (
+    "Use 'mtdata-cli shell', an MCP server, or the Web API so the training "
+    "worker remains alive."
+)
 
 
 def _read_local_project_version() -> Optional[str]:
@@ -344,6 +373,15 @@ def _normalize_cli_argv_aliases(
             break
         if token_text in functions:
             break
+
+    confluence_index = _find_command_index(normalized, "confluence_levels")
+    if confluence_index is not None:
+        for index in range(confluence_index + 1, len(normalized)):
+            token = str(normalized[index])
+            if token == "--timeframe":
+                normalized[index] = "--pivot-timeframe"
+            elif token.startswith("--timeframe="):
+                normalized[index] = "--pivot-timeframe=" + token.split("=", 1)[1]
     return normalized
 
 
@@ -354,10 +392,28 @@ def _apply_global_cli_overrides(args: Any, argv: List[str]) -> Any:
     command = command.replace("-", "_")
     args.command = command
     global_timeframe = getattr(args, "_global_timeframe", None)
-    if global_timeframe is not None and not _argv_option_present_after_command(
-        argv, command, "--timeframe"
-    ):
-        args.timeframe = global_timeframe
+    if global_timeframe is not None:
+        if command == "confluence_levels":
+            pivot_timeframe_present = (
+                _argv_option_present_after_command(
+                    argv,
+                    command,
+                    "--pivot-timeframe",
+                )
+                or _argv_option_present_after_command(
+                    argv,
+                    command,
+                    "--pivot_timeframe",
+                )
+            )
+            if not pivot_timeframe_present:
+                args.pivot_timeframe = global_timeframe
+        elif not _argv_option_present_after_command(
+            argv,
+            command,
+            "--timeframe",
+        ):
+            args.timeframe = global_timeframe
     trade_days = getattr(args, "_trade_days", None)
     if command.startswith("trade_") and trade_days is not None:
         if not (
@@ -369,18 +425,6 @@ def _apply_global_cli_overrides(args: Any, argv: List[str]) -> Any:
             except Exception:
                 args.minutes_back = trade_days
     return args
-
-
-def _argv_param_present_after_command(
-    argv: List[str], command: str, param_name: str
-) -> bool:
-    flags = (
-        f"--{param_name.replace('_', '-')}",
-        f"--{param_name}",
-    )
-    return any(
-        _argv_option_present_after_command(argv, command, flag) for flag in flags
-    )
 
 
 def _literal_choices_for_cli_param(
@@ -402,58 +446,6 @@ def _literal_choices_for_cli_param(
         return None
     choices = [str(value) for value in get_args(base_type) if value is not None]
     return choices or None
-
-
-def _default_cli_compact_choice(
-    choices: List[str],
-) -> Optional[str]:
-    by_lower = {
-        str(choice).strip().lower(): str(choice)
-        for choice in choices
-        if str(choice).strip()
-    }
-    if "full" not in by_lower:
-        return None
-    if "compact" in by_lower:
-        return by_lower["compact"]
-    if "summary" in by_lower:
-        return by_lower["summary"]
-    return None
-
-
-def _apply_cli_output_mode_defaults(
-    args: Any, argv: List[str], functions: Dict[str, ToolInfo]
-) -> Any:
-    command = getattr(args, "command", None)
-    if not isinstance(command, str) or not command:
-        return args
-
-    tool = functions.get(command)
-    if not isinstance(tool, dict):
-        return args
-
-    func = tool.get("func")
-    if func is None:
-        return args
-
-    func_info = tool.setdefault("_cli_func_info", get_function_info(func))
-    _apply_schema_overrides(tool, func_info)
-    for param in func_info.get("params") or []:
-        if not isinstance(param, dict):
-            continue
-        param_name = str(param.get("name") or "").strip()
-        if param_name != "detail":
-            continue
-        if _argv_param_present_after_command(argv, command, param_name):
-            continue
-        choices = _literal_choices_for_cli_param(param, cmd_name=command)
-        if not choices:
-            continue
-        selected = _default_cli_compact_choice(choices)
-        if selected is None:
-            continue
-        setattr(args, param_name, selected)
-    return args
 
 
 def _normalize_console_text(text: str) -> str:
@@ -844,13 +836,9 @@ def _forecast_generate_typed_value_epilog() -> str:
 
 
 def _parse_cli_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "no", "n", "off"}:
-        return False
+    parsed = parse_bool_like(value)
+    if parsed is not UNPARSED_BOOL:
+        return bool(parsed)
     raise argparse.ArgumentTypeError("expected true or false")
 
 
@@ -902,7 +890,15 @@ def _add_forecast_generate_args(cmd_parser: argparse.ArgumentParser) -> None:
 
     cmd_parser.add_argument(
         "symbol",
+        nargs="?",
+        default=argparse.SUPPRESS,
         help=_PARAM_HINTS["symbol"],
+    )
+    cmd_parser.add_argument(
+        "--symbol",
+        dest="symbol",
+        default=argparse.SUPPRESS,
+        help="Symbol name. Equivalent to the SYMBOL positional argument.",
     )
 
     group_method = cmd_parser.add_argument_group("Method")
@@ -1072,7 +1068,7 @@ def create_command_function(
     func_info, cmd_name: str = "", cmd_parser: Optional[argparse.ArgumentParser] = None
 ):
     """Create a command function that calls the MCP function dynamically"""
-    return _create_command_function_impl(
+    command_func = _create_command_function_impl(
         func_info,
         cmd_name=cmd_name,
         render_cli_result=_render_cli_result,
@@ -1083,6 +1079,25 @@ def create_command_function(
         is_typed_dict_type=_is_typed_dict_type,
         invoke_tool_function=_invoke_cli_tool_function,
     )
+    if cmd_name != "forecast_train":
+        return command_func
+
+    def _forecast_train_cmd(args: Any) -> int:
+        if _SHELL_SESSION_DEPTH <= 0:
+            return _render_cli_result_status(
+                build_error_payload(
+                    "Background forecast training cannot run in a one-shot CLI process.",
+                    code="cli_background_process_required",
+                    operation=cmd_name,
+                    remediation=_BACKGROUND_COMMAND_REMEDIATION,
+                    documentation="docs/FORECAST.md#background-training--model-store",
+                ),
+                args=args,
+                cmd_name=cmd_name,
+            )
+        return command_func(args)
+
+    return _forecast_train_cmd
 
 
 def _type_name(t):
@@ -1580,7 +1595,7 @@ def _print_extended_help(functions: Dict[str, ToolInfo], query: str) -> None:
         print("")
 
 
-def main():
+def main():  # noqa: C901
     """Main CLI entry point with dynamic parameter discovery"""
     raw_argv = sys.argv[1:]
     if raw_argv in (["--version"], ["-V"]):
@@ -1640,7 +1655,8 @@ def main():
         metavar="TIMEFRAME",
         help=(
             "Default MT5 timeframe for commands with a timeframe parameter; "
-            "command-level --timeframe overrides it."
+            "command-level --timeframe overrides it. For confluence_levels, "
+            "this defaults --pivot-timeframe instead."
         ),
     )
 
@@ -1654,7 +1670,8 @@ def main():
         description=(
             "Run an interactive mtdata-cli session or read a batch from stdin. "
             "Enter ordinary command lines without the mtdata-cli prefix; blank "
-            "lines and comments are ignored, and exit or quit stops the session."
+            "lines and comments are ignored, and exit or quit stops the session. "
+            "Batch output is one JSON envelope per command (NDJSON)."
         ),
         formatter_class=_CLIHelpFormatter,
         allow_abbrev=False,
@@ -1756,10 +1773,32 @@ def main():
         _add_forecast_generate_args(cmd_parser)
 
         def _forecast_generate_cmd(args):
+            if not hasattr(args, "symbol") or not str(args.symbol or "").strip():
+                cmd_parser.error("Missing required argument: symbol.")
             try:
                 overrides = _parse_set_overrides(args.set_overrides)
             except ValueError as exc:
                 cmd_parser.error(str(exc))
+            allowed_override_sections = {"method", "denoise", "features", "dimred", "target"}
+            unknown_sections = sorted(set(overrides) - allowed_override_sections)
+            if unknown_sections:
+                cmd_parser.error(
+                    f"Unknown --set section(s): {', '.join(unknown_sections)}. "
+                    "Use one of: method, denoise, features, dimred, target."
+                )
+
+            def _parse_mapping_value(value, *, option_name):
+                if not isinstance(value, str):
+                    return value
+                if not value.strip():
+                    return None
+                parsed = _parse_kv_string(value)
+                if parsed is None:
+                    cmd_parser.error(
+                        f"Invalid --{option_name.replace('_', '-')} value. "
+                        "Use JSON object syntax or key=value pairs."
+                    )
+                return parsed
 
             params_raw = _resolve_forecast_typed_cli_value(
                 args.params,
@@ -1792,11 +1831,7 @@ def main():
                 parser=cmd_parser,
             )
 
-            params = (
-                _parse_kv_string(params_raw)
-                if isinstance(params_raw, str)
-                else params_raw
-            )
+            params = _parse_mapping_value(params_raw, option_name="params")
 
             denoise = None
             if isinstance(denoise_raw, dict):
@@ -1804,24 +1839,13 @@ def main():
             elif denoise_raw:
                 denoise = {"method": str(denoise_raw).strip()}
                 if str(denoise_raw).strip().startswith("{"):
-                    parsed = _parse_kv_string(str(denoise_raw))
-                    denoise = parsed if parsed is not None else denoise
+                    denoise = _parse_mapping_value(denoise_raw, option_name="denoise")
 
-            features = (
-                _parse_kv_string(features_raw)
-                if isinstance(features_raw, str)
-                else features_raw
+            features = _parse_mapping_value(features_raw, option_name="features")
+            dimred_params = _parse_mapping_value(
+                dimred_params_raw, option_name="dimred_params"
             )
-            dimred_params = (
-                _parse_kv_string(dimred_params_raw)
-                if isinstance(dimred_params_raw, str)
-                else dimred_params_raw
-            )
-            target_spec = (
-                _parse_kv_string(target_spec_raw)
-                if isinstance(target_spec_raw, str)
-                else target_spec_raw
-            )
+            target_spec = _parse_mapping_value(target_spec_raw, option_name="target_spec")
 
             # --set overrides (sections: method/denoise/features/dimred/target)
             params = _merge_dict(params, overrides.get("method"))
@@ -1871,6 +1895,19 @@ def main():
                     _write_cli_text(config_output)
                 return 0
 
+            if request.async_mode and _SHELL_SESSION_DEPTH <= 0:
+                return _render_cli_result_status(
+                    build_error_payload(
+                        "Asynchronous forecast generation cannot run in a one-shot CLI process.",
+                        code="cli_background_process_required",
+                        operation="forecast_generate",
+                        remediation=_BACKGROUND_COMMAND_REMEDIATION,
+                        documentation="docs/FORECAST.md#background-training--model-store",
+                    ),
+                    args=args,
+                    cmd_name="forecast_generate",
+                )
+
             out = _invoke_cli_tool_function(
                 func,
                 args=args,
@@ -1897,7 +1934,6 @@ def main():
     # Parse arguments
     args = parser.parse_args(argv)
     args = _apply_global_cli_overrides(args, argv)
-    args = _apply_cli_output_mode_defaults(args, argv, functions)
 
     if not args.command:
         parser.print_help()
@@ -1923,12 +1959,77 @@ def main():
         return 1
 
 
+def _split_shell_command(line: str) -> List[str]:
+    """Split a warm-shell command using quote delimiters and Windows-safe paths."""
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    # Backslashes are ordinary Windows path characters in this shell grammar.
+    # Quote characters delimit values but are not part of the resulting argv.
+    lexer.escape = ""
+    return list(lexer)
+
+
+def _shell_batch_record(
+    *,
+    line_number: int,
+    command: str,
+    command_argv: List[str],
+    program: str,
+) -> Tuple[Dict[str, Any], int]:
+    """Run one batch command and capture it in a single NDJSON record."""
+    stdout_buffer = StringIO()
+    stderr_buffer = StringIO()
+    sys.argv = [program, *command_argv]
+    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+        try:
+            raw_status = main()
+        except SystemExit as exc:
+            if isinstance(exc.code, int):
+                raw_status = exc.code
+            else:
+                raw_status = 0 if exc.code is None else 1
+
+    status = int(raw_status) if isinstance(raw_status, int) else 0
+    record: Dict[str, Any] = {
+        "line": line_number,
+        "command": command,
+        "success": status == 0,
+        "status": status,
+    }
+    stdout = stdout_buffer.getvalue().strip()
+    if stdout:
+        try:
+            record["result"] = json.loads(stdout)
+        except (TypeError, ValueError):
+            record["output"] = stdout
+    stderr = stderr_buffer.getvalue().strip()
+    if stderr:
+        record["stderr"] = stderr
+    return record, status
+
+
+def _write_shell_batch_record(record: Dict[str, Any]) -> None:
+    _write_cli_text(
+        json.dumps(
+            record,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=_json_default,
+        )
+    )
+
+
 def run_shell(*, interactive: bool = True) -> int:
     """Run repeated CLI commands while reusing the initialized Python process."""
+    global _SHELL_SESSION_DEPTH
+
     if interactive:
         print("mtdata-cli shell (type 'exit' or 'quit' to stop)")
     original_argv = list(sys.argv)
     overall_status = 0
+    line_number = 0
+    _SHELL_SESSION_DEPTH += 1
     try:
         while True:
             if interactive:
@@ -1944,35 +2045,66 @@ def run_shell(*, interactive: bool = True) -> int:
                 line = sys.stdin.readline()
                 if line == "":
                     return overall_status
+                line_number += 1
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
             if stripped.lower() in {"exit", "quit"}:
                 return overall_status
             try:
-                command_argv = shlex.split(stripped, posix=False)
+                command_argv = _split_shell_command(stripped)
             except ValueError as exc:
-                print(f"Invalid command line: {exc}", file=sys.stderr)
-                if not interactive:
+                message = f"Invalid command line: {exc}"
+                if interactive:
+                    print(message, file=sys.stderr)
+                else:
                     overall_status = 2
+                    _write_shell_batch_record(
+                        {
+                            "line": line_number,
+                            "command": stripped,
+                            "success": False,
+                            "status": 2,
+                            "error": message,
+                        }
+                    )
                 continue
             if command_argv and command_argv[0].lower() == "shell":
-                print("A shell session is already active.", file=sys.stderr)
-                if not interactive:
+                message = "A shell session is already active."
+                if interactive:
+                    print(message, file=sys.stderr)
+                else:
                     overall_status = 2
+                    _write_shell_batch_record(
+                        {
+                            "line": line_number,
+                            "command": stripped,
+                            "success": False,
+                            "status": 2,
+                            "error": message,
+                        }
+                    )
+                continue
+            if not interactive:
+                record, status = _shell_batch_record(
+                    line_number=line_number,
+                    command=stripped,
+                    command_argv=command_argv,
+                    program=original_argv[0],
+                )
+                _write_shell_batch_record(record)
+                if status != 0:
+                    overall_status = status
                 continue
             sys.argv = [original_argv[0], *command_argv]
             try:
-                status = main()
-                if not interactive and isinstance(status, int) and status != 0:
-                    overall_status = status
-            except SystemExit as exc:
+                main()
+            except SystemExit:
                 # argparse has already rendered its error or help text. Keep the
                 # warmed shell alive for the next command.
-                if not interactive and isinstance(exc.code, int) and exc.code != 0:
-                    overall_status = exc.code
                 continue
     finally:
+        _SHELL_SESSION_DEPTH -= 1
         sys.argv = original_argv
 
 

@@ -7,8 +7,12 @@ from pydantic import ValidationError
 
 from ...services.data_service import fetch_candles, fetch_ticks
 from ...shared.schema import DetailLiteral, TimeframeLiteral
-from ...utils.mt5 import ensure_mt5_connection_or_raise
 from ...utils.coercion import coerce_finite_float
+from ...utils.mt5 import (
+    ensure_mt5_connection_or_raise,
+    get_symbol_info_cached,
+    symbol_candle_price_basis,
+)
 from .._mcp_instance import mcp
 from ..execution_logging import run_logged_operation
 from ..mt5_gateway import create_mt5_gateway
@@ -153,6 +157,7 @@ def _support_resistance_watchers(
     if not isinstance(levels, list):
         return []
     watch_for: List[Dict[str, Any]] = []
+    price_source = _default_level_price_source(symbol)
     for level in levels:
         if not isinstance(level, dict):
             continue
@@ -171,6 +176,7 @@ def _support_resistance_watchers(
                 "symbol": symbol,
                 "level": level_value,
                 "direction": "either",
+                "price_source": price_source,
             }
         )
         watch_for.append(
@@ -179,6 +185,7 @@ def _support_resistance_watchers(
                 "symbol": symbol,
                 "level": level_value,
                 "direction": direction,
+                "price_source": price_source,
             }
         )
     return watch_for
@@ -187,7 +194,11 @@ def _support_resistance_watchers(
 def _pivot_zone_watchers(*, symbol: str, timeframe: TimeframeLiteral) -> List[Dict[str, Any]]:
     try:
         raw_tool = getattr(pivot_compute_points, "__wrapped__", pivot_compute_points)
-        payload = raw_tool(symbol=symbol, timeframe=_default_wait_event_pivot_timeframe(timeframe))
+        payload = raw_tool(
+            symbol=symbol,
+            timeframe=_default_wait_event_pivot_timeframe(timeframe),
+            detail="standard",
+        )
     except Exception:
         return []
     if not isinstance(payload, dict) or payload.get("error"):
@@ -196,6 +207,7 @@ def _pivot_zone_watchers(*, symbol: str, timeframe: TimeframeLiteral) -> List[Di
     if len(levels) < 2:
         return []
     watch_for: List[Dict[str, Any]] = []
+    price_source = _default_level_price_source(symbol)
     for idx in range(len(levels) - 1):
         lower = levels[idx]["value"]
         upper = levels[idx + 1]["value"]
@@ -208,9 +220,23 @@ def _pivot_zone_watchers(*, symbol: str, timeframe: TimeframeLiteral) -> List[Di
                 "lower": lower,
                 "upper": upper,
                 "direction": "either",
+                "price_source": price_source,
             }
         )
     return watch_for
+
+
+def _default_level_price_source(symbol: str) -> str:
+    """Match generated chart levels against the broker's chart price basis."""
+    try:
+        basis = symbol_candle_price_basis(get_symbol_info_cached(symbol))
+    except Exception:
+        return "auto"
+    if basis == "bid":
+        return "bid"
+    if basis == "last_trade":
+        return "last"
+    return "auto"
 
 
 def _default_wait_event_pivot_timeframe(timeframe: TimeframeLiteral) -> TimeframeLiteral:
@@ -361,7 +387,6 @@ def _compact_wait_event_public_result(
         return out
 
     for key in (
-        "matched",
         "event",
         "criteria",
         "timeframe",
@@ -491,9 +516,9 @@ def data_fetch_candles(
         "open,high,low,close,volume".
 
     include_spread : bool, optional
-        Append the historical MT5 candle spread column to each returned row.
-        Defaults to false because many symbols/timeframes return missing or zero
-        historical spread and the extra column increases every row.
+        Request the historical MT5 per-bar spread column. When unavailable,
+        the result reports spread_mode=single_reference with one non-historical
+        live/tick reference, or spread_mode=unavailable. Defaults to false.
     
     indicators : list, optional
         Technical indicators list, e.g., [{"name": "rsi", "params": [14]}]
@@ -636,9 +661,17 @@ def wait_event(
 
     `max_wait_seconds` defaults to 15 seconds on the public tool surface so
     interactive and agent calls have a short timebox. Set it to null to use no
-    timeout, or raise it explicitly for longer long-lived transport waits. A
-    timeout is a failed wait (`success=false`, `error_code=wait_event_timeout`)
-    and produces a nonzero CLI exit status.
+    timeout, or raise it explicitly for longer long-lived transport waits.
+    A timeout is a failed wait (`success=false`, `error_code=wait_event_timeout`)
+    and produces a nonzero CLI exit status. When watchers are active, reaching
+    an `end_on` boundary before a match is also a failed wait
+    (`success=false`, `matched=false`,
+    `error_code=wait_event_boundary_reached`); `completed=true` distinguishes
+    that terminal boundary from a timeout. A boundary-only wait
+    (`watch_for=[]` or `wait_next_bar=true`) succeeds when its boundary is
+    reached. A candle boundary already known to
+    be beyond the budget returns `error_code=wait_budget_exceeded` immediately,
+    with no event, because no boundary was observed.
     Set `poll_interval_seconds` to tune polling cadence; omit it to use the
     engine default.
 
@@ -700,7 +733,7 @@ def wait_event(
             request_kwargs["poll_interval_seconds"] = poll_interval_seconds
         if normalized_end_on is not None:
             request_kwargs["end_on"] = list(normalized_end_on)
-        else:
+        elif normalized_watch_for is None or wait_next_bar:
             request_kwargs["end_on"] = [
                 {"type": "candle_close", "timeframe": timeframe},
             ]

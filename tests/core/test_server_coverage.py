@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import logging
 import math
 import os
 import sys
@@ -68,7 +69,7 @@ class TestMcpRuntimeSettings:
         monkeypatch.setenv("FASTMCP_HOST", "0.0.0.0")
         monkeypatch.delenv("FASTMCP_ALLOW_REMOTE", raising=False)
         monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
-        with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
+        with pytest.raises(ValueError, match="FASTMCP_ALLOW_REMOTE"):
             load_mcp_runtime_settings()
 
     def test_non_loopback_host_with_auth_token(self, monkeypatch):
@@ -77,10 +78,8 @@ class TestMcpRuntimeSettings:
         monkeypatch.setenv("FASTMCP_HOST", "0.0.0.0")
         monkeypatch.setenv("MCP_AUTH_TOKEN", "remote-secret")
         monkeypatch.delenv("FASTMCP_ALLOW_REMOTE", raising=False)
-        with pytest.warns(RuntimeWarning, match="FASTMCP_ALLOW_REMOTE"):
-            settings = load_mcp_runtime_settings()
-        assert settings.host == "0.0.0.0"
-        assert settings.auth_token == "remote-secret"
+        with pytest.raises(ValueError, match="FASTMCP_ALLOW_REMOTE"):
+            load_mcp_runtime_settings()
 
     def test_stdio_skips_remote_bind_guard(self, monkeypatch):
         from mtdata.bootstrap.runtime import load_mcp_runtime_settings
@@ -91,6 +90,39 @@ class TestMcpRuntimeSettings:
 
         assert settings.transport == "stdio"
         assert settings.host == "0.0.0.0"
+
+    def test_wildcard_remote_bind_requires_allowed_hosts(self, monkeypatch):
+        from mtdata.bootstrap.runtime import load_mcp_runtime_settings
+
+        monkeypatch.setenv("FASTMCP_HOST", "0.0.0.0")
+        monkeypatch.setenv("FASTMCP_ALLOW_REMOTE", "1")
+        monkeypatch.setenv("MCP_AUTH_TOKEN", "remote-secret")
+        monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
+
+        with pytest.raises(ValueError, match="MCP_ALLOWED_HOSTS"):
+            load_mcp_runtime_settings()
+
+    def test_remote_transport_security_uses_operator_allowlists(self, monkeypatch):
+        from mtdata.bootstrap.runtime import (
+            apply_mcp_runtime_settings,
+            load_mcp_runtime_settings,
+        )
+
+        monkeypatch.setenv("FASTMCP_HOST", "0.0.0.0")
+        monkeypatch.setenv("FASTMCP_ALLOW_REMOTE", "1")
+        monkeypatch.setenv("MCP_AUTH_TOKEN", "remote-secret")
+        monkeypatch.setenv("MCP_ALLOWED_HOSTS", "mt5.example.test:*,192.0.2.10:*")
+        monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://client.example.test")
+        settings = load_mcp_runtime_settings()
+        mcp = MagicMock()
+        mcp.settings = MagicMock()
+
+        apply_mcp_runtime_settings(mcp, settings)
+
+        security = mcp.settings.transport_security
+        assert security.enable_dns_rebinding_protection is True
+        assert security.allowed_hosts == ["mt5.example.test:*", "192.0.2.10:*"]
+        assert security.allowed_origins == ["https://client.example.test"]
 
     def test_apply_to_mcp_settings(self):
         from mtdata.bootstrap.runtime import (
@@ -119,6 +151,24 @@ class TestMcpRuntimeSettings:
         assert mcp.settings.mount_path == "/x"
         assert mcp.settings.sse_path == "/events"
         assert mcp.settings.message_path == "/message"
+
+    def test_apply_mount_path_to_streamable_http_endpoint(self):
+        from mtdata.bootstrap.runtime import (
+            McpRuntimeSettings,
+            apply_mcp_runtime_settings,
+        )
+
+        mcp = MagicMock()
+        mcp.settings = MagicMock()
+        apply_mcp_runtime_settings(
+            mcp,
+            McpRuntimeSettings(
+                transport="streamable-http",
+                mount_path="/mtdata",
+            ),
+        )
+
+        assert mcp.settings.streamable_http_path == "/mtdata"
 
     def test_mcp_auth_factory_fails_closed_when_middleware_attach_fails(self):
         from mtdata.bootstrap.runtime import _install_mcp_bearer_auth
@@ -921,6 +971,25 @@ class TestRecordingToolDecorator:
         finally:
             tools._ORIG_TOOL_DECORATOR = original
 
+    def test_cli_raw_output_keeps_requested_guidance(self):
+        import mtdata.core._mcp_tools as tools
+
+        original = tools._ORIG_TOOL_DECORATOR
+        try:
+            tools._ORIG_TOOL_DECORATOR = lambda *a, **k: (lambda fn: fn)
+            dec = tools._recording_tool_decorator()
+
+            def market_ticker():
+                return {"success": True, "value": 1}
+
+            wrapped = dec(market_ticker)
+            result = wrapped(__cli_raw=True, extras="guidance")
+
+            assert result["success"] is True
+            assert result["related_tools"]
+        finally:
+            tools._ORIG_TOOL_DECORATOR = original
+
     def test_wrapped_function_injects_extras_into_supplied_request_model(self):
         import mtdata.core._mcp_tools as tools
 
@@ -989,8 +1058,9 @@ class TestRecordingToolDecorator:
             assert structured["detail_seen"] == "full"
             assert structured["meta"]["domain"]["symbol"] == "EURUSD"
             assert structured["diagnostics"]["source"] == "mt5"
-            assert isinstance(legacy_structured, str)
-            assert "Invalid extras value" in legacy_structured
+            assert isinstance(legacy_structured, dict)
+            assert legacy_structured["error_code"] == "tool_execution_error"
+            assert "Invalid extras value" in legacy_structured["error"]
             assert detailed["detail_seen"] == "full"
             assert detailed["meta"]["domain"]["symbol"] == "EURUSD"
         finally:
@@ -1021,6 +1091,41 @@ class TestRecordingToolDecorator:
             assert result["thread"] != caller_thread
             assert not hasattr(tools, "_TOOL_TIMEOUT_SECONDS")
         finally:
+            tools._ORIG_TOOL_DECORATOR = original
+
+    def test_async_wrapped_defers_cancellation_until_worker_finishes(self):
+        import asyncio
+        import threading
+
+        import mtdata.core._mcp_tools as tools
+
+        original = tools._ORIG_TOOL_DECORATOR
+        started = threading.Event()
+        release = threading.Event()
+        try:
+            tools._ORIG_TOOL_DECORATOR = lambda *a, **k: (lambda fn: fn)
+            dec = tools._recording_tool_decorator()
+
+            def slow_tool():
+                started.set()
+                release.wait(timeout=2.0)
+                return {"success": True}
+
+            async_wrapped = dec(slow_tool)._mcp_async_wrapper
+
+            async def exercise():
+                task = asyncio.create_task(async_wrapped(__cli_raw=True))
+                await asyncio.to_thread(started.wait, 1.0)
+                task.cancel()
+                await asyncio.sleep(0.02)
+                assert not task.done()
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+            asyncio.run(exercise())
+        finally:
+            release.set()
             tools._ORIG_TOOL_DECORATOR = original
 
     def test_async_wrapped_uses_same_worker_path_for_long_analysis_tools(self):
@@ -1144,6 +1249,8 @@ class TestMcpToolSchemas:
         from mcp import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
+        from mtdata.core import schema_attach
+
         async def _run() -> dict[str, dict]:
             server = StdioServerParameters(
                 command=sys.executable,
@@ -1166,6 +1273,7 @@ class TestMcpToolSchemas:
             props = schema.get("properties") or {}
             assert props["json"]["type"] == "boolean", name
             assert "extras" in props, name
+            schema_attach._validate_local_def_refs(schema)
 
     def test_wait_event_list_tools_schema_omits_legacy_varargs(self):
         from mcp import ClientSession
@@ -1312,9 +1420,59 @@ class TestDisconnectMt5:
         mock_conn.disconnect.assert_called_once()
 
 
+class TestJoblibCpuCacheWarmup:
+
+    def test_skips_non_windows(self, monkeypatch):
+        from mtdata.core import server
+
+        mock_cpu_count = MagicMock()
+        fake_joblib = types.SimpleNamespace(cpu_count=mock_cpu_count)
+        monkeypatch.setattr(server.os, "name", "posix")
+        monkeypatch.setitem(sys.modules, "joblib", fake_joblib)
+
+        server._warm_windows_joblib_cpu_cache()
+
+        mock_cpu_count.assert_not_called()
+
+    def test_warms_physical_core_cache_on_windows(self, monkeypatch):
+        from mtdata.core import server
+
+        mock_cpu_count = MagicMock(return_value=8)
+        fake_joblib = types.SimpleNamespace(cpu_count=mock_cpu_count)
+        monkeypatch.setattr(server.os, "name", "nt")
+        monkeypatch.setitem(sys.modules, "joblib", fake_joblib)
+
+        server._warm_windows_joblib_cpu_cache()
+
+        mock_cpu_count.assert_called_once_with(only_physical_cores=True)
+
+    def test_warmup_failure_does_not_block_server_startup(
+        self, monkeypatch, caplog
+    ):
+        from mtdata.core import server
+
+        mock_cpu_count = MagicMock(side_effect=RuntimeError("probe failed"))
+        fake_joblib = types.SimpleNamespace(cpu_count=mock_cpu_count)
+        monkeypatch.setattr(server.os, "name", "nt")
+        monkeypatch.setitem(sys.modules, "joblib", fake_joblib)
+
+        with caplog.at_level(logging.WARNING):
+            server._warm_windows_joblib_cpu_cache()
+
+        assert "Could not warm joblib CPU topology cache." in caplog.text
+
+
 # ── main / main_stdio / main_sse ──────────────────────────────────────────
 
 class TestMainEntryPoints:
+
+    @pytest.fixture(autouse=True)
+    def _mock_joblib_cpu_cache_warmup(self):
+        with patch(
+            "mtdata.core.server._warm_windows_joblib_cpu_cache"
+        ) as mock_warmup:
+            self.mock_joblib_cpu_cache_warmup = mock_warmup
+            yield
 
     @patch("mtdata.core.server.bootstrap_tools")
     @patch("mtdata.core.server.mcp")
@@ -1332,7 +1490,29 @@ class TestMainEntryPoints:
         mock_mcp.run = MagicMock()
         from mtdata.core.server import main
         main()
+        self.mock_joblib_cpu_cache_warmup.assert_called_once_with()
         mock_mcp.run.assert_called_once()
+
+    @patch("mtdata.core.server._run_prefixed_sse")
+    @patch("mtdata.core.server.bootstrap_tools")
+    @patch("mtdata.core.server.mcp")
+    def test_main_mounts_prefixed_sse_app(
+        self,
+        mock_mcp,
+        mock_bootstrap,
+        mock_run_prefixed_sse,
+    ):
+        from mtdata.bootstrap.runtime import McpRuntimeSettings
+        from mtdata.core.server import main
+
+        runtime = McpRuntimeSettings(transport="sse", mount_path="/mtdata")
+        mock_mcp.settings = MagicMock()
+        mock_mcp.run = MagicMock()
+
+        main(runtime_settings=runtime)
+
+        mock_run_prefixed_sse.assert_called_once_with(runtime)
+        mock_mcp.run.assert_not_called()
 
     @patch("mtdata.core.server.main")
     def test_main_stdio_forces_transport(self, mock_main, monkeypatch):
@@ -1380,7 +1560,7 @@ class TestMainEntryPoints:
 
     @patch("mtdata.core.server.bootstrap_tools")
     @patch("mtdata.core.server.mcp")
-    def test_main_remote_bind_warns_and_starts(self, mock_mcp, mock_bootstrap, monkeypatch):
+    def test_main_remote_bind_requires_explicit_opt_in(self, mock_mcp, mock_bootstrap, monkeypatch):
         monkeypatch.delenv("MCP_TRANSPORT", raising=False)
         monkeypatch.setenv("FASTMCP_HOST", "0.0.0.0")
         monkeypatch.setenv("MCP_AUTH_TOKEN", "remote-secret")
@@ -1389,12 +1569,84 @@ class TestMainEntryPoints:
         mock_mcp.run = MagicMock()
         from mtdata.core.server import main
 
-        with pytest.warns(RuntimeWarning, match="FASTMCP_ALLOW_REMOTE"):
+        with pytest.raises(ValueError, match="FASTMCP_ALLOW_REMOTE"):
             main()
 
-        mock_bootstrap.assert_called_once()
-        mock_mcp.run.assert_called_once()
+        mock_bootstrap.assert_not_called()
+        mock_mcp.run.assert_not_called()
 
+
+class TestMcpHttpProbes:
+    def test_fastmcp_http_apps_include_probe_routes(self):
+        from mtdata.core import server
+
+        for app in (server.mcp.sse_app(), server.mcp.streamable_http_app()):
+            paths = {getattr(route, "path", None) for route in app.routes}
+            assert {"/live", "/ready"} <= paths
+
+    def test_readiness_payload_reports_connected(self):
+        from mtdata.core import server
+
+        with patch.object(server, "mt5_connection_error", return_value=None):
+            payload, status_code = server._mcp_readiness_payload()
+
+        assert status_code == 200
+        assert payload == {
+            "service": "mtdata-mcp",
+            "status": "ok",
+            "ready": True,
+            "components": {"mt5_connection": {"status": "ok"}},
+        }
+
+    def test_readiness_payload_reports_mt5_outage_without_error_details(self):
+        from mtdata.core import server
+
+        connection_error = {
+            "error": "terminal path and account details",
+            "error_code": "mt5_connection_error",
+            "remediation": "secret remediation context",
+        }
+        with patch.object(
+            server,
+            "mt5_connection_error",
+            return_value=connection_error,
+        ):
+            payload, status_code = server._mcp_readiness_payload()
+
+        assert status_code == 503
+        assert payload["ready"] is False
+        assert payload["components"]["mt5_connection"] == {
+            "status": "error",
+            "error_code": "mt5_connection_error",
+        }
+
+    def test_prefixed_sse_keeps_probes_at_server_root(self):
+        from starlette.testclient import TestClient
+
+        from mtdata.bootstrap.runtime import McpRuntimeSettings
+        from mtdata.core import server
+
+        captured = {}
+
+        def capture_app(app, **_kwargs):
+            captured["app"] = app
+
+        runtime = McpRuntimeSettings(transport="sse", mount_path="/mtdata")
+        with (
+            patch.object(server.mcp, "sse_app", return_value=MagicMock()),
+            patch("uvicorn.run", side_effect=capture_app),
+        ):
+            server._run_prefixed_sse(runtime)
+
+        with (
+            patch.object(server, "mt5_connection_error", return_value=None),
+            TestClient(captured["app"]) as client,
+        ):
+            assert client.get("/live").status_code == 200
+            ready = client.get("/ready")
+
+        assert ready.status_code == 200
+        assert ready.json()["ready"] is True
 
 # ── mcp instance ──────────────────────────────────────────────────────────
 

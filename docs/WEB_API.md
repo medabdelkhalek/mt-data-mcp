@@ -1,6 +1,6 @@
 # Web API
 
-Local HTTP access to mtdata for dashboards, notebooks, scripts, and apps — plus an optional React UI after you build `webui/`. Same research strengths as the CLI; **smaller surface** than full CLI/MCP (if a tool is missing here, use those instead).
+Local HTTP access to mtdata for dashboards, notebooks, scripts, and apps — and the **bundled chart workspace** served at `/app`. Peer delivery surface to CLI and MCP (same research stack; **smaller HTTP surface** than full CLI/MCP — if a tool is missing here, use those instead).
 
 **Base URL:** `http://localhost:8000` (default)
 
@@ -14,23 +14,31 @@ Local HTTP access to mtdata for dashboards, notebooks, scripts, and apps — plu
 
 ## Quick start
 
-Start the local server:
+### Start API → open UI
+
+Build the production SPA once with Node.js 22.12 or newer (Node is only required for this step, not at runtime):
 
 ```bash
+cd webui
+npm install
+npm run build
+cd ..
 mtdata-webapi
 ```
 
-Check health and fetch a small candle sample:
+Then open the chart workspace:
+
+```text
+http://127.0.0.1:8000/app/
+```
+
+The Python package does not ship generated `webui/dist/` assets. Without a build, REST stays available and `/app` returns a deliberate enablement page (HTML or JSON) with the same commands — not a silent skip or bare framework 404. Override the dist path with `WEBUI_DIST_DIR` if needed.
+
+### API smoke checks
 
 ```bash
 curl http://127.0.0.1:8000/api/v1/health
 curl "http://127.0.0.1:8000/api/v1/history?symbol=EURUSD&timeframe=H1&limit=50"
-```
-
-Open the bundled UI after building `webui/dist/`:
-
-```text
-http://127.0.0.1:8000/app
 ```
 
 ## Authentication
@@ -61,6 +69,11 @@ Security checklist for remote access:
 
 Responses are JSON. Most endpoints return compact, UI-oriented payloads rather than the full CLI/MCP output contract. For richer historical rows or method diagnostics, prefer the CLI with `--json` and `--extras`.
 
+Every response includes `X-Request-ID`. Clients may supply a log-safe identifier
+in the same request header (1–128 letters, digits, `.`, `_`, `:`, or `-`); the
+server otherwise generates one. Error envelopes and request-scoped operation
+logs use that same identifier so a failed HTTP call can be traced end to end.
+
 ## Endpoints
 
 ### Health / UI
@@ -74,8 +87,8 @@ Same liveness payload as `/`.
 #### `GET /ready`
 Readiness probe. Returns HTTP 200 when the API can establish an MT5 connection and HTTP 503 when MT5 is unavailable. Also available at `GET /api/ready` and `GET /api/v1/ready`.
 
-#### `GET /app`
-Serves the built Web UI (if `webui/dist/` exists).
+#### `GET /app` · `GET /app/`
+Serves the production chart workspace when `webui/dist/index.html` exists (or `WEBUI_DIST_DIR`). Asset URLs use the `/app/` base. If the dist is missing, responds with HTTP 503 and a professional enablement page (HTML by default; JSON when `Accept: application/json`) describing `npm run build` and restart.
 
 #### `GET /api/health`
 API liveness check. Also available at `GET /api/v1/health`.
@@ -108,7 +121,7 @@ Fetch OHLCV candles for a symbol.
   - `timestamp_format` (`epoch` | `iso`): Timestamp encoding for returned rows. Default `iso`; explicit epoch responses identify the unit as `unix_seconds_utc`.
   - `extras` (`metadata`, optional): Include full diagnostics and runtime metadata. Compact responses omit the diagnostic `meta` tree.
   - `denoise_method` (string, optional): Apply denoising (e.g., "ema").
-  - `denoise_params` (string, optional): JSON or "k=v" params for denoising.
+  - `denoise_params` (string, optional): JSON or comma-separated `k=v` denoising settings. Both forms accept `when`, `causality`, `keep_original`, and `columns`; other keys are method parameters. Use JSON for multiple columns.
 - **Response Notes:**
   - Compact responses expose `server_utc_offset_seconds` when available.
     `extras=metadata` includes the full runtime timezone tree under
@@ -172,6 +185,15 @@ List available dimensionality reduction methods (PCA, UMAP, t-SNE, etc.) with pa
 #### `GET /api/methods`
 List available forecasting models and their requirements.
 
+#### `GET /api/models`
+List trained model artifacts currently available in the model store.
+
+- **Query Params:** `method` (optional method-name filter), `extras` (optional
+  comma-separated output extras such as `metadata`, or `all`)
+- **Default response:** compact model rows plus `count`, `detail`, and
+  `success`; request metadata extras for storage paths, timestamps, TTL, and
+  artifact-size diagnostics.
+
 #### `GET /api/volatility/methods`
 List available volatility models and their requirements.
 
@@ -224,6 +246,42 @@ Generate volatility forecasts.
   "denoise": null
 }
 ```
+
+#### `GET /api/tools`
+List registered MCP tools for the Web UI runner (bootstraps the full tool surface).
+
+- **Query Params:** `category`, `search`, `detail` (`compact`|`standard`|`full`), `include_fields` (bool)
+- **Response:** tools with `surface` (`dedicated_ui`|`generic_runner`|`intentional_omit`) and `safety` metadata (confirm flags, warnings)
+
+#### `GET /api/tools/{tool_name}`
+Return one tool with parameter field descriptors for the form runner.
+
+#### `POST /api/tools/{tool_name}/invoke`
+Invoke a registered tool.
+
+```json
+{
+  "arguments": {
+    "symbol": "EURUSD",
+    "timeframe": "H1",
+    "extras": "metadata,guidance",
+    "fields": "symbol,summary"
+  },
+  "confirm": false
+}
+```
+
+Generic invocation uses the shared structured-output contract. Output is compact
+by default; `extras` requests richer sections and `guidance` adds related-tool
+suggestions when the tool defines them. `fields` accepts comma-separated names
+or dotted paths and keeps the standard envelope fields alongside each match.
+
+`forecast_tune_genetic` and `forecast_tune_optuna` are cataloged as
+`intentional_omit`: tuning can run longer than an HTTP request and the generic
+runner has no progress or cancellation contract. Run those tools through CLI or
+MCP instead.
+
+Live trade mutations (`trade_place`, `trade_modify`, `trade_close`) and destructive model/task tools require `"confirm": true`. See [WEBUI_TOOL_COVERAGE.md](WEBUI_TOOL_COVERAGE.md).
 
 #### `POST /api/backtest`
 Run a rolling-origin backtest.

@@ -34,10 +34,11 @@ from ..shared.schema import DenoiseSpec, IndicatorSpec, SimplifySpec, TimeframeL
 from ..shared.validators import invalid_timeframe_error
 from ..utils.coercion import round_finite
 from ..utils.denoise import (
-    apply_denoise as apply_denoise_util,
+    DenoiseCausalityError,
+    consume_denoise_warnings,
 )
 from ..utils.denoise import (
-    consume_denoise_warnings,
+    apply_denoise as apply_denoise_util,
 )
 from ..utils.denoise import (
     normalize_denoise_spec as _normalize_denoise_spec,
@@ -70,13 +71,25 @@ from ..utils.mt5 import (
     get_symbol_info_cached,
     mt5,
     resolve_broker_symbol_name,
+)
+from ..utils.mt5 import (
     symbol_candle_price_basis as _symbol_candle_price_basis,
+)
+from ..utils.mt5 import (
     symbol_path as _symbol_path,
+)
+from ..utils.mt5 import (
     symbol_price_currency as _symbol_price_currency,
+)
+from ..utils.mt5 import (
     symbol_price_digits as _symbol_price_digits,
+)
+from ..utils.mt5 import (
     symbol_price_point as _symbol_price_point,
 )
 from ..utils.ohlcv import validate_and_clean_ohlcv_frame
+from ..utils.quote import tick_epoch
+from ..utils.quote import tick_value as _tick_field_value
 
 # Simplify entrypoint and helpers.
 from ..utils.simplify import (
@@ -91,6 +104,8 @@ from ..utils.time import (
     _format_time_explicit,
     _format_time_explicit_local,
     _resolve_client_tz,
+    bar_close_epoch,
+    format_datetime_utc,
     format_epoch_utc,
 )
 from ..utils.utils import (
@@ -110,7 +125,8 @@ _TICK_SUMMARY_MIN_ANALYTIC_TICKS = 20
 _ONE_SIDED_TICK_WARNING_RATIO = 0.50
 _DATE_FORMAT_HINT = (
     "Accepted examples: '2026-01-15', '2026-01-15 14:30', "
-    "'2026-01-15T14:30:00Z', 'yesterday', '2 days ago', 'last Friday'."
+    "'2026-01-15T14:30:00Z', '2026-01-15 09:30 America/New_York', "
+    "'yesterday', '2 days ago', 'last Friday'."
 )
 _CANDLE_PRICE_COLUMNS = frozenset({"open", "high", "low", "close", "spread"})
 _TICK_PRICE_COLUMNS = frozenset({"bid", "ask", "mid", "spread", "last"})
@@ -221,9 +237,7 @@ def _round_tick_price_payload(out: Dict[str, Any], digits: int) -> None:
                 continue
             for key in _TICK_PRICE_STAT_KEYS:
                 if key in values:
-                    stat_digits = digits
-                    if name == "spread" and key in {"mean", "std", "stderr"}:
-                        stat_digits = max(digits + 2, digits)
+                    stat_digits = digits + 2 if name == "spread" else digits
                     values[key] = _round_price_value(values[key], stat_digits)
     last_quote = out.get("last_quote")
     if isinstance(last_quote, dict):
@@ -355,9 +369,11 @@ def _build_no_data_error_with_context(
         _bounded_weekend_no_data_context(symbol, start_datetime, end_datetime)
     )
     
-    # Try to sample available bars for this timeframe to suggest a usable range.
+    # Fetch only the latest available bar. Error construction must remain cheap;
+    # discovering the terminal's full historical floor would require an
+    # unbounded history read.
     try:
-        available_bars = _mt5_copy_rates_from_pos(symbol, mt5_timeframe, 0, 100_000)
+        available_bars = _mt5_copy_rates_from_pos(symbol, mt5_timeframe, 0, 1)
 
         if available_bars is not None and len(available_bars) > 0:
             times: List[float] = []
@@ -370,14 +386,13 @@ def _build_no_data_error_with_context(
                     times.append(epoch)
             if not times:
                 raise ValueError("available bars have no finite timestamps")
-            first_epoch = min(times)
             last_epoch = max(times)
-            first_time = datetime.fromtimestamp(first_epoch, tz=dt_timezone.utc)
             last_time = datetime.fromtimestamp(last_epoch, tz=dt_timezone.utc)
 
             details["available_range"] = {
-                "earliest": _format_time_explicit(first_epoch),
                 "latest": _format_time_explicit(last_epoch),
+                "earliest": None,
+                "earliest_status": "not_scanned",
             }
 
             # Provide a suggestion based on the mismatch
@@ -391,9 +406,6 @@ def _build_no_data_error_with_context(
                     if req_start and req_start > last_time:
                         error_msg = f"No data available - requested start date is after latest available data ({_format_time_explicit(last_epoch)})"
                         details["suggestion"] = f"Use start='{_format_time_explicit(last_epoch)}' or earlier"
-                    elif req_start and req_start < first_time:
-                        error_msg = f"No data available - requested date range is before earliest available data ({_format_time_explicit(first_epoch)})"
-                        details["suggestion"] = f"Use start='{_format_time_explicit(first_epoch)}' or later"
                 except Exception:
                     pass
     except Exception:
@@ -432,23 +444,30 @@ def _is_last_bar_forming(
 ) -> bool:
     """Return True if the last bar in *rates_or_df* is still forming."""
     try:
-        seconds_per_bar = TIMEFRAME_SECONDS.get(timeframe, 3600)
         current_time = (
             float(current_time_epoch)
             if current_time_epoch is not None and math.isfinite(float(current_time_epoch))
             else float(_utc_epoch_seconds(datetime.now(dt_timezone.utc)))
         )
         if isinstance(rates_or_df, pd.DataFrame):
-            if len(rates_or_df) == 0 or '__epoch' not in rates_or_df.columns:
+            if len(rates_or_df) == 0:
                 return False
-            last_epoch = float(rates_or_df['__epoch'].iloc[-1])
+            epoch_column = '__epoch' if '__epoch' in rates_or_df.columns else 'time'
+            if epoch_column not in rates_or_df.columns:
+                return True
+            last_epoch = float(rates_or_df[epoch_column].iloc[-1])
         else:
             if rates_or_df is None or len(rates_or_df) == 0:
                 return False
             last_epoch = float(rates_or_df[-1]["time"])
-        return 0 <= current_time - last_epoch < seconds_per_bar
+        return current_time < bar_close_epoch(last_epoch, timeframe)
     except Exception:
-        return False
+        # A non-empty tail whose timestamp cannot be classified must not be
+        # silently presented as a completed candle.
+        try:
+            return rates_or_df is not None and len(rates_or_df) > 0
+        except Exception:
+            return False
 
 
 def _drop_incomplete_tail(
@@ -590,11 +609,38 @@ def _fetch_rates_with_warmup(  # noqa: C901
         future_error = _future_start_error(start_datetime, from_date, seconds_per_bar)
         if future_error:
             return None, future_error
-        from_date_internal = from_date - timedelta(seconds=seconds_per_bar * (warmup_bars + extra_bars))
+        from_date_internal = from_date - timedelta(
+            seconds=seconds_per_bar * (warmup_bars + extra_bars)
+        )
         expected_end_ts = _utc_epoch_seconds(to_date)
+        requested_rows = max(1, candles + warmup_bars + extra_bars)
+        bounded_span_seconds = max(
+            seconds_per_bar * requested_rows * 2,
+            seconds_per_bar * requested_rows + 7 * 24 * 60 * 60,
+        )
+        provider_from_date = max(
+            from_date_internal,
+            to_date - timedelta(seconds=bounded_span_seconds),
+        )
+        if diagnostics is not None:
+            diagnostics["range_fetch"] = {
+                "provider_bounded": provider_from_date > from_date_internal,
+                "provider_start": _format_time_explicit(
+                    _utc_epoch_seconds(provider_from_date)
+                ),
+                "requested_start": _format_time_explicit(
+                    _utc_epoch_seconds(from_date)
+                ),
+                "provider_row_budget": requested_rows,
+            }
 
         def _fetch():
-            return _mt5_copy_rates_range(symbol, mt5_timeframe, from_date_internal, to_date)
+            return _mt5_copy_rates_range(
+                symbol,
+                mt5_timeframe,
+                provider_from_date,
+                to_date,
+            )
 
     elif start_datetime:
         from_date, from_date_error = _parse_fetch_datetime_arg(start_datetime)
@@ -606,16 +652,46 @@ def _fetch_rates_with_warmup(  # noqa: C901
         future_error = _future_start_error(start_datetime, from_date, seconds_per_bar)
         if future_error:
             return None, future_error
-        to_date = datetime.now(dt_timezone.utc)
+        now_utc = datetime.now(dt_timezone.utc)
+        from_date_internal = from_date - timedelta(
+            seconds=seconds_per_bar * (warmup_bars + extra_bars)
+        )
+        requested_rows = candles + extra_bars
+        # A start-only query means "the first N bars from start", not "the
+        # latest N bars, filtered by start".  Allow extra calendar space for
+        # closed sessions while retaining a bounded provider request.
+        span_seconds = seconds_per_bar * max(requested_rows * 3, requested_rows + 7)
+        to_date = min(now_utc, from_date + timedelta(seconds=span_seconds))
         expected_end_ts = _utc_epoch_seconds(to_date)
 
         def _fetch():
-            return _mt5_copy_rates_from(
-                symbol,
-                mt5_timeframe,
-                to_date,
-                candles + warmup_bars + extra_bars,
-            )
+            # Closed sessions consume calendar time without producing rows.
+            # Expand only when the bounded response cannot satisfy the first-N
+            # contract, stopping at the present rather than guessing a fixed
+            # weekend/holiday allowance.
+            candidate_end = to_date
+            result = None
+            for _ in range(8):
+                result = _mt5_copy_rates_range(
+                    symbol, mt5_timeframe, from_date_internal, candidate_end
+                )
+                if result is None:
+                    return None
+                qualifying = sum(
+                    float(row["time"]) >= _utc_epoch_seconds(from_date)
+                    for row in result
+                )
+                if qualifying >= candles or candidate_end >= now_utc:
+                    return result
+                elapsed = max(
+                    seconds_per_bar,
+                    (candidate_end - from_date).total_seconds(),
+                )
+                candidate_end = min(
+                    now_utc,
+                    from_date + timedelta(seconds=elapsed * 2),
+                )
+            return result
 
     elif end_datetime:
         to_date, to_date_error = _parse_fetch_datetime_arg(end_datetime, end_bound=True)
@@ -648,8 +724,24 @@ def _fetch_rates_with_warmup(  # noqa: C901
         if rates is not None and len(rates) > 0:
             last_t = rates[-1]["time"]
             freshness_cutoff = expected_end_ts - seconds_per_bar * (SANITY_BARS_TOLERANCE + extra_bars)
+            tail_is_forming = _is_last_bar_forming(
+                rates, timeframe, current_time_epoch=expected_end_ts
+            )
+            if tail_is_forming and include_incomplete:
+                # The forming bar itself proves the feed reached its open
+                # time; completed-bar freshness is attached after it is
+                # excluded, while live output gets last-tick freshness.
+                last_completed_epoch = float(last_t)
+            elif tail_is_forming and len(rates) >= 2:
+                last_completed_epoch = bar_close_epoch(
+                    rates[-2]["time"], timeframe
+                )
+            elif tail_is_forming:
+                last_completed_epoch = None
+            else:
+                last_completed_epoch = bar_close_epoch(last_t, timeframe)
             freshness_meta = _build_candle_freshness_diagnostics(
-                last_bar_epoch=last_t,
+                last_bar_epoch=last_completed_epoch,
                 expected_end_epoch=expected_end_ts,
                 freshness_cutoff_epoch=freshness_cutoff,
             )
@@ -710,7 +802,22 @@ def _parse_fetch_datetime_arg(
     parsed = _parse_end_datetime(value) if end_bound else _parse_start_datetime(value)
     if parsed is None:
         return None, f"Could not parse date {value!r}. {_DATE_FORMAT_HINT}"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_timezone.utc)
+    else:
+        parsed = parsed.astimezone(dt_timezone.utc)
     return parsed, None
+
+
+def _format_resolved_query_bound(value: datetime) -> str:
+    """Format a parsed query bound without hiding an inclusive day-end."""
+    resolved = (
+        value.replace(tzinfo=dt_timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(dt_timezone.utc)
+    )
+    timespec = "microseconds" if resolved.microsecond else "seconds"
+    return format_datetime_utc(resolved, timespec=timespec)
 
 
 def _future_start_error(
@@ -823,23 +930,6 @@ def _build_rates_df(rates: Any, use_client_tz: bool) -> pd.DataFrame:
     return df
 
 
-def _tick_field_value(tick: Any, name: str) -> Any:
-    if tick is None:
-        return None
-    try:
-        return tick[name]
-    except Exception:
-        pass
-    try:
-        return getattr(tick, name)
-    except Exception:
-        pass
-    try:
-        return tick.get(name)
-    except Exception:
-        return None
-
-
 def _fetch_ticks_range_with_retry(
     symbol: str,
     from_date: datetime,
@@ -872,6 +962,12 @@ def _fetch_recent_ticks_backwards(
 
     chunk_days = 1
     max_lookback_days = max(max(1, int(TICKS_LOOKBACK_DAYS)), 30)
+    budget_floor = to_date - timedelta(days=max_lookback_days)
+    effective_floor = (
+        max(min_from_date, budget_floor)
+        if min_from_date is not None
+        else budget_floor
+    )
     cursor_end = to_date
     lookback_days_used = 0
     saw_response = False
@@ -879,34 +975,54 @@ def _fetch_recent_ticks_backwards(
 
     while True:
         chunk_from = cursor_end - timedelta(days=chunk_days)
-        if min_from_date is not None and chunk_from < min_from_date:
-            chunk_from = min_from_date
+        if chunk_from < effective_floor:
+            chunk_from = effective_floor
 
+        overlaps_newer_range = saw_response
         ticks_candidate = _fetch_ticks_range_with_retry(symbol, chunk_from, cursor_end)
         if ticks_candidate is not None:
             saw_response = True
-            if len(ticks_candidate) > 0:
-                collected = list(ticks_candidate) + collected
+            candidate_rows = list(ticks_candidate)
+            if overlaps_newer_range and candidate_rows:
+                boundary_epoch = float(cursor_end.timestamp())
+                candidate_rows = [
+                    tick
+                    for tick in candidate_rows
+                    if (
+                        (tick_epoch := _tick_epoch_seconds_from_row(tick)) is None
+                        or tick_epoch < boundary_epoch
+                    )
+                ]
+            if candidate_rows:
+                collected = candidate_rows + collected
                 if len(collected) > limit:
                     collected = collected[-limit:]
                 if len(collected) >= limit:
                     break
 
-        if min_from_date is not None:
-            if chunk_from <= min_from_date:
-                break
-        else:
-            lookback_days_used += chunk_days
-            if lookback_days_used >= max_lookback_days:
-                break
+        chunk_span_days = max(
+            1,
+            int(math.ceil((cursor_end - chunk_from).total_seconds() / 86_400.0)),
+        )
+        lookback_days_used += chunk_span_days
+        if chunk_from <= effective_floor or lookback_days_used >= max_lookback_days:
+            break
 
-        cursor_end = chunk_from - timedelta(microseconds=1)
+        cursor_end = chunk_from
+        chunk_days = min(
+            chunk_days * 2,
+            max(1, max_lookback_days - lookback_days_used),
+        )
 
     if collected:
         return collected
     if saw_response:
         return []
     return None
+
+
+def _tick_epoch_seconds_from_row(tick: Any) -> Optional[float]:
+    return tick_epoch(tick)
 
 
 def _trim_df_to_target(
@@ -916,6 +1032,7 @@ def _trim_df_to_target(
     candles: int,
     *,
     copy_rows: bool = True,
+    timeframe: Optional[str] = None,
 ) -> pd.DataFrame:
     if start_datetime and end_datetime:
         from_dt = _parse_start_datetime(start_datetime)
@@ -925,7 +1042,9 @@ def _trim_df_to_target(
             return out.copy() if copy_rows else out
         target_from = _utc_epoch_seconds(from_dt)
         target_to = _utc_epoch_seconds(to_dt)
-        out = df.loc[(df['__epoch'] >= target_from) & (df['__epoch'] <= target_to)]
+        out = df.loc[
+            (df["__epoch"] >= target_from) & (df["__epoch"] <= target_to)
+        ]
     elif start_datetime:
         from_dt = _parse_start_datetime(start_datetime)
         if not from_dt:
@@ -934,14 +1053,14 @@ def _trim_df_to_target(
         target_from = _utc_epoch_seconds(from_dt)
         out = df.loc[df['__epoch'] >= target_from]
         if len(out) > candles:
-            out = out.iloc[-candles:]
+            out = out.iloc[:candles]
     elif end_datetime:
         to_dt = _parse_end_datetime(end_datetime)
         if not to_dt:
             out = df.iloc[0:0]
             return out.copy() if copy_rows else out
         target_to = _utc_epoch_seconds(to_dt)
-        out = df.loc[df['__epoch'] <= target_to]
+        out = df.loc[df["__epoch"] <= target_to]
         if len(out) > candles:
             out = out.iloc[-candles:]
     else:
@@ -1119,12 +1238,22 @@ def _normalize_candle_spread_columns(
         df.rename(columns={"spread": "spread_points"}, inplace=True)
     if "spread_points" not in df.columns:
         return
+    spread_points = pd.to_numeric(df["spread_points"], errors="coerce")
+    spread_available = spread_points.notna() & spread_points.gt(0.0)
+    df["spread_available"] = spread_available
+    df["spread_points"] = spread_points.astype(object).where(
+        spread_available,
+        None,
+    )
     if "spread_points" not in headers:
         headers.append("spread_points")
+    if "spread_available" not in headers:
+        headers.append("spread_available")
     if price_point is None or price_point <= 0.0:
         return
-    df["spread"] = pd.to_numeric(df["spread_points"], errors="coerce") * float(
-        price_point
+    df["spread"] = (spread_points * float(price_point)).astype(object).where(
+        spread_available,
+        None,
     )
     if "spread" not in headers:
         headers.insert(headers.index("spread_points"), "spread")
@@ -1164,6 +1293,7 @@ def _append_denoise_application(
     default_keep_original: bool,
     added_columns: List[str],
     overwritten_columns: List[str],
+    ohlc_geometry_repaired: int = 0,
 ) -> None:
     if not added_columns and not overwritten_columns:
         return
@@ -1171,18 +1301,19 @@ def _append_denoise_application(
         denoise_meta = dict(source_spec or {})
         columns = denoise_meta.get('columns', 'close')
         keep_original = bool(denoise_meta.get('keep_original', default_keep_original))
-        denoise_apps.append(
-            {
-                'method': str(denoise_meta.get('method', 'none')).lower(),
-                'when': str(denoise_meta.get('when', default_when)).lower(),
-                'causality': str(denoise_meta.get('causality', default_causality)),
-                'keep_original': keep_original,
-                'columns': columns,
-                'params': denoise_meta.get('params') or {},
-                'added_columns': added_columns,
-                'overwrote_columns': overwritten_columns,
-            }
-        )
+        application = {
+            'method': str(denoise_meta.get('method', 'none')).lower(),
+            'when': str(denoise_meta.get('when', default_when)).lower(),
+            'causality': str(denoise_meta.get('causality', default_causality)),
+            'keep_original': keep_original,
+            'columns': columns,
+            'params': denoise_meta.get('params') or {},
+            'added_columns': added_columns,
+            'overwrote_columns': overwritten_columns,
+        }
+        if ohlc_geometry_repaired > 0:
+            application['ohlc_geometry_repaired'] = int(ohlc_geometry_repaired)
+        denoise_apps.append(application)
     except Exception:
         pass
 
@@ -1223,6 +1354,11 @@ def _apply_pre_ti_denoise(
             if isinstance(last_application, dict)
             else []
         )
+        ohlc_geometry_repaired = (
+            int(last_application.get("ohlc_geometry_repaired") or 0)
+            if isinstance(last_application, dict)
+            else 0
+        )
         _extend_unique_headers(headers, added_columns)
         _append_denoise_application(
             denoise_apps,
@@ -1232,6 +1368,7 @@ def _apply_pre_ti_denoise(
             default_keep_original=True,
             added_columns=added_columns,
             overwritten_columns=overwritten_columns,
+            ohlc_geometry_repaired=ohlc_geometry_repaired,
         )
 
 
@@ -1340,6 +1477,11 @@ def _apply_post_ti_denoise(
             if isinstance(last_application, dict)
             else []
         )
+        ohlc_geometry_repaired = (
+            int(last_application.get("ohlc_geometry_repaired") or 0)
+            if isinstance(last_application, dict)
+            else 0
+        )
         _extend_unique_headers(headers, added_columns)
         _append_denoise_application(
             denoise_apps,
@@ -1349,6 +1491,7 @@ def _apply_post_ti_denoise(
             default_keep_original=True,
             added_columns=added_columns,
             overwritten_columns=overwritten_columns,
+            ohlc_geometry_repaired=ohlc_geometry_repaired,
         )
 
 
@@ -1513,7 +1656,14 @@ def _public_simplify_meta(meta: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(meta, dict):
         return None
     out: Dict[str, Any] = {}
-    for key in ("method", "mode", "points", "ratio"):
+    for key in (
+        "method",
+        "mode",
+        "points",
+        "ratio",
+        "non_ohlc_numeric_aggregation",
+        "segment_mean_columns",
+    ):
         value = meta.get(key)
         if value is not None:
             out[key] = value
@@ -1538,6 +1688,29 @@ def fetch_candles(  # noqa: C901
 ) -> Dict[str, Any]:
     """Return historical candles as tabular data."""
     try:
+        if denoise:
+            try:
+                _normalize_denoise_spec(denoise, default_when="pre_ti")
+            except DenoiseCausalityError as exc:
+                return {
+                    "success": False,
+                    "error_code": "denoise_non_causal_requires_opt_in",
+                    "error": (
+                        f"Denoise method '{exc.method}' requires explicit zero-phase "
+                        "opt-in because it uses future bars."
+                    ),
+                    "operation": "data_fetch_candles",
+                    "remediation": (
+                        "Set denoise causality to zero_phase only for retrospective "
+                        "analysis (CLI: --denoise-params causality=zero_phase). "
+                        "Do not use zero-phase output for live signals or forward tests."
+                    ),
+                    "details": {
+                        "method": exc.method,
+                        "required_causality": "zero_phase",
+                        "uses_future_bars": True,
+                    },
+                }
         symbol = resolve_broker_symbol_name(symbol)
         query_started_at = time.perf_counter()
         # Backward/compat mappings to internal variable names used in implementation
@@ -1624,13 +1797,16 @@ def fetch_candles(  # noqa: C901
             )
         raw_bars_fetched = int(len(rates))
         live_bar_reference_epoch = _resolve_live_bar_reference_epoch(symbol, timeframe)
+        # Requested bounds only clip the returned window. Bar completion is a
+        # live fact and must never be advanced by a future range end.
+        completion_reference_epoch = live_bar_reference_epoch
         initial_incomplete_trimmed = False
         if not include_incomplete:
             rates_before_trim = int(len(rates))
             rates = _drop_incomplete_tail(
                 rates,
                 timeframe,
-                current_time_epoch=live_bar_reference_epoch,
+                current_time_epoch=completion_reference_epoch,
             )
             initial_incomplete_trimmed = int(len(rates)) < rates_before_trim
         if len(rates) == 0:
@@ -1675,12 +1851,20 @@ def fetch_candles(  # noqa: C901
         denoise_warnings.extend(consume_denoise_warnings(df))
 
         # Filter out warmup region to return the intended target window only
-        df = _trim_df_to_target(df, start_datetime, end_datetime, candles, copy_rows=True)
+        df = _trim_df_to_target(
+            df,
+            start_datetime,
+            end_datetime,
+            candles,
+            copy_rows=True,
+            timeframe=timeframe,
+        )
         rows_after_target_trim = int(len(df))
         warmup_retry_meta: Dict[str, Any] = {
             "applied": False,
             "warmup_bars": int(warmup_bars),
         }
+        indicator_window_rebuilt = False
         indicator_rows_dropped = 0
 
         # If TI requested, check for NaNs and retry once with increased warmup
@@ -1715,6 +1899,7 @@ def fetch_candles(  # noqa: C901
                         )
                     # Rebuild df and indicators with the larger window
                     if retry_applied:
+                        indicator_window_rebuilt = True
                         df, ti_cols = _rebuild_candle_indicator_window(
                             rates_retry,
                             use_client_tz=_use_ctz,
@@ -1741,7 +1926,14 @@ def fetch_candles(  # noqa: C901
                         if len(df) == 0:
                             return {"error": f"No valid candle data available for {symbol}"}
                         # Re-trim to target window
-                        df = _trim_df_to_target(df, start_datetime, end_datetime, candles, copy_rows=False)
+                        df = _trim_df_to_target(
+                            df,
+                            start_datetime,
+                            end_datetime,
+                            candles,
+                            copy_rows=False,
+                            timeframe=timeframe,
+                        )
                         rows_after_target_trim = int(len(df))
             except Exception as exc:
                 warmup_retry_meta["error"] = str(exc)
@@ -1788,14 +1980,17 @@ def fetch_candles(  # noqa: C901
                 )
                 rows_after_target_trim = int(len(df))
 
-        # Authoritative incomplete-tail trim: covers the initial fetch *and*
-        # the TI-retry rebuild path, applied before any non-causal transforms.
+        # Authoritative incomplete-tail trim for paths not already trimmed.
+        # The ordinary fetch was classified above; do not classify its new
+        # tail a second time when a mocked/feed clock is behind the bar open.
         _trimmed_incomplete = False
-        if not include_incomplete:
+        if not include_incomplete and (
+            not initial_incomplete_trimmed or indicator_window_rebuilt
+        ):
             df, _trimmed_incomplete = _drop_incomplete_tail_df(
                 df,
                 timeframe,
-                current_time_epoch=live_bar_reference_epoch,
+                current_time_epoch=completion_reference_epoch,
             )
 
         # Optional post-TI denoising (adds new columns by default)
@@ -1832,7 +2027,7 @@ def fetch_candles(  # noqa: C901
         tail_is_forming = _is_last_bar_forming(
             df,
             timeframe,
-            current_time_epoch=live_bar_reference_epoch,
+            current_time_epoch=completion_reference_epoch,
         )
         ti_added_cols = [str(c) for c in ti_cols if isinstance(c, str)]
         price_indicator_cols = _price_indicator_columns(ti_added_cols)
@@ -1958,11 +2153,20 @@ def fetch_candles(  # noqa: C901
                         "quality_rows_removed": int(quality_rows_removed),
                         "cache_status": "unknown",
                         "warmup_retry": warmup_retry_meta,
+                        **(
+                            dict(rate_fetch_diagnostics.get("range_fetch"))
+                            if isinstance(
+                                rate_fetch_diagnostics.get("range_fetch"), dict
+                            )
+                            else {}
+                        ),
                     },
                     "indicators": {
                         "requested": bool(ti_spec),
                         "spec": _normalize_indicator_spec_for_display(ti_spec),
                         "added_columns": ti_added_cols,
+                        "volume_source": df.attrs.get("indicator_volume_source"),
+                        "index_time_basis": "utc_epoch" if ti_spec else None,
                     },
                     "session_gaps": {
                         "expected_bar_seconds": float(expected_bar_seconds) if expected_bar_seconds > 0 else None,
@@ -1988,13 +2192,13 @@ def fetch_candles(  # noqa: C901
             "end": latest_bar_time,
             "requested_limit": candles_requested,
             "returned_count": candles_returned,
-            "latest_bar_complete": not forming_candle_included,
+            "latest_bar_complete": not tail_is_forming,
         }
         if latest_bar_epoch is not None and query_mode != "range":
             latest_bar_age_epoch = float(latest_bar_epoch)
             latest_bar_age_metric = "latest_bar_open_age_seconds"
             if not forming_candle_included and expected_bar_seconds > 0:
-                latest_bar_age_epoch = float(latest_bar_epoch) + float(expected_bar_seconds)
+                latest_bar_age_epoch = bar_close_epoch(latest_bar_epoch, timeframe)
                 latest_bar_age_metric = "latest_completed_bar_close_age_seconds"
             data_window["latest_bar_age_seconds"] = round(
                 max(0.0, float(as_of_epoch) - latest_bar_age_epoch),
@@ -2021,8 +2225,35 @@ def fetch_candles(  # noqa: C901
             }
             if start_datetime not in (None, ""):
                 query_applied["start"] = start_datetime
+                resolved_start, _ = _parse_fetch_datetime_arg(start_datetime)
+                if resolved_start is not None:
+                    query_applied["resolved_start"] = _format_resolved_query_bound(
+                        resolved_start
+                    )
+                    query_applied["start_bound"] = (
+                        "inclusive_day_start"
+                        if re.fullmatch(
+                            r"\d{4}-\d{2}-\d{2}", str(start_datetime).strip()
+                        )
+                        else "inclusive_instant"
+                    )
             if end_datetime not in (None, ""):
                 query_applied["end"] = end_datetime
+                resolved_end, _ = _parse_fetch_datetime_arg(
+                    end_datetime,
+                    end_bound=True,
+                )
+                if resolved_end is not None:
+                    query_applied["resolved_end"] = _format_resolved_query_bound(
+                        resolved_end
+                    )
+                    query_applied["end_bound"] = (
+                        "inclusive_day_end"
+                        if re.fullmatch(
+                            r"\d{4}-\d{2}-\d{2}", str(end_datetime).strip()
+                        )
+                        else "inclusive_instant"
+                    )
             payload["query_applied"] = query_applied
         if price_currency:
             payload["price_currency"] = price_currency
@@ -2038,8 +2269,9 @@ def fetch_candles(  # noqa: C901
         if isinstance(freshness_diagnostics, dict):
             payload["meta"]["diagnostics"]["freshness"] = dict(freshness_diagnostics)
         if include_spread:
-            payload["spread_source"] = "mt5_candle"
+            payload["spread_historical_source"] = "mt5_candle"
             payload["spread_historical_available"] = True
+            payload["spread_mode"] = "per_bar"
         if session_gap_warning:
             payload["meta"]["diagnostics"]["session_gaps"]["warning"] = session_gap_warning
         payload["timezone"] = _timezone_label(use_client_tz=_use_ctz, client_tz=client_tz)
@@ -2047,15 +2279,28 @@ def fetch_candles(  # noqa: C901
             payload["simplified"] = True
             payload["simplify"] = _public_simplify_meta(simplify_meta) or {"applied": True}
             simplify_method = str(simplify_meta.get("method") or "").strip().lower()
+            simplify_mode = str(simplify_meta.get("mode") or "").strip().lower()
+            segment_mean_columns = list(simplify_meta.get("segment_mean_columns") or [])
             simplify_reduced_rows = int(original_rows) > int(len(df))
-            if simplify_reduced_rows and simplify_method in {"lttb", "rdp", "pla", "apca"}:
+            visualization_only = simplify_method in {"lttb", "rdp", "pla", "apca"}
+            approximate_derived_values = bool(
+                simplify_mode == "approximate" and segment_mean_columns
+            )
+            if simplify_reduced_rows and (visualization_only or approximate_derived_values):
                 payload["series_type"] = "downsampled_visualization"
                 payload["equal_interval"] = False
                 payload["analysis_compatible"] = False
-                payload.setdefault("warnings", []).append(
-                    "Simplified candle rows are visualization samples with irregular time gaps; "
-                    "do not use them as equal-interval OHLC input for indicators or forecasts."
-                )
+                if approximate_derived_values:
+                    payload.setdefault("warnings", []).append(
+                        "Approximate simplification reports non-OHLC numeric columns as "
+                        "segment means, not recomputed analytical values; do not use them "
+                        "for indicator thresholds or forecasts."
+                    )
+                else:
+                    payload.setdefault("warnings", []).append(
+                        "Simplified candle rows are visualization samples with irregular time gaps; "
+                        "do not use them as equal-interval OHLC input for indicators or forecasts."
+                    )
         # Attach denoise applications metadata if any
         if denoise_apps:
             payload['denoise'] = {'applications': denoise_apps}
@@ -2142,131 +2387,73 @@ def fetch_candles(  # noqa: C901
         # If include_spread requested but spread data is missing or all zero, try fallback estimate from recent ticks.
         if include_spread:
             data_rows = payload.get("data", []) or []
-            has_spread_values = False
-            spread_all_zero = True
-            spread_value_count = 0
-            spread_zero_count = 0
-            spread_indices: List[int] = []
-            try:
-                spread_indices = [
-                    headers.index(field)
-                    for field in ("spread", "spread_points")
-                    if field in headers
-                ]
-            except Exception:
-                spread_indices = []
+            spread_row_count = len(data_rows)
+            spread_available_count = 0
             for row in data_rows:
                 if isinstance(row, dict):
-                    spread_value = row.get("spread_points", row.get("spread"))
-                    if spread_value is not None:
-                        has_spread_values = True
-                        spread_value_count += 1
-                        try:
-                            if float(spread_value) == 0.0:
-                                spread_zero_count += 1
-                            else:
-                                spread_all_zero = False
-                        except Exception:
-                            has_spread_values = True
-                            spread_all_zero = False
-                elif isinstance(row, (list, tuple)):
-                    for spread_idx in spread_indices:
-                        if spread_idx >= len(row):
-                            continue
-                        val = row[spread_idx]
-                        if val is not None:
-                            has_spread_values = True
-                            spread_value_count += 1
-                            try:
-                                if float(val) == 0.0:
-                                    spread_zero_count += 1
-                                else:
-                                    spread_all_zero = False
-                            except Exception:
-                                has_spread_values = True
-                                spread_all_zero = False
-                        break
-            spread_mostly_zero = (
-                has_spread_values
-                and spread_value_count >= 3
-                and spread_zero_count / float(spread_value_count) >= 0.75
+                    if row.get("spread_available") is True:
+                        spread_available_count += 1
+
+            spread_missing_count = max(0, spread_row_count - spread_available_count)
+            coverage_pct = (
+                (spread_available_count / float(spread_row_count)) * 100.0
+                if spread_row_count
+                else 0.0
             )
-            if not has_spread_values or spread_all_zero or spread_mostly_zero:
-                data_rows = _remove_unavailable_spread_from_candle_rows(
-                    data_rows,
-                    spread_indices=spread_indices,
+            payload["spread_historical_available"] = bool(
+                spread_row_count and spread_missing_count == 0
+            )
+            payload["spread_historical_coverage_pct"] = round(coverage_pct, 2)
+            payload["spread_missing_count"] = spread_missing_count
+            payload["spread_source"] = (
+                "mt5_candle"
+                if spread_missing_count == 0 and spread_row_count
+                else "mt5_candle_partial"
+                if spread_available_count
+                else "unavailable"
+            )
+            if spread_missing_count:
+                payload["spread_mode"] = (
+                    "partial_per_bar" if spread_available_count else "unavailable"
                 )
-                payload["data"] = data_rows
-                payload["spread_historical_available"] = False
-                payload.pop("spread_source", None)
-                units = payload.get("units")
-                if isinstance(units, dict):
-                    units.pop("spread", None)
-                    units.pop("spread_points", None)
-                    if not units:
-                        payload.pop("units", None)
-                if spread_mostly_zero and not spread_all_zero:
-                    payload.setdefault("warnings", []).append(
-                        "include_spread native candle spread is zero for most bars; "
-                        "using an estimated spread because MT5 candle spread appears sparse."
-                    )
+                payload.setdefault("warnings", []).append(
+                    "Historical candle spread is unavailable for "
+                    f"{spread_missing_count} of {spread_row_count} row(s); those "
+                    "spread values are null and must not be treated as zero cost."
+                )
+            if spread_available_count == 0:
                 try:
-                    tick_stats = fetch_ticks(symbol, limit=5000, format="stats")
-                    spread_stats = tick_stats.get("stats", {}).get("spread")
-                    est_mean = None
-                    if isinstance(spread_stats, dict):
-                        est_mean = spread_stats.get("mean") or spread_stats.get("median") or spread_stats.get("first")
-                    estimate_source = "tick_stats"
-                    live_spread = _live_tick_spread(symbol)
-                    if est_mean is not None:
-                        est_mean = float(est_mean)
-                        if live_spread is not None and live_spread > 0.0:
-                            diff_ratio = abs(float(live_spread) - est_mean) / max(float(live_spread), abs(est_mean), 1e-12)
-                            payload.setdefault("meta", {}).setdefault("diagnostics", {}).setdefault("spread_estimate", {})["live_spread"] = live_spread
-                            payload["meta"]["diagnostics"]["spread_estimate"]["live_diff_ratio"] = diff_ratio
-                            if diff_ratio > 0.5:
-                                payload.setdefault("warnings", []).append(
-                                    "include_spread tick-stat estimate differed from live spread "
-                                    f"by {diff_ratio:.0%}; live ticker spread ({live_spread:g}) applied."
-                                )
-                                est_mean = float(live_spread)
-                                estimate_source = "live_ticker_crosscheck"
-                                payload["spread_accuracy"] = "tick_stats_replaced_by_live"
+                    live_spread, reference_freshness = _live_tick_spread_reference(symbol)
+                    if live_spread is not None:
+                        estimate = float(live_spread)
                         payload.setdefault("warnings", []).append(
-                            "include_spread requested but per-bar spread unavailable; a single "
-                            f"reference spread from {estimate_source} ({est_mean:g}) is returned "
+                            "include_spread requested but historical per-bar spread is "
+                            "unavailable; a single current live ticker reference "
+                            f"({estimate:g}) is returned "
                             "at payload level and is not per-bar historical spread."
                         )
                         payload["spread_reference"] = {
-                            "value": est_mean,
+                            "value": estimate,
                             "unit": "price",
-                            "source": estimate_source,
+                            "source": "live_ticker",
                             "basis": "single_reference_not_per_bar_historical",
+                            **reference_freshness,
                         }
-                        payload.setdefault("meta", {}).setdefault("diagnostics", {}).setdefault("spread_estimate", {})["estimated_mean"] = est_mean
-                        payload["meta"]["diagnostics"]["spread_estimate"]["source"] = estimate_source
+                        payload["spread_mode"] = "single_reference"
+                        payload["spread_source"] = "live_ticker"
+                        payload.setdefault("meta", {}).setdefault("diagnostics", {}).setdefault("spread_estimate", {})["estimated_mean"] = estimate
+                        payload["meta"]["diagnostics"]["spread_estimate"]["source"] = "live_ticker"
                         payload["meta"]["diagnostics"]["spread_estimate"]["unit"] = "price"
-                        payload["meta"]["diagnostics"]["spread_estimate"]["tick_stats"] = spread_stats
-                    else:
-                        # Fallback to live ticker
-                        if live_spread is not None:
-                            est_mean = float(live_spread)
-                            payload.setdefault("warnings", []).append(
-                                "include_spread requested but spread unavailable; "
-                                f"current live ticker spread ({est_mean:g}) is returned at payload "
-                                "level and is not per-bar historical spread."
-                            )
-                            payload["spread_reference"] = {
-                                "value": est_mean,
-                                "unit": "price",
-                                "source": "live_ticker",
-                                "basis": "single_reference_not_per_bar_historical",
-                            }
-                            payload.setdefault("meta", {}).setdefault("diagnostics", {}).setdefault("spread_estimate", {})["estimated_mean"] = est_mean
-                            payload["meta"]["diagnostics"]["spread_estimate"]["source"] = "live_ticker"
-                            payload["meta"]["diagnostics"]["spread_estimate"]["unit"] = "price"
                 except Exception:
                     payload.setdefault("warnings", []).append("include_spread requested but spread unavailable; no fallback available.")
+                if payload.get("spread_mode") == "unavailable" and not any(
+                    "include_spread requested" in str(item)
+                    for item in payload.get("warnings", [])
+                ):
+                    payload.setdefault("warnings", []).append(
+                        "include_spread requested but historical per-bar spread and a "
+                        "live/tick reference are unavailable."
+                    )
 
         return payload
     except Exception as e:
@@ -2282,7 +2469,9 @@ def fetch_candles(  # noqa: C901
         }
 
 
-def _live_tick_spread(symbol: str) -> Optional[float]:
+def _live_tick_spread_reference(
+    symbol: str,
+) -> Tuple[Optional[float], Dict[str, Any]]:
     try:
         tick = mt5.symbol_info_tick(symbol)
     except Exception:
@@ -2293,30 +2482,29 @@ def _live_tick_spread(symbol: str) -> Optional[float]:
         bid_f = float(bid)
         ask_f = float(ask)
     except Exception:
-        return None
-    if not math.isfinite(bid_f) or not math.isfinite(ask_f):
-        return None
-    spread = max(0.0, ask_f - bid_f)
-    return spread if spread > 0.0 else None
-
-
-def _remove_unavailable_spread_from_candle_rows(
-    data_rows: list[Any],
-    *,
-    spread_indices: list[int],
-) -> list[Any]:
-    for i, row in enumerate(data_rows):
-        if isinstance(row, dict):
-            row.pop("spread", None)
-            row.pop("spread_points", None)
-            row.pop("spread_source", None)
-        else:
-            row_list = list(row)
-            for spread_idx in spread_indices:
-                if spread_idx < len(row_list):
-                    row_list[spread_idx] = None
-            data_rows[i] = row_list
-    return data_rows
+        spread = None
+    else:
+        spread = (
+            ask_f - bid_f
+            if math.isfinite(bid_f) and math.isfinite(ask_f) and ask_f > bid_f
+            else None
+        )
+    epoch = tick_epoch(tick) if tick is not None else None
+    context = build_tick_freshness_context(
+        symbol,
+        tick_epoch=epoch,
+        now_epoch=time.time(),
+        item="spread reference",
+        age_rounder=lambda value: round(value, 3),
+    )
+    freshness = {
+        "reference_time": _format_time_explicit(epoch) if epoch is not None else None,
+        "reference_time_epoch": epoch,
+        "data_age_seconds": context.get("data_age_seconds"),
+        "freshness_state": context.get("freshness_state") or "unknown",
+        "usable_for_live_trading": context.get("usable_for_live_trading") is True,
+    }
+    return spread, freshness
 
 
 def _mt5_tick_flag_value(name: str, default: int) -> int:
@@ -2357,11 +2545,6 @@ def _tick_flag_definitions() -> tuple[tuple[int, str, str], ...]:
             _mt5_tick_flag_value("TICK_FLAG_SELL", 64),
             "sell",
             "Last trade was seller-initiated.",
-        ),
-        (
-            _mt5_tick_flag_value("TICK_FLAG_VOLUME_REAL", 1024),
-            "volume_real",
-            "Last-trade real volume changed in this snapshot.",
         ),
     )
 
@@ -2407,10 +2590,13 @@ def _json_safe_payload(value: Any) -> Any:
         return [_json_safe_payload(item) for item in value]
     if isinstance(value, tuple):
         return [_json_safe_payload(item) for item in value]
+    if value is None or isinstance(value, (bool, str, bytes)):
+        return value
     if isinstance(value, Real) and not isinstance(value, bool):
         number = float(value)
         if not math.isfinite(number):
             return None
+        return value
     try:
         if pd.isna(value) and not isinstance(value, (str, bytes)):
             return None
@@ -2466,6 +2652,10 @@ def _compact_tick_summary(out: Dict[str, Any]) -> Dict[str, Any]:
         "broker_server_tz",
         "session_utc_offset_seconds",
         "spread_statistics_basis",
+        "history_window_truncated",
+        "history_window_limit_days",
+        "history_window_floor",
+        "warnings",
     ):
         if out.get(key) is not None:
             compact[key] = out.get(key)
@@ -2514,6 +2704,8 @@ def fetch_ticks(  # noqa: C901
     try:
         symbol = resolve_broker_symbol_name(symbol)
         effective_limit = int(limit)
+        history_window_truncated = False
+        history_window_floor: Optional[datetime] = None
         if effective_limit <= 0:
             return {"error": "limit must be greater than 0."}
         # Ensure symbol is ready; remember original visibility to restore later
@@ -2553,19 +2745,44 @@ def fetch_ticks(  # noqa: C901
                         return {"error": f"Could not parse end date {end!r}. {_DATE_FORMAT_HINT}"}
                     if from_date > to_date:
                         return {"error": "start must be before or equal to end."}
-                    ticks = _fetch_ticks_range_with_retry(symbol, from_date, to_date)
-                    if ticks is not None and effective_limit and len(ticks) > effective_limit:
-                        ticks = ticks[-effective_limit:]
-                else:
+                    max_lookback_days = max(max(1, int(TICKS_LOOKBACK_DAYS)), 30)
+                    history_window_floor = to_date - timedelta(days=max_lookback_days)
+                    history_window_truncated = from_date < history_window_floor
                     ticks = _fetch_recent_ticks_backwards(
                         symbol,
-                        to_date=datetime.now(dt_timezone.utc),
+                        to_date=to_date,
+                        limit=effective_limit,
+                        min_from_date=from_date,
+                    )
+                else:
+                    max_lookback_days = max(max(1, int(TICKS_LOOKBACK_DAYS)), 30)
+                    history_to_date = datetime.now(dt_timezone.utc)
+                    if from_date.tzinfo is None or from_date.utcoffset() is None:
+                        history_to_date = history_to_date.replace(tzinfo=None)
+                    history_window_floor = history_to_date - timedelta(
+                        days=max_lookback_days
+                    )
+                    history_window_truncated = from_date < history_window_floor
+                    ticks = _fetch_recent_ticks_backwards(
+                        symbol,
+                        to_date=history_to_date,
                         limit=effective_limit,
                         min_from_date=from_date,
                     )
             else:
-                # Get recent ticks from current time (now)
-                to_date = datetime.now(dt_timezone.utc)
+                # End-only requests are historical backward queries anchored
+                # at the supplied endpoint, not aliases for "latest".
+                if end:
+                    to_date = _parse_end_datetime(end)
+                    if not to_date:
+                        return {
+                            "error": (
+                                f"Could not parse end date {end!r}. "
+                                f"{_DATE_FORMAT_HINT}"
+                            )
+                        }
+                else:
+                    to_date = datetime.now(dt_timezone.utc)
                 ticks = _fetch_recent_ticks_backwards(
                     symbol,
                     to_date=to_date,
@@ -2588,16 +2805,6 @@ def fetch_ticks(  # noqa: C901
                 )
             }
 
-        def _tick_epoch_seconds(tick: Any) -> float:
-            time_msc = _tick_field_value(tick, "time_msc")
-            try:
-                time_msc_value = float(time_msc)
-            except (TypeError, ValueError):
-                time_msc_value = float("nan")
-            if math.isfinite(time_msc_value) and time_msc_value > 0.0:
-                return time_msc_value / 1000.0
-            return float(_tick_field_value(tick, "time"))
-
         # Extract shared tick columns once so summary/stats, simplification,
         # and row rendering can all reuse the same values.
         _epochs: List[float] = []
@@ -2612,7 +2819,10 @@ def fetch_ticks(  # noqa: C901
         trade_events: List[bool] = []
         quote_types: List[str] = []
         for tick in ticks:
-            _epochs.append(_tick_epoch_seconds(tick))
+            tick_time = tick_epoch(tick)
+            if tick_time is None:
+                raise ValueError("tick timestamp unavailable")
+            _epochs.append(tick_time)
             bid_value = _finite_or_none(_tick_field_value(tick, "bid"))
             ask_value = _finite_or_none(_tick_field_value(tick, "ask"))
             bid = float("nan") if bid_value is None else bid_value
@@ -2914,6 +3124,19 @@ def fetch_ticks(  # noqa: C901
 
         def _add_tick_context_fields(payload: Dict[str, Any]) -> None:
             payload["spread_statistics_basis"] = "coherent_bid_ask_updates"
+            if history_window_truncated:
+                payload["history_window_truncated"] = True
+                payload["history_window_limit_days"] = max(
+                    max(1, int(TICKS_LOOKBACK_DAYS)), 30
+                )
+                if history_window_floor is not None:
+                    payload["history_window_floor"] = _format_time_explicit(
+                        history_window_floor.timestamp()
+                    )
+                payload.setdefault("warnings", []).append(
+                    "Tick history retrieval stopped at the configured lookback "
+                    "budget before reaching the requested start."
+                )
             last_quote = payload.get("last_quote")
             if isinstance(last_quote, dict) and price_point is not None:
                 spread_value = _finite_or_none(last_quote.get("spread"))
@@ -2943,6 +3166,27 @@ def fetch_ticks(  # noqa: C901
                 age_rounder=lambda value: round(value, 3),
             )
             payload.update(freshness_context)
+            if (
+                isinstance(last_quote, dict)
+                and last_quote.get("spread_valid") is not True
+            ):
+                payload["usable_for_live_trading"] = False
+                payload["usable_for_live_trading_basis"] = (
+                    "quote_age_market_session_and_positive_spread"
+                )
+                blockers = list(payload.get("execution_blockers") or [])
+                blocker = f"latest_quote_{last_quote.get('spread_quality') or 'invalid'}"
+                if blocker not in blockers:
+                    blockers.append(blocker)
+                payload["execution_blockers"] = blockers
+                warning = (
+                    "Latest quote is not executable because it lacks a positive "
+                    "two-sided spread."
+                )
+                warnings_list = list(payload.get("warnings") or [])
+                if warning not in warnings_list:
+                    warnings_list.append(warning)
+                payload["warnings"] = warnings_list
 
         def _last_snapshot_quote(frame: pd.DataFrame) -> Dict[str, Any]:
             bid = _finite_or_none(frame["bid"].iloc[-1])
@@ -2950,15 +3194,40 @@ def fetch_ticks(  # noqa: C901
             spread_valid = bool(
                 bid is not None and ask is not None and float(ask) > float(bid)
             )
-            spread = float(ask) - float(bid) if spread_valid else None
-            mid = (float(bid) + float(ask)) / 2.0 if spread_valid else None
+            two_sided = bid is not None and ask is not None
+            spread = (
+                float(ask) - float(bid)
+                if two_sided and float(ask) >= float(bid)
+                else None
+            )
+            mid = (
+                (float(bid) + float(ask)) / 2.0
+                if two_sided and float(ask) >= float(bid)
+                else None
+            )
+            spread_quality = (
+                "two_sided"
+                if spread_valid
+                else "locked"
+                if two_sided and float(ask) == float(bid)
+                else "inverted"
+                if two_sided
+                else "one_sided"
+            )
             return {
                 "bid": bid,
                 "ask": ask,
                 "mid": mid,
                 "spread": spread,
                 "spread_valid": spread_valid,
-                "spread_basis": "quote_snapshot" if spread_valid else "unavailable",
+                "spread_quality": spread_quality,
+                "spread_basis": (
+                    "quote_snapshot"
+                    if spread_valid
+                    else "quote_snapshot_locked"
+                    if spread_quality == "locked"
+                    else "unavailable"
+                ),
             }
 
         def _compact_summary_from_ticks() -> Dict[str, Any]:
@@ -2990,11 +3259,15 @@ def fetch_ticks(  # noqa: C901
                 ),
                 "timezone": _timezone_label(use_client_tz=_use_ctz, client_tz=client_tz),
                 "stats": {
-                    "spread": {
-                        "low": float(spread.min()),
-                        "high": float(spread.max()),
-                        "mean": float(spread.mean()),
-                    }
+                    "spread": (
+                        {
+                            "low": float(spread.min()),
+                            "high": float(spread.max()),
+                            "mean": float(spread.mean()),
+                        }
+                        if not spread.empty
+                        else {"available": False}
+                    )
                 },
                 "last_quote": _last_snapshot_quote(df_stats),
             }
@@ -3262,7 +3535,17 @@ def fetch_ticks(  # noqa: C901
 
         # If simplify mode requests approximation or resampling, use shared path
         if simplify_present and simplify_mode in ('approximate', 'resample'):
-            df_out, simplify_meta = _simplify_dataframe_rows_ext(df_ticks, headers, simplify_used)
+            df_for_simplify = df_ticks.copy()
+            if simplify_mode == "resample":
+                trade_mask = df_for_simplify["trade_event"].astype(bool)
+                for volume_column in ("volume", "volume_real"):
+                    if volume_column in df_for_simplify:
+                        df_for_simplify[volume_column] = df_for_simplify[
+                            volume_column
+                        ].where(trade_mask, 0.0)
+            df_out, simplify_meta = _simplify_dataframe_rows_ext(
+                df_for_simplify, headers, simplify_used
+            )
             rows = _format_numeric_rows_from_df(df_out, headers, stringify=False)
             rows = _round_row_price_columns(
                 rows,

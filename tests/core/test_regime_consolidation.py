@@ -5,6 +5,7 @@ import pytest
 from mtdata.core.regime.api import (
     _apply_bocpd_output_mode,
     _consolidate_payload,
+    _smoothing_warnings,
     _summary_only_payload,
 )
 from mtdata.core.regime.smoothing import (
@@ -20,6 +21,27 @@ def test_causal_state_confirmation_never_rewrites_prefix() -> None:
     assert full[:6].tolist() == prefix.tolist()
     assert full.tolist() == [0, 0, 0, 0, 0, 0, 0, 1]
     assert meta["postprocess"] == "causal_confirmation"
+    assert meta["confirmation_semantics"] == (
+        "consecutive_raw_state_evidence_before_transition"
+    )
+    assert meta["pending_state"] is None
+    assert meta["pending_bars"] == 0
+
+
+def test_causal_state_confirmation_reports_pending_terminal_candidate() -> None:
+    emitted, meta = _confirm_state_changes_causally(
+        np.array([0, 0, 1, 1], dtype=int),
+        3,
+    )
+
+    assert emitted.tolist() == [0, 0, 0, 0]
+    assert meta["pending_state"] == 1
+    assert meta["pending_bars"] == 2
+    assert meta["pending_bars_required"] == 3
+    assert _smoothing_warnings("hmm", meta) == [
+        "method='hmm' has candidate state 1 pending confirmation (2/3 required "
+        "consecutive bars); the current emitted regime is retained."
+    ]
 
 
 def test_bocpd_compact_lookback_preserves_true_segment_age() -> None:
@@ -213,9 +235,8 @@ class TestConsolidatePayload:
             "method": "hmm",
             "target": "return",
             "success": True,
-            "times": ["T1", "T2"],
-            "state": [0, 1],
-            "state_probabilities": [[0.95, 0.05], [0.05, 0.95]],
+            "times": [f"T{i}" for i in range(100)],
+            "state": [0] * 50 + [1] * 50,
             "regime_params": {
                 "weights": [0.6, 0.4],
                 "mu": [0.002, -0.001],
@@ -252,9 +273,8 @@ class TestConsolidatePayload:
             "method": "ms_ar",
             "target": "return",
             "success": True,
-            "times": ["T1", "T2"],
-            "state": [0, 1],
-            "state_probabilities": [[0.95, 0.05], [0.05, 0.95]],
+            "times": [f"T{i}" for i in range(100)],
+            "state": [0] * 50 + [1] * 50,
             "regime_params": {
                 "mean_return": [-0.002, 0.001],
                 "volatility": [0.003, 0.0005],
@@ -326,6 +346,61 @@ class TestConsolidatePayload:
         assert "not observed" in result["regime_info"][1]["note"]
         assert "not necessarily the fraction" in result["regime_info"][1]["weight_note"]
 
+    @pytest.mark.parametrize(
+        ("method", "threshold_scope", "expected_scope"),
+        [
+            ("hmm", None, "retrospective_full_window_model_fit"),
+            ("ms_ar", None, "retrospective_full_window_model_fit"),
+            (
+                "garch",
+                "full_window_percentiles",
+                "retrospective_full_window_fit_and_percentile_thresholds",
+            ),
+        ],
+    )
+    def test_compact_discloses_retrospective_historical_labels(
+        self,
+        method,
+        threshold_scope,
+        expected_scope,
+    ):
+        params_used = {"model_fit_scope": "full_window"}
+        if threshold_scope is not None:
+            params_used["threshold_scope"] = threshold_scope
+        payload = {
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "method": method,
+            "target": "return",
+            "success": True,
+            "times": ["T1", "T2"],
+            "state": [0, 1],
+            "state_probabilities": [[1.0, 0.0], [0.0, 1.0]],
+            "params_used": params_used,
+        }
+
+        result = _consolidate_payload(payload, method, "compact")
+
+        assert result["historical_labels_are_retrospective"] is True
+        assert result["historical_label_scope"] == expected_scope
+        assert "rolling as_of" in result["point_in_time_guidance"]
+
+    def test_compact_omits_retrospective_disclosure_for_online_labels(self):
+        payload = {
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "method": "bocpd",
+            "success": True,
+            "times": ["T1", "T2"],
+            "cp_prob": [0.1, 0.2],
+            "params_used": {"model_fit_scope": "online"},
+        }
+
+        result = _consolidate_payload(payload, "bocpd", "compact")
+
+        assert "historical_labels_are_retrospective" not in result
+        assert "historical_label_scope" not in result
+
     def test_hmm_price_target_uses_price_level_metadata(self):
         payload = {
             "symbol": "EURUSD",
@@ -359,15 +434,10 @@ class TestConsolidatePayload:
             "method": "clustering",
             "target": "return",
             "success": True,
-            "times": ["T1", "T2", "T3"],
-            "state": [0, 1, 2],
-            "state_probabilities": [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
+            "times": [f"T{i}" for i in range(150)],
+            "state": [0] * 50 + [1] * 50 + [2] * 50,
             "regime_params": {
-                "mean_return": [-0.001, 0.0, 0.001],
+                "mean_return": [-0.001, 0.0, 0.002],
                 "volatility": [0.0004, 0.0015, 0.004],
             },
         }

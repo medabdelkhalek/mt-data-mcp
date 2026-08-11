@@ -424,7 +424,7 @@ def _task_status_payload(
             payload["produced_model_ids"] = [task.result.model_id]
         payload["message"] = (
             f"Training complete. Model stored as '{task.result.model_id}'. "
-            "Subsequent forecast_generate calls will use this model automatically."
+            "Matching live forecast_generate calls will reuse this model and report its staleness in bars."
         )
         if detail == "full":
             payload["result"] = _serialize_model_handle(task.result, detail="full")
@@ -557,7 +557,12 @@ def forecast_train(request: ForecastTrainRequest) -> Dict[str, Any]:
         )
         payload["message"] = (
             "Training task queued. Poll forecast_task_status or use forecast_task_wait "
-            "to observe completion."
+            "to observe completion from the same long-lived process."
+        )
+        payload["process_lifetime_warning"] = (
+            "Tasks run in the submitting process. For CLI use, submit and poll from "
+            "mtdata-cli shell; MCP and Web API servers remain active while running. "
+            "A one-shot mtdata-cli command exits and cannot retain a queued task."
         )
         return payload
 
@@ -724,6 +729,16 @@ def forecast_task_wait(request: ForecastTaskWaitRequest) -> Dict[str, Any]:
             runtime=tm.runtime_snapshot(),
         )
         payload["wait_timeout_seconds"] = request.timeout_seconds
+        if task.status not in {"completed", "failed", "cancelled"}:
+            payload["task_status"] = task.status
+            payload["status"] = "timeout"
+            payload["success"] = False
+            payload["timeout"] = True
+            payload["error_code"] = "forecast_task_wait_timeout"
+            payload["error"] = (
+                f"Wait timed out after {request.timeout_seconds} seconds while task "
+                f"remains {task.status}."
+            )
         return payload
 
     return run_logged_operation(

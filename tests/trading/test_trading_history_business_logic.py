@@ -121,10 +121,6 @@ def test_trade_history_supports_offset_pagination() -> None:
 
     assert out["success"] is True
     assert [item["deal_ticket"] for item in out["items"]] == [3, 2]
-    assert out["total_count"] == 4
-    assert out["offset"] == 1
-    assert out["limit"] == 2
-    assert out["has_more"] is True
     assert out["pagination"] == {
         "total": 4,
         "returned": 2,
@@ -133,6 +129,7 @@ def test_trade_history_supports_offset_pagination() -> None:
         "has_more": True,
         "more_available": 1,
     }
+    assert not {"total_count", "offset", "limit", "has_more"} & out.keys()
 
     with patch("mtdata.core.trading.account._use_client_tz", lambda: False):
         ascending = trade_history(
@@ -144,6 +141,45 @@ def test_trade_history_supports_offset_pagination() -> None:
     if prev is not None:
         sys.modules["MetaTrader5"] = prev
     assert [item["deal_ticket"] for item in ascending["items"]] == [1, 2]
+
+
+def test_trade_history_warns_when_default_window_misses_open_event() -> None:
+    mt5, prev = _install_mock_mt5()
+    mt5.history_deals_get.return_value = []
+    old_epoch = (datetime.now(timezone.utc) - timedelta(days=8)).timestamp()
+    mt5.positions_get.return_value = [
+        SimpleNamespace(ticket=42, symbol="EURUSD", time=old_epoch)
+    ]
+
+    out = trade_history(history_kind="deals", __cli_raw=True)
+    if prev is not None:
+        sys.modules["MetaTrader5"] = prev
+
+    assert out["history_incomplete_for_open_positions"] is True
+    assert out["open_positions_outside_history_window_count"] == 1
+    assert out["open_positions_outside_history_window"][0]["ticket"] == 42
+    assert "default 7-day history window" in out["warnings"][0]
+
+
+def test_trade_history_labels_account_currency_money_fields() -> None:
+    out = normalize_trade_history_output(
+        [
+            {
+                "ticket": 1,
+                "symbol": "EURUSD",
+                "profit": 12.5,
+                "commission": -0.25,
+                "swap": -0.1,
+                "fee": -0.05,
+            }
+        ],
+        request=TradeHistoryRequest(history_kind="deals"),
+        account_currency="USD",
+    )
+
+    assert out["currency"] == "USD"
+    for field in ("profit", "commission", "swap", "fee"):
+        assert out["units"][field] == "account_currency"
 
 
 def test_trade_history_rounds_money_fields_for_display() -> None:
@@ -850,6 +886,38 @@ def test_run_trade_history_logs_finish_event(caplog) -> None:
     )
 
 
+def test_run_trade_history_resolves_client_timezone_once_per_request() -> None:
+    Deal = namedtuple("Deal", ["ticket", "time", "symbol"])
+    gateway = SimpleNamespace(
+        ensure_connection=lambda: None,
+        history_deals_get=lambda from_dt, to_dt, symbol=None: [
+            Deal(ticket=1, time=1700000000, symbol="EURUSD"),
+            Deal(ticket=2, time=1700000060, symbol="EURUSD"),
+        ],
+    )
+    mt5_config = SimpleNamespace(get_client_tz=MagicMock(return_value=timezone.utc))
+
+    out = run_trade_history(
+        TradeHistoryRequest(history_kind="deals"),
+        gateway=gateway,
+        use_client_tz=lambda: True,
+        format_time_minimal=lambda ts: f"t{int(ts)}",
+        format_time_minimal_local=lambda ts: f"lt{int(ts)}",
+        mt5_epoch_to_utc=lambda ts: ts,
+        parse_end_datetime=lambda value: None,
+        parse_start_datetime=lambda value: None,
+        normalize_limit=lambda value: value,
+        comment_row_metadata=lambda comment: {},
+        normalize_ticket_filter=lambda value, name: (None, None),
+        normalize_minutes_back=lambda value: (None, None),
+        decode_mt5_enum_label=lambda gateway, value, prefix=None: None,
+        mt5_config=mt5_config,
+    )
+
+    assert len(out) == 2
+    mt5_config.get_client_tz.assert_called_once_with()
+
+
 def test_trade_history_filters_deals_by_position_ticket() -> None:
     mt5, prev = _install_mock_mt5()
     Deal = namedtuple("Deal", ["ticket", "time", "symbol", "position_id"])
@@ -1050,7 +1118,7 @@ def test_trade_history_queries_minutes_back_as_absolute_mt5_epoch_window() -> No
         2026, 3, 1, 11, 0, 0, tzinfo=timezone.utc
     ).timestamp()
     assert float(captured["to_dt"]) - float(captured["from_dt"]) == 60 * 60
-    assert captured["symbol"] == "BTCUSD"
+    assert captured["symbol"] is None
     assert out["message"] == "No deals found for BTCUSD in the last 60 minute(s)"
 
 
@@ -1244,6 +1312,7 @@ def test_trade_journal_analyze_summarizes_realized_exit_deals() -> None:
         "mtdata.core.trading.account._run_trade_history_request",
         return_value={
             "success": True,
+            "currency": "USD",
             "count": len(history_rows),
             "items": history_rows,
         },
@@ -1256,6 +1325,9 @@ def test_trade_journal_analyze_summarizes_realized_exit_deals() -> None:
         )
 
     assert out["success"] is True
+    assert out["currency"] == "USD"
+    assert out["units"]["net_pnl"] == "account_currency"
+    assert out["units"]["commission"] == "account_currency"
     assert out["period_start"] == "2026-01-01T00:00:00Z"
     assert out["period_end"] == "2026-01-03T00:00:00Z"
     assert out["period_timezone"] == "UTC"

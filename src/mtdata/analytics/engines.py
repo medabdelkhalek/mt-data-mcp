@@ -22,9 +22,15 @@ from ..core.analytics_requests import (
 from ..shared.constants import TIMEFRAME_MAP, TIMEFRAME_SECONDS
 from ..shared.market_units import forex_points_per_pip
 from ..utils.barriers import normalize_same_bar_policy
-from ..utils.freshness import closed_session_context
+from ..utils.freshness import (
+    closed_session_context,
+    format_age_seconds,
+    standard_weekend_window,
+)
+from ..utils.market_metadata import build_tick_freshness_context
+from ..utils.sessions import market_session_label, session_definition_for_clock
 from ..utils.tick_flags import mt5_trade_event_mask
-from ..utils.time import format_epoch_utc
+from ..utils.time import format_datetime_utc, format_epoch_utc
 
 
 def _mapping(row: Any) -> Dict[str, Any]:
@@ -34,6 +40,97 @@ def _mapping(row: Any) -> Dict[str, Any]:
     if callable(converter):
         return dict(converter())
     return {name: getattr(row, name) for name in dir(row) if not name.startswith("_") and not callable(getattr(row, name, None))}
+
+
+def _classify_trade_sides(
+    trades: pd.DataFrame, prevailing_mid: pd.Series
+) -> pd.Series:
+    """Apply prevailing-quote classification, then the full-series tick rule."""
+    sides = np.sign(trades["last"] - prevailing_mid.loc[trades.index])
+    tick_sides = (
+        np.sign(trades["last"].diff())
+        .replace(0.0, np.nan)
+        .ffill()
+        .fillna(0.0)
+    )
+    zero = sides == 0
+    sides.loc[zero] = tick_sides.loc[zero]
+    return sides
+
+
+def _portfolio_mark_context(gateway: Any, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    contexts: List[Dict[str, Any]] = []
+    valid_times: List[float] = []
+    symbol_counts: Dict[str, int] = {}
+    for row in positions:
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
+    for symbol, position_count in symbol_counts.items():
+        try:
+            tick = gateway.symbol_info_tick(symbol)
+        except Exception:
+            tick = None
+        tick_epoch = getattr(tick, "time_msc", None) if tick is not None else None
+        try:
+            tick_epoch = float(tick_epoch) / 1000.0 if tick_epoch else None
+        except (TypeError, ValueError):
+            tick_epoch = None
+        if tick_epoch is None and tick is not None:
+            tick_epoch = getattr(tick, "time", None)
+        freshness = build_tick_freshness_context(
+            symbol,
+            tick_epoch=tick_epoch,
+            now_epoch=now_epoch,
+        )
+        if tick_epoch is not None:
+            try:
+                valid_times.append(float(tick_epoch))
+            except (TypeError, ValueError):
+                pass
+        if not freshness:
+            freshness = {
+                "data_stale": None,
+                "usable_for_live_trading": False,
+                "freshness_state": "unknown",
+                "freshness_reason": "missing_tick_timestamp",
+            }
+        freshness["symbol"] = symbol
+        freshness["positions"] = position_count
+        freshness["quote_time"] = format_epoch_utc(tick_epoch)
+        contexts.append(freshness)
+    if not contexts:
+        return {
+            "valuation_time": None,
+            "valuation_basis": "no_position_marks",
+            "data_stale": None,
+            "usable_for_live_trading": False,
+            "mark_freshness": [],
+        }
+    live_ready = bool(contexts) and all(
+        item.get("usable_for_live_trading") is True for item in contexts
+    )
+    stale_values = [item.get("data_stale") for item in contexts]
+    data_stale = (
+        True
+        if any(value is True for value in stale_values)
+        else False
+        if all(value is False for value in stale_values)
+        else None
+    )
+    return {
+        "valuation_time": format_epoch_utc(min(valid_times)) if valid_times else None,
+        "valuation_basis": (
+            "live_position_marks_with_completed_bar_return_history"
+            if live_ready
+            else "stale_or_unverified_position_marks_with_completed_bar_return_history"
+        ),
+        "data_stale": data_stale,
+        "usable_for_live_trading": live_ready,
+        "mark_freshness": contexts,
+    }
 
 
 def _filtered_historical_returns(
@@ -133,6 +230,20 @@ def _execution_percentiles(values: Iterable[float]) -> Dict[str, Optional[float]
     }
 
 
+def _execution_duration_display(
+    stats: Dict[str, Optional[float]],
+) -> Dict[str, str]:
+    """Format millisecond duration statistics for quick human inspection."""
+    out: Dict[str, str] = {}
+    for key, value in stats.items():
+        if value is None:
+            continue
+        display = format_age_seconds(float(value) / 1000.0)
+        if display is not None:
+            out[str(key)] = display
+    return out
+
+
 def _execution_bootstrap_mean_ci(
     values: Sequence[float],
     samples: int,
@@ -180,6 +291,8 @@ def _tick_frame(gateway: Any, symbol: str, start: datetime, end: datetime, max_t
                     "volume",
                     "volume_real",
                     "flags",
+                    "spread_valid",
+                    "spread_quality",
                     "mid",
                     "spread",
                 )
@@ -208,31 +321,71 @@ def _tick_frame(gateway: Any, symbol: str, start: datetime, end: datetime, max_t
         if column not in df:
             df[column] = 0.0
         df[column] = _finite(df[column]).fillna(0.0)
-    quote_flag_mask = (
-        getattr(gateway, "TICK_FLAG_BID", 2)
-        | getattr(gateway, "TICK_FLAG_ASK", 4)
+    two_sided_quote = (df["bid"] > 0) & (df["ask"] > df["bid"])
+    locked_quote = (df["bid"] > 0) & (df["ask"] == df["bid"])
+    inverted_quote = (df["bid"] > 0) & (df["ask"] > 0) & (df["ask"] < df["bid"])
+    df["spread_quality"] = np.select(
+        [locked_quote, inverted_quote],
+        ["locked", "inverted"],
+        default="two_sided",
     )
-    observed_quote_flags = (df["flags"].astype(np.int64) & quote_flag_mask) != 0
-    complete_quote_update = (
-        (df["flags"].astype(np.int64) & quote_flag_mask) == quote_flag_mask
+    df.loc[(df["bid"] <= 0) | (df["ask"] <= 0), "spread_quality"] = "one_sided"
+    df["spread_valid"] = two_sided_quote
+    df["mid"] = np.where(
+        two_sided_quote,
+        (df["bid"] + df["ask"]) / 2.0,
+        np.nan,
     )
-    valid_quote = (df["bid"] > 0) & (df["ask"] >= df["bid"])
-    if bool(observed_quote_flags.any()):
-        valid_quote &= complete_quote_update
-    df["spread_valid"] = valid_quote
-    df["mid"] = np.where(valid_quote, (df["bid"] + df["ask"]) / 2.0, np.nan)
     df["spread"] = np.where(np.isfinite(df["mid"]), df["ask"] - df["bid"], np.nan)
     return df.reset_index(drop=True), truncated
 
 
-def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -> Dict[str, Any]:
+def analyze_microstructure(  # noqa: C901
+    request: MarketMicrostructureRequest, gateway: Any
+) -> Dict[str, Any]:
     start, end = _window(request.start, request.end, request.minutes_back)
     df, truncated = _tick_frame(gateway, request.symbol, start, end, request.max_ticks)
+    completed_session_context = None
+    session = closed_session_context(
+        request.symbol,
+        now_epoch=end.timestamp(),
+        item="tick stream",
+    )
+    if (
+        len(df) < 20
+        and session is not None
+        and request.start is None
+        and request.end is None
+    ):
+        closure = standard_weekend_window(end)
+        if closure is not None:
+            completed_end = closure[0]
+            completed_start = completed_end - timedelta(minutes=request.minutes_back)
+            completed_df, completed_truncated = _tick_frame(
+                gateway,
+                request.symbol,
+                completed_start,
+                completed_end,
+                request.max_ticks,
+            )
+            if len(completed_df) > len(df):
+                start, end = completed_start, completed_end
+                df, truncated = completed_df, completed_truncated
+                last_epoch = float(df["epoch"].iloc[-1])
+                completed_session_context = closed_session_context(
+                    request.symbol,
+                    now_epoch=datetime.now(timezone.utc).timestamp(),
+                    item="tick stream",
+                    data_age_seconds=max(
+                        0.0,
+                        datetime.now(timezone.utc).timestamp() - last_epoch,
+                    ),
+                )
     if len(df) < 20:
         last_tick_epoch = float(df["epoch"].iloc[-1]) if len(df) else None
-        session = closed_session_context(
+        error_session = closed_session_context(
             request.symbol,
-            now_epoch=end.timestamp(),
+            now_epoch=datetime.now(timezone.utc).timestamp(),
             item="tick stream",
             data_age_seconds=(
                 max(0.0, end.timestamp() - last_tick_epoch)
@@ -240,7 +393,7 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
                 else None
             ),
         )
-        if session and session.get("market_status") == "closed":
+        if error_session and error_session.get("market_status") == "closed":
             return {
                 "error": "Market is closed and fewer than 20 recent usable ticks are available.",
                 "error_code": "market_closed",
@@ -253,7 +406,11 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
                     if last_tick_epoch is not None
                     else None
                 ),
-                **session,
+                **error_session,
+                "note": (
+                    "Market is closed; fewer than 20 ticks were found in the "
+                    "latest completed-session analysis window."
+                ),
             }
         return {"error": "At least 20 usable ticks are required.", "error_code": "insufficient_data"}
     quote_mask = np.isfinite(df["mid"])
@@ -327,9 +484,7 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
     if trade_count:
         trades = df.loc[trade_mask].copy()
         prevailing_mid = df["mid"].ffill()
-        trades["side"] = np.sign(trades["last"] - prevailing_mid.loc[trades.index])
-        zero = trades["side"] == 0
-        trades.loc[zero, "side"] = np.sign(trades.loc[zero, "last"].diff()).fillna(0.0)
+        trades["side"] = _classify_trade_sides(trades, prevailing_mid)
         summary["trade_count"] = trade_count
         summary["trade_count_imbalance"] = float(trades["side"].sum() / max(1, trade_count))
         if tier == "trade_volume":
@@ -358,6 +513,10 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
         for item in event_windows
     ]
     warnings = []
+    if completed_session_context is not None:
+        warnings.append(
+            "Market is closed; metrics use the latest completed-session tick window."
+        )
     if tier != "trade_volume":
         warnings.append("Real trade volume is insufficient; volume-impact metrics were omitted.")
     warnings.append(
@@ -368,7 +527,11 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
         "quote_coverage": float(quote_mask.mean()),
         "trade_tick_coverage": float(trade_mask.mean()),
         "real_volume_trade_coverage": real_share,
-        "invalid_partial_quote_ticks": int((~df["spread_valid"]).sum()),
+        "invalid_partial_quote_ticks": int(
+            df["spread_quality"].isin({"one_sided", "inverted"}).sum()
+        ),
+        "locked_quote_ticks": int((df["spread_quality"] == "locked").sum()),
+        "latest_spread_quality": str(df["spread_quality"].iloc[-1]),
         "truncated": truncated,
         "requested_start": start.isoformat(),
         "requested_end": end.isoformat(),
@@ -389,7 +552,72 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
             "spread": "absolute_price",
         }[spread_key]
         spread_stats = summary[spread_key]
-        return {
+        if spread_key == "spread_pips":
+            spread_series = q["spread"] / (point * float(points_per_pip))
+        elif spread_key == "spread_points":
+            spread_series = q["spread"] / point
+        else:
+            spread_series = q["spread"]
+        spread_series = pd.to_numeric(spread_series, errors="coerce")
+        latest_tick = df.iloc[-1]
+        latest_spread_quality = str(latest_tick["spread_quality"])
+        latest_quote_epoch = float(latest_tick["epoch"])
+        latest_spread = None
+        if latest_spread_quality in {"two_sided", "locked"}:
+            latest_absolute_spread = float(latest_tick["ask"] - latest_tick["bid"])
+            if spread_key == "spread_pips":
+                latest_spread = latest_absolute_spread / (point * float(points_per_pip))
+            elif spread_key == "spread_points":
+                latest_spread = latest_absolute_spread / point
+            else:
+                latest_spread = latest_absolute_spread
+        recent_mask = (
+            q["epoch"] >= latest_quote_epoch - 300.0
+            if latest_quote_epoch is not None
+            else pd.Series(False, index=q.index)
+        )
+        recent_spreads = spread_series.loc[recent_mask].dropna()
+        recent_median = (
+            float(recent_spreads.median()) if len(recent_spreads) else None
+        )
+        window_median = spread_stats.get("median")
+        latest_to_window_ratio = (
+            float(latest_spread) / float(window_median)
+            if latest_spread_quality == "two_sided"
+            and latest_spread is not None
+            and window_median is not None
+            and float(window_median) > 0
+            else None
+        )
+        spread_regime = (
+            "locked_quote"
+            if latest_spread_quality == "locked"
+            else "unreliable_quote"
+            if latest_spread_quality != "two_sided"
+            else "wider_than_window"
+            if latest_to_window_ratio is not None and latest_to_window_ratio >= 2.0
+            else "tighter_than_window"
+            if latest_to_window_ratio is not None and latest_to_window_ratio <= 0.5
+            else "near_window_median"
+            if latest_to_window_ratio is not None
+            else "unknown"
+        )
+        if latest_spread_quality == "locked":
+            warnings.append(
+                "Latest analyzed quote is locked (bid equals ask); its zero "
+                "spread is not usable for execution."
+            )
+        elif latest_spread_quality != "two_sided":
+            warnings.append(
+                "Latest analyzed quote is not a valid two-sided quote; do not "
+                "use it for execution."
+            )
+        if spread_regime in {"wider_than_window", "tighter_than_window"}:
+            warnings.append(
+                "Latest analyzed spread differs materially from the full-window "
+                "median; use latest and recent_5m_median for near-term execution context."
+            )
+        compact_result = {
             "success": True,
             "symbol": request.symbol,
             "summary": {
@@ -398,22 +626,42 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
                 "duration_seconds": duration,
                 "ticks_per_second": float(len(df) / duration),
                 "spread": {
-                    "median": spread_stats.get("median"),
-                    "p95": spread_stats.get("p95"),
+                    "latest": _round_execution_stat(latest_spread),
+                    "latest_as_of": format_epoch_utc(latest_quote_epoch),
+                    "spread_valid": latest_spread_quality == "two_sided",
+                    "spread_quality": latest_spread_quality,
+                    "recent_5m_median": _round_execution_stat(recent_median),
+                    "window_median": _round_execution_stat(window_median),
+                    "window_p95": _round_execution_stat(spread_stats.get("p95")),
+                    "latest_to_window_median_ratio": _round_execution_stat(
+                        latest_to_window_ratio
+                    ),
+                    "regime": spread_regime,
                     "unit": spread_unit,
+                    "basis": "historical_tick_window_distribution",
+                    "source": "mt5.copy_ticks_range",
                 },
+            },
+            "observed_window": {
+                "start": format_epoch_utc(float(df["epoch"].iloc[0])),
+                "end": format_epoch_utc(float(df["epoch"].iloc[-1])),
             },
             "data_quality": {
                 key: data_quality[key]
                 for key in (
                     "quote_coverage",
                     "invalid_partial_quote_ticks",
+                    "locked_quote_ticks",
+                    "latest_spread_quality",
                     "truncated",
                 )
             },
             "warnings": warnings,
         }
-    return {
+        if completed_session_context is not None:
+            compact_result.update(completed_session_context)
+        return compact_result
+    result = {
         "success": True,
         "symbol": request.symbol,
         "timezone": "UTC",
@@ -439,6 +687,9 @@ def analyze_microstructure(request: MarketMicrostructureRequest, gateway: Any) -
         },
         "warnings": warnings,
     }
+    if completed_session_context is not None:
+        result.update(completed_session_context)
+    return result
 
 
 def _deal_side(row: Dict[str, Any], gateway: Any) -> Optional[str]:
@@ -470,8 +721,19 @@ def _order_type_label(value: Any, gateway: Any) -> str:
     return "UNKNOWN"
 
 
-def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: Any) -> Dict[str, Any]:
+def analyze_execution_quality(  # noqa: C901
+    request: TradeExecutionQualityRequest, gateway: Any
+) -> Dict[str, Any]:
     start, end = _window(request.start, request.end, request.minutes_back)
+    account_currency = None
+    account_info = getattr(gateway, "account_info", None)
+    if callable(account_info):
+        try:
+            account_currency = str(
+                getattr(account_info(), "currency", "") or ""
+            ).strip() or None
+        except Exception:
+            account_currency = None
     kwargs = {"group": f"*{request.symbol}*"} if request.symbol else {}
     deals = [_mapping(row) for row in (gateway.history_deals_get(start, end, **kwargs) or [])]
     orders = [_mapping(row) for row in (gateway.history_orders_get(start, end, **kwargs) or [])]
@@ -510,16 +772,39 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
         symbol = str(deal.get("symbol") or "").strip()
         order = order_by_ticket.get(int(deal.get("order") or 0), {})
         fill_epoch = float(deal.get("time_msc") or 0) / 1000.0 or float(deal.get("time") or 0)
+        time_setup_msc = float(order.get("time_setup_msc") or 0.0)
+        if not time_setup_msc and order.get("time_setup"):
+            time_setup_msc = float(order["time_setup"]) * 1000.0
+        setup_epoch = time_setup_msc / 1000.0 if time_setup_msc else None
         qstart = datetime.fromtimestamp(fill_epoch - request.quote_window_seconds, tz=timezone.utc)
         qend = datetime.fromtimestamp(fill_epoch + max(request.markout_seconds) + 5, tz=timezone.utc)
         ticks, _ = _tick_frame(gateway, symbol, qstart, qend, 50_000)
         before = ticks[(ticks["epoch"] <= fill_epoch) & np.isfinite(ticks["mid"])]
+        fill_time_quote = None
+        if len(before):
+            fill_tick = before.iloc[-1]
+            fill_time_quote = float(fill_tick["ask"] if side == "buy" else fill_tick["bid"])
         arrival = None
+        benchmark_epoch = None
         benchmark_source = None
-        if request.benchmark == "arrival_quote" and len(before):
-            latest = before.iloc[-1]
-            arrival = float(latest["ask"] if side == "buy" else latest["bid"])
-            benchmark_source = "arrival_quote"
+        if request.benchmark == "arrival_quote" and setup_epoch is not None:
+            arrival_start = datetime.fromtimestamp(
+                setup_epoch - request.quote_window_seconds,
+                tz=timezone.utc,
+            )
+            arrival_end = datetime.fromtimestamp(setup_epoch, tz=timezone.utc)
+            arrival_ticks, _ = _tick_frame(
+                gateway, symbol, arrival_start, arrival_end, 50_000
+            )
+            arrival_before = arrival_ticks[
+                (arrival_ticks["epoch"] <= setup_epoch)
+                & np.isfinite(arrival_ticks["mid"])
+            ]
+            if len(arrival_before):
+                latest = arrival_before.iloc[-1]
+                arrival = float(latest["ask"] if side == "buy" else latest["bid"])
+                benchmark_epoch = float(latest["epoch"])
+                benchmark_source = "arrival_quote"
         if request.benchmark == "order_price":
             candidate = float(order.get("price_open") or order.get("price_current") or 0.0)
             if candidate > 0:
@@ -540,9 +825,6 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
         benchmark_sources[str(benchmark_source)] += 1
         sign = 1.0 if side == "buy" else -1.0
         slippage_bps = sign * (fill_price - arrival) / arrival * 10_000.0
-        time_setup_msc = float(order.get("time_setup_msc") or 0.0)
-        if not time_setup_msc and order.get("time_setup"):
-            time_setup_msc = float(order["time_setup"]) * 1000.0
         markouts: Dict[str, Optional[float]] = {}
         for horizon in request.markout_seconds:
             candidates = ticks[(ticks["epoch"] >= fill_epoch + horizon) & (ticks["epoch"] <= fill_epoch + horizon + 5) & np.isfinite(ticks["mid"])]
@@ -559,7 +841,7 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             getattr(gateway, "ORDER_TYPE_SELL", 1),
         }
         is_market_order = order_type_value in market_order_types
-        order_to_fill_ms = (
+        order_to_fill_duration_ms = (
             max(
                 0.0,
                 float(deal.get("time_msc") or fill_epoch * 1000.0)
@@ -578,11 +860,21 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             "fill_price": fill_price,
             "benchmark_price": arrival,
             "benchmark_source": benchmark_source,
+            "benchmark_epoch": benchmark_epoch,
+            "benchmark_time": (
+                format_epoch_utc(benchmark_epoch)
+                if benchmark_epoch is not None
+                else None
+            ),
+            "fill_time_quote": fill_time_quote,
             "slippage_bps": slippage_bps,
             "price_improved": slippage_bps < 0,
-            "order_to_fill_ms": order_to_fill_ms,
+            "order_to_fill_duration_ms": order_to_fill_duration_ms,
+            "fill_timing_basis": (
+                "market_fill_latency" if is_market_order else "pending_time_to_fill"
+            ),
             "is_market_order": is_market_order,
-            "fill_ratio": min(1.0, volume / initial_volume) if initial_volume > 0 else None,
+            "deal_fill_ratio": min(1.0, volume / initial_volume) if initial_volume > 0 else None,
             "commission": float(deal.get("commission") or 0.0),
             "fee": float(deal.get("fee") or 0.0),
             "commission_fee_per_lot": (float(deal.get("commission") or 0.0) + float(deal.get("fee") or 0.0)) / volume,
@@ -592,13 +884,15 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             "order_type_code": order_type_value,
             "hour_utc": datetime.fromtimestamp(fill_epoch, tz=timezone.utc).hour,
         }
-        hour = int(item["hour_utc"])
-        item["session"] = "asia" if hour < 7 else "london" if hour < 13 else "overlap" if hour < 17 else "new_york" if hour < 22 else "off"
+        item["session"] = market_session_label(
+            datetime.fromtimestamp(fill_epoch, tz=timezone.utc),
+            session_calendar="fx",
+        )
         try:
             action = getattr(gateway, "ORDER_TYPE_BUY", 0) if side == "buy" else getattr(gateway, "ORDER_TYPE_SELL", 1)
             shortfall = gateway.order_calc_profit(action, symbol, volume, arrival, fill_price)
             if shortfall is not None:
-                item["execution_shortfall_currency_estimate"] = float(-shortfall)
+                item["execution_shortfall_currency_estimate"] = float(shortfall)
         except Exception:
             pass
         fills.append(item)
@@ -613,6 +907,24 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
     slippages = [float(item["slippage_bps"]) for item in fills]
     market_order_fills = [item for item in fills if item.get("is_market_order")]
     non_market_order_fills = [item for item in fills if not item.get("is_market_order")]
+    order_fill_totals: Dict[Any, Dict[str, float]] = {}
+    for item in fills:
+        order_ticket = item.get("order_ticket")
+        state = order_fill_totals.setdefault(
+            order_ticket,
+            {"filled_volume": 0.0, "initial_volume": 0.0},
+        )
+        state["filled_volume"] += float(item.get("volume") or 0.0)
+        order = order_by_ticket.get(int(order_ticket or 0), {})
+        state["initial_volume"] = max(
+            state["initial_volume"],
+            float(order.get("volume_initial") or item.get("volume") or 0.0),
+        )
+    partial_orders = sum(
+        state["initial_volume"] > 0.0
+        and state["filled_volume"] < state["initial_volume"] * 0.999
+        for state in order_fill_totals.values()
+    )
     summary = {
         "fills": len(fills),
         "orders": len({item["order_ticket"] for item in fills}),
@@ -624,25 +936,39 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             np.mean([item["price_improved"] for item in fills])
         ) if fills else None,
         "partial_fill_rate": _round_execution_stat(
-            np.mean([(item.get("fill_ratio") or 1.0) < 0.999 for item in fills])
-        ) if fills else None,
-        "market_order_latency_ms": _execution_percentiles(
-            item["order_to_fill_ms"]
+            partial_orders / len(order_fill_totals)
+        ) if order_fill_totals else None,
+        "partial_orders": int(partial_orders),
+        "orders_evaluated_for_partial_fills": len(order_fill_totals),
+        "partial_fill_rate_basis": "orders_aggregated_from_deals",
+        "market_fill_latency_ms": _execution_percentiles(
+            item["order_to_fill_duration_ms"]
             for item in market_order_fills
-            if item.get("order_to_fill_ms") is not None
+            if item.get("order_to_fill_duration_ms") is not None
         ),
-        "non_market_order_latency_ms": _execution_percentiles(
-            item["order_to_fill_ms"]
+        "pending_time_to_fill_ms": _execution_percentiles(
+            item["order_to_fill_duration_ms"]
             for item in non_market_order_fills
-            if item.get("order_to_fill_ms") is not None
+            if item.get("order_to_fill_duration_ms") is not None
         ),
-        "order_to_fill_ms": _execution_percentiles(
-            item["order_to_fill_ms"]
+        "order_to_fill_duration_ms": _execution_percentiles(
+            item["order_to_fill_duration_ms"]
             for item in fills
-            if item.get("order_to_fill_ms") is not None
+            if item.get("order_to_fill_duration_ms") is not None
         ),
         "commission_fee_per_lot": _execution_percentiles(item["commission_fee_per_lot"] for item in fills),
     }
+    duration_display = {
+        name.removesuffix("_ms"): display
+        for name in ("pending_time_to_fill_ms", "order_to_fill_duration_ms")
+        if (
+            display := _execution_duration_display(
+                summary.get(name) if isinstance(summary.get(name), dict) else {}
+            )
+        )
+    }
+    if duration_display:
+        summary["duration_display"] = duration_display
     for horizon in request.markout_seconds:
         summary.setdefault("markout_bps", {})[str(horizon)] = _execution_percentiles(item["markout_bps"].get(str(horizon)) for item in fills if item["markout_bps"].get(str(horizon)) is not None)
     breakdowns: Dict[str, List[Dict[str, Any]]] = {}
@@ -661,7 +987,9 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
                     ]
                     if len(codes) == 1:
                         row["order_type_code"] = codes[0]
-                    row["order_to_fill_ms"] = _execution_percentiles(items["order_to_fill_ms"])
+                    row["order_to_fill_duration_ms"] = _execution_percentiles(
+                        items["order_to_fill_duration_ms"]
+                    )
                 breakdowns[label].append(row)
     sample_start = format_epoch_utc(fills[0]["fill_epoch"]) if fills else None
     sample_end = format_epoch_utc(fills[-1]["fill_epoch"]) if fills else None
@@ -672,8 +1000,14 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
         warnings.append(
             f"{fallback_count} fill(s) used order price because no arrival quote was available."
         )
+    if non_market_order_fills:
+        warnings.append(
+            "pending_time_to_fill_ms measures intentional limit/stop order wait, not "
+            "broker execution latency; order_to_fill_duration_ms is a mixed duration."
+        )
     return {
         "success": True,
+        **({"currency": account_currency} if account_currency else {}),
         "summary": summary,
         "breakdowns": breakdowns,
         **({"items": fills} if request.detail == "full" else {}),
@@ -696,6 +1030,7 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
                     else None
                 ),
             },
+            "session_definition": session_definition_for_clock("UTC", "fx"),
         },
         "sample": {
             "selection_order": "latest_first",
@@ -705,12 +1040,22 @@ def analyze_execution_quality(request: TradeExecutionQualityRequest, gateway: An
             "sample_end": sample_end,
             "truncated": processed_candidates < len(eligible_deals),
         },
-        "latency_definition": {
-            "market_order_latency_ms": "market_order_setup_to_fill_elapsed_time",
-            "non_market_order_latency_ms": "non_market_order_setup_to_fill_elapsed_time_including_pending_wait",
-            "order_to_fill_ms": "all_order_setup_to_fill_elapsed_time_including_pending_wait",
+        "timing_definition": {
+            "market_fill_latency_ms": "market_order_setup_to_fill_elapsed_time",
+            "pending_time_to_fill_ms": "pending_order_setup_to_fill_wait_duration_not_execution_latency",
+            "order_to_fill_duration_ms": "all_order_setup_to_fill_mixed_duration_not_execution_latency",
         },
-        "units": {"slippage_bps": "basis_points_positive_is_worse", "markout_bps": "basis_points_positive_is_favorable", "market_order_latency_ms": "milliseconds", "non_market_order_latency_ms": "milliseconds", "order_to_fill_ms": "milliseconds"},
+        "units": {
+            "slippage_bps": "basis_points_positive_is_worse",
+            "markout_bps": "basis_points_positive_is_favorable",
+            "market_fill_latency_ms": "milliseconds",
+            "pending_time_to_fill_ms": "milliseconds",
+            "order_to_fill_duration_ms": "milliseconds",
+            "commission": "account_currency",
+            "fee": "account_currency",
+            "commission_fee_per_lot": "account_currency_per_broker_lot",
+            "execution_shortfall_currency_estimate": "account_currency_positive_is_worse",
+        },
         "warnings": warnings,
     }
 
@@ -756,7 +1101,14 @@ def _builtin_signal(close: pd.Series, candidate: StrategyCandidate) -> pd.Series
         else:
             a = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
             b = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
-        return pd.Series(np.where(a > b, 1.0, np.where(a < b, -1.0, 0.0)), index=close.index).where(a.notna() & b.notna())
+        valid = a.notna() & b.notna()
+        previous_valid = valid.shift(1, fill_value=False)
+        crossed_above = valid & previous_valid & (a > b) & (a.shift(1) <= b.shift(1))
+        crossed_below = valid & previous_valid & (a < b) & (a.shift(1) >= b.shift(1))
+        return pd.Series(
+            np.where(crossed_above, 1.0, np.where(crossed_below, -1.0, 0.0)),
+            index=close.index,
+        ).where(valid)
     length = int(params.get("rsi_length", 14))
     oversold = float(params.get("oversold", 30.0))
     overbought = float(params.get("overbought", 70.0))
@@ -764,7 +1116,22 @@ def _builtin_signal(close: pd.Series, candidate: StrategyCandidate) -> pd.Series
     gain = delta.clip(lower=0).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-    return pd.Series(np.where(rsi < oversold, 1.0, np.where(rsi > overbought, -1.0, 0.0)), index=close.index).where(rsi.notna())
+    valid = rsi.notna()
+    previous = rsi.shift(1)
+    entered_oversold = valid & previous.notna() & (rsi < oversold) & (previous >= oversold)
+    entered_overbought = valid & previous.notna() & (rsi > overbought) & (previous <= overbought)
+    return pd.Series(
+        np.where(entered_oversold, 1.0, np.where(entered_overbought, -1.0, 0.0)),
+        index=close.index,
+    ).where(valid)
+
+
+def _candidate_signal_definition(candidate: StrategyCandidate) -> str:
+    if candidate.type == "forecast_threshold":
+        return "forecast_threshold_anchor"
+    if candidate.strategy in {"sma_cross", "ema_cross"}:
+        return "cross_event"
+    return "zone_entry_event"
 
 
 _MAX_FORECAST_SIGNAL_ANCHORS = 200
@@ -842,7 +1209,10 @@ def _barrier_returns(
     outcomes: List[float] = []
     tp = float(tp_pct) / 100.0
     sl = float(sl_pct) / 100.0
+    next_eligible_signal = 0
     for idx in range(len(df) - horizon):
+        if idx < next_eligible_signal:
+            continue
         direction = float(signal.iloc[idx]) if pd.notna(signal.iloc[idx]) else 0.0
         if direction == 0:
             continue
@@ -877,18 +1247,55 @@ def _barrier_returns(
             result = direction * (float(df["close"].iloc[idx + horizon]) / entry - 1.0)
         indices.append(idx)
         outcomes.append(float(result))
+        # A persistent state is one position, not a fresh overlapping trade on
+        # every bar.  The next entry may be considered only after this
+        # position's full outcome window has ended.
+        next_eligible_signal = idx + int(horizon)
     return np.asarray(indices, dtype=int), np.asarray(outcomes, dtype=float)
 
 
-def _observed_spread_bps(request: StrategyValidateRequest, gateway: Any) -> Tuple[float, str, bool]:
+def _observed_spread_bps(
+    request: StrategyValidateRequest,
+    gateway: Any,
+) -> Tuple[Optional[float], str, bool, Dict[str, Any]]:
     if request.spread_bps is not None:
-        return float(request.spread_bps), "explicit", request.cost_model == "fixed"
+        return (
+            float(request.spread_bps),
+            "explicit",
+            request.cost_model == "fixed",
+            {"basis": "request"},
+        )
     now = datetime.now(timezone.utc)
-    ticks, _ = _tick_frame(gateway, request.symbol, now - timedelta(hours=1), now, 10_000)
+    to_dt = _parse_time(request.end, now)
+    from_dt = _parse_time(request.start, to_dt - timedelta(hours=1))
+    if request.start and not request.end:
+        to_dt = from_dt + timedelta(hours=1)
+    ticks, _ = _tick_frame(gateway, request.symbol, from_dt, to_dt, 10_000)
     valid = ticks[np.isfinite(ticks["mid"]) & (ticks["mid"] > 0)]
     if len(valid):
-        return float(np.median(valid["spread"] / valid["mid"] * 10_000.0)), "mt5_tick_median", False
-    return 0.0, "unavailable", False
+        source = "mt5_tick_median_historical_window" if request.start or request.end else "mt5_tick_median_recent"
+        return (
+            float(np.median(valid["spread"] / valid["mid"] * 10_000.0)),
+            source,
+            False,
+            {
+                "basis": "tick_window",
+                "start": format_datetime_utc(from_dt, timespec="auto"),
+                "end": format_datetime_utc(to_dt, timespec="auto"),
+                "observations": int(len(valid)),
+            },
+        )
+    return (
+        None,
+        "unavailable",
+        False,
+        {
+            "basis": "tick_window",
+            "start": format_datetime_utc(from_dt, timespec="auto"),
+            "end": format_datetime_utc(to_dt, timespec="auto"),
+            "observations": 0,
+        },
+    )
 
 
 def validate_strategies(  # noqa: C901
@@ -904,7 +1311,22 @@ def validate_strategies(  # noqa: C901
     )
     if len(df) < 200:
         return {"error": "At least 200 completed bars are required.", "error_code": "insufficient_data"}
-    spread_bps, spread_source, complete = _observed_spread_bps(request, gateway)
+    spread_bps, spread_source, complete, spread_window = _observed_spread_bps(request, gateway)
+    if spread_bps is None:
+        return {
+            "success": False,
+            "error": (
+                "Transaction-cost spread is unavailable for the requested evaluation window. "
+                "Provide spread_bps with cost_model='fixed' or use a window with tick history."
+            ),
+            "error_code": "cost_model_unavailable",
+            "cost_model": {
+                "source": spread_source,
+                "spread_bps": None,
+                "window": spread_window,
+                "complete": False,
+            },
+        }
     round_trip_bps = spread_bps + 2.0 * (request.commission_bps + request.slippage_bps)
     purge = int(request.purge_bars or 0)
     embargo = int(
@@ -921,6 +1343,7 @@ def validate_strategies(  # noqa: C901
     )
     results = []
     for candidate in request.candidates:
+        signal_definition = _candidate_signal_definition(candidate)
         signal = _builtin_signal(df["close"], candidate) if candidate.type == "builtin_strategy" else _forecast_signal(df, candidate, request.symbol, request.timeframe)
         candidate_fold_windows = fold_windows
         candidate_embargo_intervals = embargo_intervals
@@ -952,7 +1375,12 @@ def validate_strategies(  # noqa: C901
             same_bar_policy,
         )
         if len(indices) < request.n_splits * 5:
-            results.append({"id": candidate.id, "evaluation_status": "insufficient_data", "trades": int(len(indices))})
+            results.append({
+                "id": candidate.id,
+                "evaluation_status": "insufficient_data",
+                "signal_definition": signal_definition,
+                "trades": int(len(indices)),
+            })
             continue
         fold_rows = []
         skipped_folds: List[Dict[str, Any]] = []
@@ -996,12 +1424,13 @@ def validate_strategies(  # noqa: C901
                     from sklearn.linear_model import LogisticRegression
 
                     train_x = signal.iloc[indices[train_mask]].to_numpy(dtype=float).reshape(-1, 1)
-                    train_y = (gross[train_mask] > 0).astype(int)
+                    train_net = gross[train_mask] - round_trip_bps / 10_000.0
+                    train_y = (train_net > 0).astype(int)
                     test_x = signal.iloc[test_indices].to_numpy(dtype=float).reshape(-1, 1)
                     if len(np.unique(train_y)) > 1 and np.all(np.isfinite(train_x)) and np.all(np.isfinite(test_x)):
                         calibrator = LogisticRegression(random_state=42).fit(train_x, train_y)
                         calibrated_probabilities.extend(calibrator.predict_proba(test_x)[:, 1].tolist())
-                        calibrated_labels.extend((test_gross > 0).astype(int).tolist())
+                        calibrated_labels.extend((test > 0).astype(int).tolist())
                 except Exception:
                     pass
             fold_rows.append({
@@ -1020,14 +1449,22 @@ def validate_strategies(  # noqa: C901
             })
         arr = np.asarray(all_net, dtype=float)
         if not len(arr):
-            results.append({"id": candidate.id, "evaluation_status": "insufficient_data", "trades": 0})
+            results.append({
+                "id": candidate.id,
+                "evaluation_status": "insufficient_data",
+                "signal_definition": signal_definition,
+                "trades": 0,
+            })
             continue
         equity = np.cumprod(1.0 + np.clip(arr, -0.999, None))
         peaks = np.maximum.accumulate(equity)
         drawdown = equity / peaks - 1.0
         std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
-        sharpe = float(np.mean(arr) / std * math.sqrt(len(arr))) if std > 0 else None
         per_trade_sharpe = float(np.mean(arr) / std) if std > 0 else 0.0
+        sharpe = per_trade_sharpe if std > 0 else None
+        mean_return_t_stat = (
+            float(per_trade_sharpe * math.sqrt(len(arr))) if std > 0 else None
+        )
         trials = max(1, len(request.candidates))
         gamma = 0.5772156649015329
         expected_max = 0.0
@@ -1049,26 +1486,33 @@ def validate_strategies(  # noqa: C901
         fold_stability = float(
             np.sum(np.asarray(fold_expectancies) > 0) / request.n_splits
         ) if fold_expectancies else 0.0
-        calibration = {"status": "insufficient_data", "observations": len(calibrated_labels)}
+        base_rate_stability = {"status": "insufficient_data", "observations": len(calibrated_labels)}
         if calibrated_labels:
             probs = np.asarray(calibrated_probabilities, dtype=float)
             labels = np.asarray(calibrated_labels, dtype=float)
-            ece = 0.0
-            for lower in np.linspace(0.0, 0.9, 10):
-                mask = (probs >= lower) & (probs < lower + 0.1 if lower < 0.9 else probs <= 1.0)
-                if np.any(mask):
-                    ece += float(np.mean(mask)) * abs(float(np.mean(probs[mask])) - float(np.mean(labels[mask])))
-            calibration = {"status": "calibrated", "observations": len(labels), "method": "sigmoid_train_only", "brier_score": float(np.mean((probs - labels) ** 2)), "expected_calibration_error": ece}
+            distinct_probabilities = int(len(np.unique(np.round(probs, 12))))
+            base_rate_stability = {
+                "status": "available",
+                "observations": len(labels),
+                "method": "direction_group_train_base_rate",
+                "base_rate_brier_score": float(np.mean((probs - labels) ** 2)),
+                "weighted_base_rate_gap": float(abs(np.mean(probs) - np.mean(labels))),
+                "distinct_probabilities": distinct_probabilities,
+                "label_basis": "net_return_after_costs_positive",
+                "interpretation": "Long/short win-rate stability across folds; not continuous-score calibration.",
+            }
         results.append({
             "id": candidate.id,
             "type": candidate.type,
             "evaluation_status": "complete",
+            "signal_definition": signal_definition,
             "trades": int(len(arr)),
             "net_expectancy": float(np.mean(arr)),
             "expectancy_ci_95": expectancy_ci,
             "win_rate": float(np.mean(arr > 0)),
             "profit_factor": float(arr[arr > 0].sum() / abs(arr[arr < 0].sum())) if np.any(arr < 0) else None,
             "sharpe": sharpe,
+            "mean_return_t_stat": mean_return_t_stat,
             "deflated_sharpe_probability": deflated_probability,
             "mean_return_p_value": mean_return_p_value,
             "max_drawdown": float(np.min(drawdown)),
@@ -1079,7 +1523,7 @@ def validate_strategies(  # noqa: C901
             "signal_coverage": signal_coverage,
             "skipped_folds": skipped_folds,
             "same_bar_policy": same_bar_policy,
-            "calibration": calibration,
+            "direction_base_rate_stability": base_rate_stability,
             **({"folds": fold_rows} if request.detail == "full" else {}),
         })
     eligible_p = sorted(
@@ -1123,7 +1567,9 @@ def validate_strategies(  # noqa: C901
             "minimum_positive_fold_share": float(request.min_positive_fold_share),
         }
     ranked = sorted(results, key=lambda item: (item.get("net_expectancy") is None, -(item.get("net_expectancy") or -1e9)))
-    warnings_out = [] if complete else ["Observed spread was used, but commission/slippage completeness could not be proven from sufficient matched fills."]
+    warnings_out = [] if complete else [
+        "A tick-window spread proxy was used; commission and slippage remain the explicit request values."
+    ]
     for item in results:
         folds_evaluated = int(item.get("folds_evaluated") or 0)
         if item.get("evaluation_status") == "complete" and folds_evaluated < request.n_splits:
@@ -1153,8 +1599,15 @@ def validate_strategies(  # noqa: C901
             "execution_timing": "next_bar_open",
             "barrier_window": "entry_bar_through_horizon",
         },
-        "cost_model": {"source": spread_source, "spread_bps": spread_bps, "commission_bps_per_side": request.commission_bps, "slippage_bps_per_side": request.slippage_bps, "round_trip_bps": round_trip_bps, "complete": complete},
+        "cost_model": {"source": spread_source, "spread_bps": spread_bps, "commission_bps_per_side": request.commission_bps, "slippage_bps_per_side": request.slippage_bps, "round_trip_bps": round_trip_bps, "window": spread_window, "complete": complete},
         "data_quality": {"bars": len(df), "cost_model_complete": complete},
+        "units": {
+            "net_expectancy": "return_fraction_per_trade",
+            "max_drawdown": "return_fraction",
+            "sharpe": "mean_net_return_per_trade_divided_by_per_trade_standard_deviation",
+            "mean_return_t_stat": "dimensionless_test_statistic",
+            "trades": "non_overlapping_positions",
+        },
         "warnings": warnings_out,
     }
 
@@ -1200,8 +1653,6 @@ def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: An
         "ewma_half_life": request.ewma_half_life,
         "random_seed": request.seed,
         "completion_policy": "allow_partial" if request.allow_partial else "fail_closed",
-        "valuation_time": format_epoch_utc(datetime.now(timezone.utc).timestamp()),
-        "valuation_basis": "live_position_marks_with_completed_bar_return_history",
     }
     account = None
     try:
@@ -1222,6 +1673,7 @@ def decompose_portfolio_risk(request: PortfolioRiskDecomposeRequest, gateway: An
             "price_current": getattr(tick, "ask" if request.proposed_trade.side == "buy" else "bid", None),
             "proposed": True,
         })
+    model_context.update(_portfolio_mark_context(gateway, positions))
     if not positions:
         return {
             "success": True,
@@ -1460,18 +1912,25 @@ def rank_relative_strength(request: MarketRelativeStrengthRequest, gateway: Any)
         selected.append(name)
         if len(selected) >= request.max_symbols:
             break
-    if request.benchmark and request.benchmark.upper() not in selected:
-        selected.append(request.benchmark.upper())
+    candidate_symbols = list(selected)
+    data_symbols = list(candidate_symbols)
+    if request.benchmark and request.benchmark.upper() not in data_symbols:
+        data_symbols.append(request.benchmark.upper())
     lookback = max(max(request.horizons) + request.volatility_lookback + 15, 100)
     histories: Dict[str, pd.DataFrame] = {}
     skipped = []
-    for symbol in selected:
+    for symbol in data_symbols:
         bars = _rates(gateway, symbol, request.timeframe, lookback)
         if len(bars) < int(lookback * 0.90):
             skipped.append({"symbol": symbol, "reason": "history coverage below 90%"})
             continue
         histories[symbol] = bars
-    if len(histories) < 2:
+    candidate_histories = {
+        symbol: histories[symbol]
+        for symbol in candidate_symbols
+        if symbol in histories
+    }
+    if len(candidate_histories) < 2:
         return {"error": "At least two symbols with sufficient history are required.", "error_code": "insufficient_data", "skipped": skipped}
     return_frames = []
     for symbol, bars in histories.items():
@@ -1481,7 +1940,7 @@ def rank_relative_strength(request: MarketRelativeStrengthRequest, gateway: Any)
     rows = []
     score_parts: Dict[int, Dict[str, float]] = {h: {} for h in request.horizons}
     stability_parts: Dict[int, Dict[int, Dict[str, float]]] = {offset: {h: {} for h in request.horizons} for offset in (0, 5, 10)}
-    for symbol, bars in histories.items():
+    for symbol, bars in candidate_histories.items():
         own = pd.Series(np.log(bars["close"]).diff().to_numpy(), index=bars["time"].to_numpy()).dropna()
         factor = explicit_factor if explicit_factor is not None else returns.drop(columns=[symbol], errors="ignore").mean(axis=1, skipna=True)
         aligned = pd.concat([own.rename("own"), factor.rename("factor")], axis=1, join="inner").dropna()
@@ -1548,12 +2007,15 @@ def rank_relative_strength(request: MarketRelativeStrengthRequest, gateway: Any)
         "above_sma20": float(np.mean([row["above_sma20"] for row in ordered])) if ordered else None,
         "above_sma50": float(np.mean([row["above_sma50"] for row in ordered])) if ordered else None,
     }
-    leader_count = min(request.limit, (len(ordered) + 1) // 2)
-    laggard_count = min(request.limit, len(ordered) - leader_count)
+    returned_count = min(int(request.limit), len(ordered))
+    leader_count = (returned_count + 1) // 2
+    laggard_count = returned_count - leader_count
     return {
         "success": True,
         "timeframe": request.timeframe,
         "universe_size": len(ordered),
+        "returned_count": returned_count,
+        "applied_limit": int(request.limit),
         "rank_quality": (
             "cross_sectional" if len(ordered) >= 10 else "illustrative_small_universe"
         ),
@@ -1569,7 +2031,13 @@ def rank_relative_strength(request: MarketRelativeStrengthRequest, gateway: Any)
         ),
         "breadth": breadth,
         "factor": {"source": request.benchmark.upper() if request.benchmark else "equal_weight_universe"},
-        "data_quality": {"selected_symbols": len(selected), "ranked_symbols": len(ordered), "skipped": skipped, "minimum_history_coverage": 0.90},
+        "data_quality": {
+            "selected_symbols": len(candidate_symbols),
+            "data_symbols_fetched": len(histories),
+            "ranked_symbols": len(ordered),
+            "skipped": skipped,
+            "minimum_history_coverage": 0.90,
+        },
         "units": {"raw_momentum": "log_return_fraction", "residual_momentum": "log_return_fraction", "volatility": "per_bar_log_return_stddev", "score": "robust_z_composite", "rank_stability": "fraction_0_to_1", "tick_volume": "broker_tick_count"},
         **({"all_rankings": ordered} if request.detail == "full" else {}),
     }

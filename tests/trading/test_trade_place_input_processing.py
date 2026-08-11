@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from unittest.mock import patch
 
@@ -117,7 +118,9 @@ def test_trade_place_routes_prefixed_market_order_type() -> None:
             dry_run=False,
             __cli_raw=True,
         )
-        assert out == {"ok": True, "success": True}
+        assert out["ok"] is True
+        assert out["success"] is True
+        assert re.fullmatch(r"[0-9a-f]{12}", out["correlation_id"])
         assert mock_market.call_args.kwargs["order_type"] == "BUY"
 
 
@@ -170,7 +173,9 @@ def test_trade_place_blank_expiration_keeps_market_routing() -> None:
             dry_run=False,
             __cli_raw=True,
         )
-        assert out == {"ok": True, "success": True}
+        assert out["ok"] is True
+        assert out["success"] is True
+        assert re.fullmatch(r"[0-9a-f]{12}", out["correlation_id"])
         mock_market.assert_called_once()
         mock_pending.assert_not_called()
 
@@ -279,10 +284,11 @@ def test_trade_place_dry_run_market_preview_rejects_missing_sl_tp() -> None:
             __cli_raw=True,
         )
 
-    assert out.get("success") is False
-    assert out.get("error_code") == "trade_preview_validation_failed"
-    assert "missing_stop_loss, missing_take_profit" in out.get("error", "")
-    assert out.get("no_action_reason") == "dry_run_validation_failed"
+    assert out.get("success") is True
+    assert "error_code" not in out
+    assert "error" not in out
+    assert out.get("blockers") == ["missing_stop_loss", "missing_take_profit"]
+    assert out.get("no_action_reason") == "dry_run_validation_blocked"
     assert out.get("dry_run") is True
     assert out.get("require_sl_tp") is True
     assert "live submission with require_sl_tp=true would be rejected" in out.get(
@@ -402,13 +408,86 @@ def test_trade_place_dry_run_rejects_invalid_live_protection_preview() -> None:
             __cli_raw=True,
         )
 
-    assert out.get("success") is False
+    assert out.get("success") is True
     assert out.get("preview_ok") is False
     assert out.get("dry_run") is True
-    assert out.get("error_code") == "invalid_protection_levels"
-    assert out.get("error") == out.get("sl_tp_error")
-    assert "stop_loss must be below the live bid" in out.get("error", "")
-    assert out.get("no_action_reason") == "dry_run_preview_error"
+    assert out.get("validation_code") == "invalid_protection_levels"
+    assert out.get("validation_error") == out.get("sl_tp_error")
+    assert "stop_loss must be below the live bid" in out.get("validation_error", "")
+    assert out.get("no_action_reason") == "dry_run_validation_blocked"
+    assert out.get("blockers") == ["invalid_protection_levels"]
+    mock_market.assert_not_called()
+
+
+def test_trade_place_dry_run_orders_account_quote_and_protection_blockers() -> None:
+    with patch("mtdata.core.trading._place_market_order") as mock_market, patch(
+        "mtdata.core.trading.build_trade_place_dry_run_preview",
+        return_value={
+            "account_blockers": ["no_free_margin", "critical_margin_stress"],
+            "account_state": {
+                "margin_free": -1.0,
+                "margin_stress": {"status": "critical"},
+            },
+            "quote_context": {
+                "usable_for_live_trading": False,
+                "warning": "Quote is stale.",
+            },
+            "sl_tp_valid": False,
+            "sl_tp_error": "Protection levels are invalid.",
+            "margin_required": 20.0,
+            "margin_free": -1.0,
+            "margin_sufficient": False,
+        },
+    ):
+        out = trade_place(
+            symbol="EURUSD",
+            volume=0.01,
+            order_type="BUY",
+            stop_loss=1.08,
+            take_profit=1.12,
+            dry_run=True,
+            __cli_raw=True,
+        )
+
+    assert out["blockers"] == [
+        "no_free_margin",
+        "critical_margin_stress",
+        "margin_insufficient",
+        "quote_not_live_ready",
+        "invalid_protection_levels",
+    ]
+    assert out["preview_ok"] is False
+    assert out["account_state"]["margin_stress"]["status"] == "critical"
+    mock_market.assert_not_called()
+
+
+def test_trade_place_dry_run_blocks_insufficient_estimated_margin() -> None:
+    with patch("mtdata.core.trading._place_market_order") as mock_market, patch(
+        "mtdata.core.trading.build_trade_place_dry_run_preview",
+        return_value={
+            "quote_context": {"usable_for_live_trading": True},
+            "sl_tp_valid": True,
+            "margin_required": 200.0,
+            "margin_free": 100.0,
+            "margin_sufficient": False,
+        },
+    ):
+        out = trade_place(
+            symbol="EURUSD",
+            volume=0.01,
+            order_type="BUY",
+            stop_loss=1.08,
+            take_profit=1.12,
+            dry_run=True,
+            detail="standard",
+            __cli_raw=True,
+        )
+
+    assert out["preview_ok"] is False
+    assert out["validation_passed"] is False
+    assert out["blockers"] == ["margin_insufficient"]
+    assert out["actionability"] == "blocked_by_margin_estimate"
+    assert out["no_action_reason"] == "dry_run_validation_blocked"
     mock_market.assert_not_called()
 
 
@@ -427,12 +506,49 @@ def test_trade_place_dry_run_rejects_identical_protection_before_mt5() -> None:
             __cli_raw=True,
         )
 
-    assert out["success"] is False
-    assert out["error_code"] == "invalid_protection_levels"
-    assert out["error"] == "stop_loss and take_profit must be different prices."
+    assert out["success"] is True
+    assert out["validation_code"] == "invalid_protection_levels"
+    assert out["validation_error"] == "stop_loss and take_profit must be different prices."
     assert out["validation"]["local_requirements_passed"] is False
     assert out["validation"]["live_submission_eligible"] is False
     assert "invalid_protection_levels" in out["validation"]["blockers"]
+    assert out["no_action_reason"] == "dry_run_validation_blocked"
+    mock_preview.assert_not_called()
+    mock_market.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("order_type", "stop_loss", "take_profit", "expected_error"),
+    [
+        ("BUY", 1.1, 1.0, "take_profit must be above stop_loss for BUY orders."),
+        ("SELL", 1.0, 1.1, "stop_loss must be above take_profit for SELL orders."),
+    ],
+)
+def test_trade_place_dry_run_rejects_reversed_protection_before_mt5(
+    order_type: str,
+    stop_loss: float,
+    take_profit: float,
+    expected_error: str,
+) -> None:
+    with patch("mtdata.core.trading._place_market_order") as mock_market, patch(
+        "mtdata.core.trading.build_trade_place_dry_run_preview"
+    ) as mock_preview:
+        out = trade_place(
+            symbol="EURUSD",
+            volume=0.01,
+            order_type=order_type,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            dry_run=True,
+            detail="standard",
+            __cli_raw=True,
+        )
+
+    assert out["success"] is True
+    assert out["validation_code"] == "invalid_protection_levels"
+    assert out["validation_error"] == expected_error
+    assert out["validation"]["local_requirements_passed"] is False
+    assert out["no_action_reason"] == "dry_run_validation_blocked"
     mock_preview.assert_not_called()
     mock_market.assert_not_called()
 
@@ -481,16 +597,19 @@ def test_trade_place_dry_run_rejects_bool_like_invalid_protection_preview() -> N
             volume=0.03,
             order_type="BUY",
             stop_loss=64000,
-            take_profit=63000,
+            take_profit=68000,
             dry_run=True,
             __cli_raw=True,
         )
 
-    assert out.get("success") is False
+    assert out.get("success") is True
     assert out.get("preview_ok") is False
     assert out.get("dry_run") is True
-    assert out.get("error_code") == "invalid_protection_levels"
-    assert "take_profit must be above the live ask" in out.get("error", "")
+    assert out.get("validation_code") == "invalid_protection_levels"
+    assert "take_profit must be above the live ask" in out.get(
+        "validation_error", ""
+    )
+    assert out.get("blockers") == ["invalid_protection_levels"]
     mock_market.assert_not_called()
 
 
@@ -594,7 +713,7 @@ def test_trade_place_preserves_scalar_warning_on_unprotected_market_fill() -> No
     assert any("CRITICAL" in str(w) for w in out.get("warnings", []))
 
 
-def test_trade_place_require_sl_tp_flags_unverified_market_fill() -> None:
+def test_trade_place_auto_closes_unverified_market_fill() -> None:
     with patch(
         "mtdata.core.trading._place_market_order",
         return_value={
@@ -604,7 +723,10 @@ def test_trade_place_require_sl_tp_flags_unverified_market_fill() -> None:
             "protection_status": "protection_unverified",
             "position_ticket_candidates": [456],
         },
-    ), patch("mtdata.core.trading._close_positions") as mock_close:
+    ), patch(
+        "mtdata.core.trading._close_positions",
+        return_value={"success": True, "closed_count": 1},
+    ) as mock_close:
         out = trade_place(
             symbol="BTCUSD",
             volume=0.03,
@@ -617,13 +739,49 @@ def test_trade_place_require_sl_tp_flags_unverified_market_fill() -> None:
         )
     mock_close.assert_called_once_with(
         ticket=456,
+        volume=0.03,
         comment="AUTO-CLOSE: TP/SL protection unresolved",
         deviation=20,
     )
     assert out.get("error") == "Order was executed, but TP/SL protection could not be verified."
-    assert out.get("protection_status") == "protection_unverified"
+    assert out.get("error_code") == "protection_not_verified"
+    assert out.get("protection_status") == "auto_closed_after_sl_tp_fail"
     assert "verify protection" in out.get("warnings", [])
-    assert any("AUTO-CLOSE FAILED" in warning for warning in out.get("warnings", [])), out
+    assert any("could not be verified" in warning.lower() for warning in out.get("warnings", [])), out
+
+
+def test_trade_place_treats_unknown_protection_status_as_unverified() -> None:
+    with patch(
+        "mtdata.core.trading._place_market_order",
+        return_value={
+            "retcode": 10009,
+            "sl_tp_result": {
+                "status": "unexpected",
+                "requested": {"sl": 64000.0, "tp": 68000.0},
+            },
+            "position_ticket": 456,
+        },
+    ), patch(
+        "mtdata.core.trading._close_positions",
+        return_value={"success": True, "closed_count": 1},
+    ) as mock_close:
+        out = trade_place(
+            symbol="BTCUSD",
+            volume=0.03,
+            order_type="BUY",
+            stop_loss=64000,
+            take_profit=68000,
+            require_sl_tp=False,
+            dry_run=False,
+            __cli_raw=True,
+        )
+
+    mock_close.assert_called_once()
+    assert out["success"] is False
+    assert out["protection_status"] == "auto_closed_after_sl_tp_fail"
+    assert out["error"] == (
+        "Order was executed, but TP/SL protection could not be verified."
+    )
 
 
 def test_trade_place_does_not_treat_auto_close_not_found_as_closed() -> None:
@@ -663,7 +821,7 @@ def test_trade_place_defaults_to_auto_closing_unprotected_market_fill() -> None:
         },
     ), patch(
         "mtdata.core.trading._close_positions",
-        return_value={"closed_count": 1},
+        return_value={"success": True, "closed_count": 1},
     ) as mock_close:
         out = trade_place(
             symbol="BTCUSD",

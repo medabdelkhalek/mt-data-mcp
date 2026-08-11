@@ -106,9 +106,9 @@ mtdata-cli forecast_conformal_intervals EURUSD --timeframe H1 --method fourier_o
 
 ```bash
 mtdata-cli forecast_barrier_optimize EURUSD --timeframe H1 --horizon 12 \
-  --method hmm_mc --mode pct --grid-style volatility --refine true --refine-radius 0.35 \
-  --tp-min 0.25 --tp-max 1.5 --tp-steps 7 --sl-min 0.25 --sl-max 2.5 --sl-steps 9 \
-  --params "n_sims=5000 seed=7" --top-k 5 --return-grid false --json
+  --method hmm_mc --mode pct --grid-style volatility \
+  --params "n_sims=5000 seed=7 refine=true refine_radius=0.35 tp_min=0.25 tp_max=1.5 tp_steps=7 sl_min=0.25 sl_max=2.5 sl_steps=9 return_grid=false" \
+  --top-k 5 --json
 ```
 
 - Choose a combo by objective (edge/kelly/ev/ev_cond/ev_per_bar/prob_resolve/profit_factor/min_loss_prob/utility) subject to constraints:
@@ -137,10 +137,13 @@ mtdata-cli forecast_barrier_prob EURUSD --timeframe H1 --horizon 12 \
 Use triple‑barrier labels offline for signal evaluation and meta‑models.
 
 ```bash
-mtdata-cli labels_triple_barrier EURUSD --timeframe H1 --limit 2000 \
+mtdata-cli labels_triple_barrier EURUSD --timeframe H1 --lookback 2000 \
   --horizon 12 --tp-pct 0.4 --sl-pct 0.8 --label-on high_low \
-  --lookback 300 --json
+  --detail full --json
 ```
+
+`--lookback` controls the labeled history; `--limit` only caps the compact or
+standard sample, while `--detail full` returns the complete labeled series.
 
 - Compute in‑sample precision/recall for your entry rules; adjust thresholds (edge, cp_prob, RSI, EMA alignment) to reach desired trade quality.
 

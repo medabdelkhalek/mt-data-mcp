@@ -8,6 +8,7 @@ from mtdata.core.execution_logging import (
     log_operation_start,
     run_logged_operation,
 )
+from mtdata.core.request_context import request_id_scope
 
 
 def test_run_logged_operation_logs_finish_event(caplog):
@@ -26,21 +27,66 @@ def test_run_logged_operation_logs_finish_event(caplog):
     )
 
 
-def test_run_logged_operation_runs_cleanup_after_top_level_success(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        "mtdata.core.execution_logging._run_post_operation_cleanup",
-        lambda logger, *, operation: calls.append(operation),
+def test_request_context_is_added_to_operation_logs(caplog):
+    with (
+        request_id_scope("web-request-42"),
+        caplog.at_level(logging.DEBUG, logger="mtdata.test.exec"),
+    ):
+        run_logged_operation(
+            logging.getLogger("mtdata.test.exec"),
+            operation="sample_op",
+            func=lambda: {"success": True},
+        )
+
+    assert any(
+        "request_id=web-request-42" in record.message
+        for record in caplog.records
+        if "operation=sample_op" in record.message
     )
 
-    result = run_logged_operation(
-        logging.getLogger("mtdata.test.exec"),
-        operation="sample_op",
-        func=lambda: {"success": True},
-    )
 
-    assert result["success"] is True
-    assert calls == ["sample_op"]
+def test_structured_failure_logs_warning_with_actionable_fields(caplog):
+    with caplog.at_level(logging.WARNING, logger="mtdata.test.exec"):
+        result = run_logged_operation(
+            logging.getLogger("mtdata.test.exec"),
+            operation="trade_place",
+            symbol="EURUSD",
+            func=lambda: {
+                "success": False,
+                "error": "Broker rejected order\nrequest",
+                "error_code": "order_rejected",
+                "retcode": 10016,
+                "retcode_name": "TRADE_RETCODE_INVALID_STOPS",
+            },
+        )
+
+    assert result["success"] is False
+    record = next(
+        record
+        for record in caplog.records
+        if "event=finish operation=trade_place success=False" in record.message
+    )
+    assert record.levelno == logging.WARNING
+    assert "error=Broker rejected order request" in record.message
+    assert "error_code=order_rejected" in record.message
+    assert "retcode=10016" in record.message
+    assert "retcode_name=TRADE_RETCODE_INVALID_STOPS" in record.message
+
+
+def test_successful_operation_remains_debug_only(caplog):
+    with caplog.at_level(logging.DEBUG, logger="mtdata.test.exec"):
+        run_logged_operation(
+            logging.getLogger("mtdata.test.exec"),
+            operation="sample_op",
+            func=lambda: {"success": True},
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if "event=finish operation=sample_op success=True" in record.message
+    )
+    assert record.levelno == logging.DEBUG
 
 
 def test_run_logged_operation_logs_exception_and_reraises(caplog):
@@ -55,23 +101,6 @@ def test_run_logged_operation_logs_exception_and_reraises(caplog):
         "event=error operation=sample_fail" in record.message
         for record in caplog.records
     )
-
-
-def test_run_logged_operation_runs_cleanup_after_top_level_exception(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        "mtdata.core.execution_logging._run_post_operation_cleanup",
-        lambda logger, *, operation: calls.append(operation),
-    )
-
-    with pytest.raises(RuntimeError, match="boom"):
-        run_logged_operation(
-            logging.getLogger("mtdata.test.exec"),
-            operation="sample_fail",
-            func=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
-
-    assert calls == ["sample_fail"]
 
 
 def test_nested_same_operation_logs_single_finish_event(caplog):
@@ -95,28 +124,6 @@ def test_nested_same_operation_logs_single_finish_event(caplog):
         if "event=finish operation=sample_op success=True" in record.message
     ]
     assert len(finish_records) == 1
-
-
-def test_nested_operations_run_cleanup_once_for_outer_operation(monkeypatch):
-    logger = logging.getLogger("mtdata.test.exec")
-    calls = []
-    monkeypatch.setattr(
-        "mtdata.core.execution_logging._run_post_operation_cleanup",
-        lambda logger, *, operation: calls.append(operation),
-    )
-
-    result = run_logged_operation(
-        logger,
-        operation="outer_op",
-        func=lambda: run_logged_operation(
-            logger,
-            operation="inner_op",
-            func=lambda: {"success": True},
-        ),
-    )
-
-    assert result["success"] is True
-    assert calls == ["outer_op"]
 
 
 def test_nested_different_operations_still_log_both_finish_events(caplog):

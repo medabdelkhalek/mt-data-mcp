@@ -15,12 +15,13 @@ from ..forecast.requests import (
     ForecastVolatilityEstimateRequest,
 )
 from ..shared.schema import DetailLiteral, ForecastLibraryLiteral, reject_removed_field
-from .output_contract import output_extras_shape_detail
+from .output_contract import normalize_output_extras, output_extras_shape_detail
 
 
 def _request_detail(detail: DetailLiteral, extras: Optional[list[str] | str]) -> DetailLiteral:
-    if extras is not None:
-        return output_extras_shape_detail(extras)  # type: ignore[return-value]
+    normalized_extras = normalize_output_extras(extras)
+    if normalized_extras:
+        return output_extras_shape_detail(normalized_extras)  # type: ignore[return-value]
     return detail
 
 
@@ -42,6 +43,17 @@ class ForecastPriceBody(BaseModel):
     dimred_method: Optional[str] = None
     dimred_params: Optional[Dict[str, Any]] = None
     target_spec: Optional[Dict[str, Any]] = None
+    async_mode: bool = Field(
+        False,
+        description=(
+            "Submit trainable methods to the background task runtime and return "
+            "a task_id instead of waiting for training."
+        ),
+    )
+    model_id: Optional[str] = Field(
+        None,
+        description="Stored model ID to reuse instead of training a new artifact.",
+    )
     extras: Optional[list[str] | str] = Field(None)
     detail: DetailLiteral = Field("compact")
 
@@ -69,6 +81,8 @@ class ForecastPriceBody(BaseModel):
             dimred_method=self.dimred_method,
             dimred_params=self.dimred_params,
             target_spec=self.target_spec,
+            async_mode=self.async_mode,
+            model_id=self.model_id,
             detail=_request_detail(self.detail, self.extras),
         )
 
@@ -146,3 +160,13 @@ class BacktestBody(BaseModel):
             trade_threshold=self.trade_threshold,
             detail=_request_detail(self.detail, self.extras),
         )
+
+
+class ToolInvokeBody(BaseModel):
+    """Generic MCP tool invocation from the Web UI tool runner."""
+
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    confirm: bool = Field(
+        False,
+        description="Required true for live trade mutations and destructive model/task tools.",
+    )

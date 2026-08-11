@@ -31,11 +31,18 @@ mtdata-cli temporal_analyze EURUSD --timeframe D1 --group-by month --lookback 10
 | `--start` | (optional) | Start date (ISO or flexible format) |
 | `--end` | (optional) | End date (ISO or flexible format) |
 | `--group-by` | `dow` | Grouping: `dow` (day of week), `hour`, `month`, `session` (Asia/London/overlap/NY/off), or `all` (all four breakdowns) |
+| `--session-calendar` | `auto` | Session calendar for `session` grouping: `auto`, `fx`, or `equity`. |
 | `--day-of-week` | (optional) | Filter to a specific day (0–6 or name, e.g., `Mon`, `Friday`) |
 | `--month` | (optional) | Filter to a specific month (1–12 or name, e.g., `Jan`, `September`) |
 | `--time-range` | (optional) | Filter by time window `HH:MM-HH:MM` using a half-open interval `[start, end)` (wraps midnight, e.g., `22:00-02:00`) |
 | `--return-mode` | `pct` | Return calculation: `pct` (percentage) or `log` (logarithmic) |
 | `--min-bars` | auto for DOW | Exclude grouped rows below this sample count. Explicit values apply to every breakdown under `--group-by all`; automatic filtering applies to its DOW breakdown. |
+
+`auto` uses both symbol syntax and the broker symbol path. Currency pairs,
+metals, and broker-classified index/commodity CFDs use the near-24/5 FX session
+buckets; stock-like symbols use equity sessions. Responses include the resolved
+`session_calendar` and `session_calendar_source`. Set `fx` or `equity`
+explicitly to override inference.
 
 ---
 

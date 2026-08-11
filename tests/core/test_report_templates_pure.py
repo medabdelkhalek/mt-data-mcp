@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mtdata.core.report import _report_error_payload
-from mtdata.utils.coercion import safe_float as _safe_float
 from mtdata.core.report_templates.basic import (
     _bars_since_latest_pivot,
     _compute_compact_trend,
@@ -26,6 +25,38 @@ from mtdata.core.report_templates.basic import (
     _percentile_rank,
     _wilder_rma,
 )
+from mtdata.utils.coercion import safe_float as _safe_float
+
+
+def test_profile_report_uses_only_its_declared_timeframes(monkeypatch):
+    from mtdata.core.report_templates import common
+
+    report = {"sections": {}}
+    basic_calls = []
+    attach_calls = []
+    monkeypatch.setattr(
+        common,
+        "template_basic",
+        lambda *args, **kwargs: basic_calls.append((args, kwargs)) or report,
+    )
+    monkeypatch.setattr(
+        common,
+        "attach_report_timeframes",
+        lambda *args, **kwargs: attach_calls.append((args, kwargs)),
+    )
+
+    result = common.build_report_with_timeframes(
+        "EURUSD",
+        12,
+        None,
+        {"timeframe": "H4"},
+        default_extra=["H1", "H4", "D1", "W1"],
+        default_pivots=["D1", "W1"],
+    )
+
+    assert result is report
+    assert basic_calls[0][1]["include_default_timeframes"] is False
+    assert attach_calls[0][1]["default_extra"] == ["H1", "H4", "D1", "W1"]
 
 # ---------------------------------------------------------------------------
 # Synthetic candle helpers
@@ -278,6 +309,16 @@ class TestComputeCompactTrend:
         assert result is not None
         assert len(result['slope_atr_scores']) == 3  # windows [5, 20, 60]
         assert len(result['fit_r2_pcts']) == 3
+
+    def test_unavailable_window_is_not_silently_shortened(self):
+        result = _compute_compact_trend(_make_rows(30))
+
+        assert result is not None
+        assert result["slope_atr_scores"][:2] != [None, None]
+        assert result["slope_atr_scores"][2] is None
+        assert result["fit_r2_pcts"][2] is None
+        assert result["bars_analyzed"] == 30
+        assert result["input_resolution"] == "consecutive_timeframe_bars"
 
     def test_uptrend_positive_slopes(self):
         rows = _make_rows(30, base=100, step=0.5)
@@ -634,6 +675,10 @@ class TestTemplateBasic:
         assert "slope_atr_scores" in ctx["trend_compact_legend"]
         assert "trend_compact_explained" not in ctx
         assert "sparkline_close" not in ctx
+        context_call = next(
+            call for call in mock_raw.call_args_list if "limit" in call.kwargs
+        )
+        assert "simplify" not in context_call.kwargs
 
     @patch(f"{_BASIC_MODULE}._get_raw_result")
     @patch(f"{_BASIC_MODULE}.now_utc_iso", return_value="2024-01-15T00:00:00Z")
@@ -696,7 +741,7 @@ class TestTemplateBasic:
 
         def raw_side_effect(func, *args, **kwargs):
             name = func.__name__ if hasattr(func, "__name__") else str(func)
-            if "simplify" in kwargs and "limit" in kwargs:
+            if "limit" in kwargs and "indicators" in kwargs:
                 return {"data": candle_rows, "meta": {"diagnostics": {"freshness": dict(base_freshness)}}}
             if "pivot" in name.lower():
                 return _mock_pivot_data()
@@ -1231,7 +1276,7 @@ class TestTemplateBasic:
     @patch(f"{_BASIC_MODULE}.pick_best_forecast_method")
     @patch(f"{_BASIC_MODULE}.summarize_barrier_grid")
     @patch(f"{_BASIC_MODULE}.attach_multi_timeframes")
-    def test_basic_falls_back_when_best_forecast_is_degenerate(
+    def test_basic_falls_back_with_typed_forecast_error(
         self, mock_mtf, mock_sum_bar, mock_pick, mock_tail,
         mock_now, mock_raw,
     ):
@@ -1255,13 +1300,15 @@ class TestTemplateBasic:
                 return {
                     "results": {
                         "sf_autoarima": {
+                            "success": True,
                             "avg_rmse": 0.9,
                             "avg_mae": 0.7,
                             "avg_directional_accuracy": 0.2,
                             "successful_tests": 20,
                         },
                         "naive": {
-                            "avg_rmse": 0.95,
+                            "success": True,
+                            "avg_rmse": 0.94,
                             "avg_mae": 0.8,
                             "avg_directional_accuracy": 0.1,
                             "successful_tests": 20,
@@ -1271,7 +1318,7 @@ class TestTemplateBasic:
             if "forecast_generate" in name.lower() or "generate" in name.lower():
                 method = kwargs.get("method")
                 if method == "sf_autoarima":
-                    return {"forecast_price": [65290.6] * 12}
+                    return {"error": "optional dependency unavailable"}
                 if method == "naive":
                     return {"forecast_price": [65290.6, 65320.0, 65380.0, 65440.0]}
                 return {"error": f"unexpected method: {method}"}
@@ -1289,7 +1336,9 @@ class TestTemplateBasic:
         forecast = report["sections"].get("forecast", {})
         assert forecast.get("method") == "naive"
         assert forecast.get("fallback_from") == "sf_autoarima"
-        assert any("degenerate" in str(v).lower() for v in forecast.get("selection_warnings", []))
+        assert forecast.get("fallback_reason_code") == "forecast_error"
+        assert "optional dependency unavailable" in forecast.get("fallback_reason", "")
+        assert any("forecast error" in str(v).lower() for v in forecast.get("selection_warnings", []))
         assert report.get("fallback_applied") is True
         assert report.get("original_method") == "sf_autoarima"
         assert report.get("fallback_method") == "naive"
@@ -1301,6 +1350,7 @@ class TestTemplateBasic:
         assert selection_basis.get("primary_metric") == "avg_rmse"
         assert selection_basis.get("tie_breaker") == "avg_directional_accuracy"
         assert selection_basis.get("fallback_applied") is True
+        assert selection_basis.get("fallback_reason_code") == "forecast_error"
         criteria = report["sections"].get("backtest", {}).get("selection_criteria", {})
         assert criteria.get("primary_metric") == "avg_rmse"
 
@@ -1509,8 +1559,29 @@ _COMMON_MODULE = "mtdata.core.report_templates.common"
 class TestTemplateScalping:
     @patch(f"{_SCALP_MODULE}.build_report_with_market")
     @patch(f"{_SCALP_MODULE}.market_snapshot")
+    @patch(f"{_SCALP_MODULE}._get_tick_size")
+    def test_bounded_scalping_skips_live_market_calls(
+        self, mock_tick_size, mock_snapshot, mock_build
+    ):
+        mock_build.return_value = {"meta": {}, "sections": {}}
+
+        from mtdata.core.report_templates.scalping import template_scalping
+
+        template_scalping(
+            "EURUSD",
+            8,
+            None,
+            {"start": "2024-01-01", "end": "2024-01-31"},
+        )
+
+        mock_snapshot.assert_not_called()
+        mock_tick_size.assert_not_called()
+        assert mock_build.call_args.kwargs["snapshot"] == {}
+
+    @patch(f"{_SCALP_MODULE}.build_report_with_market")
+    @patch(f"{_SCALP_MODULE}.market_snapshot")
     @patch(f"{_SCALP_MODULE}.merge_params")
-    @patch(f"{_SCALP_MODULE}._get_pip_size", return_value=0.01)
+    @patch(f"{_SCALP_MODULE}._get_tick_size", return_value=0.01)
     def test_scalping_returns_report(self, mock_pip, mock_merge, mock_snap, mock_build):
         mock_merge.return_value = {"timeframe": "M5", "mode": "ticks"}
         mock_snap.return_value = {"bid": 1.2345, "ask": 1.2347, "spread_ticks": 20}
@@ -1524,11 +1595,30 @@ class TestTemplateScalping:
 
         assert isinstance(report, dict)
         mock_build.assert_called_once()
+        params = mock_build.call_args.args[3]
+        assert params["tp_min"] == 50.0
+        assert params["tp_max"] == 120.0
+        assert params["sl_min"] == 50.0
+        assert params["sl_max"] == 160.0
 
     @patch(f"{_SCALP_MODULE}.build_report_with_market")
     @patch(f"{_SCALP_MODULE}.market_snapshot")
     @patch(f"{_SCALP_MODULE}.merge_params")
-    @patch(f"{_SCALP_MODULE}._get_pip_size", return_value=0.01)
+    @patch(f"{_SCALP_MODULE}._get_tick_size", return_value=0.00001)
+    def test_scalping_preserves_user_barriers(self, mock_pip, mock_merge, mock_snap, mock_build):
+        mock_merge.return_value = {"mode": "ticks", "tp_min": 7.0}
+        mock_snap.return_value = {"bid": 1.2345, "ask": 1.2347, "spread_ticks": 20}
+        mock_build.return_value = {"meta": {}, "sections": {}}
+
+        from mtdata.core.report_templates.scalping import template_scalping
+        template_scalping("EURUSD", 8, None, {"tp_min": 7.0})
+
+        assert mock_build.call_args.args[3]["tp_min"] == 7.0
+
+    @patch(f"{_SCALP_MODULE}.build_report_with_market")
+    @patch(f"{_SCALP_MODULE}.market_snapshot")
+    @patch(f"{_SCALP_MODULE}.merge_params")
+    @patch(f"{_SCALP_MODULE}._get_tick_size", return_value=0.01)
     def test_scalping_default_timeframe_m5(self, mock_pip, mock_merge, mock_snap, mock_build):
         mock_merge.return_value = {"mode": "ticks"}
         mock_snap.return_value = {"bid": 1.23, "ask": 1.24}
@@ -1546,7 +1636,7 @@ class TestTemplateScalping:
     @patch(f"{_SCALP_MODULE}.build_report_with_market")
     @patch(f"{_SCALP_MODULE}.market_snapshot")
     @patch(f"{_SCALP_MODULE}.merge_params")
-    @patch(f"{_SCALP_MODULE}._get_pip_size", return_value=1.0)
+    @patch(f"{_SCALP_MODULE}._get_tick_size", return_value=1.0)
     def test_scalping_high_price_adjusts_pip_levels(self, mock_pip, mock_merge, mock_snap, mock_build):
         mock_merge.return_value = {"mode": "ticks"}
         mock_snap.return_value = {
@@ -1562,7 +1652,7 @@ class TestTemplateScalping:
     @patch(f"{_SCALP_MODULE}.build_report_with_market")
     @patch(f"{_SCALP_MODULE}.market_snapshot")
     @patch(f"{_SCALP_MODULE}.merge_params")
-    @patch(f"{_SCALP_MODULE}._get_pip_size", return_value=0.01)
+    @patch(f"{_SCALP_MODULE}._get_tick_size", return_value=0.01)
     def test_scalping_pct_mode_no_adjustment(self, mock_pip, mock_merge, mock_snap, mock_build):
         mock_merge.return_value = {"mode": "pct"}
         mock_snap.return_value = {"bid": 1.23, "ask": 1.24}
@@ -1576,7 +1666,7 @@ class TestTemplateScalping:
     @patch(f"{_SCALP_MODULE}.build_report_with_market")
     @patch(f"{_SCALP_MODULE}.market_snapshot")
     @patch(f"{_SCALP_MODULE}.merge_params")
-    @patch(f"{_SCALP_MODULE}._get_pip_size", return_value=0.01)
+    @patch(f"{_SCALP_MODULE}._get_tick_size", return_value=0.01)
     def test_scalping_snapshot_error_still_runs(self, mock_pip, mock_merge, mock_snap, mock_build):
         mock_merge.return_value = {"mode": "ticks"}
         mock_snap.return_value = {"error": "MT5 offline"}
@@ -1590,7 +1680,7 @@ class TestTemplateScalping:
     @patch(f"{_SCALP_MODULE}.build_report_with_market")
     @patch(f"{_SCALP_MODULE}.market_snapshot")
     @patch(f"{_SCALP_MODULE}.merge_params")
-    @patch(f"{_SCALP_MODULE}._get_pip_size", return_value=1.0)
+    @patch(f"{_SCALP_MODULE}._get_tick_size", return_value=1.0)
     def test_scalping_no_spread_ticks_uses_price_based(self, mock_pip, mock_merge, mock_snap, mock_build):
         mock_merge.return_value = {"mode": "ticks"}
         mock_snap.return_value = {"bid": 2000.0, "ask": 2001.0}

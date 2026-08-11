@@ -2,17 +2,26 @@
 
 import logging
 import math
+import threading
 import time as _stdlib_time
 from datetime import datetime, timedelta, timezone
+from numbers import Real
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
 from ...bootstrap.settings import mt5_config, trade_guardrails_config
 from ...shared.market_units import forex_points_per_pip
 from ...utils.coercion import round_finite
+from ...utils.quote import compute_spread_metrics, resolve_quote_tick, tick_value
 from . import comments, common, time, validation
 from .gateway import MT5TradingGateway, create_trading_gateway, trading_connection_error
 from .positions import _resolve_open_position
-from .safety import evaluate_trade_guardrails
+from .safety import (
+    _account_uses_netting,
+    _resolve_existing_symbol_net,
+    assess_margin_stress,
+    evaluate_trade_guardrails,
+    load_guardrail_book_snapshots,
+)
 from .time import ExpirationValue
 from .validation import MarketOrderTypeInput, OrderTypeInput
 
@@ -20,6 +29,8 @@ from .validation import MarketOrderTypeInput, OrderTypeInput
 class _OrderSymbolContext(TypedDict):
     symbol_info: Any
     volume: float
+    account_info: Any
+    account_state_block: Optional[Dict[str, Any]]
 
 
 class _OrderSubmitOutcome(TypedDict):
@@ -32,6 +43,7 @@ _POSITION_RESOLUTION_WAIT_SCHEDULE_SECONDS = (0.15, 0.3, 0.6, 1.2, 2.4)
 _TRADE_TICK_MAX_AGE_SECONDS = 10.0
 _POSITION_DEAL_LOOKUP_WINDOW_SECONDS = 30
 _DEFAULT_ORDER_MAGIC = 234000
+_TRADE_DECISION_LOCK = threading.RLock()
 logger = logging.getLogger(__name__)
 
 
@@ -140,21 +152,6 @@ def _build_sl_tp_result(
     return out
 
 
-def _sl_tp_price_tolerance(symbol_info: Any) -> float:
-    price_tol = validation._safe_float_attr(symbol_info, "point")
-    if price_tol is None or not math.isfinite(price_tol) or price_tol <= 0:
-        return 1e-9
-    return float(price_tol)
-
-
-def _position_protection_levels(position: Any) -> tuple[Optional[float], Optional[float]]:
-    sl = validation._safe_float_attr(position, "sl")
-    tp = validation._safe_float_attr(position, "tp")
-    applied_sl = float(sl) if sl is not None and math.isfinite(sl) and sl != 0.0 else None
-    applied_tp = float(tp) if tp is not None and math.isfinite(tp) and tp != 0.0 else None
-    return applied_sl, applied_tp
-
-
 def _evaluate_requested_protection(
     *,
     requested_sl: Optional[float],
@@ -163,7 +160,8 @@ def _evaluate_requested_protection(
     applied_tp: Optional[float],
     symbol_info: Any,
 ) -> tuple[bool, bool, Optional[Dict[str, Dict[str, float]]]]:
-    price_tol = _sl_tp_price_tolerance(symbol_info)
+    point = validation._safe_float_attr(symbol_info, "point", default=0.0) or 0.0
+    price_tol = validation._protection_level_tolerance(point=point)
     all_requested_present = True
     adjustment: Dict[str, Dict[str, float]] = {}
     for label, requested, applied in (
@@ -175,7 +173,11 @@ def _evaluate_requested_protection(
         if applied is None:
             all_requested_present = False
             continue
-        if abs(float(applied) - float(requested)) > price_tol:
+        if not validation._protection_levels_match(
+            float(applied),
+            float(requested),
+            tol=price_tol,
+        ):
             adjustment[label] = {
                 "requested": float(requested),
                 "applied": float(applied),
@@ -192,7 +194,7 @@ class _ProtectionOutcome(TypedDict, total=False):
     warnings: List[str]
 
 
-def _attach_post_fill_protection(
+def _attach_post_fill_protection(  # noqa: C901
     mt5: Any,
     *,
     symbol: str,
@@ -269,6 +271,8 @@ def _attach_post_fill_protection(
                 side=side,
                 volume=volume,
                 magic=magic,
+                require_exact_ticket_match=True,
+                allow_alternate_ticket_match=True,
             )
             if isinstance(resolve_info, dict):
                 last_resolve_info = dict(resolve_info)
@@ -313,7 +317,7 @@ def _attach_post_fill_protection(
             }
 
         if position_obj is not None and position_ticket is not None:
-            sl_applied, tp_applied = _position_protection_levels(position_obj)
+            sl_applied, tp_applied = validation._position_protection_levels(position_obj)
             initial_confirmed, initial_adjusted, initial_adjustment = (
                 _evaluate_requested_protection(
                     requested_sl=stop_loss,
@@ -334,8 +338,18 @@ def _attach_post_fill_protection(
                     "action": mt5.TRADE_ACTION_SLTP,
                     "symbol": symbol,
                     "position": position_ticket,
-                    "sl": 0.0 if stop_loss is None else float(stop_loss),
-                    "tp": 0.0 if take_profit is None else float(take_profit),
+                    "sl": (
+                        0.0
+                        if stop_loss is None and sl_applied is None
+                        else float(sl_applied if stop_loss is None else stop_loss)
+                    ),
+                    "tp": (
+                        0.0
+                        if take_profit is None and tp_applied is None
+                        else float(
+                            tp_applied if take_profit is None else take_profit
+                        )
+                    ),
                     "comment": comments._normalize_trade_comment(
                         comment,
                         default=request_comment,
@@ -357,6 +371,14 @@ def _attach_post_fill_protection(
                         modify_result = None
                         sl_tp_last_error = str(ex)
                         sl_tp_error = f"Error setting TP/SL: {str(ex)}"
+                    if modify_result is None:
+                        if sl_tp_error is None:
+                            sl_tp_error = (
+                                "Ambiguous broker response while setting TP/SL; "
+                                "the request was not retried."
+                            )
+                        sl_tp_apply_status = "unverified"
+                        break
                     if modify_result is not None:
                         sl_tp_last_retcode = getattr(modify_result, "retcode", None)
                         sl_tp_last_comment = getattr(modify_result, "comment", None)
@@ -384,7 +406,9 @@ def _attach_post_fill_protection(
                         ]
                         if exact_positions:
                             pos_after = exact_positions[0]
-                            sl_applied, tp_applied = _position_protection_levels(pos_after)
+                            sl_applied, tp_applied = validation._position_protection_levels(
+                                pos_after
+                            )
                             confirmed, adjusted, adjustment = _evaluate_requested_protection(
                                 requested_sl=stop_loss,
                                 requested_tp=take_profit,
@@ -428,7 +452,8 @@ def _attach_post_fill_protection(
                         if sl_tp_last_error:
                             detail_bits.append(f"broker_error={sl_tp_last_error!r}")
                         sl_tp_error = "Failed to set TP/SL (" + ", ".join(detail_bits) + ")"
-                    sl_tp_apply_status = "failed"
+                    if sl_tp_apply_status != "unverified":
+                        sl_tp_apply_status = "failed"
         else:
             checked = ", ".join(str(v) for v in position_ticket_candidates) or "none"
             sl_tp_error = (
@@ -576,7 +601,7 @@ def _send_order_with_fill_mode_retry(
             last_result = result
             last_request = request_to_send
             try:
-                if validation._retcode_is_done(mt5, getattr(result, "retcode", -1)):
+                if validation._retcode_is_accepted(mt5, getattr(result, "retcode", -1)):
                     return result, last_error, attempts, last_request
             except Exception:
                 pass
@@ -612,8 +637,6 @@ def _prepare_order_gateway(
 ) -> tuple[Optional[MT5TradingGateway], Optional[Dict[str, Any]]]:
     mt5 = create_trading_gateway(
         gateway=gateway,
-        include_trade_preflight=True,
-        include_retcode_name=True,
     )
     connection_error = trading_connection_error(mt5)
     if connection_error is not None:
@@ -621,11 +644,99 @@ def _prepare_order_gateway(
     return mt5, None
 
 
+def _assess_order_account_state(
+    mt5: Any,
+    *,
+    preflight: Optional[Dict[str, Any]] = None,
+) -> tuple[Any, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Return one canonical account snapshot and any new-order blockers."""
+    try:
+        account_info = mt5.account_info()
+    except Exception:
+        account_info = None
+    if account_info is None:
+        block = validation.snapshot_unavailable_error(
+            mt5,
+            snapshot="account",
+            context="evaluate the current account execution and margin state",
+        )
+        block["blockers"] = ["account_snapshot_unavailable"]
+        if preflight is not None:
+            block["preflight"] = preflight
+        return (
+            None,
+            {
+                "margin_stress": {"status": "unknown", "reasons": []},
+                "blockers": ["account_snapshot_unavailable"],
+            },
+            block,
+        )
+
+    numeric_margin_fields = {
+        field: getattr(account_info, field, None)
+        for field in ("equity", "margin", "margin_free", "margin_level")
+    }
+    has_concrete_margin_data = any(
+        isinstance(value, Real) and not isinstance(value, bool)
+        for value in numeric_margin_fields.values()
+    )
+    margin_stress = (
+        assess_margin_stress(account_info)
+        if has_concrete_margin_data
+        else {"status": "unknown", "reasons": []}
+    )
+    margin_free = (
+        validation._safe_float_attr(account_info, "margin_free", None)
+        if isinstance(numeric_margin_fields["margin_free"], Real)
+        and not isinstance(numeric_margin_fields["margin_free"], bool)
+        else None
+    )
+    trade_allowed = getattr(account_info, "trade_allowed", None)
+    blockers: List[str] = []
+    if trade_allowed is False:
+        blockers.append("account_trading_disabled")
+    if margin_free is not None and margin_free <= 0:
+        blockers.append("no_free_margin")
+    if margin_stress.get("status") == "critical":
+        blockers.append("critical_margin_stress")
+    blockers = list(dict.fromkeys(blockers))
+
+    account_state: Dict[str, Any] = {
+        "margin_free": margin_free,
+        "margin_stress": margin_stress,
+        "blockers": blockers,
+    }
+    if isinstance(trade_allowed, bool):
+        account_state["trade_allowed"] = trade_allowed
+    account_state = {
+        key: value for key, value in account_state.items() if value is not None
+    }
+
+    if not blockers:
+        return account_info, account_state, None
+    block: Dict[str, Any] = {
+        "error": "Trading blocked by the current account execution or margin state.",
+        "error_code": "trade_blocked_account_state",
+        "blockers": blockers,
+        "margin_free": margin_free,
+        "margin_stress": margin_stress,
+        "remediation": (
+            "Enable account trading if disabled, reduce or close exposure, "
+            "restore free margin, and re-check trade_account_info before "
+            "placing a new order."
+        ),
+    }
+    if preflight is not None:
+        block["preflight"] = preflight
+    return account_info, account_state, block
+
+
 def _prepare_order_symbol_context(
     mt5: Any,
     *,
     symbol: str,
     volume: float,
+    defer_margin_block: bool = False,
 ) -> tuple[Optional[_OrderSymbolContext], Optional[Dict[str, Any]]]:
     preflight = mt5.build_trade_preflight()
     if not preflight.get("execution_ready_strict", preflight.get("execution_ready", True)):
@@ -636,6 +747,13 @@ def _prepare_order_symbol_context(
             "hint": guidance[0] if guidance else None,
             "next_steps": guidance,
         }
+
+    account_info, _account_state, account_state_block = _assess_order_account_state(
+        mt5,
+        preflight=preflight,
+    )
+    if account_state_block is not None and not defer_margin_block:
+        return None, account_state_block
 
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
@@ -651,7 +769,40 @@ def _prepare_order_symbol_context(
     return {
         "symbol_info": symbol_info,
         "volume": volume_validated,
+        "account_info": account_info,
+        "account_state_block": account_state_block,
     }, None
+
+
+def _reduce_only_margin_exemption(
+    mt5: Any,
+    *,
+    symbol: str,
+    side: str,
+    volume: float,
+    account_info: Any,
+) -> tuple[bool, Optional[Dict[str, Any]]]:
+    """Prove that a netting market deal can only reduce current exposure."""
+    if account_info is None or not _account_uses_netting(account_info):
+        return False, None
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        return False, validation.snapshot_unavailable_error(
+            mt5,
+            snapshot="positions",
+            context="evaluate a reduce-only margin exemption",
+        )
+    net_side, net_volume = _resolve_existing_symbol_net(
+        symbol=symbol,
+        existing_positions=list(positions),
+    )
+    opposite = {"BUY": "SELL", "SELL": "BUY"}
+    proven = bool(
+        net_side is not None
+        and side == opposite.get(net_side)
+        and float(volume) <= float(net_volume) + 1e-12
+    )
+    return proven, None
 
 
 def _evaluate_live_trade_guardrails(
@@ -671,10 +822,13 @@ def _evaluate_live_trade_guardrails(
         account_info = mt5.account_info()
     except Exception:
         account_info = None
-    try:
-        positions = mt5.positions_get()
-    except Exception:
-        positions = None
+    positions, pending_orders, snapshot_error = load_guardrail_book_snapshots(
+        mt5,
+        trade_guardrails_config,
+        account_info=account_info,
+    )
+    if snapshot_error is not None:
+        return snapshot_error
     return evaluate_trade_guardrails(
         trade_guardrails_config,
         symbol=symbol,
@@ -684,7 +838,8 @@ def _evaluate_live_trade_guardrails(
         side=side,
         entry_price=entry_price,
         account_info=account_info,
-        existing_positions=list(positions or []),
+        existing_positions=positions,
+        existing_pending_orders=pending_orders,
         symbol_info=symbol_info,
         symbol_info_resolver=mt5.symbol_info,
     )
@@ -710,11 +865,19 @@ def _order_result_value(result: Any, field: str) -> Any:
         return None
 
 
-def _order_retcode_name(mt5: Any, retcode: Any) -> Optional[str]:
-    try:
-        return mt5.retcode_name(retcode)
-    except Exception:
-        return common._retcode_name(mt5, retcode)
+def _meaningful_last_error(value: Any) -> Any:
+    """Drop MT5's success sentinel when an order result itself is a failure."""
+    if value is None:
+        return None
+    if isinstance(value, (tuple, list)) and value:
+        try:
+            code = int(value[0])
+        except (TypeError, ValueError):
+            code = None
+        message = str(value[1] if len(value) > 1 else "").strip().lower()
+        if code in {0, 1} and message in {"", "success", "ok", "no error"}:
+            return None
+    return value
 
 
 def _submit_order_request(
@@ -732,20 +895,23 @@ def _submit_order_request(
         symbol_info=symbol_info,
         price_refresh=price_refresh,
     )
+    diagnostic_last_error = _meaningful_last_error(last_error)
     if result is None:
-        return None, {
+        failure = {
             "error": (
                 "Order submission outcome is unknown; the broker may have accepted "
                 "the request. Do not retry without reconciling open orders and positions."
             ),
             "error_code": "order_send_ambiguous",
             "ambiguous": True,
-            "last_error": last_error,
             "fill_mode_attempts": fill_mode_attempts,
         }
+        if diagnostic_last_error is not None:
+            failure["last_error"] = diagnostic_last_error
+        return None, failure
 
     retcode = _order_result_value(result, "retcode")
-    if not validation._retcode_is_done(mt5, retcode):
+    if not validation._retcode_is_accepted(mt5, retcode):
         error_message = base_error
         ambiguous = retcode == validation._safe_int_attr(
             mt5, "TRADE_RETCODE_TIMEOUT", 10012
@@ -761,12 +927,13 @@ def _submit_order_request(
         failure = {
             "error": error_message,
             "retcode": retcode,
-            "retcode_name": _order_retcode_name(mt5, retcode),
+            "retcode_name": mt5.retcode_name(retcode),
             "comment": _order_result_value(result, "comment"),
             "request_id": _order_result_value(result, "request_id"),
-            "last_error": last_error,
             "fill_mode_attempts": fill_mode_attempts,
         }
+        if diagnostic_last_error is not None:
+            failure["last_error"] = diagnostic_last_error
         if ambiguous:
             failure.update(error_code="order_send_ambiguous", ambiguous=True)
         return None, failure
@@ -838,6 +1005,7 @@ def _margin_preview_fields(
     symbol: str,
     volume: float,
     entry_price: float,
+    account_info: Any = None,
 ) -> Dict[str, Any]:
     if order_type_value is None:
         return {}
@@ -852,7 +1020,6 @@ def _margin_preview_fields(
         return {}
 
     out: Dict[str, Any] = {"margin_required": round(float(margin), 2)}
-    account_info = mt5.account_info()
     margin_free = validation._safe_float_attr(account_info, "margin_free")
     if margin_free is not None and math.isfinite(margin_free):
         out["margin_free"] = round(float(margin_free), 2)
@@ -883,6 +1050,8 @@ def build_trade_place_dry_run_preview(
             ),
         }
 
+    account_info, account_state, account_state_block = _assess_order_account_state(mt5)
+
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
         return {"preview_error": f"Symbol {symbol} not found"}
@@ -893,12 +1062,18 @@ def build_trade_place_dry_run_preview(
     if volume_error:
         return {"preview_error": volume_error}
 
-    tick = mt5.symbol_info_tick(symbol)
+    quote_now = _stdlib_time.time()
+    tick, quote_source = resolve_quote_tick(
+        mt5,
+        symbol,
+        mt5.symbol_info_tick(symbol),
+        now_epoch=quote_now,
+    )
     if tick is None:
         return {"preview_error": f"Failed to get current price for {symbol}"}
 
-    bid = validation._safe_float_attr(tick, "bid")
-    ask = validation._safe_float_attr(tick, "ask")
+    bid = validation.coerce_finite_float(tick_value(tick, "bid"))
+    ask = validation.coerce_finite_float(tick_value(tick, "ask"))
     if bid is None or ask is None or not math.isfinite(bid) or not math.isfinite(ask):
         return {"preview_error": f"Failed to get valid bid/ask for {symbol}"}
 
@@ -907,30 +1082,51 @@ def build_trade_place_dry_run_preview(
     side = "BUY" if str(order_type).upper().startswith("BUY") else "SELL"
     order_type_value = _order_type_constant(mt5, order_type)
     entry_price = float(price) if pending and price not in (None, 0) else (ask if side == "BUY" else bid)
+    points_per_pip = forex_points_per_pip(
+        symbol,
+        path=str(getattr(symbol_info, "path", "") or ""),
+        point=point,
+        digits=digits,
+    )
+    spread_metrics = compute_spread_metrics(
+        bid,
+        ask,
+        point=point,
+        points_per_pip=points_per_pip,
+    )
 
+    quote_context = common.build_trade_quote_context(
+        symbol,
+        tick,
+        now_epoch=quote_now,
+    )
+    quote_context.update(quote_source)
+    if spread_metrics["spread_valid"] is not True:
+        quote_context["usable_for_live_trading"] = False
+        quote_context["usable_for_live_trading_basis"] = (
+            "quote_age_market_session_and_positive_spread"
+        )
+        quote_context["quote_quality"] = spread_metrics["spread_quality"]
     out: Dict[str, Any] = {
         "bid": _round_preview_price(bid, digits=digits),
         "ask": _round_preview_price(ask, digits=digits),
         "estimated_fill_price": _round_preview_price(entry_price, digits=digits),
-        "quote_context": common.build_trade_quote_context(symbol, tick),
+        "quote_context": quote_context,
     }
+    if account_state is not None:
+        out["account_state"] = account_state
+    if account_state_block is not None:
+        out["account_blockers"] = list(account_state_block["blockers"])
     if pending:
         out["entry_price"] = _round_preview_price(entry_price, digits=digits)
 
     if point > 0:
-        spread_price = ask - bid
-        out["spread_points"] = round(spread_price / point, 2)
-        points_per_pip = forex_points_per_pip(
-            symbol,
-            path=str(getattr(symbol_info, "path", "") or ""),
-            point=point,
-            digits=digits,
-        )
-        if points_per_pip:
-            out["spread_pips"] = round(out["spread_points"] / points_per_pip, 2)
-        midpoint = (ask + bid) / 2.0
-        if midpoint:
-            out["spread_pct"] = round((spread_price / midpoint) * 100.0, 6)
+        if spread_metrics["spread_points"] is not None:
+            out["spread_points"] = round(spread_metrics["spread_points"], 2)
+        if spread_metrics["spread_pips"] is not None:
+            out["spread_pips"] = round(spread_metrics["spread_pips"], 2)
+        if spread_metrics["spread_pct"] is not None:
+            out["spread_pct"] = round(spread_metrics["spread_pct"], 6)
         broker_distance = validation._broker_distance_metadata(symbol_info)
         out["min_distance_points"] = int(broker_distance["min_distance_points"])
 
@@ -983,6 +1179,7 @@ def build_trade_place_dry_run_preview(
             symbol=symbol,
             volume=float(volume_validated),
             entry_price=float(entry_price),
+            account_info=account_info,
         )
     )
     return {key: value for key, value in out.items() if value is not None}
@@ -1010,6 +1207,7 @@ def _place_market_order(  # noqa: C901
                 mt5,
                 symbol=symbol,
                 volume=volume,
+                defer_margin_block=True,
             )
             if order_context_error is not None:
                 return order_context_error
@@ -1024,6 +1222,28 @@ def _place_market_order(  # noqa: C901
                 return {"error": f"Unsupported order_type '{order_type}'. Use BUY or SELL for market orders."}
             side = t
 
+            account_state_block = order_context.get("account_state_block")
+            if account_state_block is not None:
+                blockers = set(account_state_block.get("blockers") or [])
+                margin_only = blockers and blockers <= {
+                    "no_free_margin",
+                    "critical_margin_stress",
+                }
+                exempt = False
+                exemption_error = None
+                if margin_only:
+                    exempt, exemption_error = _reduce_only_margin_exemption(
+                        mt5,
+                        symbol=symbol,
+                        side=side,
+                        volume=volume_validated,
+                        account_info=order_context.get("account_info"),
+                    )
+                if exemption_error is not None:
+                    return exemption_error
+                if not exempt:
+                    return account_state_block
+
             deviation_validated, deviation_error = validation._validate_deviation(deviation)
             if deviation_error:
                 return {"error": deviation_error}
@@ -1037,6 +1257,32 @@ def _place_market_order(  # noqa: C901
                 return {"error": price_inputs_error}
             norm_sl = price_inputs["stop_loss"]
             norm_tp = price_inputs["take_profit"]
+            if (
+                (norm_sl is not None or norm_tp is not None)
+                and order_context.get("account_info") is not None
+                and _account_uses_netting(order_context["account_info"])
+            ):
+                existing_symbol_positions = mt5.positions_get(symbol=symbol)
+                if existing_symbol_positions is None:
+                    return validation.snapshot_unavailable_error(
+                        mt5,
+                        snapshot="positions",
+                        context="validate netting-account protection scope",
+                    )
+                if list(existing_symbol_positions):
+                    return {
+                        "success": False,
+                        "error": (
+                            "Cannot attach order-specific SL/TP while a netting-account "
+                            f"position already exists for {symbol}; MT5 protection would "
+                            "replace levels on the entire aggregate position."
+                        ),
+                        "error_code": "netting_position_protection_conflict",
+                        "remediation": (
+                            "Modify the existing aggregate position explicitly, or close/reduce "
+                            "it before placing a newly protected order."
+                        ),
+                    }
 
             # Validate against a recent quote, then refresh again right before send.
             validate_tick = mt5.symbol_info_tick(symbol)
@@ -1219,6 +1465,23 @@ def _place_market_order(  # noqa: C901
             result = send_outcome["result"]
             fill_mode_attempts = send_outcome["fill_mode_attempts"]
             used_request = send_outcome["used_request"]
+            retcode = _order_result_value(result, "retcode")
+            execution_status = validation._trade_execution_status(mt5, retcode)
+            filled_volume = validation._safe_float_attr(
+                result, "volume", default=None
+            )
+            if (
+                execution_status == "complete"
+                and filled_volume is not None
+                and filled_volume > 0.0
+                and filled_volume + 1e-12 < float(volume_validated)
+            ):
+                execution_status = "partial"
+            remaining_volume = (
+                max(0.0, float(volume_validated) - float(filled_volume))
+                if filled_volume is not None
+                else None
+            )
 
             order_ticket = validation._safe_int_ticket(getattr(result, "order", None))
             deal_ticket = validation._safe_int_ticket(getattr(result, "deal", None))
@@ -1235,12 +1498,16 @@ def _place_market_order(  # noqa: C901
             )
             protection_status = None
             warnings_out: List[str] = []
-            if sl_tp_requested:
+            if sl_tp_requested and execution_status != "queued":
                 protection_outcome = _attach_post_fill_protection(
                     mt5,
                     symbol=symbol,
                     side=side,
-                    volume=volume_validated,
+                    volume=(
+                        filled_volume
+                        if filled_volume is not None and filled_volume > 0.0
+                        else volume_validated
+                    ),
                     position_ticket_candidates=position_ticket_candidates,
                     stop_loss=norm_sl,
                     take_profit=norm_tp,
@@ -1262,7 +1529,7 @@ def _place_market_order(  # noqa: C901
                     warning_text = str(warning).strip()
                     if warning_text:
                         warnings_out.append(warning_text)
-            else:
+            elif not sl_tp_requested:
                 if position_ticket_candidates:
                     position_obj, resolved_ticket, resolve_info = _resolve_open_position(
                         mt5,
@@ -1290,13 +1557,39 @@ def _place_market_order(  # noqa: C901
                     last_retcode=None,
                     last_comment=None,
                 )
-            retcode = _order_result_value(result, "retcode")
+            else:
+                sl_tp_result = _build_sl_tp_result(
+                    requested_sl=norm_sl,
+                    requested_tp=norm_tp,
+                    applied_sl=None,
+                    applied_tp=None,
+                    status="pending_fill",
+                    error=(
+                        "Order is queued; protection cannot be verified until a "
+                        "position fill exists."
+                    ),
+                    broker_adjusted=False,
+                    adjustment=None,
+                    attempts=0,
+                    last_retcode=None,
+                    last_comment=None,
+                )
+                protection_status = "pending_fill"
+                warnings_out.append(
+                    "Order is queued, not filled; reconcile the resulting position "
+                    "and attach SL/TP after execution."
+                )
             out: Dict[str, Any] = {
+                "success": execution_status == "complete",
+                "execution_status": execution_status,
                 "retcode": retcode,
-                "retcode_name": _order_retcode_name(mt5, retcode),
+                "retcode_name": mt5.retcode_name(retcode),
                 "deal": _order_result_value(result, "deal"),
                 "order": _order_result_value(result, "order"),
                 "volume": _order_result_value(result, "volume"),
+                "requested_volume": volume_validated,
+                "filled_volume": filled_volume,
+                "remaining_volume": remaining_volume,
                 "price": _order_result_value(result, "price"),
                 "bid": _order_result_value(result, "bid"),
                 "ask": _order_result_value(result, "ask"),
@@ -1325,10 +1618,14 @@ def _place_market_order(  # noqa: C901
         except Exception as e:
             return {"error": str(e)}
 
-    return _place_market_order()
+    # Keep the portfolio snapshot, guardrail decision, and broker submission in
+    # one process-wide critical section so concurrent tool calls cannot spend
+    # the same exposure or wallet-risk headroom.
+    with _TRADE_DECISION_LOCK:
+        return _place_market_order()
 
 
-def _place_pending_order(
+def _place_pending_order(  # noqa: C901
     symbol: str,
     volume: float,
     order_type: OrderTypeInput,
@@ -1346,7 +1643,7 @@ def _place_pending_order(
     if connection_error is not None:
         return connection_error
 
-    def _place_pending_order():
+    def _place_pending_order():  # noqa: C901
         try:
             order_context, order_context_error = _prepare_order_symbol_context(
                 mt5,
@@ -1361,6 +1658,13 @@ def _place_pending_order(
             initial_tick = mt5.symbol_info_tick(symbol)
             if initial_tick is None:
                 return {"error": f"Failed to get current price for {symbol}"}
+            freshness_error = validation._validate_tick_freshness(
+                initial_tick,
+                symbol=symbol,
+                max_age_seconds=_TRADE_TICK_MAX_AGE_SECONDS,
+            )
+            if freshness_error is not None:
+                return freshness_error
 
             deviation_validated, deviation_error = validation._validate_deviation(deviation)
             if deviation_error:
@@ -1395,6 +1699,13 @@ def _place_pending_order(
             live_tick = mt5.symbol_info_tick(symbol) or initial_tick
             if live_tick is None:
                 return {"error": f"Failed to refresh current price for {symbol}"}
+            freshness_error = validation._validate_tick_freshness(
+                live_tick,
+                symbol=symbol,
+                max_age_seconds=_TRADE_TICK_MAX_AGE_SECONDS,
+            )
+            if freshness_error is not None:
+                return freshness_error
             bid = validation._safe_float_attr(live_tick, "bid")
             ask = validation._safe_float_attr(live_tick, "ask")
             price_tol = point * 0.1 if point > 0 else 1e-9
@@ -1479,6 +1790,28 @@ def _place_pending_order(
                     request["type_time"] = mt5.ORDER_TIME_SPECIFIED
                     request["expiration"] = normalized_expiration
 
+            send_tick = mt5.symbol_info_tick(symbol)
+            if send_tick is None:
+                return {"error": f"Failed to refresh current price for {symbol}"}
+            freshness_error = validation._validate_tick_freshness(
+                send_tick,
+                symbol=symbol,
+                max_age_seconds=_TRADE_TICK_MAX_AGE_SECONDS,
+            )
+            if freshness_error is not None:
+                return freshness_error
+            send_level_error = validation._validate_pending_order_levels(
+                symbol_info=symbol_info,
+                tick=send_tick,
+                order_type_value=order_type_value,
+                price=float(norm_price),
+                stop_loss=None if norm_sl is None else float(norm_sl),
+                take_profit=None if norm_tp is None else float(norm_tp),
+                mt5=mt5,
+            )
+            if send_level_error is not None:
+                return send_level_error
+
             send_outcome, send_error = _submit_order_request(
                 mt5,
                 request,
@@ -1497,10 +1830,14 @@ def _place_pending_order(
             used_request = send_outcome["used_request"]
 
             retcode = _order_result_value(result, "retcode")
+            submission_status = validation._trade_execution_status(mt5, retcode)
+            pending_created = submission_status in {"complete", "queued"}
             out: Dict[str, Any] = {
-                "success": True,
+                "success": pending_created,
+                "execution_status": "complete" if pending_created else submission_status,
+                "submission_status": submission_status,
                 "retcode": retcode,
-                "retcode_name": _order_retcode_name(mt5, retcode),
+                "retcode_name": mt5.retcode_name(retcode),
                 "deal": _order_result_value(result, "deal"),
                 "order": _order_result_value(result, "order"),
                 "volume": _order_result_value(result, "volume"),
@@ -1532,4 +1869,5 @@ def _place_pending_order(
         except Exception as e:
             return {"error": str(e)}
 
-    return _place_pending_order()
+    with _TRADE_DECISION_LOCK:
+        return _place_pending_order()

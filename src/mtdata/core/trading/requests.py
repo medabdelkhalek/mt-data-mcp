@@ -221,6 +221,14 @@ class TradeCloseRequest(BaseModel):
     )
     comment: Optional[str] = None
     deviation: int = Field(default=20, ge=0)
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional durable dedupe key with a configurable 24-hour TTL. "
+            "Reusing the same key with the same payload replays the prior "
+            "close/cancel outcome instead of sending another broker request."
+        ),
+    )
 
 
 class TradeHistoryRequest(_SideNormalizedRequest):
@@ -333,39 +341,35 @@ class TradeRiskAnalyzeRequest(BaseModel):
         default="fixed_fraction",
         description=(
             "Position sizing method. fixed_fraction uses desired_risk_pct; "
-            "kelly uses win-rate and average win/loss inputs to derive risk. "
-            "Use trade_journal_analyze to estimate those inputs from realized "
-            "trade history."
+            "kelly uses win rate and stake-normalized average win/loss returns "
+            "to derive risk."
         ),
     )
     kelly_metrics: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
             "Optional metrics dict containing win_rate, avg_win_return, and "
-            "avg_loss_return. The trade_journal_analyze summary provides "
-            "compatible win_rate/avg_win/avg_loss inputs. Explicit kelly_* "
-            "fields override this dict."
+            "avg_loss_return. Returns must be normalized to a consistent stake "
+            "or unit of risk; raw account-currency PnL is not accepted. Explicit "
+            "kelly_* fields override this dict."
         ),
     )
     kelly_win_rate: Optional[float] = Field(
         default=None,
-        description=(
-            "Kelly win probability as a fraction in [0, 1]. Map from "
-            "trade_journal_analyze summary.win_rate when available."
-        ),
+        description="Kelly win probability as a fraction in [0, 1].",
     )
     kelly_avg_win: Optional[float] = Field(
         default=None,
         description=(
-            "Average winning return for Kelly sizing. A practical source is "
-            "trade_journal_analyze summary.avg_win."
+            "Average winning stake-normalized return for Kelly sizing, such as "
+            "an R-multiple; not an account-currency PnL average."
         ),
     )
     kelly_avg_loss: Optional[float] = Field(
         default=None,
         description=(
-            "Average losing return magnitude for Kelly sizing. A practical "
-            "source is trade_journal_analyze summary.avg_loss."
+            "Average losing stake-normalized return magnitude for Kelly sizing, "
+            "such as an R-multiple; not an account-currency PnL average."
         ),
     )
     kelly_fraction_multiplier: float = Field(
@@ -421,12 +425,25 @@ class TradeRiskAnalyzeRequest(BaseModel):
 
 
 class TradeVarCvarRequest(BaseModel):
-    symbol: Optional[str] = None
+    symbol: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional scope: calculate VaR/CVaR for currently open positions in this "
+            "symbol. Omit it for the full open portfolio."
+        ),
+    )
     timeframe: TimeframeLiteral = Field(
         default="H1",
         description="Return interval and one-bar VaR/CVaR holding period.",
     )
     lookback: int = 500
+    include_incomplete: bool = Field(
+        default=False,
+        description=(
+            "Include the current forming candle in return history. Defaults to false "
+            "so VaR/CVaR uses completed bars only."
+        ),
+    )
     confidence: float = Field(
         0.95,
         description=(
@@ -434,8 +451,20 @@ class TradeVarCvarRequest(BaseModel):
             "or a percentage such as 95. Values must resolve to 0 < confidence < 1."
         ),
     )
-    method: str = "historical"
-    transform: str = "log_return"
+    method: str = Field(
+        default="historical",
+        description=(
+            "Tail-risk method: historical (or hist) or parametric "
+            "(or gaussian/normal)."
+        ),
+    )
+    transform: str = Field(
+        default="log_return",
+        description=(
+            "Return transform: log_return (aliases log_returns/log) or pct "
+            "(aliases pct_return/percent/simple_return)."
+        ),
+    )
     min_observations: int = 50
     detail: DetailLiteral = Field(
         default="compact",

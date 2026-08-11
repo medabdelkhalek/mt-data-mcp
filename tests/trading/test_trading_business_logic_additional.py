@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from mtdata.core.trading.comments import (
     _comment_sanitization_info,
@@ -14,11 +14,12 @@ from mtdata.core.trading.validation import (
     _normalize_order_type_input,
     _normalize_price_for_symbol,
     _normalize_trade_price_inputs,
-    _retcode_is_done,
+    _retcode_is_accepted,
     _safe_float_attr,
-    _trade_done_codes,
+    _trade_accepted_codes,
     _validate_deviation,
     _validate_live_protection_levels,
+    _validate_pending_order_levels,
     _validate_volume,
 )
 
@@ -69,12 +70,12 @@ def test_trade_done_helpers_use_safe_int_attr_and_cached_codes():
         TRADE_RETCODE_DONE_PARTIAL="10010",
     )
 
-    done_codes = _trade_done_codes(mt5)
+    accepted_codes = _trade_accepted_codes(mt5)
 
-    assert done_codes == {10008, 10009, 10010}
-    assert _retcode_is_done(mt5, "10008", done_codes) is True
-    assert _retcode_is_done(mt5, "10010", done_codes) is True
-    assert _retcode_is_done(mt5, 1, done_codes) is False
+    assert accepted_codes == {10008, 10009, 10010}
+    assert _retcode_is_accepted(mt5, "10008", accepted_codes) is True
+    assert _retcode_is_accepted(mt5, "10010", accepted_codes) is True
+    assert _retcode_is_accepted(mt5, 1, accepted_codes) is False
 
 
 def test_normalize_price_for_symbol_accepts_negative_non_zero_values():
@@ -119,6 +120,40 @@ def test_validate_live_protection_levels_accepts_negative_quotes():
     )
 
     assert result is None
+
+
+def test_protection_validators_accept_mapping_ticks():
+    symbol_info = SimpleNamespace(
+        point=0.0001,
+        trade_stops_level=0,
+        trade_freeze_level=0,
+    )
+    tick = {"bid": 1.1, "ask": 1.1002}
+
+    live_result = _validate_live_protection_levels(
+        symbol_info=symbol_info,
+        tick=tick,
+        side="BUY",
+        stop_loss=1.09,
+        take_profit=1.11,
+    )
+    pending_result = _validate_pending_order_levels(
+        symbol_info=symbol_info,
+        tick=tick,
+        order_type_value=2,
+        price=1.099,
+        stop_loss=1.09,
+        take_profit=1.11,
+        mt5=SimpleNamespace(
+            ORDER_TYPE_BUY_LIMIT=2,
+            ORDER_TYPE_SELL_LIMIT=3,
+            ORDER_TYPE_BUY_STOP=4,
+            ORDER_TYPE_SELL_STOP=5,
+        ),
+    )
+
+    assert live_result is None
+    assert pending_result is None
 
 
 def test_run_trade_close_rejects_conflicting_profit_and_loss_filters():
@@ -237,7 +272,10 @@ def test_run_trade_place_logs_finish_event(caplog):
             safe_int_ticket=lambda value: value,
         )
 
-    assert result == {"success": True, "order_id": 7}
+    assert result["success"] is True
+    assert result["order_id"] == 7
+    assert result["guardrails_enabled"] is False
+    assert any("without configured trade guardrails" in warning for warning in result["warnings"])
     assert any(
         "event=finish operation=trade_place success=True" in record.message
         for record in caplog.records
@@ -267,7 +305,9 @@ def test_run_trade_place_ignores_gtc_for_market_buy_sell_without_price():
         safe_int_ticket=lambda value: value,
     )
 
-    assert result == {"success": True, "path": "market"}
+    assert result["success"] is True
+    assert result["path"] == "market"
+    assert result["guardrails_enabled"] is False
     place_market_order.assert_called_once()
     place_pending_order.assert_not_called()
 
@@ -336,7 +376,8 @@ def test_run_trade_place_dry_run_returns_preview_without_execution():
     assert result["actionability"] == "preview_only"
     assert "validation_not_performed" not in result
     assert "protection_level_preview" in result["preview_checks_performed"]
-    assert "margin_estimate" in result["preview_checks_performed"]
+    assert "margin_estimate" not in result["preview_checks_performed"]
+    assert "margin_estimate" in result["checks_not_performed"]
     assert "broker_acceptance" in result["broker_validation_not_performed"]
     assert result["requested_sl"] == 1.08
     assert result["requested_tp"] == 1.12
@@ -432,7 +473,10 @@ def test_run_trade_place_dry_run_blocks_untrusted_quote_preview():
     )
 
     assert result["preview_ok"] is False
+    assert result["success"] is True
     assert result["validation_passed"] is False
+    assert result["blockers"] == ["quote_not_live_ready"]
+    assert result["no_action_reason"] == "dry_run_validation_blocked"
     assert result["quote_context"]["usable_for_live_trading"] is False
 
 
@@ -454,23 +498,29 @@ def test_build_trade_place_dry_run_preview_uses_live_quote_and_margin():
         trade_stops_level=10,
         trade_freeze_level=0,
     )
+    fixed_now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
     gateway.symbol_info_tick.return_value = SimpleNamespace(
         bid=1.0999,
         ask=1.1001,
-        time=datetime.now(timezone.utc).timestamp(),
+        time=fixed_now.timestamp(),
     )
     gateway.account_info.return_value = SimpleNamespace(margin_free=1000.0)
 
-    result = build_trade_place_dry_run_preview(
-        symbol="EURUSD",
-        volume=0.1,
-        order_type="BUY",
-        pending=False,
-        price=None,
-        stop_loss=1.08,
-        take_profit=1.12,
-        gateway=gateway,
-    )
+    with patch("mtdata.core.trading.common.datetime", wraps=datetime) as mock_datetime, patch(
+        "mtdata.core.trading.orders._stdlib_time.time",
+        return_value=fixed_now.timestamp(),
+    ):
+        mock_datetime.now.return_value = fixed_now
+        result = build_trade_place_dry_run_preview(
+            symbol="EURUSD",
+            volume=0.1,
+            order_type="BUY",
+            pending=False,
+            price=None,
+            stop_loss=1.08,
+            take_profit=1.12,
+            gateway=gateway,
+        )
 
     assert result["bid"] == 1.0999
     assert result["ask"] == 1.1001
@@ -487,6 +537,158 @@ def test_build_trade_place_dry_run_preview_uses_live_quote_and_margin():
     assert result["quote_context"]["freshness_state"] == "live"
     assert result["quote_context"]["quote_timezone"] == "UTC"
     adapter.order_calc_margin.assert_called_once_with(0, "EURUSD", 0.1, 1.1001)
+
+
+def test_trade_preview_does_not_emit_negative_metrics_for_inverted_quote():
+    now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc).timestamp()
+    gateway = MagicMock()
+    gateway.adapter = SimpleNamespace(
+        ORDER_TYPE_BUY=0,
+        order_calc_margin=MagicMock(return_value=10.0),
+    )
+    gateway.ORDER_TYPE_BUY = 0
+    gateway.symbol_info.return_value = SimpleNamespace(
+        visible=True,
+        volume_min=0.01,
+        volume_max=100.0,
+        volume_step=0.01,
+        point=0.0001,
+        digits=4,
+        trade_stops_level=0,
+        trade_freeze_level=0,
+    )
+    gateway.symbol_info_tick.return_value = SimpleNamespace(
+        bid=1.1002,
+        ask=1.1,
+        time=now,
+    )
+
+    with patch("mtdata.core.trading.orders._stdlib_time.time", return_value=now):
+        result = build_trade_place_dry_run_preview(
+            symbol="EURUSD",
+            volume=0.1,
+            order_type="BUY",
+            pending=False,
+            price=None,
+            stop_loss=None,
+            take_profit=None,
+            gateway=gateway,
+        )
+
+    assert "spread_points" not in result
+    assert "spread_pips" not in result
+    assert "spread_pct" not in result
+    assert result["quote_context"]["usable_for_live_trading"] is False
+
+
+def test_build_trade_place_dry_run_preview_exposes_account_blockers():
+    adapter = SimpleNamespace(
+        ORDER_TYPE_BUY=0,
+        order_calc_margin=MagicMock(return_value=20.0),
+    )
+    gateway = MagicMock()
+    gateway.adapter = adapter
+    gateway.ORDER_TYPE_BUY = 0
+    gateway.symbol_info.return_value = SimpleNamespace(
+        visible=True,
+        volume_min=0.01,
+        volume_max=100.0,
+        volume_step=0.01,
+        point=0.00001,
+        digits=5,
+        trade_stops_level=0,
+        trade_freeze_level=0,
+    )
+    now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc).timestamp()
+    gateway.symbol_info_tick.return_value = SimpleNamespace(
+        bid=1.0999,
+        ask=1.1001,
+        time=now,
+    )
+    gateway.account_info.return_value = SimpleNamespace(
+        equity=100.0,
+        margin=101.0,
+        margin_free=-1.0,
+        margin_level=99.0,
+        trade_allowed=False,
+    )
+
+    with patch("mtdata.core.trading.orders._stdlib_time.time", return_value=now):
+        result = build_trade_place_dry_run_preview(
+            symbol="EURUSD",
+            volume=0.1,
+            order_type="BUY",
+            pending=False,
+            price=None,
+            stop_loss=1.08,
+            take_profit=1.12,
+            gateway=gateway,
+        )
+
+    assert result["account_blockers"] == [
+        "account_trading_disabled",
+        "no_free_margin",
+        "critical_margin_stress",
+    ]
+    assert result["account_state"]["trade_allowed"] is False
+    assert result["account_state"]["margin_stress"]["status"] == "critical"
+    assert result["margin_sufficient"] is False
+
+
+def test_trade_preview_reconciles_equal_timestamp_quote_conflict():
+    now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc).timestamp()
+    gateway = MagicMock()
+    gateway.adapter = SimpleNamespace(
+        ORDER_TYPE_BUY=0,
+        order_calc_margin=MagicMock(return_value=123.45),
+    )
+    gateway.ORDER_TYPE_BUY = 0
+    gateway.COPY_TICKS_ALL = 0
+    gateway.symbol_info.return_value = SimpleNamespace(
+        visible=True,
+        volume_min=0.01,
+        volume_max=100.0,
+        volume_step=0.01,
+        point=0.00001,
+        digits=5,
+        trade_stops_level=10,
+        trade_freeze_level=0,
+    )
+    gateway.symbol_info_tick.return_value = SimpleNamespace(
+        bid=1.15304,
+        ask=1.15326,
+        time=now,
+        time_msc=now * 1000,
+    )
+    gateway.copy_ticks_range.return_value = [
+        {
+            "bid": 1.15308,
+            "ask": 1.15322,
+            "time": now,
+            "time_msc": now * 1000,
+        }
+    ]
+
+    with patch("mtdata.core.trading.orders._stdlib_time.time", return_value=now):
+        result = build_trade_place_dry_run_preview(
+            symbol="EURUSD",
+            volume=0.1,
+            order_type="BUY",
+            pending=False,
+            price=None,
+            stop_loss=1.14,
+            take_profit=1.16,
+            gateway=gateway,
+        )
+
+    assert result["bid"] == 1.15308
+    assert result["ask"] == 1.15322
+    assert result["estimated_fill_price"] == 1.15322
+    assert result["sl_tp_valid"] is True
+    assert result["quote_context"]["quote_source"] == "mt5.copy_ticks_range"
+    assert result["quote_context"]["quote_source_conflict"]["reason"] == (
+        "equal_timestamp_bid_ask_disagreement"
+    )
 
 
 def test_build_trade_place_dry_run_preview_preserves_zero_symbol_digits():
@@ -575,7 +777,7 @@ def test_run_trade_place_auto_close_uses_candidate_ticket_when_primary_is_missin
 
     def close_positions(**kwargs):
         close_calls.append(kwargs)
-        return {"closed_count": 1}
+        return {"success": True, "closed_count": 1}
 
     result = run_trade_place(
         request,

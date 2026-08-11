@@ -7,6 +7,8 @@ import time
 from contextvars import ContextVar
 from typing import Any, Callable, Optional, TypeVar
 
+from .request_context import current_request_id
+
 ResultT = TypeVar("ResultT")
 
 _ACTIVE_OPERATIONS: ContextVar[tuple[str, ...]] = ContextVar(
@@ -66,7 +68,8 @@ def log_operation_finish(
     parent_operation = _pop_operation(operation)
     if parent_operation == str(operation):
         return
-    logger.debug(
+    log = logger.debug if success else logger.warning
+    log(
         "event=finish operation=%s success=%s duration_ms=%.3f %s",
         operation,
         bool(success),
@@ -118,17 +121,18 @@ def run_logged_operation(
         raise
     else:
         success_value = infer_result_success(result) if success_eval is None else bool(success_eval(result))
+        finish_fields = dict(fields)
+        if not success_value:
+            for key, value in _failure_log_fields(result).items():
+                finish_fields.setdefault(key, value)
         log_operation_finish(
             logger,
             operation=operation,
             started_at=started_at,
             success=success_value,
-            **fields,
+            **finish_fields,
         )
         return result
-    finally:
-        if not _ACTIVE_OPERATIONS.get():
-            _run_post_operation_cleanup(logger, operation=operation)
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -159,16 +163,48 @@ def _pop_operation(operation: str) -> Optional[str]:
     return None
 
 
-def _run_post_operation_cleanup(logger: logging.Logger, *, operation: str) -> None:
+def _failure_log_fields(result: Any) -> dict[str, Any]:
+    """Extract bounded, non-payload diagnostics from a structured failure."""
     try:
-        from ..forecast.gpu_runtime import cleanup_forecast_gpu_runtime
+        from ..shared.result import Err
+    except Exception:  # pragma: no cover - package always ships shared.result
+        Err = ()  # type: ignore[assignment,misc]
 
-        cleanup_forecast_gpu_runtime(clear_model_cache=True)
-    except Exception as exc:
-        logger.debug("post-operation cleanup failed for %s: %s", operation, exc)
+    if isinstance(result, Err):
+        source: dict[str, Any] = {
+            "error": result.message,
+            "error_code": result.code,
+            **result.details,
+        }
+    elif isinstance(result, dict):
+        source = result
+    elif isinstance(result, list):
+        source = next(
+            (
+                item
+                for item in result
+                if isinstance(item, dict) and not infer_result_success(item)
+            ),
+            {},
+        )
+    else:
+        return {}
+
+    fields: dict[str, Any] = {}
+    for key in ("error", "error_code", "code", "retcode", "retcode_name", "ambiguous"):
+        value = source.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, str):
+            value = " ".join(value.split())[:300]
+        fields[key] = value
+    return fields
 
 
 def _format_fields(fields: dict[str, Any]) -> str:
+    request_id = current_request_id()
+    if request_id and "request_id" not in fields:
+        fields = {"request_id": request_id, **fields}
     parts: list[str] = []
     for key, value in fields.items():
         if value is None:

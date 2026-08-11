@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import inspect
+import math
 import os
 import threading
 import time
 import types
-
-import math
+from datetime import timezone
 from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import numpy as np
@@ -26,7 +26,6 @@ from mtdata.forecast.common import (
     _create_training_dataframes,
     _extract_forecast_values,
     _normalize_weights,
-    bars_per_year as _bars_per_year,
     build_ci_diagnostics,
     default_seasonality,
     edge_pad_to_length,
@@ -35,6 +34,9 @@ from mtdata.forecast.common import (
     next_times_from_last,
     nf_setup_and_predict,
     pd_freq_from_timeframe,
+)
+from mtdata.forecast.common import (
+    bars_per_year as _bars_per_year,
 )
 from mtdata.forecast.forecast_engine import (
     _calculate_lookback_bars,
@@ -80,33 +82,29 @@ class TestEdgePadToLength:
 
     def test_trim_longer(self):
         arr = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
-        result = edge_pad_to_length(arr, 3)
-        np.testing.assert_array_equal(result, [10.0, 20.0, 30.0])
+        with pytest.raises(ValueError, match="requested 3, received 5"):
+            edge_pad_to_length(arr, 3)
 
     def test_pad_shorter(self):
         arr = np.array([1.0, 2.0])
-        result = edge_pad_to_length(arr, 5)
-        assert result.shape == (5,)
-        np.testing.assert_array_equal(result[:2], [1.0, 2.0])
-        # edge-padded with last value
-        np.testing.assert_array_equal(result[2:], [2.0, 2.0, 2.0])
+        with pytest.raises(ValueError, match="requested 5, received 2"):
+            edge_pad_to_length(arr, 5)
 
     def test_zero_length(self):
-        result = edge_pad_to_length(np.array([1.0, 2.0]), 0)
-        assert result.shape == (0,)
+        with pytest.raises(ValueError, match="requested 0, received 2"):
+            edge_pad_to_length(np.array([1.0, 2.0]), 0)
 
     def test_negative_length_treated_as_zero(self):
-        result = edge_pad_to_length(np.array([1.0]), -5)
-        assert result.shape == (0,)
+        with pytest.raises(ValueError, match="requested 0, received 1"):
+            edge_pad_to_length(np.array([1.0]), -5)
 
     def test_empty_input_pad(self):
-        result = edge_pad_to_length(np.array([]), 4)
-        assert result.shape == (4,)
-        assert np.all(np.isnan(result))
+        with pytest.raises(ValueError, match="requested 4, received 0"):
+            edge_pad_to_length(np.array([]), 4)
 
     def test_single_element_pad(self):
-        result = edge_pad_to_length(np.array([7.0]), 3)
-        np.testing.assert_array_equal(result, [7.0, 7.0, 7.0])
+        with pytest.raises(ValueError, match="requested 3, received 1"):
+            edge_pad_to_length(np.array([7.0]), 3)
 
     def test_float_dtype(self):
         result = edge_pad_to_length(np.array([1, 2, 3]), 3)
@@ -114,14 +112,13 @@ class TestEdgePadToLength:
 
     def test_2d_input_flattened(self):
         arr = np.array([[1.0, 2.0], [3.0, 4.0]])
-        result = edge_pad_to_length(arr, 3)
+        result = edge_pad_to_length(arr, 4)
         assert result.ndim == 1
-        assert result.shape == (3,)
+        assert result.shape == (4,)
 
     def test_large_pad(self):
-        result = edge_pad_to_length(np.array([5.0]), 100)
-        assert result.shape == (100,)
-        assert np.all(result == 5.0)
+        with pytest.raises(ValueError, match="requested 100, received 1"):
+            edge_pad_to_length(np.array([5.0]), 100)
 
 
 # ===================================================================
@@ -175,7 +172,9 @@ class TestLogReturnsFromPrices:
 # ===================================================================
 class TestExtractForecastValues:
     def test_y_column_requires_explicit_actual_fallback(self):
-        df = pd.DataFrame({"unique_id": ["ts"] * 5, "ds": range(5), "y": [1.0, 2.0, 3.0, 4.0, 5.0]})
+        df = pd.DataFrame(
+            {"unique_id": ["ts"] * 3, "ds": range(3), "y": [1.0, 2.0, 3.0]}
+        )
         with pytest.raises(RuntimeError, match="refusing to use actuals column 'y'"):
             _extract_forecast_values(df, fh=3)
         result = _extract_forecast_values(df, fh=3, allow_actual_fallback=True)
@@ -189,14 +188,13 @@ class TestExtractForecastValues:
 
     def test_pad_when_fewer_values(self):
         df = pd.DataFrame({"unique_id": ["ts"] * 2, "ds": range(2), "pred": [1.0, 2.0]})
-        result = _extract_forecast_values(df, fh=5)
-        assert result.shape == (5,)
-        np.testing.assert_array_equal(result[:2], [1.0, 2.0])
+        with pytest.raises(ValueError, match="requested 5, received 2"):
+            _extract_forecast_values(df, fh=5)
 
     def test_trim_when_more_values(self):
         df = pd.DataFrame({"pred": range(10)})
-        result = _extract_forecast_values(df, fh=3)
-        assert result.shape == (3,)
+        with pytest.raises(ValueError, match="requested 3, received 10"):
+            _extract_forecast_values(df, fh=3)
 
     def test_no_prediction_column_raises(self):
         df = pd.DataFrame({"unique_id": ["ts"], "ds": [0]})
@@ -342,11 +340,29 @@ class TestNextTimesFromLast:
             pd.Timestamp(epoch, unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M")
             for epoch in result
         ] == [
+            "2026-05-24 21:00",
             "2026-05-24 22:00",
             "2026-05-24 23:00",
             "2026-05-25 00:00",
-            "2026-05-25 01:00",
         ]
+
+    def test_monthly_projection_uses_calendar_boundaries(self):
+        last_epoch = pd.Timestamp("2025-01-01", tz="UTC").timestamp()
+        with patch(
+            "mtdata.utils.time._broker_calendar_timezone",
+            return_value=timezone.utc,
+        ):
+            result = next_times_from_last(
+                last_epoch,
+                30 * 86400,
+                2,
+                timeframe="MN1",
+            )
+
+        assert [
+            pd.Timestamp(epoch, unit="s", tz="UTC").strftime("%Y-%m-%d")
+            for epoch in result
+        ] == ["2025-02-01", "2025-03-01"]
 
 
 # ===================================================================
@@ -496,6 +512,9 @@ class TestNormalizeWeights:
 
     def test_wrong_size(self):
         assert _normalize_weights([1.0, 2.0], 3) is None
+
+    def test_extra_values_are_not_truncated(self):
+        assert _normalize_weights([1.0, 2.0, 3.0], 2) is None
 
     def test_all_zeros(self):
         assert _normalize_weights([0.0, 0.0, 0.0], 3) is None
@@ -673,6 +692,71 @@ class TestFormatForecastOutput:
         )
         assert result["forecast_epoch"] == [1060.0, 1120.0, 1180.0]
 
+    def test_forecast_target_bar_states_distinguish_forming_and_future(self):
+        result = _format_forecast_output(
+            forecast_values=np.array([1.0, 2.0, 3.0]),
+            last_epoch=1000.0,
+            tf_secs=60,
+            horizon=3,
+            base_col="close",
+            df=self._make_df(),
+            ci_alpha=None,
+            ci_values=None,
+            method="naive",
+            quantity="price",
+            denoise_used=False,
+            now_epoch=1090.0,
+        )
+
+        assert result["forecast_bar_states"] == ["forming", "future", "future"]
+        assert result["forecast_time_semantics"] == "target_bar_open_time"
+        assert result["forecast_value_semantics"] == "target_bar_close"
+
+    def test_forecast_target_bar_state_closes_at_bar_boundary(self):
+        result = _format_forecast_output(
+            forecast_values=np.array([1.0, 2.0]),
+            last_epoch=1000.0,
+            tf_secs=60,
+            horizon=2,
+            base_col="close",
+            df=self._make_df(),
+            ci_alpha=None,
+            ci_values=None,
+            method="naive",
+            quantity="price",
+            denoise_used=False,
+            now_epoch=1120.0,
+        )
+
+        assert result["forecast_bar_states"] == ["closed", "forming"]
+
+    def test_direction_threshold_scales_with_observed_bar_noise(self):
+        df = pd.DataFrame(
+            {
+                "time": np.arange(5, dtype=float),
+                "close": [100.0, 101.0, 100.0, 101.0, 100.0],
+            }
+        )
+
+        result = _format_forecast_output(
+            forecast_values=np.array([101.0, 102.0, 103.0, 104.0]),
+            last_epoch=1000.0,
+            tf_secs=60,
+            horizon=4,
+            base_col="close",
+            df=df,
+            ci_alpha=None,
+            ci_values=None,
+            method="naive",
+            quantity="price",
+            denoise_used=False,
+        )
+
+        assert result["direction_threshold_pct"] == pytest.approx(1.990099)
+        assert result["direction_threshold_basis"] == (
+            "max(0.05_pct,median_abs_bar_return_pct*sqrt(horizon))"
+        )
+
     def test_forecast_time_anchor_metadata_is_explicit(self):
         vals = np.array([1.0, 2.0])
         with patch("mtdata.forecast.forecast_engine._use_client_tz", return_value=False):
@@ -741,7 +825,7 @@ class TestFormatForecastOutput:
             )
 
         assert result["forecast_time"] == [
-            "2026-05-22T21:00Z",
+            "2026-05-24T21:00Z",
             "2026-05-24T22:00Z",
             "2026-05-24T23:00Z",
             "2026-05-25T00:00Z",
@@ -750,8 +834,8 @@ class TestFormatForecastOutput:
         ]
         assert result["forecast_calendar_gaps"] == [
             {
-                "from": "2026-05-22T22:00Z",
-                "to": "2026-05-24T21:00Z",
+                "from": "2026-05-22T21:00Z",
+                "to": "2026-05-24T20:00Z",
                 "skipped_bars": 48,
                 "reason": "weekend",
             }

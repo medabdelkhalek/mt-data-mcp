@@ -11,6 +11,7 @@ from mtdata.core.causal import (
     _evaluate_cointegration_pair,
     _fit_cointegration_hedge,
     _format_summary,
+    _limit_pair_rows,
     _normalize_cointegration_transform,
     _normalize_cointegration_trend,
     _normalize_correlation_method,
@@ -20,6 +21,7 @@ from mtdata.core.causal import (
     _parse_symbols,
     _rank_correlation_pairs,
     _standardize_frame,
+    _transform_aligned_pair,
     _transform_cointegration_frame,
     _transform_frame,
 )
@@ -47,6 +49,27 @@ def test_cointegration_pair_uses_stable_left_dependent_orientation():
     assert row["dependent"] == "A"
     assert row["hedge"] == "B"
     assert row["orientation_policy"] == "left_dependent"
+
+
+def test_pair_pagination_uses_canonical_nested_contract():
+    rows, truncated, metadata = _limit_pair_rows(
+        [{"pair": 1}, {"pair": 2}, {"pair": 3}],
+        limit=1,
+        offset=1,
+    )
+
+    assert rows == [{"pair": 2}]
+    assert truncated is True
+    assert metadata == {
+        "pagination": {
+            "total": 3,
+            "returned": 1,
+            "offset": 1,
+            "limit": 1,
+            "has_more": True,
+            "more_available": 1,
+        }
+    }
 
 
 class TestParseSymbols:
@@ -118,6 +141,7 @@ def test_rank_correlation_pairs_rounds_statistical_estimates() -> None:
         frame,
         ["A", "B"],
         method="pearson",
+        transform="level",
         window_bars=6,
         min_overlap=2,
     )
@@ -127,6 +151,8 @@ def test_rank_correlation_pairs_rounds_statistical_estimates() -> None:
     assert row["correlation"] == round(row["correlation"], 6)
     assert row["abs_correlation"] == round(row["abs_correlation"], 6)
     assert len(str(row["correlation"]).split(".")[1]) <= 6
+    assert row["ci_familywise_method"] == "bonferroni_fisher_z"
+    assert row["pair_tests_run"] == 1
 
 
 def test_pair_workflow_related_tools_are_cataloged():
@@ -169,6 +195,35 @@ class TestTransformFrame:
         result = _transform_frame(df, "log_return")
         # Zero prices → NaN in log → dropped
         assert len(result) <= 2
+
+    def test_transform_uses_each_series_true_predecessor(self):
+        frame = pd.DataFrame(
+            {
+                "A": pd.Series([100.0, 110.0, 121.0], index=[0, 2, 4]),
+                "B": pd.Series([50.0, 55.0, 60.5], index=[0, 1, 4]),
+            }
+        )
+
+        result = _transform_frame(frame, "pct")
+
+        assert result.loc[2, "A"] == pytest.approx(0.1)
+        assert result.loc[1, "B"] == pytest.approx(0.1)
+        assert result.loc[4, "A"] == pytest.approx(0.1)
+        assert result.loc[4, "B"] == pytest.approx(0.1)
+
+    def test_pair_transform_uses_shared_observation_predecessor(self):
+        frame = pd.DataFrame(
+            {
+                "A": pd.Series([100.0, 110.0, 121.0], index=[0, 2, 4]),
+                "B": pd.Series([50.0, 55.0, 60.5], index=[0, 1, 4]),
+            }
+        )
+
+        result = _transform_aligned_pair(frame, "A", "B", "pct")
+
+        assert list(result.index) == [4]
+        assert result.loc[4, "A"] == pytest.approx(0.21)
+        assert result.loc[4, "B"] == pytest.approx(0.21)
 
 
 class TestStandardizeFrame:
@@ -364,8 +419,8 @@ class TestFormatSummary:
             {"effect": "EURUSD", "cause": "USDJPY", "lag": 2, "p_value": 0.20, "samples": 100},
         ]
         result = _format_summary(rows, ["EURUSD", "GBPUSD", "USDJPY"], "log_return", 0.05)
-        assert "causal" in result
-        assert "no-link" in result
+        assert "granger-predictive-link" in result
+        assert "no-granger-link" in result
         assert "EURUSD <- GBPUSD" in result
 
     def test_group_hint(self):

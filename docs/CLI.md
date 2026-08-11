@@ -13,13 +13,21 @@ local exploration, run `mtdata-cli shell` and enter ordinary command lines
 without the `mtdata-cli` prefix; imports remain warm until `exit` or `quit`.
 The shell also accepts newline-delimited commands on stdin for non-interactive
 batches, ignores blank lines and `#` comments, and exits nonzero if any command
-fails.
+fails. Batch output is NDJSON: each executable input line produces one compact
+JSON envelope with `line`, `command`, `success`, and `status`. Parsed child JSON
+is nested under `result`; non-JSON output and diagnostics use `output` and
+`stderr`.
 Repeated agent or application calls should keep a process alive with
 `mtdata-stdio`, `mtdata-streamable-http`, or `mtdata-webapi`. The full tool surface is also
 available over [MCP](GLOSSARY.md#mcp-model-context-protocol). The Web API
 exposes a focused subset with the same canonical payload semantics for
 operations shared across interfaces. Default text presentation is
 [TOON](GLOSSARY.md#toon); use `--json` for machines.
+
+Background training is rejected by one-shot CLI processes because their workers
+would be terminated as soon as the command returned. Run `forecast_train` or
+`forecast_generate --async-mode true` inside `mtdata-cli shell`, through MCP, or
+through the Web API.
 
 Stuck on an acronym in output (BOCPD, Kelly, CVaR, …)? See the [glossary quick find](GLOSSARY.md#quick-find).
 
@@ -95,9 +103,10 @@ For scripts that always require JSON, set `MTDATA_OUTPUT_FORMAT=json` in the
 environment or `.env` file. Accepted values are `json` and `toon`; an explicit
 `--json` flag always selects JSON.
 
-JSON output keeps numeric values unminimized by default. Text output uses
-`--precision auto`, which preserves full precision for trading and price-level
-tools while compacting known large tables such as candles and scans.
+JSON output always keeps numeric values unminimized. Text output uses
+`--precision auto`, which compacts most tools while preserving full precision
+for an explicit set of sensitive outputs, including trading, quotes, forecasts,
+reports, and price-level tools.
 
 Control display precision explicitly:
 ```bash
@@ -107,13 +116,13 @@ mtdata-cli market_ticker EURUSD --precision full
 # Compact a large table for token-saving display
 mtdata-cli data_fetch_candles EURUSD --limit 200 --precision compact
 
-# Use a deterministic display decimal count
-mtdata-cli data_fetch_candles EURUSD --limit 200 --precision compact --decimals 5
 ```
 
 `--precision raw` is accepted as an alias for `full`, and `display` is accepted
-as an alias for `compact`. Precision controls only presentation; internal tool
-processing and JSON/raw payloads keep numeric values.
+as an alias for `compact`. There is no global `--decimals` option; tools with a
+domain-specific decimal control document it in their own help. Precision
+controls only text presentation; internal tool processing and JSON/raw payloads
+keep numeric values.
 
 ### Extras
 Compact output is implicit. For richer sections such as runtime metadata,
@@ -210,6 +219,15 @@ mtdata-cli data_fetch_candles EURUSD --start "1 week ago"
 mtdata-cli data_fetch_candles EURUSD --start "2025-12-01" --end "2025-12-31"
 ```
 
+For candle ranges, bounds are inclusive and resolved in UTC. An ISO date-only
+`--start` means 00:00:00 at the beginning of that day, while a date-only
+`--end` means 23:59:59.999999 at the end of that day. Include an explicit time
+and timezone when automation needs an exact instant, using either an ISO offset
+(`2026-08-03T09:30-04:00`) or an IANA name
+(`2026-08-03 09:30 America/New_York`). Ambiguous or nonexistent daylight-saving
+local times are rejected; use an ISO offset to choose a specific instant.
+Candle responses echo the resolved instants and bound modes in `query_applied`.
+
 ---
 
 ## Command Categories
@@ -256,7 +274,14 @@ mtdata-cli data_fetch_candles EURUSD --start "2025-12-01" --end "2025-12-31"
 | `forecast_models_delete` | Delete a stored model by `model_id` |
 | `forecast_models_cleanup` | Preview or delete stale/expired stored models |
 
-Trained models are written under `~/.mtdata/models/` by default and re-used automatically by subsequent `forecast_generate` calls with the same method/symbol/timeframe/params. Task status is persisted in `~/.mtdata/forecast/jobs.sqlite` by default, so recent task state can survive process restarts. See [ENV_VARS.md](ENV_VARS.md#async-training--model-store) for the related environment variables.
+Trained models are written under `~/.mtdata/models/` by default and reused by
+live `forecast_generate` calls with the same method, symbol, timeframe, horizon,
+seasonality, preprocessing, and training parameters. Results report model age
+in bars, and live reuse is capped at one resolved seasonal cycle. Historical
+`as_of` forecasts require an exact training anchor. Task
+status is persisted in `~/.mtdata/forecast/jobs.sqlite` by default, so recent
+task state can survive process restarts. See
+[ENV_VARS.md](ENV_VARS.md#async-training--model-store) for related variables.
 
 ### Risk Analysis
 | Command | Description |
@@ -287,12 +312,16 @@ Trained models are written under `~/.mtdata/models/` by default and re-used auto
 | `correlation_matrix` | Pairwise correlation matrix between symbols |
 | `cross_correlation` | Estimate lead/lag correlation between two symbols |
 | `cointegration_test` | Engle-Granger pair tests or Johansen multivariate cointegration |
-| `causal_discover_signals` | Granger-style causal discovery between symbols |
+| `causal_discover_signals` | Granger predictive-link discovery between symbols |
+
+The root `--timeframe` default maps to `--pivot-timeframe` for
+`confluence_levels`; an explicit command-level `--pivot-timeframe` takes
+precedence. `--sr-timeframe` remains independent and defaults to `auto`.
 
 Volume profile example:
 
 ```bash
-mtdata-cli volume_profile_levels EURUSD --start "1 week ago" --end "now" \
+mtdata-cli volume_profile_levels EURUSD --start "1 day ago" --end "now" \
   --source auto --price-source mid --bucket-points 10 --json
 ```
 
@@ -302,6 +331,9 @@ You can also derive the window from a lookback:
 mtdata-cli volume_profile_levels EURUSD --timeframe H1 --limit 168 \
   --source auto --bucket-points 10 --json
 ```
+
+The default tick window is one day and 50,000 ticks. Longer `auto` windows use
+the labeled M1-bar approximation unless those caps are raised explicitly.
 
 For fractal + volume-structure confluence, opt in through pattern config:
 
@@ -338,8 +370,9 @@ Denoising is applied to data via the `--denoise`/`--denoise-params` flags (see [
 | `trade_stress_test` | Apply deterministic percentage shocks to open positions |
 
 See [TRADING_RISK.md](TRADING_RISK.md) for position sizing (fixed-fraction + Kelly), VaR/CVaR, and stress-test parameters and output.
-For Kelly sizing, `trade_journal_analyze` is the quickest way to derive
-`win_rate`, `avg_win`, and `avg_loss` inputs from realized trade history.
+`trade_journal_analyze` reports raw account-currency PnL per exit deal. Those
+averages are useful for journal review, but they are not Kelly inputs because
+they are not normalized to a consistent stake or unit of risk.
 
 ### News
 | Command | Description |
@@ -414,8 +447,9 @@ mtdata-cli symbols_describe EURUSD --json
 # Rank the current watchlist by spread, volume, and price change
 mtdata-cli symbols_top_markets --rank-by all --limit 5 --timeframe H1 --json
 
-# Opt into a slower full-universe scan when you need hidden tradable symbols too
-mtdata-cli symbols_top_markets --rank-by spread --limit 10 --universe all --json
+# Include hidden symbols within a bounded comparable category
+mtdata-cli symbols_top_markets --rank-by spread --limit 10 --universe all \
+  --category forex --json
 
 # Scan visible majors for strong RSI and price above SMA
 mtdata-cli market_scan --group "Forex\\Majors" --rsi-above 60 --price-vs-sma above \
@@ -426,6 +460,15 @@ mtdata-cli market_scan EURUSD,GBPUSD,USDJPY --rsi-below 35 --max-spread-pct 0.03
 
 # Multi-symbol selectors use the canonical `symbols` selector.
 ```
+
+`market_scan` and `symbols_top_markets` keep completed-bar values such as
+`close` separate from the current executable quote. When a quote is available,
+rows expose `bid`, `ask`, `mid`, and `quote_as_of`; use those fields for a live
+mark and the bar fields for ranking and indicator context.
+
+`symbols_list` rejects non-positive limits. `symbols_top_markets` preserves
+exact ranking semantics and rejects a filtered candidate universe above 250
+symbols before activating hidden quotes; narrow it with `group` or `category`.
 
 ### Fetch Market Data
 ```bash
@@ -464,7 +507,16 @@ mtdata-cli strategy_backtest EURUSD --timeframe H1 --strategy sma_cross \
 
 mtdata-cli strategy_backtest EURUSD --timeframe H1 --strategy rsi_reversion \
   --rsi-length 14 --oversold 30 --overbought 70 --position-mode long_only --json
+
+# Historical MT5 bar spread is the default cost model. For a controlled constant:
+mtdata-cli strategy_backtest EURUSD --cost-model fixed --spread-bps 1.2 --json
 ```
+
+Net returns and derived performance metrics are reported only when every trade has
+a spread cost. If historical spread data cannot price every trade, the response
+keeps gross results, labels the partial result `return_after_known_costs`, reports
+the priced-trade coverage, and marks performance metrics unavailable. Use an
+explicit fixed spread when a complete, comparable net result is required.
 
 ### Analyze Risk
 ```bash
@@ -495,6 +547,10 @@ mtdata-cli market_status --symbol EURUSD --json
 # Consolidated broker/session context (account, open/pending, quote, computed state)
 mtdata-cli trade_session_context EURUSD --json
 ```
+
+In symbol mode, `is_tradable` reflects the broker trade mode (including
+close-only symbols), while `can_open_new_positions` additionally requires a
+live-ready quote and an active session.
 
 ### Place Orders
 `trade_place` requires `symbol`, `volume`, and `order_type`.
@@ -528,10 +584,16 @@ mtdata-cli trade_place BTCUSD --volume 0.01 --order-type BUY \
 | `--require-sl-tp` | `trade_place` | Require both stop-loss and take-profit on market orders. |
 | `--auto-close-on-sl-tp-fail` | `trade_place` | If SL/TP attachment fails after a market fill, try to close the unprotected position. |
 | `--expiration` | `trade_place`, `trade_modify` | Expiration time for pending orders (`dateparser`, UTC epoch seconds, or `GTC`). |
-| `--idempotency-key` | `trade_place`, `trade_modify` | Dedupe repeated requests within the current process only (in-memory ~5-minute TTL; not persisted across restarts or shared across workers). |
+| `--idempotency-key` | `trade_place`, `trade_modify` | Durable dedupe key shared by CLI and server processes within the configured retention window. |
 | `--close-all` | `trade_close` | Close all matching positions instead of one ticket. |
 | `--profit-only` / `--loss-only` | `trade_close` | Restrict closes to positions currently in profit or loss. |
 | `--close-priority` | `trade_close` | When multiple positions match, close `loss_first`, `profit_first`, or `largest_first`. |
+
+Every `trade_place`, `trade_modify`, and `trade_close` response includes a
+`correlation_id`. The same value appears in execution logs; live order results
+also log MT5's numeric `request_id` as `mt5_request_id`. Idempotent replays expose
+both the current `correlation_id` and the original invocation's
+`original_correlation_id`.
 
 For account-level safety, configure trade guardrails in [ENV_VARS.md](ENV_VARS.md#trade-guardrails) before moving from preview to live execution.
 
@@ -554,9 +616,10 @@ mtdata-cli trade_journal_analyze --symbol EURUSD --minutes-back 43200 --breakdow
 ```
 
 `trade_history` and `trade_journal_analyze` default to a 7-day lookback (`--minutes-back 10080`) when you do not pass a time window explicitly.
-For Kelly sizing in `trade_risk_analyze`, map `summary.win_rate`,
-`summary.avg_win`, and `summary.avg_loss` from `trade_journal_analyze` to
-`--kelly-win-rate`, `--kelly-avg-win`, and `--kelly-avg-loss`.
+For Kelly sizing in `trade_risk_analyze`, derive `--kelly-win-rate`,
+`--kelly-avg-win`, and `--kelly-avg-loss` from complete trade lifecycles whose
+returns are normalized consistently (for example, R-multiples). Do not map the
+raw `trade_journal_analyze` PnL averages into those flags.
 
 ### Estimate Portfolio Tail Risk
 ```bash

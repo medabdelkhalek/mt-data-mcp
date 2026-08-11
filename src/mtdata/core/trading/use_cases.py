@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from ...bootstrap.settings import trade_guardrails_config
+from ...services.data_service import _is_last_bar_forming
 from ...shared.constants import BROKER_VOLUME_UNIT, TIMEFRAME_MAP
 from ...shared.market_units import price_delta_ticks
 from ...shared.result import Err, Ok, Result, to_dict
@@ -23,6 +24,7 @@ from ...utils.mt5 import (
     _to_mt5_history_epoch_seconds,
     mt5_adapter,
 )
+from ...utils.quote import resolve_quote_tick, tick_value
 from ...utils.time import _format_datetime_second_explicit
 from ..error_envelope import normalize_error_payload
 from ..execution_logging import (
@@ -53,6 +55,8 @@ from .requests import (
 from .safety import (
     assess_margin_stress,
     evaluate_trade_guardrails,
+    guardrails_require_pending_snapshot,
+    guardrails_require_position_snapshot,
     preview_trade_guardrails,
 )
 from .sizing import (
@@ -110,6 +114,8 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "margin_required",
     "margin_free",
     "margin_sufficient",
+    "account_state",
+    "account_blockers",
     "sl_distance_points",
     "sl_distance_pct",
     "tp_distance_points",
@@ -117,6 +123,9 @@ _TRADE_PLACE_PREVIEW_KEYS = (
     "min_distance_points",
     "sl_tp_valid",
     "sl_tp_error",
+    "validation_error",
+    "validation_code",
+    "blockers",
     "preview_error",
     "message",
     "dry_run_note",
@@ -175,6 +184,7 @@ _TRADE_PLACE_BASIC_KEYS = _TRADE_PLACE_PREVIEW_KEYS + (
     "preview_checks_performed",
     "broker_validation_not_performed",
     "preview_scope_summary",
+    "checks_not_performed",
     "validation_not_performed",
     "warnings",
     "guardrails_preview",
@@ -251,6 +261,7 @@ def _standardize_trade_operation_payload(
     *,
     operation: str,
     default_error_code: str,
+    request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return result
@@ -258,11 +269,103 @@ def _standardize_trade_operation_payload(
         return normalize_error_payload(
             result,
             default_code=default_error_code,
+            request_id=request_id,
             operation=operation,
         )
     out = dict(result)
     out.setdefault("success", True)
     return out
+
+
+def _attach_live_guardrail_status(
+    result: Dict[str, Any],
+    *,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """Make the configured safety state explicit on submitted trade outcomes."""
+    if dry_run or not isinstance(result, dict):
+        return result
+    if not (
+        infer_result_success(result)
+        or result.get("ambiguous") is True
+        or result.get("error_code") == "order_send_ambiguous"
+    ):
+        return result
+    out = dict(result)
+    enabled = bool(trade_guardrails_config.is_enabled())
+    out["guardrails_enabled"] = enabled
+    if enabled:
+        return out
+    warning = (
+        "Live trade submitted without configured trade guardrails. Set "
+        "MTDATA_TRADE_GUARDRAILS_ENABLED=1 and configure symbol, volume, or "
+        "risk limits to enable pre-trade protection."
+    )
+    warnings_out = (
+        [str(item).strip() for item in out.get("warnings", []) if str(item).strip()]
+        if isinstance(out.get("warnings"), list)
+        else []
+    )
+    if warning not in warnings_out:
+        warnings_out.append(warning)
+    out["warnings"] = warnings_out
+    return out
+
+
+def _attach_trade_correlation(
+    result: Dict[str, Any],
+    *,
+    correlation_id: Optional[str],
+) -> Dict[str, Any]:
+    """Attach the invocation ID and link an idempotent replay to its source."""
+    correlation_value = str(correlation_id or "").strip()
+    if not correlation_value or not isinstance(result, dict):
+        return result
+    out = dict(result)
+    out["correlation_id"] = correlation_value
+    original_outcome = out.get("original_outcome")
+    if isinstance(original_outcome, dict):
+        original_correlation_id = str(
+            original_outcome.get("correlation_id") or ""
+        ).strip()
+        if original_correlation_id:
+            out["original_correlation_id"] = original_correlation_id
+    return out
+
+
+def _log_trade_correlation(
+    *,
+    operation: str,
+    result: Dict[str, Any],
+) -> None:
+    """Log bounded identifiers that join an invocation to its MT5 result."""
+    correlation_id = str(result.get("correlation_id") or "").strip()
+    if not correlation_id:
+        return
+    fields = [f"correlation_id={correlation_id}"]
+    original_correlation_id = str(
+        result.get("original_correlation_id") or ""
+    ).strip()
+    if original_correlation_id:
+        fields.append(f"original_correlation_id={original_correlation_id}")
+
+    original_outcome = result.get("original_outcome")
+    identifier_source = (
+        original_outcome if isinstance(original_outcome, dict) else result
+    )
+    mt5_request_id = identifier_source.get("request_id")
+    if isinstance(mt5_request_id, int) and not isinstance(mt5_request_id, bool):
+        fields.append(f"mt5_request_id={mt5_request_id}")
+    for key in ("order", "deal", "position_ticket", "ticket"):
+        value = identifier_source.get(key)
+        if value not in (None, "", 0, "0"):
+            fields.append(f"{key}={value}")
+    idempotency_key = result.get("idempotency_key")
+    if idempotency_key not in (None, ""):
+        fields.append(f"idempotency_key={idempotency_key}")
+    if result.get("duplicate") is True:
+        fields.append("duplicate=True")
+    logger.info("event=trade_result operation=%s %s", operation, " ".join(fields))
 
 
 def _sl_tp_result_details(result: Dict[str, Any]) -> tuple[bool, str]:
@@ -293,13 +396,24 @@ def _best_effort_trade_guardrail_account_info() -> Any:
         return None
 
 
-def _best_effort_trade_guardrail_positions() -> List[Any]:
+def _best_effort_trade_guardrail_positions() -> Optional[List[Any]]:
     if not trade_guardrails_config.is_enabled():
         return []
     try:
-        return list(mt5_adapter.positions_get() or [])
+        positions = mt5_adapter.positions_get()
     except Exception:
+        return None
+    return None if positions is None else list(positions)
+
+
+def _best_effort_trade_guardrail_pending_orders() -> Optional[List[Any]]:
+    if not trade_guardrails_config.is_enabled():
         return []
+    try:
+        pending_orders = mt5_adapter.orders_get()
+    except Exception:
+        return None
+    return None if pending_orders is None else list(pending_orders)
 
 
 def _normalize_idempotency_key(value: Any) -> Optional[str]:
@@ -357,12 +471,31 @@ def _should_persist_idempotency_outcome(result: Any) -> bool:
     """
     if not isinstance(result, dict):
         return False
+    if result.get("dry_run") or result.get("no_action"):
+        return False
     if result.get("duplicate"):
         return True
     if result.get("ambiguous") or result.get("error_code") == "order_send_ambiguous":
         return True
     if infer_result_success(result):
         return True
+    for count_key in ("closed_count", "cancelled_count"):
+        try:
+            if int(result.get(count_key) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    nested_results = result.get("results")
+    if isinstance(nested_results, list):
+        for nested in nested_results:
+            if not isinstance(nested, dict):
+                continue
+            if (
+                nested.get("ambiguous") is True
+                or nested.get("error_code") == "order_send_ambiguous"
+                or infer_result_success(nested)
+            ):
+                return True
     for key in (
         "deal",
         "order",
@@ -535,18 +668,37 @@ def _resolve_live_trade_risk_entry(
     direction: Any,
 ) -> tuple[float | None, str | None, Dict[str, Any]]:
     try:
-        tick = gateway.symbol_info_tick(symbol)
+        raw_tick = gateway.symbol_info_tick(symbol)
     except Exception:
         return None, None, {}
-    if tick is None:
+    if raw_tick is None:
         return None, None, {}
+    tick, quote_source = resolve_quote_tick(
+        gateway,
+        symbol,
+        raw_tick,
+        now_epoch=time.time(),
+    )
+    if tick is None:
+        return None, None, quote_source
 
     quote_context = build_trade_quote_context(symbol, tick)
-    if quote_context.get("usable_for_live_trading") is not True:
-        return None, None, quote_context
+    quote_context.update(quote_source)
+    live_quote = quote_context.get("usable_for_live_trading") is True
+    source_prefix = "live_tick" if live_quote else "last_available_tick"
+    if not live_quote:
+        quote_context["sizing_reference_only"] = True
+        quote_context["sizing_warning"] = (
+            "Position sizing uses the last available non-live quote as a reference; "
+            "refresh the entry before submitting an order."
+        )
 
-    bid = _positive_trade_price(getattr(tick, "bid", None))
-    ask = _positive_trade_price(getattr(tick, "ask", None))
+    bid = _positive_trade_price(tick_value(tick, "bid"))
+    ask = _positive_trade_price(tick_value(tick, "ask"))
+    if bid is not None:
+        quote_context["bid"] = bid
+    if ask is not None:
+        quote_context["ask"] = ask
     direction_norm = None
     if direction is not None:
         direction_norm, direction_error = normalize_trade_direction(str(direction))
@@ -555,21 +707,21 @@ def _resolve_live_trade_risk_entry(
 
     if direction_norm == "long":
         if ask is not None:
-            return ask, "live_tick_ask", quote_context
+            return ask, f"{source_prefix}_ask", quote_context
         if bid is not None:
-            return bid, "live_tick_bid_fallback", quote_context
+            return bid, f"{source_prefix}_bid_fallback", quote_context
     elif direction_norm == "short":
         if bid is not None:
-            return bid, "live_tick_bid", quote_context
+            return bid, f"{source_prefix}_bid", quote_context
         if ask is not None:
-            return ask, "live_tick_ask_fallback", quote_context
+            return ask, f"{source_prefix}_ask_fallback", quote_context
 
     if bid is not None and ask is not None:
-        return (bid + ask) / 2.0, "live_tick_mid", quote_context
+        return (bid + ask) / 2.0, f"{source_prefix}_mid", quote_context
     if bid is not None:
-        return bid, "live_tick_bid_only", quote_context
+        return bid, f"{source_prefix}_bid_only", quote_context
     if ask is not None:
-        return ask, "live_tick_ask_only", quote_context
+        return ask, f"{source_prefix}_ask_only", quote_context
     return None, None, quote_context
 
 
@@ -674,6 +826,7 @@ def _build_trade_evaluation(
     if level_error:
         out["status"] = "invalid"
         out["error"] = level_error
+        return out
 
     sl_distance = abs(float(entry) - float(stop_loss))
     out["sl_distance_price"] = round(sl_distance, 10)
@@ -851,6 +1004,68 @@ def _shape_trade_risk_analyze_payload(
     return shaped
 
 
+def _apply_trade_candidate_outcome(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote proposed-trade validity to the operation-level contract."""
+    evaluation = result.get("trade_evaluation")
+    if not isinstance(evaluation, dict):
+        return result
+
+    candidate_status = str(evaluation.get("status") or "").strip().lower()
+    if candidate_status == "valid":
+        result["candidate_valid"] = True
+        result["candidate_status"] = "valid"
+        return result
+    if candidate_status != "invalid":
+        return result
+
+    candidate_error = evaluation.get("error")
+    sizing_error = result.get("position_sizing_error")
+    candidate_error_codes = {
+        "direction_inference_ambiguous",
+        "direction_unable_to_infer",
+        "invalid_direction",
+        "invalid_sl_for_direction",
+        "invalid_tp_for_direction",
+        "non_positive_sl_distance",
+    }
+    if (
+        not isinstance(candidate_error, dict)
+        and isinstance(sizing_error, dict)
+        and sizing_error.get("code") in candidate_error_codes
+    ):
+        candidate_error = sizing_error
+
+    error_code = "invalid_trade_candidate"
+    error_message = "The proposed trade is invalid."
+    if isinstance(candidate_error, dict):
+        error_code = str(candidate_error.get("code") or error_code)
+        error_message = str(
+            candidate_error.get("reason")
+            or candidate_error.get("message")
+            or error_message
+        )
+    elif candidate_error:
+        error_message = str(candidate_error)
+        direction_source = str(evaluation.get("direction_source") or "")
+        if direction_source == "unable_to_infer":
+            error_code = "direction_unable_to_infer"
+        elif evaluation.get("direction") is None:
+            error_code = "invalid_direction"
+
+    result.update(
+        {
+            "success": False,
+            "candidate_valid": False,
+            "candidate_status": "invalid",
+            "error_code": error_code,
+            "error": error_message,
+            "portfolio_snapshot_status": "available",
+        }
+    )
+    result.pop("position_sizing", None)
+    return result
+
+
 def _shape_trade_var_cvar_payload(
     result: Dict[str, Any],
     *,
@@ -873,8 +1088,21 @@ def _shape_trade_var_cvar_payload(
             "summary",
             "equity",
             "currency",
+            "history_policy",
+            "forming_candle_status",
+            "forming_candle_status_by_symbol",
             "history_failures",
             "warnings",
+            "mark_freshness_status",
+            "usable_for_live_trading",
+            "data_stale",
+            "valuation_time",
+            "valuation_basis",
+            "valuation_warning",
+            "entry_price_fallback_positions",
+            "market_status",
+            "market_status_reason",
+            "mark_freshness",
         )
         if key in result
     }
@@ -936,8 +1164,6 @@ def _extract_trade_risk_kelly_inputs(
             (
                 "kelly_avg_win",
                 "avg_win_return",
-                "avg_win",
-                "average_win",
                 "mean_win_return",
             ),
         ),
@@ -946,10 +1172,7 @@ def _extract_trade_risk_kelly_inputs(
             (
                 "kelly_avg_loss",
                 "avg_loss_return",
-                "avg_loss",
-                "average_loss",
                 "mean_loss_return",
-                "avg_loss_magnitude",
             ),
         ),
     }
@@ -1187,6 +1410,7 @@ def run_trade_place(  # noqa: C901
     safe_int_ticket: Any,
     build_dry_run_preview: Any = None,
     idempotency_store: Optional[TradeIdempotencyStore] = _TRADE_IDEMPOTENCY_STORE,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     missing: List[str] = []
@@ -1201,6 +1425,7 @@ def run_trade_place(  # noqa: C901
     log_operation_start(
         logger,
         operation="trade_place",
+        correlation_id=correlation_id,
         symbol=symbol_norm or None,
         requested_order_type=request.order_type,
     )
@@ -1216,8 +1441,11 @@ def run_trade_place(  # noqa: C901
             result,
             operation="trade_place",
             default_error_code="trade_place_error",
+            request_id=correlation_id,
         )
+        result = _attach_live_guardrail_status(result, dry_run=request.dry_run)
         result = _annotate_idempotency_scope(result, idempotency_key, idempotency_store)
+        result = _attach_trade_correlation(result, correlation_id=correlation_id)
         if not idempotency_consumed:
             if _record_or_release_idempotency(
                 idempotency_store,
@@ -1226,11 +1454,13 @@ def run_trade_place(  # noqa: C901
                 request_signature=idempotency_signature,
             ):
                 idempotency_consumed = True
+        _log_trade_correlation(operation="trade_place", result=result)
         log_operation_finish(
             logger,
             operation="trade_place",
             started_at=started_at,
             success=infer_result_success(result),
+            correlation_id=correlation_id,
             symbol=symbol_norm or None,
             order_type=order_type,
             pending=pending,
@@ -1250,13 +1480,14 @@ def run_trade_place(  # noqa: C901
         dry_run_missing_protection: List[str] = []
         dry_run_protection_error: Optional[Dict[str, Any]] = None
 
-        def _dry_run_preview(
+        def _dry_run_preview(  # noqa: C901
             *,
             order_type: str,
             pending: bool,
             normalized_expiration: Any,
             expiration_provided: bool,
             guardrail_preview: Dict[str, Any],
+            order_preview: Optional[Dict[str, Any]] = None,
         ) -> Dict[str, Any]:
             preview_detail = _resolve_trade_place_preview_detail(request)
             validation_scope = "local_preview_plus_estimates"
@@ -1273,6 +1504,8 @@ def run_trade_place(  # noqa: C901
             ]
             if dry_run_protection_error is not None:
                 local_blockers.append("invalid_protection_levels")
+            if guardrail_preview.get("checks_not_performed"):
+                local_blockers.append("guardrail_checks_incomplete")
             preview: Dict[str, Any] = {
                 "success": True,
                 "dry_run": True,
@@ -1302,13 +1535,12 @@ def run_trade_place(  # noqa: C901
                     "Use this preview for request routing only."
                 ),
                 "preview_scope_summary": (
-                    "Routing, local level checks, and margin estimates only."
+                    "Routing and local level checks, plus a margin estimate when available."
                 ),
                 "preview_checks_performed": [
                     "request_routing",
                     "local_safety_requirements",
                     "protection_level_preview",
-                    "margin_estimate",
                 ],
                 "broker_validation_not_performed": list(
                     broker_validation_not_performed
@@ -1345,13 +1577,15 @@ def run_trade_place(  # noqa: C901
                     {
                         "sl_tp_valid": False,
                         "sl_tp_error": dry_run_protection_error.get("error"),
-                        "preview_error": dry_run_protection_error.get("error"),
-                        "error_code": dry_run_protection_error.get(
+                        "validation_error": dry_run_protection_error.get("error"),
+                        "validation_code": dry_run_protection_error.get(
                             "error_code",
                             "invalid_protection_levels",
                         ),
                     }
                 )
+            elif isinstance(order_preview, dict):
+                preview.update(order_preview)
             elif callable(build_dry_run_preview):
                 preview.update(
                     build_dry_run_preview(
@@ -1364,6 +1598,63 @@ def run_trade_place(  # noqa: C901
                         take_profit=request.take_profit,
                     )
                 )
+            account_blockers = [
+                str(blocker)
+                for blocker in list(preview.get("account_blockers") or [])
+                if str(blocker).strip()
+            ]
+            if account_blockers:
+                validation_payload = preview.get("validation")
+                if isinstance(validation_payload, dict):
+                    existing_blockers = list(
+                        validation_payload.get("blockers") or []
+                    )
+                    validation_payload["blockers"] = [
+                        *account_blockers,
+                        *(
+                            blocker
+                            for blocker in existing_blockers
+                            if blocker not in account_blockers
+                        ),
+                    ]
+                    validation_payload["live_submission_eligible"] = False
+                preview["validation_passed"] = False
+                preview["preview_ok"] = False
+                preview["actionability"] = "blocked_by_account_state"
+                preview["actionability_reason"] = (
+                    "The account execution or margin state blocks a new order."
+                )
+            margin_estimate = validation.coerce_finite_float(
+                preview.get("margin_required")
+            )
+            if margin_estimate is not None:
+                preview["preview_checks_performed"].append("margin_estimate")
+                if preview.get("margin_sufficient") is False:
+                    validation_payload = preview.get("validation")
+                    if isinstance(validation_payload, dict):
+                        validation_payload["live_submission_eligible"] = False
+                        blockers = validation_payload.setdefault("blockers", [])
+                        if "margin_insufficient" not in blockers:
+                            blockers.append("margin_insufficient")
+                    preview["validation_passed"] = False
+                    preview["preview_ok"] = False
+                    preview["actionability"] = "blocked_by_margin_estimate"
+                    preview["actionability_reason"] = (
+                        "The estimated required margin exceeds current free margin."
+                    )
+            else:
+                checks_not_performed = preview.setdefault(
+                    "checks_not_performed", []
+                )
+                if "margin_estimate" not in checks_not_performed:
+                    checks_not_performed.append("margin_estimate")
+                warnings_out = preview.setdefault("warnings", [])
+                warning = (
+                    "Margin estimate unavailable from MT5; preview_ok covers local "
+                    "request validity only, not affordability."
+                )
+                if warning not in warnings_out:
+                    warnings_out.append(warning)
             quote_context = preview.get("quote_context")
             if (
                 isinstance(quote_context, dict)
@@ -1407,15 +1698,17 @@ def run_trade_place(  # noqa: C901
                 preview["preview_ok"] = False
                 sl_tp_error = str(preview.get("sl_tp_error") or "").strip()
                 if sl_tp_error:
-                    preview["preview_error"] = sl_tp_error
-                    preview.setdefault("error_code", "invalid_protection_levels")
-            if local_blockers and not preview.get("preview_error"):
-                preview["success"] = False
-                preview["error_code"] = "trade_preview_validation_failed"
-                preview["error"] = (
-                    "Dry-run validation failed: " + ", ".join(local_blockers) + "."
-                )
-                preview["no_action_reason"] = "dry_run_validation_failed"
+                    preview["validation_error"] = sl_tp_error
+                    preview.setdefault("validation_code", "invalid_protection_levels")
+            validation_payload = preview.get("validation")
+            validation_blockers = (
+                list(validation_payload.get("blockers") or [])
+                if isinstance(validation_payload, dict)
+                else list(local_blockers)
+            )
+            if validation_blockers:
+                preview["blockers"] = validation_blockers
+                preview["no_action_reason"] = "dry_run_validation_blocked"
             preview_error = str(preview.get("preview_error") or "").strip()
             if preview_error:
                 preview["success"] = False
@@ -1649,8 +1942,65 @@ def run_trade_place(  # noqa: C901
                     )
 
         if bool(request.dry_run):
+            order_preview: Optional[Dict[str, Any]] = None
+            if dry_run_protection_error is None and callable(build_dry_run_preview):
+                order_preview = build_dry_run_preview(
+                    symbol=symbol_norm,
+                    volume=float(request.volume),
+                    order_type=order_type_norm,
+                    pending=is_pending,
+                    price=request.price,
+                    stop_loss=request.stop_loss,
+                    take_profit=request.take_profit,
+                )
+            entry_price = validation.coerce_finite_float(
+                (order_preview or {}).get("estimated_fill_price")
+            )
             guardrail_account_info = _best_effort_trade_guardrail_account_info()
-            guardrail_positions = _best_effort_trade_guardrail_positions()
+            snapshot_required = guardrails_require_position_snapshot(
+                trade_guardrails_config,
+                account_info=guardrail_account_info,
+                enforce_account_risk=True,
+                enforce_wallet_risk=True,
+            )
+            guardrail_positions = (
+                _best_effort_trade_guardrail_positions()
+                if snapshot_required
+                else []
+            )
+            if guardrail_positions is None:
+                return _finish(
+                    validation.snapshot_unavailable_error(
+                        mt5_adapter,
+                        snapshot="positions",
+                        context="preview configured trade guardrails",
+                        guardrail_blocked=True,
+                    ),
+                    order_type=order_type_norm,
+                    pending=is_pending,
+                )
+            pending_snapshot_required = guardrails_require_pending_snapshot(
+                trade_guardrails_config,
+                account_info=guardrail_account_info,
+                enforce_account_risk=True,
+                enforce_wallet_risk=True,
+            )
+            guardrail_pending_orders = (
+                _best_effort_trade_guardrail_pending_orders()
+                if pending_snapshot_required
+                else []
+            )
+            if guardrail_pending_orders is None:
+                return _finish(
+                    validation.snapshot_unavailable_error(
+                        mt5_adapter,
+                        snapshot="orders",
+                        context="preview configured trade guardrails",
+                        guardrail_blocked=True,
+                    ),
+                    order_type=order_type_norm,
+                    pending=is_pending,
+                )
             guardrail_preview = preview_trade_guardrails(
                 trade_guardrails_config,
                 symbol=symbol_norm,
@@ -1658,8 +2008,11 @@ def run_trade_place(  # noqa: C901
                 stop_loss=request.stop_loss,
                 deviation=request.deviation,
                 side=_guardrail_order_side(order_type_norm),
+                entry_price=entry_price,
                 account_info=guardrail_account_info,
                 existing_positions=guardrail_positions,
+                existing_pending_orders=guardrail_pending_orders,
+                symbol_info_resolver=mt5_adapter.symbol_info,
             )
             if guardrail_preview.get("blocked"):
                 violations = list(guardrail_preview.get("violations") or [])
@@ -1709,13 +2062,33 @@ def run_trade_place(  # noqa: C901
                     normalized_expiration=normalized_expiration,
                     expiration_provided=expiration_provided,
                     guardrail_preview=guardrail_preview,
+                    order_preview=order_preview,
                 ),
                 order_type=order_type_norm,
                 pending=is_pending,
             )
 
         guardrail_account_info = _best_effort_trade_guardrail_account_info()
-        guardrail_positions = _best_effort_trade_guardrail_positions()
+        snapshot_required = guardrails_require_position_snapshot(
+            trade_guardrails_config,
+            account_info=guardrail_account_info,
+            enforce_account_risk=False,
+            enforce_wallet_risk=False,
+        )
+        guardrail_positions = (
+            _best_effort_trade_guardrail_positions() if snapshot_required else []
+        )
+        if guardrail_positions is None:
+            return _finish(
+                validation.snapshot_unavailable_error(
+                    mt5_adapter,
+                    snapshot="positions",
+                    context="evaluate configured trade guardrails",
+                    guardrail_blocked=True,
+                ),
+                order_type=order_type_norm,
+                pending=is_pending,
+            )
         static_guardrail = evaluate_trade_guardrails(
             trade_guardrails_config,
             symbol=symbol_norm,
@@ -1745,7 +2118,7 @@ def run_trade_place(  # noqa: C901
             if isinstance(result, dict):
                 sl_tp_requested, sl_tp_status = _sl_tp_result_details(result)
                 sl_tp_failed = sl_tp_status == "failed"
-                sl_tp_unverified = sl_tp_status == "unverified"
+                sl_tp_unverified = sl_tp_status not in {"applied", "failed"}
                 if sl_tp_requested and (sl_tp_failed or sl_tp_unverified):
                     warnings_out = _coerce_warning_list(result.get("warnings"))
                     pos_ticket = result.get("position_ticket")
@@ -1754,12 +2127,12 @@ def run_trade_place(  # noqa: C901
                         for ticket in list(result.get("position_ticket_candidates") or [])
                         if ticket is not None
                     ]
-                    if pos_ticket is not None:
+                    if sl_tp_failed and pos_ticket is not None:
                         critical = (
                             "CRITICAL: Order executed without applied TP/SL protection. "
                             f"Run trade_modify {pos_ticket} now, or close the position."
                         )
-                    elif candidate_tickets:
+                    elif sl_tp_failed and candidate_tickets:
                         candidate_list = ", ".join(str(v) for v in candidate_tickets)
                         critical = (
                             "CRITICAL: Order executed without applied TP/SL protection. "
@@ -1768,11 +2141,16 @@ def run_trade_place(  # noqa: C901
                             "If that fails, run trade_get_open to confirm the live position ticket, "
                             "or close the position."
                         )
-                    else:
+                    elif sl_tp_failed:
                         critical = (
                             "CRITICAL: Order executed without applied TP/SL protection. "
                             "Run trade_get_open to find the live position ticket, then trade_modify it now, "
                             "or close the position."
+                        )
+                    else:
+                        critical = (
+                            "CRITICAL: TP/SL attachment was accepted but could not be verified. "
+                            "Confirm the live protection levels before treating this position as protected."
                         )
                     if critical not in warnings_out:
                         warnings_out.append(critical)
@@ -1793,44 +2171,50 @@ def run_trade_place(  # noqa: C901
                         else:
                             auto_close_result = close_positions(
                                 ticket=close_ticket,
+                                volume=(
+                                    validation.coerce_finite_float(
+                                        result.get("filled_volume")
+                                    )
+                                    or float(request.volume)
+                                ),
                                 comment="AUTO-CLOSE: TP/SL protection unresolved",
                                 deviation=request.deviation,
                             )
                         result["auto_close_on_sl_tp_fail"] = True
                         result["auto_close_result"] = auto_close_result
 
-                        auto_close_ok = False
-                        if isinstance(auto_close_result, dict):
-                            if "error" not in auto_close_result:
-                                retcode = auto_close_result.get("retcode")
-                                if retcode is not None:
-                                    try:
-                                        # DONE / DONE_PARTIAL / PLACED
-                                        auto_close_ok = int(retcode) in {
-                                            10008,
-                                            10009,
-                                            10010,
-                                        }
-                                    except (TypeError, ValueError):
-                                        auto_close_ok = False
-                                else:
-                                    try:
-                                        auto_close_ok = (
-                                            int(auto_close_result.get("closed_count", 0))
-                                            > 0
-                                        )
-                                    except Exception:
-                                        auto_close_ok = False
+                        auto_close_ok = bool(
+                            isinstance(auto_close_result, dict)
+                            and (
+                                auto_close_result.get("success") is True
+                                or (
+                                    "success" not in auto_close_result
+                                    and auto_close_result.get("retcode") == 10009
+                                )
+                            )
+                        )
                         if auto_close_ok:
                             result["protection_status"] = "auto_closed_after_sl_tp_fail"
                             result["success"] = False
                         else:
                             warnings_out = _coerce_warning_list(result.get("warnings"))
-                            auto_close_warning = "AUTO-CLOSE FAILED: position remains unprotected; close immediately."
+                            auto_close_warning = (
+                                "AUTO-CLOSE FAILED: position protection remains unresolved; "
+                                "reconcile and close immediately."
+                            )
                             if auto_close_warning not in warnings_out:
                                 warnings_out.append(auto_close_warning)
                             result["warnings"] = warnings_out
                             result["success"] = False
+
+                    if sl_tp_unverified:
+                        result.setdefault(
+                            "error",
+                            "Order was executed, but TP/SL protection could not be verified.",
+                        )
+                        result.setdefault("error_code", "protection_not_verified")
+                        result.setdefault("protection_status", "protection_unverified")
+                        result["success"] = False
 
                 if (
                     bool(request.require_sl_tp)
@@ -1844,6 +2228,11 @@ def run_trade_place(  # noqa: C901
                         else "Order was executed, but TP/SL protection could not be verified."
                     )
                     result["require_sl_tp"] = bool(request.require_sl_tp)
+                    result["error_code"] = (
+                        "protection_not_applied"
+                        if sl_tp_failed
+                        else "protection_not_verified"
+                    )
                     result["success"] = False
                     result["protection_status"] = (
                         result.get("protection_status")
@@ -1896,6 +2285,7 @@ def run_trade_modify(
     modify_pending_order: Any,
     modify_position: Any,
     idempotency_store: Optional[TradeIdempotencyStore] = _TRADE_IDEMPOTENCY_STORE,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     idempotency_key = _normalize_idempotency_key(getattr(request, "idempotency_key", None))
@@ -1908,6 +2298,7 @@ def run_trade_modify(
     log_operation_start(
         logger,
         operation="trade_modify",
+        correlation_id=correlation_id,
         ticket=request.ticket,
         dry_run=request.dry_run,
     )
@@ -1918,7 +2309,16 @@ def run_trade_modify(
         pending: Optional[bool] = None,
     ) -> Dict[str, Any]:
         nonlocal idempotency_consumed
+        if correlation_id and str(result.get("error") or "").strip():
+            result = normalize_error_payload(
+                result,
+                default_code="trade_modify_error",
+                request_id=correlation_id,
+                operation="trade_modify",
+            )
+        result = _attach_live_guardrail_status(result, dry_run=request.dry_run)
         result = _annotate_idempotency_scope(result, idempotency_key, idempotency_store)
+        result = _attach_trade_correlation(result, correlation_id=correlation_id)
         if not idempotency_consumed:
             if _record_or_release_idempotency(
                 idempotency_store,
@@ -1927,11 +2327,13 @@ def run_trade_modify(
                 request_signature=idempotency_signature,
             ):
                 idempotency_consumed = True
+        _log_trade_correlation(operation="trade_modify", result=result)
         log_operation_finish(
             logger,
             operation="trade_modify",
             started_at=started_at,
             success=infer_result_success(result),
+            correlation_id=correlation_id,
             ticket=request.ticket,
             pending=pending,
             dry_run=request.dry_run,
@@ -2037,18 +2439,20 @@ def run_trade_modify(
             )
 
 
-def run_trade_close(  # noqa: C901
+def _run_trade_close_once(  # noqa: C901
     request: TradeCloseRequest,
     *,
     close_positions: Any,
     cancel_pending: Any,
     lookup_ticket_history: Any = None,
     resolve_close_target: Any = None,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     log_operation_start(
         logger,
         operation="trade_close",
+        correlation_id=correlation_id,
         ticket=request.ticket,
         close_all=request.close_all,
         symbol=request.symbol,
@@ -2069,13 +2473,16 @@ def run_trade_close(  # noqa: C901
             result = normalize_error_payload(
                 result,
                 default_code="trade_close_error",
+                request_id=correlation_id,
                 operation="trade_close",
             )
+        result = _attach_trade_correlation(result, correlation_id=correlation_id)
         log_operation_finish(
             logger,
             operation="trade_close",
             started_at=started_at,
             success=infer_result_success(result),
+            correlation_id=correlation_id,
             ticket=request.ticket,
             close_all=request.close_all,
             symbol=request.symbol,
@@ -2212,6 +2619,10 @@ def run_trade_close(  # noqa: C901
                 ticket=request.ticket,
                 symbol=request.symbol,
                 volume=request.volume,
+                magic=request.magic,
+                profit_only=request.profit_only,
+                loss_only=request.loss_only,
+                close_priority=request.close_priority,
             )
             if isinstance(target_result, dict) and target_result.get("error"):
                 return _finish(
@@ -2282,6 +2693,8 @@ def run_trade_close(  # noqa: C901
                         "total_profit",
                         "filters_applied",
                         "would_send_orders",
+                        "preview_ok",
+                        "market_readiness",
                     ):
                         if key in position_preview:
                             preview[key] = position_preview[key]
@@ -2324,6 +2737,15 @@ def run_trade_close(  # noqa: C901
                     "resolved_ticket",
                     "target_symbol",
                     "target_volume",
+                    "matched_count",
+                    "matched_positions",
+                    "total_volume",
+                    "total_profit",
+                    "filters_applied",
+                    "would_send_orders",
+                    "preview_ok",
+                    "market_readiness",
+                    "requested_close_volume",
                 ):
                     value = target_result.get(key)
                     if value is not None:
@@ -2495,6 +2917,94 @@ def run_trade_close(  # noqa: C901
     return _finish(position_result, scope="positions")
 
 
+def run_trade_close(
+    request: TradeCloseRequest,
+    *,
+    close_positions: Any,
+    cancel_pending: Any,
+    lookup_ticket_history: Any = None,
+    resolve_close_target: Any = None,
+    idempotency_store: Optional[TradeIdempotencyStore] = _TRADE_IDEMPOTENCY_STORE,
+    correlation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a close/cancel operation with the shared durable dedupe lifecycle."""
+    idempotency_key = _normalize_idempotency_key(
+        getattr(request, "idempotency_key", None)
+    )
+    idempotency_signature = (
+        _build_trade_request_signature(request)
+        if idempotency_key is not None
+        else None
+    )
+    duplicate_result, idempotency_reserved = _begin_trade_idempotency(
+        idempotency_store=idempotency_store,
+        key=idempotency_key,
+        request_signature=idempotency_signature,
+    )
+    idempotency_consumed = False
+    if duplicate_result is not None:
+        started_at = time.perf_counter()
+        log_operation_start(
+            logger,
+            operation="trade_close",
+            correlation_id=correlation_id,
+            ticket=request.ticket,
+            duplicate=True,
+        )
+        result = _annotate_idempotency_scope(
+            duplicate_result,
+            idempotency_key,
+            idempotency_store,
+        )
+        result = _attach_trade_correlation(result, correlation_id=correlation_id)
+        _log_trade_correlation(operation="trade_close", result=result)
+        log_operation_finish(
+            logger,
+            operation="trade_close",
+            started_at=started_at,
+            success=infer_result_success(result),
+            correlation_id=correlation_id,
+            ticket=request.ticket,
+            duplicate=True,
+        )
+        return result
+
+    try:
+        result = _run_trade_close_once(
+            request,
+            close_positions=close_positions,
+            cancel_pending=cancel_pending,
+            lookup_ticket_history=lookup_ticket_history,
+            resolve_close_target=resolve_close_target,
+            correlation_id=correlation_id,
+        )
+        result = _annotate_idempotency_scope(
+            result,
+            idempotency_key,
+            idempotency_store,
+        )
+        if _record_or_release_idempotency(
+            idempotency_store,
+            idempotency_key,
+            result,
+            request_signature=idempotency_signature,
+        ):
+            idempotency_consumed = True
+        _log_trade_correlation(operation="trade_close", result=result)
+        return result
+    finally:
+        if (
+            idempotency_reserved
+            and not idempotency_consumed
+            and idempotency_store is not None
+            and idempotency_key is not None
+        ):
+            idempotency_store.release(
+                idempotency_key,
+                request_signature=idempotency_signature,
+            )
+
+
 def run_trade_history(  # noqa: C901
     request: TradeHistoryRequest,
     *,
@@ -2557,20 +3067,32 @@ def run_trade_history(  # noqa: C901
     def _get_history():  # noqa: C901
         try:
             use_client_tz_value = use_client_tz()
+            client_tz_resolved = False
+            client_tz_lookup_failed = False
+            client_tz_obj: Any = None
+
+            def _resolve_client_timezone() -> tuple[Any, bool]:
+                nonlocal client_tz_lookup_failed, client_tz_obj, client_tz_resolved
+                if not client_tz_resolved:
+                    client_tz_resolved = True
+                    try:
+                        client_tz_obj = mt5_config.get_client_tz()
+                    except Exception:
+                        client_tz_lookup_failed = True
+                return client_tz_obj, client_tz_lookup_failed
 
             def _format_trade_history_timestamp(epoch_seconds: float) -> str:
                 if use_client_tz_value:
-                    try:
-                        tz_obj = mt5_config.get_client_tz()
-                        if tz_obj is not None:
-                            return _format_datetime_second_explicit(
-                                datetime.fromtimestamp(
-                                    epoch_seconds,
-                                    tz=timezone.utc,
-                                ).astimezone(tz_obj)
-                            )
-                    except Exception:
+                    client_timezone, lookup_failed = _resolve_client_timezone()
+                    if lookup_failed:
                         return format_time_minimal_local(epoch_seconds)
+                    if client_timezone is not None:
+                        return _format_datetime_second_explicit(
+                            datetime.fromtimestamp(
+                                epoch_seconds,
+                                tz=timezone.utc,
+                            ).astimezone(client_timezone)
+                        )
                 return _format_datetime_second_explicit(
                     datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
                 )
@@ -2839,16 +3361,16 @@ def run_trade_history(  # noqa: C901
 
             if kind == "deals":
                 try:
-                    rows = (
-                        gateway.history_deals_get(
-                            history_from_dt, history_to_dt, symbol=request.symbol
-                        )
-                        if request.symbol
-                        else gateway.history_deals_get(history_from_dt, history_to_dt)
-                    )
+                    rows = gateway.history_deals_get(history_from_dt, history_to_dt)
                 except Exception as exc:
                     return _history_fetch_error("deal", exc)
-                if rows is None or len(rows) == 0:
+                if rows is None:
+                    return validation.snapshot_unavailable_error(
+                        gateway,
+                        snapshot="history_deals",
+                        context="read trade history",
+                    )
+                if len(rows) == 0:
                     return _empty_history_message("deals")
                 df = _trade_rows_to_dataframe(rows, pd_module=pd)
                 if request.symbol and "symbol" in df.columns:
@@ -2900,16 +3422,16 @@ def run_trade_history(  # noqa: C901
                         df = df.drop(columns=[noise_col])
             else:
                 try:
-                    rows = (
-                        gateway.history_orders_get(
-                            history_from_dt, history_to_dt, symbol=request.symbol
-                        )
-                        if request.symbol
-                        else gateway.history_orders_get(history_from_dt, history_to_dt)
-                    )
+                    rows = gateway.history_orders_get(history_from_dt, history_to_dt)
                 except Exception as exc:
                     return _history_fetch_error("order", exc)
-                if rows is None or len(rows) == 0:
+                if rows is None:
+                    return validation.snapshot_unavailable_error(
+                        gateway,
+                        snapshot="history_orders",
+                        context="read trade history",
+                    )
+                if len(rows) == 0:
                     return _empty_history_message("orders")
                 df = _trade_rows_to_dataframe(rows, pd_module=pd)
                 if request.symbol and "symbol" in df.columns:
@@ -2984,13 +3506,13 @@ def run_trade_history(  # noqa: C901
             )
             timezone_label = "UTC"
             if use_client_tz_value:
-                try:
-                    tz_obj = mt5_config.get_client_tz()
+                tz_obj, lookup_failed = _resolve_client_timezone()
+                if lookup_failed:
+                    timezone_label = "client_local"
+                else:
                     timezone_label = str(
                         getattr(tz_obj, "zone", None) or tz_obj or "client_local"
                     )
-                except Exception:
-                    timezone_label = "client_local"
             for row in records:
                 if isinstance(row, dict):
                     row["timezone"] = timezone_label
@@ -3054,6 +3576,7 @@ def run_trade_risk_analyze(  # noqa: C901
     )
 
     def _finish(result: Dict[str, Any]) -> Dict[str, Any]:
+        result = _apply_trade_candidate_outcome(result)
         result = _shape_trade_risk_analyze_payload(
             result,
             detail=str(getattr(request, "detail", "compact")),
@@ -3083,20 +3606,31 @@ def run_trade_risk_analyze(  # noqa: C901
             equity = validation._safe_float_attr(account, "equity", 0.0)
             margin_stress = assess_margin_stress(account)
             currency = getattr(account, "currency", None)
-            positions = (
-                gateway.positions_get(symbol=request.symbol)
-                if request.symbol
-                else gateway.positions_get()
-            )
+            try:
+                positions = (
+                    gateway.positions_get(symbol=request.symbol)
+                    if request.symbol
+                    else gateway.positions_get()
+                )
+            except Exception:
+                positions = None
             if positions is None:
-                positions = []
+                return validation.snapshot_unavailable_error(
+                    gateway,
+                    snapshot="positions",
+                    context="analyze open-position risk",
+                )
             portfolio_positions_total: Optional[int] = None
+            portfolio_snapshot_available = True
             if request.symbol:
                 try:
                     portfolio_positions = gateway.positions_get()
                 except Exception:
                     portfolio_positions = None
-                portfolio_positions_total = len(list(portfolio_positions or []))
+                if portfolio_positions is None:
+                    portfolio_snapshot_available = False
+                else:
+                    portfolio_positions_total = len(list(portfolio_positions))
 
             position_type_buy = validation._safe_int_attr(
                 gateway,
@@ -3114,6 +3648,8 @@ def run_trade_risk_analyze(  # noqa: C901
             total_risk_currency = 0.0
             total_pending_risk_currency = 0.0
             positions_without_sl = 0
+            positions_with_breached_stops = 0
+            total_stop_overrun_currency = 0.0
             pending_orders_without_sl = 0
             total_notional_exposure = 0.0
             total_pending_notional_exposure = 0.0
@@ -3139,6 +3675,12 @@ def run_trade_risk_analyze(  # noqa: C901
                         continue
 
                     entry_price = float(pos.price_open)
+                    mark_price = float(pos.price_current)
+                    if not math.isfinite(mark_price) or mark_price <= 0.0:
+                        raise ValueError(
+                            "Current mark price is unavailable; remaining stop risk "
+                            "cannot be calculated."
+                        )
                     sl_price = float(pos.sl) if pos.sl and pos.sl > 0 else None
                     tp_price = float(pos.tp) if pos.tp and pos.tp > 0 else None
                     volume = float(pos.volume)
@@ -3163,10 +3705,10 @@ def run_trade_risk_analyze(  # noqa: C901
                     if not math.isfinite(contract_size) or contract_size <= 0:
                         contract_size = 1.0
 
-                    contract_price_product = abs(volume) * contract_size * entry_price
+                    contract_price_product = abs(volume) * contract_size * mark_price
                     notional_value = _linearized_account_currency_notional(
                         volume=volume,
-                        price=entry_price,
+                        price=mark_price,
                         symbol_info=sym_info,
                     )
                     notional_items_total += 1
@@ -3175,6 +3717,7 @@ def run_trade_risk_analyze(  # noqa: C901
                         notional_items_included += 1
 
                     risk_currency = None
+                    stop_overrun_currency = None
                     risk_pct = None
                     reward_currency = None
                     rr_ratio = None
@@ -3187,30 +3730,43 @@ def run_trade_risk_analyze(  # noqa: C901
 
                     if sl_price and tick_size > 0 and tick_value_valid:
                         risk_ticks = (
-                            price_delta_ticks(entry_price, sl_price, tick_size)
+                            price_delta_ticks(mark_price, sl_price, tick_size)
                             if is_buy_position
-                            else price_delta_ticks(sl_price, entry_price, tick_size)
+                            else price_delta_ticks(sl_price, mark_price, tick_size)
                         )
-                        risk_ticks = max(0, risk_ticks or 0)
-                        risk_currency = risk_ticks * risk_tick_value * abs(volume)
-                        risk_pct = (
-                            (risk_currency / equity) * 100.0 if equity > 0 else 0.0
-                        )
-                        total_risk_currency += risk_currency
-                        risk_status = "defined"
+                        stop_breached = risk_ticks is not None and risk_ticks < 0
+                        if stop_breached:
+                            positions_with_breached_stops += 1
+                            stop_overrun_currency = (
+                                abs(risk_ticks or 0)
+                                * risk_tick_value
+                                * abs(volume)
+                            )
+                            total_stop_overrun_currency += stop_overrun_currency
+                            risk_status = "breached"
+                        else:
+                            risk_ticks = abs(risk_ticks or 0)
+                            risk_currency = risk_ticks * risk_tick_value * abs(volume)
+                            risk_pct = (
+                                (risk_currency / equity) * 100.0
+                                if equity > 0
+                                else 0.0
+                            )
+                            total_risk_currency += risk_currency
+                            risk_status = "defined"
 
                         if tp_price:
                             reward_ticks = (
-                                price_delta_ticks(tp_price, entry_price, tick_size)
+                                price_delta_ticks(tp_price, mark_price, tick_size)
                                 if is_buy_position
-                                else price_delta_ticks(entry_price, tp_price, tick_size)
+                                else price_delta_ticks(mark_price, tp_price, tick_size)
                             )
                             if reward_ticks is not None and reward_ticks > 0:
                                 reward_currency = (
                                     reward_ticks * tick_value * abs(volume)
                                 )
                                 reward_status = "defined"
-                                if risk_currency > 0:
+                                if risk_currency is not None and risk_currency > 0:
                                     rr_ratio = reward_currency / risk_currency
                             else:
                                 reward_status = "invalid"
@@ -3240,6 +3796,9 @@ def run_trade_risk_analyze(  # noqa: C901
                                 "1 broker lot equals contract_size contract units."
                             ),
                             "entry": entry_price,
+                            "current_mark": mark_price,
+                            "risk_reference_price": mark_price,
+                            "risk_reference_basis": "current_mark",
                             "sl": sl_price,
                             "tp": tp_price,
                             "risk_currency": _round_optional_number(
@@ -3247,6 +3806,9 @@ def run_trade_risk_analyze(  # noqa: C901
                             ),
                             "risk_pct": _round_optional_number(risk_pct, 2),
                             "risk_status": risk_status,
+                            "stop_overrun_currency": _round_optional_number(
+                                stop_overrun_currency, 2
+                            ),
                             "notional_value": _round_optional_number(
                                 notional_value, 2
                             ),
@@ -3281,7 +3843,11 @@ def run_trade_risk_analyze(  # noqa: C901
                     else gateway.orders_get()
                 )
                 if pending_orders is None:
-                    pending_orders = []
+                    return validation.snapshot_unavailable_error(
+                        gateway,
+                        snapshot="orders",
+                        context="include pending-order risk",
+                    )
                 pending_buy_types = {
                     validation._safe_int_attr(gateway, "ORDER_TYPE_BUY_LIMIT", 2),
                     validation._safe_int_attr(gateway, "ORDER_TYPE_BUY_STOP", 4),
@@ -3448,7 +4014,20 @@ def run_trade_risk_analyze(  # noqa: C901
                 (total_notional_exposure / equity) * 100.0 if equity > 0 else 0.0
             )
 
-            stop_risk_level = "high" if total_risk_pct > 10 else "moderate" if total_risk_pct > 5 else "low"
+            if (
+                positions_without_sl > 0
+                or pending_orders_without_sl > 0
+                or positions_with_breached_stops > 0
+            ):
+                stop_risk_level = "unlimited"
+            else:
+                stop_risk_level = (
+                    "high"
+                    if total_risk_pct > 10
+                    else "moderate"
+                    if total_risk_pct > 5
+                    else "low"
+                )
             margin_risk_level = (
                 "high" if margin_stress["status"] == "critical"
                 else "moderate" if margin_stress["status"] == "stressed"
@@ -3458,13 +4037,23 @@ def run_trade_risk_analyze(  # noqa: C901
                 "high" if notional_exposure_pct >= 400.0
                 else "moderate" if notional_exposure_pct >= 200.0 else "low"
             )
-            risk_rank = {"unknown": -1, "low": 0, "moderate": 1, "high": 2}
+            risk_rank = {
+                "unknown": -1,
+                "low": 0,
+                "moderate": 1,
+                "high": 2,
+                "unlimited": 3,
+            }
             quantified_risk_level = max(
                 (stop_risk_level, margin_risk_level, notional_risk_level),
                 key=lambda value: risk_rank[value],
             )
 
-            if positions_without_sl > 0 or pending_orders_without_sl > 0:
+            if (
+                positions_without_sl > 0
+                or pending_orders_without_sl > 0
+                or positions_with_breached_stops > 0
+            ):
                 overall_risk_status = "unlimited"
             elif risk_calculation_failures:
                 overall_risk_status = "incomplete"
@@ -3504,6 +4093,8 @@ def run_trade_risk_analyze(  # noqa: C901
                     "pending_orders_included": bool(getattr(request, "include_pending", True)),
                     "pending_orders_count": len(pending_order_risks),
                     "positions_without_sl": positions_without_sl,
+                    "positions_with_breached_stops": positions_with_breached_stops,
+                    "stop_overrun_currency": round(total_stop_overrun_currency, 2),
                     "pending_orders_without_sl": pending_orders_without_sl,
                     "positions_with_risk_calculation_failures": len(
                         risk_calculation_failures
@@ -3561,8 +4152,18 @@ def run_trade_risk_analyze(  # noqa: C901
                 scoped_risk = result.pop("portfolio_risk")
                 result["scoped_risk"] = scoped_risk
                 result["risk_visibility"] = (
-                    "partial" if other_positions_count else "symbol_scope"
+                    "partial"
+                    if other_positions_count or not portfolio_snapshot_available
+                    else "symbol_scope"
                 )
+                if not portfolio_snapshot_available:
+                    scoped_risk["overall_risk_status"] = "incomplete"
+                    scoped_risk["quantified_risk_level"] = "unknown"
+                    result["scope_warning"] = (
+                        "The symbol-scoped analysis succeeded, but the full portfolio "
+                        "position snapshot was unavailable. Aggregate portfolio risk "
+                        "and other-position counts are unknown."
+                    )
                 if other_positions_count:
                     scoped_risk["overall_risk_status"] = "partial"
                     scoped_risk["quantified_risk_level"] = "unknown"
@@ -3580,16 +4181,22 @@ def run_trade_risk_analyze(  # noqa: C901
                     "risk_target_basis": "percent_of_account_equity",
                     "candidate_symbol": str(request.symbol),
                     "account_margin_context_included": True,
-                    "existing_portfolio_stop_risk_included": not bool(
-                        other_positions_count
+                    "existing_portfolio_stop_risk_included": bool(
+                        portfolio_snapshot_available and not other_positions_count
                     ),
-                    "portfolio_positions": int(portfolio_positions_total or 0),
-                    "other_positions": int(other_positions_count or 0),
                     "note": (
                         "Suggested volume limits this candidate trade's stop risk; "
                         "it does not cap aggregate portfolio stop risk."
                     ),
                 }
+                if portfolio_positions_total is not None:
+                    result["sizing_risk_policy"]["portfolio_positions"] = int(
+                        portfolio_positions_total
+                    )
+                if other_positions_count is not None:
+                    result["sizing_risk_policy"]["other_positions"] = int(
+                        other_positions_count
+                    )
             else:
                 result["risk_visibility"] = "portfolio"
                 result["scope"] = {
@@ -3646,7 +4253,63 @@ def run_trade_risk_analyze(  # noqa: C901
                 except Exception:
                     candidate_symbol_info = None
 
-            if request.entry is not None and request.stop_loss is not None:
+            direction_inference_ambiguous = False
+            if (
+                entry_was_omitted
+                and request.direction is None
+                and request.stop_loss is not None
+            ):
+                quote_bid = _positive_trade_price(live_quote_context.get("bid"))
+                quote_ask = _positive_trade_price(live_quote_context.get("ask"))
+                if (
+                    quote_bid is not None
+                    and quote_ask is not None
+                    and min(quote_bid, quote_ask)
+                    <= float(request.stop_loss)
+                    <= max(quote_bid, quote_ask)
+                ):
+                    direction_inference_ambiguous = True
+                    ambiguity_reason = (
+                        "Direction cannot be inferred from a stop_loss inside the live "
+                        "bid/ask spread. Provide direction='long' or direction='short'."
+                    )
+                    result["trade_evaluation"] = {
+                        "status": "invalid",
+                        "symbol": request.symbol,
+                        "direction": None,
+                        "direction_source": "ambiguous_inside_spread",
+                        "entry": request.entry,
+                        "sl": float(request.stop_loss),
+                        "tp": (
+                            float(request.take_profit)
+                            if request.take_profit is not None
+                            else None
+                        ),
+                        "error": ambiguity_reason,
+                    }
+                    result["position_sizing_error"] = _build_position_sizing_error(
+                        code="direction_inference_ambiguous",
+                        field="direction",
+                        reason=ambiguity_reason,
+                        entry=(
+                            float(request.entry)
+                            if request.entry is not None
+                            else None
+                        ),
+                        remediation="Provide direction='long' or direction='short'.",
+                        details={
+                            "bid": quote_bid,
+                            "ask": quote_ask,
+                            "stop_loss": float(request.stop_loss),
+                            "entry_in_spread": True,
+                        },
+                    )
+
+            if (
+                not direction_inference_ambiguous
+                and request.entry is not None
+                and request.stop_loss is not None
+            ):
                 result["trade_evaluation"] = _build_trade_evaluation(
                     symbol=request.symbol,
                     direction=request.direction,
@@ -3737,18 +4400,14 @@ def run_trade_risk_analyze(  # noqa: C901
                         )
                         if sizing_method == "fixed_fraction"
                         else (
-                            "Kelly sizing needs win rate and average win/loss "
-                            "returns; desired_risk_pct is optional and acts as a "
-                            "cap. Use trade_journal_analyze to estimate "
-                            "win_rate, avg_win, and avg_loss from realized "
-                            "trades."
+                            "Kelly sizing needs win rate and stake-normalized average "
+                            "win/loss returns (for example, R-multiples); "
+                            "desired_risk_pct is optional and acts as a cap. Raw "
+                            "account-currency PnL averages are not valid inputs."
                         ),
                     }
                     if sizing_method == "kelly":
                         position_sizing["sizing_method"] = sizing_method
-                        position_sizing["related_tools"] = [
-                            "trade_journal_analyze"
-                        ]
                     if position_sizing_provided:
                         proposed_context = {
                             key: value
@@ -3785,6 +4444,7 @@ def run_trade_risk_analyze(  # noqa: C901
 
             sizing_ready = bool(
                 sizing_method_error is None
+                and not direction_inference_ambiguous
                 and request.entry is not None
                 and request.stop_loss is not None
                 and (
@@ -3974,8 +4634,9 @@ def run_trade_risk_analyze(  # noqa: C901
                                     else "Invalid Kelly sizing inputs"
                                 ),
                                 remediation=(
-                                    "Provide valid Kelly metrics or derive them from "
-                                    "trade_journal_analyze."
+                                    "Provide win rate and stake-normalized average "
+                                    "win/loss returns from a consistently risk-sized "
+                                    "out-of-sample track record."
                                 ),
                                 details={
                                     "kelly_win_rate": kelly_inputs.get("win_rate"),
@@ -4416,7 +5077,13 @@ def run_trade_stress_test(
         positions = gateway.positions_get()
     except Exception as exc:
         return {"error": str(exc)}
-    positions = list(positions or [])
+    if positions is None:
+        return validation.snapshot_unavailable_error(
+            gateway,
+            snapshot="positions",
+            context="run a portfolio stress test",
+        )
+    positions = list(positions)
     equity = validation._safe_float_attr(account, "equity", 0.0) if account is not None else 0.0
     currency = str(getattr(account, "currency", "") or "").strip() if account is not None else ""
     position_type_buy = validation._safe_int_attr(
@@ -4439,8 +5106,10 @@ def run_trade_stress_test(
             warnings_out.append({"symbol": symbol, "warning": "Symbol info unavailable."})
             continue
         current_price = validation._safe_float_attr(position, "price_current", 0.0)
+        valuation_basis = "position_current_price"
         if current_price <= 0.0:
             current_price = validation._safe_float_attr(position, "price_open", 0.0)
+            valuation_basis = "entry_price_fallback"
         volume = validation._safe_float_attr(position, "volume", 0.0)
         tick_size = validation._safe_float_attr(symbol_info, "trade_tick_size", 0.0)
         if tick_size <= 0.0:
@@ -4495,6 +5164,7 @@ def run_trade_stress_test(
             "volume": round(float(volume), 6),
             "shock_pct": round(shock_value, 6),
             "current_price": round(float(current_price), 8),
+            "valuation_basis": valuation_basis,
             "shocked_price": round(float(shocked_price), 8),
             "pnl_impact": round(float(pnl_impact), 2),
         }
@@ -4533,11 +5203,112 @@ def run_trade_stress_test(
     if not positions:
         result.update({"empty": True, "message": "No open positions found."})
     elif not rows:
-        result["message"] = "No open positions matched the requested shocks or had usable tick metadata."
+        result.update(
+            {
+                "success": False,
+                "error_code": "stress_no_positions_evaluated",
+                "error": (
+                    "No open positions matched the requested shocks or had usable "
+                    "tick metadata."
+                ),
+            }
+        )
     if warnings_out:
         result["warnings"] = warnings_out
         result["partial_failure"] = True
+    result.update(_position_mark_freshness(gateway, positions))
     return result
+
+
+def _position_mark_freshness(
+    gateway: Any,
+    positions: List[Any],
+) -> Dict[str, Any]:
+    contexts: List[Dict[str, Any]] = []
+    symbol_counts: Dict[str, int] = {}
+    fallback_counts: Dict[str, int] = {}
+    for position in positions:
+        symbol = str(getattr(position, "symbol", "") or "").strip()
+        if not symbol:
+            continue
+        symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
+        current_price = validation._safe_float_attr(position, "price_current", 0.0)
+        open_price = validation._safe_float_attr(position, "price_open", 0.0)
+        if current_price <= 0.0 and open_price > 0.0:
+            fallback_counts[symbol] = fallback_counts.get(symbol, 0) + 1
+    for symbol, position_count in symbol_counts.items():
+        try:
+            tick = gateway.symbol_info_tick(symbol)
+        except Exception:
+            tick = None
+        context = build_trade_quote_context(symbol, tick)
+        context["symbol"] = symbol
+        context["positions"] = int(position_count)
+        if fallback_counts.get(symbol):
+            context["entry_price_fallback_positions"] = fallback_counts[symbol]
+            context["valuation_basis"] = "entry_price_fallback"
+        contexts.append(context)
+    if not contexts:
+        return {
+            "mark_freshness_status": "unknown",
+            "usable_for_live_trading": False,
+            "data_stale": None,
+        }
+    def _age(context: Dict[str, Any]) -> float:
+        try:
+            value = context.get("data_age_seconds")
+            return float(value) if value is not None else float("inf")
+        except (TypeError, ValueError):
+            return float("inf")
+
+    oldest = max(contexts, key=_age)
+    fallback_used = bool(fallback_counts)
+    live_ready = not fallback_used and all(
+        item.get("usable_for_live_trading") is True for item in contexts
+    )
+    stale_values = [item.get("data_stale") for item in contexts]
+    data_stale = (
+        True
+        if any(value is True for value in stale_values)
+        else False
+        if all(value is False for value in stale_values)
+        else None
+    )
+    out: Dict[str, Any] = {
+        "mark_freshness_status": (
+            "live"
+            if live_ready
+            else "entry_price_fallback"
+            if fallback_used
+            else "stale_or_unverified"
+        ),
+        "usable_for_live_trading": live_ready,
+        "data_stale": data_stale,
+        "valuation_time": oldest.get("quote_time"),
+        "valuation_basis": (
+            "live_position_marks"
+            if live_ready
+            else "entry_price_fallback"
+            if fallback_used
+            else "stale_or_unverified_position_marks"
+        ),
+        "mark_freshness": contexts,
+    }
+    if fallback_used:
+        out["valuation_warning"] = (
+            "One or more positions were valued from entry price because the current "
+            "position mark was unavailable; results are not live-mark ready."
+        )
+        out["entry_price_fallback_positions"] = sum(fallback_counts.values())
+    for key in ("market_status", "market_status_reason"):
+        values = [item.get(key) for item in contexts if item.get(key) not in (None, "")]
+        if values:
+            out[key] = values[0]
+    return {
+        key: value
+        for key, value in out.items()
+        if value is not None or key == "data_stale"
+    }
 
 
 def run_trade_var_cvar_calculate(  # noqa: C901
@@ -4602,6 +5373,11 @@ def run_trade_var_cvar_calculate(  # noqa: C901
         return _finish({"error": "lookback must be an integer"})
     if lookback < 2:
         return _finish({"error": "lookback must be at least 2"})
+    history_policy = (
+        "includes_current_forming_bar"
+        if request.include_incomplete
+        else "completed_bars_only"
+    )
 
     try:
         min_observations = int(request.min_observations)
@@ -4638,9 +5414,21 @@ def run_trade_var_cvar_calculate(  # noqa: C901
             else gateway.positions_get()
         )
     except Exception as exc:
-        return _finish({"error": str(exc)})
+        result = validation.snapshot_unavailable_error(
+            gateway,
+            snapshot="positions",
+            context="calculate portfolio VaR/CVaR",
+        )
+        result["cause"] = str(exc)
+        return _finish(result)
     if positions is None:
-        positions = []
+        return _finish(
+            validation.snapshot_unavailable_error(
+                gateway,
+                snapshot="positions",
+                context="calculate portfolio VaR/CVaR",
+            )
+        )
     if not positions:
         message = (
             f"No open positions found for symbol {request.symbol}"
@@ -4658,6 +5446,8 @@ def run_trade_var_cvar_calculate(  # noqa: C901
                 f"One {timeframe_value} bar loss on the current position snapshot."
             ),
             "lookback": int(lookback),
+            "history_policy": history_policy,
+            "forming_candle_status": "not_applicable",
             "min_observations": int(min_observations),
             "observations": 0,
             "positions": 0,
@@ -4690,6 +5480,8 @@ def run_trade_var_cvar_calculate(  # noqa: C901
                 "status": "no_open_positions",
                 "message": message,
                 "positions": 0,
+                "history_policy": history_policy,
+                "forming_candle_status": "not_applicable",
             }
         if request.symbol:
             result["scope"] = "symbol"
@@ -4718,41 +5510,50 @@ def run_trade_var_cvar_calculate(  # noqa: C901
     mt5_timeframe = TIMEFRAME_MAP[timeframe_value]
     symbol_info_cache: Dict[str, Any] = {}
     history_failures: List[Dict[str, Any]] = []
-    warnings: List[Dict[str, Any]] = []
+    valuation_failures: List[Dict[str, Any]] = []
     position_exposures: List[Dict[str, Any]] = []
     symbol_exposures: Dict[str, Dict[str, Any]] = {}
+
+    def _record_valuation_failure(
+        position: Any,
+        *,
+        symbol: Optional[str],
+        error: str,
+    ) -> None:
+        failure: Dict[str, Any] = {
+            "ticket": getattr(position, "ticket", None),
+            "error": error,
+        }
+        if symbol:
+            failure["symbol"] = symbol
+        valuation_failures.append(failure)
 
     for position in positions:
         symbol = str(getattr(position, "symbol", "") or "").strip()
         if not symbol:
-            warnings.append(
-                {
-                    "ticket": getattr(position, "ticket", None),
-                    "warning": "Position has no symbol",
-                }
+            _record_valuation_failure(
+                position,
+                symbol=None,
+                error="Position has no symbol.",
             )
             continue
         if symbol not in symbol_info_cache:
             symbol_info_cache[symbol] = gateway.symbol_info(symbol)
         symbol_info = symbol_info_cache[symbol]
         if symbol_info is None:
-            warnings.append(
-                {
-                    "ticket": getattr(position, "ticket", None),
-                    "symbol": symbol,
-                    "warning": "Symbol info unavailable",
-                }
+            _record_valuation_failure(
+                position,
+                symbol=symbol,
+                error="Symbol info is unavailable.",
             )
             continue
 
         volume = validation._safe_float_attr(position, "volume", 0.0)
         if not math.isfinite(volume) or volume <= 0.0:
-            warnings.append(
-                {
-                    "ticket": getattr(position, "ticket", None),
-                    "symbol": symbol,
-                    "warning": "Position volume is invalid",
-                }
+            _record_valuation_failure(
+                position,
+                symbol=symbol,
+                error="Position volume is invalid.",
             )
             continue
 
@@ -4762,15 +5563,15 @@ def run_trade_var_cvar_calculate(  # noqa: C901
         if not math.isfinite(contract_size) or contract_size <= 0.0:
             contract_size = 1.0
         mark_price = validation._safe_float_attr(position, "price_current", 0.0)
+        valuation_basis = "position_current_price"
         if mark_price <= 0.0:
             mark_price = validation._safe_float_attr(position, "price_open", 0.0)
+            valuation_basis = "entry_price_fallback"
         if not math.isfinite(mark_price) or mark_price <= 0.0:
-            warnings.append(
-                {
-                    "ticket": getattr(position, "ticket", None),
-                    "symbol": symbol,
-                    "warning": "Position mark price is invalid",
-                }
+            _record_valuation_failure(
+                position,
+                symbol=symbol,
+                error="Position mark price is invalid.",
             )
             continue
 
@@ -4783,15 +5584,13 @@ def run_trade_var_cvar_calculate(  # noqa: C901
             symbol_info=symbol_info,
         )
         if account_notional is None:
-            warnings.append(
-                {
-                    "ticket": getattr(position, "ticket", None),
-                    "symbol": symbol,
-                    "warning": (
-                        "Symbol tick value/tick size is unavailable; position "
-                        "cannot be included in account-currency VaR/CVaR."
-                    ),
-                }
+            _record_valuation_failure(
+                position,
+                symbol=symbol,
+                error=(
+                    "Symbol tick value/tick size is unavailable for "
+                    "account-currency VaR/CVaR."
+                ),
             )
             continue
         signed_notional = side_sign * account_notional
@@ -4804,6 +5603,7 @@ def run_trade_var_cvar_calculate(  # noqa: C901
                 "side": side,
                 "volume": float(volume),
                 "mark_price": round(float(mark_price), 6),
+                "valuation_basis": valuation_basis,
                 "contract_size": round(float(contract_size), 6),
                 "signed_notional": round(float(signed_notional), 2),
                 "contract_price_product": round(
@@ -4829,20 +5629,59 @@ def run_trade_var_cvar_calculate(  # noqa: C901
         exposure["gross_notional"] += abs(float(signed_notional))
         exposure["positions"] += 1
 
+    if valuation_failures:
+        return _finish(
+            {
+                "success": False,
+                "error": (
+                    "Portfolio VaR/CVaR requires account-currency valuation for "
+                    "every open position; refusing a partial calculation."
+                ),
+                "error_code": "portfolio_var_incomplete",
+                "scope": "symbol" if request.symbol else "portfolio",
+                "valuation_failures": valuation_failures,
+                "omitted_symbols": sorted(
+                    {
+                        str(item.get("symbol"))
+                        for item in valuation_failures
+                        if item.get("symbol")
+                    }
+                ),
+                "remediation": (
+                    "Restore valid symbol metadata, position volume and mark prices, "
+                    "and positive tick-size/tick-value economics for every position."
+                ),
+            }
+        )
+
     if not position_exposures:
-        result = {
-            "error": "No usable open positions available for VaR/CVaR calculation."
-        }
-        if warnings:
-            result["warnings"] = warnings
-        return _finish(result)
+        return _finish(
+            {"error": "No usable open positions available for VaR/CVaR calculation."}
+        )
 
     return_series: Dict[str, Any] = {}
+    forming_candle_statuses: Dict[str, str] = {}
     for symbol in list(symbol_exposures.keys()):
         try:
-            rates = gateway.copy_rates_from_pos(symbol, mt5_timeframe, 0, lookback)
+            rates = gateway.copy_rates_from_pos(
+                symbol,
+                mt5_timeframe,
+                0,
+                lookback + (0 if request.include_incomplete else 1),
+            )
             if rates is not None:
                 rates = _normalize_times_in_struct(rates)
+                forming = _is_last_bar_forming(rates, timeframe_value)
+                forming_candle_statuses[symbol] = (
+                    "included"
+                    if forming and request.include_incomplete
+                    else "excluded"
+                    if forming
+                    else "none_detected"
+                )
+                if forming and not request.include_incomplete:
+                    rates = rates[:-1]
+                rates = rates[-lookback:]
         except Exception as exc:
             history_failures.append({"symbol": symbol, "error": str(exc)})
             continue
@@ -4858,14 +5697,37 @@ def run_trade_var_cvar_calculate(  # noqa: C901
             continue
         return_series[symbol] = returns
 
+    if history_failures:
+        return _finish(
+            {
+                "success": False,
+                "error": (
+                    "Portfolio VaR/CVaR requires return history for every included "
+                    "open-position symbol; refusing a partial calculation."
+                ),
+                "error_code": "portfolio_var_incomplete",
+                "scope": "symbol" if request.symbol else "portfolio",
+                "history_failures": history_failures,
+                "omitted_symbols": sorted(
+                    {
+                        str(item.get("symbol"))
+                        for item in history_failures
+                        if item.get("symbol")
+                    }
+                ),
+                "remediation": (
+                    "Restore price history for every omitted symbol or narrow the "
+                    "request to a symbol with sufficient history."
+                ),
+            }
+        )
+
     if not return_series:
         result: Dict[str, Any] = {
             "error": "Unable to build return series for any open-position symbols.",
         }
         if history_failures:
             result["history_failures"] = history_failures
-        if warnings:
-            result["warnings"] = warnings
         return _finish(result)
 
     valid_symbols = set(return_series)
@@ -4901,8 +5763,6 @@ def run_trade_var_cvar_calculate(  # noqa: C901
         }
         if history_failures:
             result["history_failures"] = history_failures
-        if warnings:
-            result["warnings"] = warnings
         return _finish(result)
 
     exposure_vector = pd.Series(
@@ -4984,6 +5844,13 @@ def run_trade_var_cvar_calculate(  # noqa: C901
         for timestamp, value in worst_bars.items()
     ]
 
+    forming_candle_status = (
+        "included"
+        if "included" in forming_candle_statuses.values()
+        else "excluded"
+        if "excluded" in forming_candle_statuses.values()
+        else "none_detected"
+    )
     summary: Dict[str, Any] = {
         "method": method_value,
         "confidence": round(float(confidence_value), 6),
@@ -5000,6 +5867,8 @@ def run_trade_var_cvar_calculate(  # noqa: C901
             f"One {timeframe_value} bar loss on the current position snapshot."
         ),
         "lookback": int(lookback),
+        "history_policy": history_policy,
+        "forming_candle_status": forming_candle_status,
         "min_observations": int(min_observations),
         "observations": int(len(pnl_values)),
         "positions": int(len(position_exposures)),
@@ -5026,6 +5895,9 @@ def run_trade_var_cvar_calculate(  # noqa: C901
     result = {
         "success": True,
         "scope": "symbol" if request.symbol else "portfolio",
+        "history_policy": history_policy,
+        "forming_candle_status": forming_candle_status,
+        "forming_candle_status_by_symbol": forming_candle_statuses,
         "summary": summary,
         "symbol_exposures": symbol_rows,
         "positions": position_exposures,
@@ -5038,8 +5910,7 @@ def run_trade_var_cvar_calculate(  # noqa: C901
         )
     if history_failures:
         result["history_failures"] = history_failures
-    if warnings:
-        result["warnings"] = warnings
+    result.update(_position_mark_freshness(gateway, positions))
     return _finish(
         _shape_trade_var_cvar_payload(result, detail=request.detail)
     )
@@ -5221,6 +6092,8 @@ def _trade_query_empty_filter_message(request: Any) -> Optional[str]:
 def _fetch_trade_query_rows(
     request: Any,
     *,
+    gateway: Any,
+    snapshot: str,
     fetch_rows: Any,
     no_ticket_message: Any,
     no_symbol_message: Any,
@@ -5229,7 +6102,15 @@ def _fetch_trade_query_rows(
     if request.ticket is not None:
         ticket_int = int(request.ticket)
         rows = fetch_rows(ticket=ticket_int)
-        if rows is None or len(rows) == 0:
+        if rows is None:
+            return None, [
+                validation.snapshot_unavailable_error(
+                    gateway,
+                    snapshot=snapshot,
+                    context="read trading state",
+                )
+            ]
+        if len(rows) == 0:
             return None, [{"message": no_ticket_message(request.ticket)}]
     elif request.symbol is not None:
         # Validate symbol before querying
@@ -5237,11 +6118,27 @@ def _fetch_trade_query_rows(
         if symbol_error:
             return None, [{"error": symbol_error}]
         rows = fetch_rows(symbol=request.symbol)
-        if rows is None or len(rows) == 0:
+        if rows is None:
+            return None, [
+                validation.snapshot_unavailable_error(
+                    gateway,
+                    snapshot=snapshot,
+                    context="read trading state",
+                )
+            ]
+        if len(rows) == 0:
             return None, [{"message": no_symbol_message(request.symbol)}]
     else:
         rows = fetch_rows()
-        if rows is None or len(rows) == 0:
+        if rows is None:
+            return None, [
+                validation.snapshot_unavailable_error(
+                    gateway,
+                    snapshot=snapshot,
+                    context="read trading state",
+                )
+            ]
+        if len(rows) == 0:
             return None, [{"message": no_rows_message}]
     return rows, None
 
@@ -5474,6 +6371,7 @@ def _run_trade_query_impl(
     normalize_limit: Any,
     comment_row_metadata: Any,
     pd_module: Any,
+    snapshot: str,
     fetch_rows: Any,
     no_ticket_message: Any,
     no_symbol_message: Any,
@@ -5492,6 +6390,8 @@ def _run_trade_query_impl(
         timezone_label = "client_local" if use_client_tz_value else "UTC"
         rows, empty_response = _fetch_trade_query_rows(
             request,
+            gateway=gateway,
+            snapshot=snapshot,
             fetch_rows=fetch_rows,
             no_ticket_message=no_ticket_message,
             no_symbol_message=no_symbol_message,
@@ -5591,6 +6491,7 @@ def _run_trade_get_open_impl(
         normalize_limit=normalize_limit,
         comment_row_metadata=comment_row_metadata,
         pd_module=pd_module,
+        snapshot="positions",
         fetch_rows=gateway.positions_get,
         no_ticket_message=lambda ticket: f"No position found with ID {ticket}",
         no_symbol_message=lambda symbol: f"No open positions for {symbol}",
@@ -5622,6 +6523,7 @@ def _run_trade_get_pending_impl(
         normalize_limit=normalize_limit,
         comment_row_metadata=comment_row_metadata,
         pd_module=pd_module,
+        snapshot="orders",
         fetch_rows=gateway.orders_get,
         no_ticket_message=lambda ticket: f"No pending order found with ID {ticket}",
         no_symbol_message=lambda symbol: f"No pending orders for {symbol}",

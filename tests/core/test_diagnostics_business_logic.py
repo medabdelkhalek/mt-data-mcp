@@ -42,6 +42,33 @@ def _raw(tool):
     return getattr(tool, "__wrapped__", tool)
 
 
+def test_fetch_diagnostic_bars_excludes_forming_tail_by_default(monkeypatch):
+    frame = _bars(np.linspace(100.0, 120.0, 21))
+    requested = []
+    monkeypatch.setattr(diagnostics, "_ensure_symbol_ready", lambda _symbol: None)
+    monkeypatch.setattr(
+        diagnostics,
+        "_mt5_copy_rates_from",
+        lambda _symbol, _timeframe, _now, count: requested.append(count)
+        or frame.to_dict("records"),
+    )
+    monkeypatch.setattr(diagnostics, "_is_last_bar_forming", lambda *_args: True)
+
+    completed, error = diagnostics._fetch_diagnostic_bars("TEST", "H1", 20)
+    included, included_error = diagnostics._fetch_diagnostic_bars(
+        "TEST", "H1", 20, include_incomplete=True
+    )
+
+    assert error is None and included_error is None
+    assert requested == [21, 20]
+    assert len(completed) == 20
+    assert completed.iloc[-1]["close"] == 119.0
+    assert completed.attrs["history_policy"] == "completed_bars_only"
+    assert completed.attrs["forming_candle_status"] == "excluded"
+    assert included.iloc[-1]["close"] == 120.0
+    assert included.attrs["forming_candle_status"] == "included"
+
+
 def test_stationarity_test_combines_adf_and_kpss(monkeypatch):
     rng = np.random.default_rng(7)
     frame = _bars(100.0 + rng.normal(0.0, 1.0, 500))
@@ -92,6 +119,7 @@ def test_seasonality_detect_finds_known_period(monkeypatch):
     assert result["success"] is True
     assert result["dominant_period_bars"] == 12
     assert result["signal_quality"] in {"moderate", "strong"}
+    assert result["detection_status"] in {"candidate", "detected"}
     assert "signal_quality" in result["items"][0]
     assert result["items"][0]["period_duration"] == "12 hours"
     assert result["items"][0]["period_duration_seconds"] == 43_200
@@ -121,6 +149,13 @@ def test_seasonality_detect_does_not_inflate_noise_spectral_score(monkeypatch):
         row["signal_quality"] in {"very_weak", "weak", "moderate"}
         for row in result["items"]
     )
+    if all(
+        row["signal_quality"] in {"very_weak", "weak"}
+        for row in result["items"]
+    ):
+        assert result["detection_status"] == "not_detected"
+    else:
+        assert result["detection_status"] == "candidate"
 
 
 def test_outliers_detect_flags_price_and_volume_spike(monkeypatch):
